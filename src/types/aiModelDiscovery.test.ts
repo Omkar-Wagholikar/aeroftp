@@ -79,6 +79,25 @@ describe('provider capability discovery', () => {
         expect(model.supportsVision).toBe(true);
         expect(model.nativeCapabilities).toBeUndefined();
     });
+    it('resets scoped overrides and automatic ceilings between two verified models', () => {
+        const original = resolveProviderModel({ name: 'nvidia/nemotron-3-ultra-550b-a55b', capabilityOverrides: { supportsTools: false } }, nvidia) as AIModel;
+        expect(resolveProviderModel(original, nvidia).supportsTools).toBe(false);
+        const renamed = resolveProviderModel({ ...original, name: 'moonshotai/kimi-k3' }, nvidia);
+        expect(renamed).toMatchObject({ supportsTools: true, supportsVision: true, maxContextTokens: 1048576, capabilitySource: 'provider' });
+        expect(renamed.capabilityOverrides).toBeUndefined();
+        const moved = resolveProviderModel({ ...original, name: 'vendor/model' }, router, { id: 'vendor/model', supportsTools: true, maxContextTokens: 2000000 });
+        expect(moved).toMatchObject({ supportsTools: true, maxContextTokens: 2000000 });
+        const limited = resolveProviderModel({ ...original, maxContextTokens: 16000, maxTokens: 1000, name: 'moonshotai/kimi-k3' }, nvidia);
+        expect(limited).toMatchObject({ maxContextTokens: 16000, maxTokens: 1000 });
+    });
+    it('resets model overrides between recognized Alibaba workspace endpoints', () => {
+        const studio = { ...router, type: 'custom', baseUrl: 'https://first.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1' } as AIProvider;
+        const original = resolveProviderModel({ name: 'qwen3.8-flash', capabilityOverrides: { supportsVision: false } }, studio) as AIModel;
+        expect(resolveProviderModel(original, studio).supportsVision).toBe(false);
+        const moved = resolveProviderModel(original, { ...studio, baseUrl: 'https://second.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1' });
+        expect(moved.supportsVision).toBe(true);
+        expect(moved.capabilityOverrides).toBeUndefined();
+    });
     it('does not interpret availability-only discovery as capabilities', () => {
         expect(providerModelSnapshot(router, 'vendor/new', { id: 'vendor/new' })).toBeUndefined();
         expect(resolveProviderModel({ name: 'unknown/model', supportsTools: false }, nvidia).capabilitySource).toBeUndefined();

@@ -3304,11 +3304,15 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             {isTranscribingAudio ? <RefreshCw size={16} className="animate-spin" /> : isListening ? <MicOff size={16} /> : <Mic size={16} />}
                         </button>
                         <button
-                            onClick={handleSend}
-                            disabled={(!input.trim() && attachedImages.length === 0) || isLoading}
-                            className="p-1.5 text-purple-400 hover:text-purple-300 disabled:text-gray-600 disabled:cursor-not-allowed transition-colors"
+                            onClick={isLoading ? cancelActiveStream : handleSend}
+                            disabled={!isLoading && !input.trim() && attachedImages.length === 0}
+                            title={isLoading ? t('ai.stopGeneration') : undefined}
+                            aria-label={isLoading ? t('ai.stopGeneration') : undefined}
+                            className={`p-1.5 rounded transition-colors ${isLoading
+                                ? 'text-red-400 hover:text-red-300 hover:bg-red-500/20'
+                                : 'text-purple-400 hover:text-purple-300 disabled:text-gray-600 disabled:cursor-not-allowed'}`}
                         >
-                            <Send size={16} />
+                            {isLoading ? <Square size={16} fill="currentColor" /> : <Send size={16} />}
                         </button>
                     </div>
 

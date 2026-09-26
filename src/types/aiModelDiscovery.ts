@@ -86,16 +86,21 @@ export function resolveProviderModel(model: Partial<AIModel> & {name: string}, p
     if (!provider) return reconcilePersistedModel(model);
     const saved = model.providerCapabilities;
     const savedMatches = saved?.id === model.name && saved.providerType === provider.type && saved.baseUrl === normalizedUrl(provider.baseUrl);
-    const snapshot = providerModelSnapshot(provider, model.name, info) || (savedMatches ? saved : undefined);
-    if (!snapshot) {
-        if (saved) return applyDiscoveredModelDefaults({
+    if (saved && !savedMatches) {
+        // Invalidate the old scope before resolving the destination, including
+        // when both endpoints/models have their own verified profiles.
+        model = {
             ...model,
             // Values equal to the old endpoint ceiling were derived/clamped by
             // discovery. Only a strictly lower user budget may survive a move.
             maxContextTokens: saved.maxContextTokens && model.maxContextTokens === saved.maxContextTokens ? undefined : model.maxContextTokens,
             maxTokens: saved.maxTokens && model.maxTokens === saved.maxTokens ? undefined : model.maxTokens,
             providerCapabilities: undefined, capabilityOverrides: undefined, nativeCapabilities: undefined, capabilitySource: 'unknown',
-        });
+        };
+    }
+    const snapshot = providerModelSnapshot(provider, model.name, info) || (savedMatches ? saved : undefined);
+    if (!snapshot) {
+        if (saved) return applyDiscoveredModelDefaults(model);
         return reconcilePersistedModel(model);
     }
     const resolved: Partial<AIModel> = {
