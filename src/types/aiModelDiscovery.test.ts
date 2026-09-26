@@ -6,6 +6,7 @@ import type { AIModel, AIProvider } from './ai';
 import { normalizeModelCatalog, providerModelSnapshot, reconcileProviderNames, resolveProviderModel } from './aiModelDiscovery';
 import { isModelStudioEndpoint, MODEL_STUDIO_MODELS } from './aiModelStudio';
 import { requiresNativeTurn } from '../components/DevTools/aiChatNativeTurn';
+import { resolveModelContext } from './aiModelRegistry';
 
 const nvidia = { id: 'n', type: 'nvidia', baseUrl: 'https://integrate.api.nvidia.com/v1' } as AIProvider;
 const router = { id: 'r', type: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1' } as AIProvider;
@@ -61,6 +62,16 @@ describe('provider capability discovery', () => {
             expect(resolved.capabilitySource).toBe('unknown');
         }
         expect(providerModelSnapshot({ ...nvidia, type: 'custom' }, 'moonshotai/kimi-k3')).toBeUndefined();
+    });
+    it('drops automatic token ceilings when leaving the endpoint that established them', () => {
+        const info = { id: 'vendor/model', supportsTools: true, maxContextTokens: 1000000, maxTokens: 2048 };
+        const model = resolveProviderModel({ name: info.id }, router, info) as AIModel;
+        const moved = resolveProviderModel(model, { ...router, baseUrl: 'https://private.example/v1' });
+        expect(moved.maxContextTokens).toBeUndefined();
+        expect(resolveModelContext(moved).tokens).toBeLessThan(1000000);
+        expect(moved.maxTokens).not.toBe(2048);
+        const explicit = resolveProviderModel({ name: info.id, maxContextTokens: 16000, maxTokens: 1000 }, router, info) as AIModel;
+        expect(resolveProviderModel(explicit, { ...router, baseUrl: 'https://private.example/v1' })).toMatchObject({ maxContextTokens: 16000, maxTokens: 1000 });
     });
     it('retains deliberate capability overrides without turning metadata into hosted features', () => {
         const model = resolveProviderModel({ name: 'moonshotai/kimi-k3', capabilityOverrides: { supportsTools: false } }, nvidia);

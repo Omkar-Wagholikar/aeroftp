@@ -286,6 +286,43 @@ fn reject_scope_model_endpoint_transport_changes_and_orphan_results() {
 }
 
 #[test]
+fn openrouter_stream_replays_reasoning_detail_chunks_verbatim() {
+    let mut req = request("openrouter", "anthropic/claude-fable-5.1");
+    let mut state = StreamState::default();
+    let details = vec![
+        json!({"index":0,"id":"reasoning-text-1","type":"reasoning.text","format":"anthropic-claude-v1","text":"first","signature":null}),
+        json!({"index":0,"id":"reasoning-text-1","type":"reasoning.text","format":"anthropic-claude-v1","text":"second","signature":"signed"}),
+        json!({"id":null,"type":"reasoning.encrypted","format":"unknown","data":"opaque"}),
+    ];
+    for detail in &details {
+        state.ingest(&json!({"choices":[{"delta":{"role":"assistant","reasoning_details":[detail]},"finish_reason":null}]}), false).unwrap();
+    }
+    state.ingest(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"inspect","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}), false).unwrap();
+    state.complete = true;
+    let response = state.finish(&req).unwrap();
+    let turn = response.native_turn.unwrap();
+    assert_eq!(turn.payload["reasoning_details"], json!(details));
+    let mut message: crate::ai::ChatMessage =
+        serde_json::from_value(json!({"role":"assistant","content":""})).unwrap();
+    message.native_turn = Some(turn);
+    req.messages.push(message);
+    req.messages.push(result("c1", "missing file"));
+    for stream in [false, true] {
+        assert_eq!(
+            chat_body(&req, stream).unwrap()["messages"][1]["reasoning_details"],
+            json!(details)
+        );
+    }
+    let mut invalid = StreamState::default();
+    assert!(invalid
+        .ingest(
+            &json!({"choices":[{"delta":{"reasoning_details":["invalid"]}}]}),
+            false
+        )
+        .is_err());
+}
+
+#[test]
 fn kimi_stream_retains_reasoning_unknown_fields_and_split_tool_arguments() {
     let req = request("kimi", "kimi-k3");
     let mut state = StreamState::default();

@@ -633,7 +633,25 @@ fn merge_delta(target: &mut Value, delta: &Value) -> Result<(), String> {
                     continue;
                 }
                 let slot = object.entry(key.clone()).or_insert(Value::Null);
-                if matches!(key.as_str(), "role" | "type") && !slot.is_null() {
+                if key == "reasoning_details" {
+                    // OpenRouter defines this as an ordered sequence of detail
+                    // chunks, not tool-call fragments. Preserve complete objects
+                    // (including optional index, repeated IDs, format and signed
+                    // data) exactly as received for the next request.
+                    if value.is_null() {
+                        continue;
+                    }
+                    let items = value.as_array().ok_or("Invalid reasoning details")?;
+                    if !items.iter().all(Value::is_object) {
+                        return Err("Invalid reasoning detail chunk".into());
+                    }
+                    if slot.is_null() {
+                        *slot = json!([]);
+                    }
+                    slot.as_array_mut()
+                        .ok_or("Inconsistent reasoning details")?
+                        .extend(items.iter().cloned());
+                } else if matches!(key.as_str(), "role" | "type") && !slot.is_null() {
                     if slot != value {
                         return Err("Conflicting assistant delta identity".into());
                     }
