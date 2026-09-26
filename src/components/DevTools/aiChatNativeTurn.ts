@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
+import { usesModelStudioContract } from '../../types/aiModelStudio';
+
 /** Opaque backend envelope. Never render, edit or persist its payload. */
 export interface NativeTurn {
     provider: string;
@@ -44,6 +46,8 @@ function lastAssistantIndex(history: History): number {
 
 export function requiresNativeTurn(request: Record<string, unknown>): boolean {
     return request.use_responses_api === true
+        || usesModelStudioContract(String(request.provider_type), String(request.base_url), String(request.model))
+        || request.provider_type === 'nvidia' || request.provider_type === 'openrouter'
         || (request.provider_type === 'anthropic' && ['claude-opus-5-5', 'claude-fable-5-1'].includes(String(request.model)))
         || (request.provider_type === 'kimi' && request.model === 'kimi-k3')
         || (request.provider_type === 'xai' && request.model === 'grok-4.7')

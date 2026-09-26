@@ -51,6 +51,7 @@ pub mod aerovault_v3;
 pub mod agent_memory_db;
 pub mod ai;
 pub mod ai_core;
+mod ai_model_catalog;
 pub mod ai_native;
 pub mod ai_stream;
 mod ai_tools;
@@ -14626,10 +14627,18 @@ async fn ai_list_models(
     provider_type: ai::AIProviderType,
     base_url: String,
     api_key: Option<String>,
-) -> Result<Vec<String>, String> {
-    ai::list_models(provider_type, base_url, api_key)
-        .await
-        .map_err(|e| e.to_string())
+    include_metadata: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    if include_metadata.unwrap_or(false) {
+        ai_model_catalog::list(provider_type, base_url, api_key)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        ai::list_models(provider_type, base_url, api_key)
+            .await
+            .map(|names| serde_json::json!(names))
+            .map_err(|e| e.to_string())
+    }
 }
 
 // Tool execution request

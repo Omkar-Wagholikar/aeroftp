@@ -157,30 +157,79 @@ pub(crate) fn modern_anthropic(request: &AIRequest) -> bool {
         )
 }
 
+fn model_studio(request: &AIRequest) -> bool {
+    if !matches!(
+        request.provider_type,
+        AIProviderType::Qwen | AIProviderType::Custom
+    ) || !matches!(
+        request.model.as_str(),
+        "qwen3.8-flash"
+            | "qwen3.8-max-0902"
+            | "qwen3.8-2.4t-a95b"
+            | "deepseek-v4-pro-0813"
+            | "deepseek-v4.1-flash"
+            | "kimi-k3"
+    ) {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(&request.base_url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let workspace = host
+        .strip_suffix(".ap-southeast-1.maas.aliyuncs.com")
+        .is_some_and(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().trim_end_matches('/') == "/compatible-mode/v1"
+        && (host == "dashscope-intl.aliyuncs.com" || workspace)
+}
+
 pub(crate) fn modern_chat(request: &AIRequest) -> bool {
-    matches!(
-        (&request.provider_type, request.model.as_str()),
-        (AIProviderType::Kimi, "kimi-k3")
-            | (AIProviderType::Xai, "grok-4.7")
-            | (
-                AIProviderType::OpenAI,
-                "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
-            )
-    ) && !request.use_responses_api.unwrap_or(false)
+    (model_studio(request)
+        || matches!(
+            (&request.provider_type, request.model.as_str()),
+            (AIProviderType::Kimi, "kimi-k3")
+                | (AIProviderType::Nvidia | AIProviderType::OpenRouter, _)
+                | (AIProviderType::Xai, "grok-4.7")
+                | (
+                    AIProviderType::OpenAI,
+                    "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+                )
+        ))
+        && !request.use_responses_api.unwrap_or(false)
 }
 
 /// Budget sliders are translated only for reviewed provider/model contracts.
 /// Explicit effort is validated, never silently downgraded.
 pub(crate) fn effort(request: &AIRequest) -> Result<Option<String>, AIError> {
     let model = request.model.as_str();
+    let studio = model_studio(request);
     let allowed: &[&str] = match (&request.provider_type, model) {
+        (_, "qwen3.8-flash" | "qwen3.8-max-0902") if studio => &["none", "low", "medium", "xhigh"],
+        (_, "qwen3.8-2.4t-a95b") if studio => &["low", "medium", "xhigh"],
+        (_, "kimi-k3" | "deepseek-v4-pro-0813" | "deepseek-v4.1-flash") if studio => {
+            &["low", "high", "max"]
+        }
         (AIProviderType::OpenAI, "gpt-6-astra") => &["low", "medium", "high", "xhigh", "max"],
         (
             AIProviderType::OpenAI,
             "gpt-6-sol" | "gpt-6-luna" | "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra"
             | "gpt-5.6-luna",
         ) => &["none", "low", "medium", "high", "xhigh", "max"],
-        (AIProviderType::Kimi, "kimi-k3") => &["low", "high", "max"],
+        (AIProviderType::Kimi, "kimi-k3")
+        | (AIProviderType::Nvidia, "moonshotai/kimi-k3" | "z-ai/glm-5.3" | "z-ai/glm-5.3-flash") => {
+            &["low", "high", "max"]
+        }
         (AIProviderType::Xai, "grok-4.7") => &["low", "medium", "high", "xhigh"],
         (AIProviderType::Anthropic, "claude-opus-5-5" | "claude-fable-5-1") => {
             &["low", "medium", "high", "xhigh", "max"]
@@ -201,14 +250,23 @@ pub(crate) fn effort(request: &AIRequest) -> Result<Option<String>, AIError> {
     if allowed.is_empty() {
         return Ok(None);
     }
-    let mapped = match budget {
-        0 if allowed.contains(&"none") => "none",
-        0..=5_000 => "low",
-        5_001..=20_000 if allowed.contains(&"medium") => "medium",
-        5_001..=50_000 => "high",
-        50_001..=99_999 if allowed.contains(&"xhigh") => "xhigh",
-        _ if allowed.contains(&"max") => "max",
-        _ => "xhigh",
+    let mapped = if studio && model.starts_with("qwen3.8-") {
+        match budget {
+            0 if allowed.contains(&"none") => "none",
+            0..=4096 => "low",
+            4097..=16384 => "medium",
+            _ => "xhigh",
+        }
+    } else {
+        match budget {
+            0 if allowed.contains(&"none") => "none",
+            0..=5_000 => "low",
+            5_001..=20_000 if allowed.contains(&"medium") => "medium",
+            5_001..=50_000 => "high",
+            50_001..=99_999 if allowed.contains(&"xhigh") => "xhigh",
+            _ if allowed.contains(&"max") => "max",
+            _ => "xhigh",
+        }
     };
     Ok(Some(mapped.to_owned()))
 }
@@ -225,7 +283,10 @@ pub(crate) fn chat_body(request: &AIRequest, stream: bool) -> Result<Value, AIEr
             "This model requires Responses for reasoning with tools; enable OpenAI Responses",
         ));
     }
-    if request.provider_type == AIProviderType::Kimi && request.web_search.unwrap_or(false) {
+    if (request.provider_type == AIProviderType::Kimi
+        || (model_studio(request) && request.model == "kimi-k3"))
+        && request.web_search.unwrap_or(false)
+    {
         return Err(invalid(
             "Kimi K3 hosted web search is not supported by this adapter",
         ));
@@ -258,15 +319,21 @@ pub(crate) fn chat_body(request: &AIRequest, stream: bool) -> Result<Value, AIEr
     }
     let mut body = json!({"model":request.model,"messages":messages,"stream":stream});
     if let Some(max) = request.max_tokens {
-        let key = if request.provider_type == AIProviderType::Xai {
-            "max_tokens"
-        } else {
+        let key = if matches!(
+            request.provider_type,
+            AIProviderType::OpenAI | AIProviderType::Kimi
+        ) {
             "max_completion_tokens"
+        } else {
+            "max_tokens"
         };
         body[key] = json!(max);
     }
     if let Some(value) = reasoning {
         body["reasoning_effort"] = json!(value);
+    }
+    if model_studio(request) && request.web_search.unwrap_or(false) {
+        body["enable_search"] = json!(true);
     }
     if let Some(tools) = &request.tools {
         // AeroAgent has optional schema fields: do not falsely claim strict mode.
@@ -275,7 +342,24 @@ pub(crate) fn chat_body(request: &AIRequest, stream: bool) -> Result<Value, AIEr
     if stream {
         body["stream_options"] = json!({"include_usage":true});
     }
-    // All contracts here are reasoning models; fixed/incompatible sampling omitted.
+    // Router/NIM models keep the compatible sampling contract unless the exact
+    // endpoint model has a reviewed fixed-sampling requirement (Kimi K3).
+    if (model_studio(request)
+        || matches!(
+            request.provider_type,
+            AIProviderType::Nvidia | AIProviderType::OpenRouter
+        ))
+        && !(request.provider_type == AIProviderType::Nvidia
+            && request.model == "moonshotai/kimi-k3")
+        && !(model_studio(request) && request.model == "kimi-k3")
+    {
+        if let Some(value) = request.temperature {
+            body["temperature"] = json!(value);
+        }
+        if let Some(value) = request.top_p {
+            body["top_p"] = json!(value);
+        }
+    }
     Ok(body)
 }
 

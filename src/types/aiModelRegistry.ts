@@ -6,7 +6,7 @@ import { AIModel, AIModelNativeCapabilities, AIProviderType } from './ai';
 export const MODEL_REGISTRY_REVIEWED_AT = '2026-09-26';
 export const UNKNOWN_MODEL_CONTEXT_BUDGET = 8192;
 
-export type ModelCapabilitySource = 'registry' | 'user' | 'unknown';
+export type ModelCapabilitySource = 'registry' | 'provider' | 'user' | 'unknown';
 
 export interface ModelContextResolution {
     tokens: number;
@@ -863,6 +863,7 @@ export function resolveModelContext(model: Partial<AIModel> | null | undefined):
 
 /** Derive status for old saved settings that predate capabilitySource. */
 export function getModelCapabilitySource(model: Partial<AIModel>): ModelCapabilitySource {
+    if (model.capabilitySource === 'provider') return model.providerCapabilities?.id === model.name ? 'provider' : 'unknown';
     if (model.capabilitySource === 'registry') {
         return model.nativeCapabilities ? 'registry' : 'unknown';
     }

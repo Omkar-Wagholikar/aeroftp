@@ -5,10 +5,11 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { Send, Bot, Sparkles, Mic, MicOff, ChevronDown, Trash2, MessageSquare, ImageIcon, X, ShieldAlert, AlertTriangle, FolderOpen, FileCode, Search, Archive, Terminal, Shield, RefreshCw, Brain, Eye, Key, Settings, Upload, Download, Square } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { createTauriListener } from '../../hooks/useTauriListener';
-import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, QwenIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from './AIIcons';
+import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from './AIIcons';
 import { AISettingsPanel } from '../AISettings';
 import { AISettings, AIProviderType } from '../../types/ai';
-import { reconcilePersistedModel, reconcilePersistedModels, resolveModelContext, shouldUseOpenAIResponses } from '../../types/aiModelRegistry';
+import { resolveModelContext, shouldUseOpenAIResponses } from '../../types/aiModelRegistry';
+import { reconcileProviderModels, reconcileProviderNames, resolveProviderModel } from '../../types/aiModelDiscovery';
 import { AEROAGENT_VERSION } from '../../utils/aeroagentVersion';
 import { AgentToolCall, AGENT_TOOLS, toNativeDefinitions, isSafeTool, getToolByName, getToolByNameFromAll } from '../../types/tools';
 import { PluginManifest, allPluginTools, findPluginForTool } from '../../types/plugins';
@@ -262,7 +263,7 @@ const getProviderIcon = (type: AIProviderType, size = 12): React.ReactNode => {
         case 'openrouter': return <OpenRouterIcon size={size} />;
         case 'ollama': return <OllamaIcon size={size} />;
         case 'kimi': return <KimiIcon size={size} />;
-        case 'qwen': return <QwenIcon size={size} />;
+        case 'qwen': return <AlibabaModelStudioIcon size={size} />;
         case 'deepseek': return <DeepSeekIcon size={size} />;
         case 'mistral': return <MistralIcon size={size} />;
         case 'groq': return <GroqIcon size={size} />;
@@ -1040,6 +1041,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         // Read from vault with localStorage fallback, update cache
         const settings = await secureGetWithFallback<AISettings>('ai_settings', 'aeroftp_ai_settings');
         if (settings) {
+            settings.providers = reconcileProviderNames(settings.providers);
             setCachedAiSettings(settings);
             try {
                 const models: SelectedModel[] = [];
@@ -2156,7 +2158,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             if (!settings) {
                 throw new Error('No AI providers configured. Click ⚙️ to add one.');
             }
-            settings.models = reconcilePersistedModels(settings.models);
+            settings.models = reconcileProviderModels(settings.models, settings.providers);
             setCachedAiSettings(settings);
 
             // Auto-routing: classify the prompt, then resolve the model that answers
@@ -2188,7 +2190,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                 // Check model capabilities (needed for context budget calculation)
                 const modelDef = (() => {
                     const found = settings.models?.find((m: { id: string }) => m.id === activeModel.modelId);
-                    return found ? reconcilePersistedModel(found) : found;
+                    return found ? resolveProviderModel(found, provider) : found;
                 })();
                 // Output limits are not context windows. Unknown models receive a
                 // deliberately conservative context budget until the registry or

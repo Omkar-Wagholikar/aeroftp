@@ -13,7 +13,7 @@ import {
 } from './providerMarketplaceData';
 import {
     GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon,
-    OllamaIcon, KimiIcon, QwenIcon, DeepSeekIcon, MistralIcon,
+    OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon,
     GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon,
     AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon,
     NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon
@@ -34,7 +34,7 @@ const PROVIDER_ICON_MAP: Record<AIProviderType, React.FC<{ size?: number; classN
     openrouter: OpenRouterIcon,
     ollama: OllamaIcon,
     kimi: KimiIcon,
-    qwen: QwenIcon,
+    qwen: AlibabaModelStudioIcon,
     deepseek: DeepSeekIcon,
     mistral: MistralIcon,
     groq: GroqIcon,

@@ -25,6 +25,93 @@ fn result(id: &str, content: &str) -> crate::ai::ChatMessage {
 }
 
 #[test]
+fn model_studio_contract_is_endpoint_scoped_and_preserves_reasoning() {
+    for provider in ["custom", "qwen"] {
+        for model in [
+            "qwen3.8-flash",
+            "qwen3.8-max-0902",
+            "qwen3.8-2.4t-a95b",
+            "deepseek-v4-pro-0813",
+            "deepseek-v4.1-flash",
+            "kimi-k3",
+        ] {
+            let mut req = request(provider, model);
+            req.base_url =
+                "https://llm-test.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1".into();
+            assert!(modern_chat(&req));
+            let payload = json!({"role":"assistant","content":null,"reasoning_content":"opaque","tool_calls":[{"id":"read-1","type":"function","function":{"name":"inspect","arguments":"{}"}}]});
+            req.messages.push(assistant(&req, payload.clone()));
+            req.messages.push(result("read-1", "missing file"));
+            for stream in [false, true] {
+                let body = chat_body(&req, stream).unwrap();
+                assert_eq!(body["messages"][1], payload);
+                assert_eq!(body["max_tokens"], 4096);
+                assert!(body.get("thinking_budget").is_none());
+            }
+            req.thinking_budget = Some(20000);
+            assert_eq!(
+                effort(&req).unwrap().unwrap(),
+                if model.starts_with("qwen") {
+                    "xhigh"
+                } else {
+                    "high"
+                }
+            );
+            req.web_search = Some(true);
+            if model == "kimi-k3" {
+                assert!(chat_body(&req, false).is_err());
+            } else {
+                assert_eq!(chat_body(&req, false).unwrap()["enable_search"], true);
+            }
+        }
+    }
+    let mut req = request("custom", "kimi-k3");
+    for url in [
+        "https://dashscope-intl.aliyuncs.com.evil.test/compatible-mode/v1",
+        "http://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "https://user@dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1?route=other",
+        "https://dashscope-intl.aliyuncs.com:8443/compatible-mode/v1",
+        "https://llm-test.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "https://nested.llm-test.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+    ] {
+        req.base_url = url.into();
+        assert!(!modern_chat(&req), "{url}");
+    }
+    req.base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/".into();
+    assert!(modern_chat(&req));
+    req.model = "unknown".into();
+    assert!(!modern_chat(&req));
+}
+
+#[test]
+fn gateway_continuations_keep_reasoning_and_provider_identity() {
+    for (provider, model) in [
+        ("nvidia", "moonshotai/kimi-k3"),
+        ("nvidia", "z-ai/glm-5.3"),
+        ("openrouter", "qwen/qwen3.8-27b:free"),
+    ] {
+        let mut req = request(provider, model);
+        assert!(modern_chat(&req));
+        let payload = json!({"role":"assistant","content":null,"reasoning_content":"opaque","reasoning_details":[{"type":"reasoning.encrypted","data":"private"}],"tool_calls":[{"id":"read-1","type":"function","function":{"name":"inspect","arguments":"{}"}}]});
+        req.messages.push(assistant(&req, payload.clone()));
+        req.messages.push(result("read-1", "missing file"));
+        for stream in [false, true] {
+            let body = chat_body(&req, stream).unwrap();
+            assert_eq!(body["messages"][1], payload);
+            assert_eq!(body["messages"][2]["tool_call_id"], "read-1");
+            assert_eq!(body["max_tokens"], 4096);
+            assert!(body.get("max_completion_tokens").is_none());
+            if provider == "nvidia" {
+                assert_eq!(body["reasoning_effort"], "low");
+            }
+        }
+        req.provider_type = crate::ai::AIProviderType::Custom;
+        assert!(validate_history(&req).is_err());
+    }
+}
+
+#[test]
 fn modern_efforts_and_sampling_are_model_aware() {
     for (provider, model, expected) in [
         ("kimi", "kimi-k3", "low"),

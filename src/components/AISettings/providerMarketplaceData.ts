@@ -133,12 +133,12 @@ export const MARKETPLACE_PROVIDERS: MarketplaceProvider[] = [
     },
     {
         type: 'qwen',
-        name: 'Qwen (Alibaba)',
-        description: 'Qwen Max, Plus, Turbo. Multilingual and vision capable.',
+        name: 'Alibaba Model Studio',
+        description: 'Alibaba Cloud platform for Qwen, DeepSeek, Kimi and other models. Regional API keys and workspace endpoints.',
         category: 'chinese',
         features: ['streaming', 'tools', 'vision', 'thinking'],
         pricingTier: 'freemium',
-        highlight: '1M context (Turbo)',
+        highlight: 'Multi-model platform',
     },
     {
         type: 'deepseek',
