@@ -106,7 +106,7 @@ tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-suppaftp = { version = "=10.0.2", features = ["tokio", "tokio-rustls-aws-lc-rs", "deprecated"] }
+suppaftp = { version = "=12.1.0", features = ["tokio", "tokio-rustls-aws-lc-rs", "deprecated"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
@@ -497,4 +497,4 @@ n0-mainline = { git = "https://github.com/axpdev-lab/n0-mainline", rev = "25ee35
 # become permanent because the exit condition is missing; it becomes
 # permanent because the exit condition is written in a form nobody can
 # verify.
-suppaftp = { git = "https://github.com/axpdev-lab/suppaftp", rev = "2d39fadca96b4be37998c3097cb97c36b39231e1" }
+suppaftp = { git = "https://github.com/axpdev-lab/suppaftp", rev = "6b7b66e222f9387aaa86cb00945c37f6e00ef6cf" }
