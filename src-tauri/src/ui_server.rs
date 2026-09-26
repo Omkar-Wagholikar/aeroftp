@@ -492,19 +492,14 @@ async fn serve(
             }
         })
     };
-    let connection = http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout)
-        .max_buf_size(MAX_HEAD_BYTES)
-        .max_headers(MAX_HEADERS)
-        .serve_connection(
-            TokioIo::new(StallGuard::new(
-                stream,
-                limits.write_stall_timeout,
-                occupant.clone(),
-            )),
-            service,
-        );
+    let connection = http1_builder(&limits).serve_connection(
+        TokioIo::new(StallGuard::new(
+            stream,
+            limits.write_stall_timeout,
+            occupant.clone(),
+        )),
+        service,
+    );
     tokio::pin!(connection);
     let aged = tokio::time::sleep(limits.max_connection_age);
     tokio::pin!(aged);
@@ -550,6 +545,17 @@ async fn serve(
         }
     }
     site.stats.ended.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The HTTP/1 settings every connection is served with.
+fn http1_builder(limits: &Limits) -> http1::Builder {
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout)
+        .max_buf_size(MAX_HEAD_BYTES)
+        .max_headers(MAX_HEADERS);
+    builder
 }
 
 /// What woke a connection's task.
@@ -1017,6 +1023,8 @@ mod tests {
         /// Answers every path, as Tauri's resolver does with its fallbacks: a
         /// request that reached it unchecked would show as a 200.
         catch_all: bool,
+        /// How long each resolution takes, as a decompression does.
+        delay: Duration,
         asked: Asked,
     }
 
@@ -1031,6 +1039,7 @@ mod tests {
 
         fn asset(&self, path: &str) -> Option<ServedAsset> {
             self.asked.lock().unwrap().push(path.to_string());
+            std::thread::sleep(self.delay);
             let fallback = self.catch_all.then_some("/index.html");
             let found = self.assets.get(path).or_else(|| self.assets.get(fallback?));
             found.map(|(bytes, mime, csp)| ServedAsset {
@@ -1277,6 +1286,14 @@ mod tests {
             ),
             (get("/index.html", &with(&format!("[::1]:{port}"))), 421),
             (
+                get("/index.html", &with(&format!("127.0.0.1:{port}0"))),
+                421,
+            ),
+            (
+                get("/index.html", &with(&format!("x127.0.0.1:{port}"))),
+                421,
+            ),
+            (
                 get("/index.html", &with(&format!("attacker.example:{port}"))),
                 421,
             ),
@@ -1288,7 +1305,15 @@ mod tests {
                 ),
                 421,
             ),
-            // An absolute-form target's authority takes the place of Host.
+            // An absolute-form target's authority takes the place of Host, and
+            // both must name this origin: ours with a foreign Host is refused.
+            (
+                get(
+                    &format!("http://127.0.0.1:{port}/index.html"),
+                    &with(&format!("evil.example:{port}")),
+                ),
+                421,
+            ),
             (get("http://evil.example/index.html", &ours), 421),
             (
                 get(&format!("http://evil.example:{port}/index.html"), &ours),
@@ -1756,11 +1781,18 @@ mod tests {
     /// requests that race for it before it is cached.
     #[test]
     fn an_asset_is_resolved_once_however_often_it_is_asked_for() {
-        let (addr, asked) = serve(Limits::APP);
+        // A resolution that takes a while and eight requests released at
+        // once: all of them arrive while the first is still resolving.
+        let mut source = site();
+        source.delay = Duration::from_millis(200);
+        let (addr, asked) = serve_source(source, Limits::APP);
+        let start = Arc::new(std::sync::Barrier::new(8));
         let racers: Vec<_> = (0..8)
             .map(|_| {
+                let start = start.clone();
                 std::thread::spawn(move || {
                     let mut stream = connect(addr);
+                    start.wait();
                     send(&mut stream, "GET", "/assets/vendor.js", host(addr));
                     let (status, _, body) = read_response(&mut stream, false);
                     (status, body.len())
@@ -1842,36 +1874,105 @@ mod tests {
         );
     }
 
-    /// hyper queues a response body and writes it with `writev` only when the
-    /// stream says it writes vectored; otherwise it first copies the whole
-    /// body into its own buffer, a private copy of the asset per connection.
+    /// A socket that notes where each slice it is asked to write starts.
+    struct Recording<S> {
+        inner: S,
+        starts: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Recording<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Recording<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.starts.lock().unwrap().push(buf.as_ptr() as usize);
+            Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.starts
+                .lock()
+                .unwrap()
+                .extend(bufs.iter().map(|buf| buf.as_ptr() as usize));
+            Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.inner.is_write_vectored()
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A response body goes to the socket from the shared copy itself. hyper
+    /// copies it into a buffer of its own first when it is not allowed to
+    /// write vectored, whether the stream (`StallGuard`) hides that it can or
+    /// the connection settings turn it off: a private copy of the asset per
+    /// connection.
     #[test]
-    fn hyper_sees_a_stream_that_writes_vectored() {
+    fn a_response_body_is_written_from_the_shared_copy() {
+        let shared = Bytes::from(vec![b'/'; 1 << 20]);
+        let starts = Arc::new(Mutex::new(Vec::new()));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-                .await
-                .unwrap();
-            let (server, _) = listener.accept().await.unwrap();
-            let mut stream = TokioIo::new(StallGuard::new(
-                server,
-                Duration::from_secs(1),
+            let addr = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut stream = connect(addr);
+                send(&mut stream, "GET", "/", host(addr));
+                read_response(&mut stream, false).2.len()
+            });
+            let (socket, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(StallGuard::new(
+                Recording {
+                    inner: socket,
+                    starts: starts.clone(),
+                },
+                Duration::from_secs(5),
                 Arc::new(Occupant::new(0, Instant::now())),
             ));
-            assert!(hyper::rt::Write::is_write_vectored(&stream));
-            let parts = [io::IoSlice::new(b"head"), io::IoSlice::new(b"body")];
-            let written = std::future::poll_fn(|cx| {
-                hyper::rt::Write::poll_write_vectored(Pin::new(&mut stream), cx, &parts)
-            })
-            .await
-            .unwrap();
-            assert_eq!(written, 8, "only the first buffer went out");
-            drop(client);
+            let body = shared.clone();
+            let service = service_fn(move |_| {
+                let body = body.clone();
+                async move { Ok::<_, Infallible>(Response::new(Full::new(body))) }
+            });
+            let connection = http1_builder(&Limits::APP).serve_connection(io, service);
+            tokio::time::timeout(Duration::from_secs(10), connection)
+                .await
+                .expect("the connection did not end")
+                .expect("the connection failed");
+            assert_eq!(client.join().unwrap(), shared.len());
         });
+        assert!(
+            starts.lock().unwrap().contains(&(shared.as_ptr() as usize)),
+            "the body was copied before it was written"
+        );
     }
 
     #[test]
