@@ -1840,9 +1840,10 @@ pub(crate) fn decide_download(
     }
 }
 
-fn newer_without_timestamp_skip(winner: &str) -> String {
-    format!("timestamp missing or unreadable, size decides: {winner}")
-}
+/// Why `newer` leaves a changed pair alone when no date orders it (the
+/// size-only policy, a date missing, the same date within the window): the
+/// size is not a stand-in for the date, in either direction.
+const NEWER_UNORDERED: &str = "no date orders the pair: cannot tell which copy is newer";
 
 fn decide_upload_by_size(
     local_size: u64,
@@ -1853,13 +1854,9 @@ fn decide_upload_by_size(
         SyncTreeAction::Skip("identical size".to_string())
     } else {
         match mode {
-            ConflictMode::Larger | ConflictMode::Newer if local_size > remote_size => {
-                SyncTreeAction::Copy
-            }
+            ConflictMode::Larger if local_size > remote_size => SyncTreeAction::Copy,
             ConflictMode::Larger => SyncTreeAction::Skip("remote is larger".to_string()),
-            ConflictMode::Newer => {
-                SyncTreeAction::Skip(newer_without_timestamp_skip("remote is larger"))
-            }
+            ConflictMode::Newer => SyncTreeAction::Skip(NEWER_UNORDERED.to_string()),
             ConflictMode::Skip => SyncTreeAction::Skip("conflict skip".to_string()),
         }
     };
@@ -1878,13 +1875,9 @@ fn decide_download_by_size(
         SyncTreeAction::Skip("identical size".to_string())
     } else {
         match mode {
-            ConflictMode::Larger | ConflictMode::Newer if remote_size > local_size => {
-                SyncTreeAction::Copy
-            }
+            ConflictMode::Larger if remote_size > local_size => SyncTreeAction::Copy,
             ConflictMode::Larger => SyncTreeAction::Skip("local is larger".to_string()),
-            ConflictMode::Newer => {
-                SyncTreeAction::Skip(newer_without_timestamp_skip("local is larger"))
-            }
+            ConflictMode::Newer => SyncTreeAction::Skip(NEWER_UNORDERED.to_string()),
             ConflictMode::Skip => SyncTreeAction::Skip("conflict skip".to_string()),
         }
     };
@@ -1926,8 +1919,8 @@ fn decide_upload_by_mtime(
 
     // A backend that keeps no comparable time cannot say which copy is
     // newer: `newer` leaves the pair alone instead of letting the larger copy
-    // win. A per-file missing time on a backend that keeps times still falls
-    // back to the sizes, as before.
+    // win (a missing date on a backend that keeps dates does the same through
+    // the size decision below, with its own reason).
     if matches!(mode, ConflictMode::Newer) && !window.compares_times() && local_size != remote_size
     {
         return SyncTreeDecision {
@@ -1972,8 +1965,8 @@ fn decide_download_by_mtime(
 
     // A backend that keeps no comparable time cannot say which copy is
     // newer: `newer` leaves the pair alone instead of letting the larger copy
-    // win. A per-file missing time on a backend that keeps times still falls
-    // back to the sizes, as before.
+    // win (a missing date on a backend that keeps dates does the same through
+    // the size decision below, with its own reason).
     if matches!(mode, ConflictMode::Newer) && !window.compares_times() && remote_size != local_size
     {
         return SyncTreeDecision {
@@ -3355,7 +3348,8 @@ pub fn classify_with_summary(
                 // it and comparing it would flag every file as changed every
                 // cycle. Such providers fall back to timestamp only.
                 // The baseline's time is a LOCAL mtime (a download records the
-                // remote side, whose time the downloaded file keeps), so the
+                // remote side's time, which the downloaded file keeps, or the
+                // downloaded file's own when the remote lists none), so the
                 // local side is read with two local clocks: under a size-only
                 // pair window it would stop seeing a same-size local edit, and
                 // the remote change would then overwrite it.
@@ -7962,99 +7956,36 @@ mod tests {
         }
     }
 
-    /// G44 / D28: with no usable timestamp, Newer must pick the larger file
-    /// in both directions. Before the fix, upload copied and download skipped,
-    /// so a two-way run silently preferred the local side.
+    /// G44 / D28: with no usable timestamp the two directions of `newer` must
+    /// agree, so a two-way run does not silently prefer one side (upload used
+    /// to copy while download skipped). Since the re-review of #949 they agree
+    /// by leaving the pair alone in both directions: no date orders it, and
+    /// the size is not a stand-in for the date.
     #[test]
-    fn newer_without_timestamp_picks_the_larger_file_in_both_directions() {
+    fn newer_without_timestamp_leaves_the_pair_alone_in_both_directions() {
         let larger_local = local_entry(20, None, None);
         let smaller_local = local_entry(5, None, None);
         let remote = remote_entry(10, None, None);
 
         for policy in [DeltaPolicy::SizeOnly, DeltaPolicy::Mtime] {
-            let upload_when_local_larger =
-                decide_upload(&larger_local, Some(&remote), policy, ConflictMode::Newer);
-            let download_when_local_larger = decide_download(
-                &remote,
-                Some(&larger_local),
-                policy,
-                ConflictMode::Newer,
-                false,
-            );
-            assert!(
-                matches!(upload_when_local_larger.action, SyncTreeAction::Copy),
-                "{policy:?}"
-            );
-            assert_eq!(
-                skip_reason(&download_when_local_larger.action),
-                "timestamp missing or unreadable, size decides: local is larger",
-                "{policy:?}"
-            );
-
-            let upload_when_remote_larger =
-                decide_upload(&smaller_local, Some(&remote), policy, ConflictMode::Newer);
-            let download_when_remote_larger = decide_download(
-                &remote,
-                Some(&smaller_local),
-                policy,
-                ConflictMode::Newer,
-                false,
-            );
-            assert_eq!(
-                skip_reason(&upload_when_remote_larger.action),
-                "timestamp missing or unreadable, size decides: remote is larger",
-                "{policy:?}"
-            );
-            assert!(
-                matches!(download_when_remote_larger.action, SyncTreeAction::Copy),
-                "{policy:?}"
-            );
+            for local in [&larger_local, &smaller_local] {
+                let upload = decide_upload(local, Some(&remote), policy, ConflictMode::Newer);
+                let download =
+                    decide_download(&remote, Some(local), policy, ConflictMode::Newer, false);
+                assert_eq!(
+                    skip_reason(&upload.action),
+                    NEWER_UNORDERED,
+                    "{policy:?} local {}",
+                    local.size
+                );
+                assert_eq!(
+                    skip_reason(&download.action),
+                    NEWER_UNORDERED,
+                    "{policy:?} local {}",
+                    local.size
+                );
+            }
         }
-    }
-
-    /// Same pair on a two-way run: the upload skip must not suppress the
-    /// download that should win, and the upload copy must still suppress
-    /// the download of the smaller remote.
-    #[test]
-    fn newer_without_timestamp_two_way_legs_do_not_contradict() {
-        let local_larger = local_entry(20, None, None);
-        let local_smaller = local_entry(5, None, None);
-        let remote = remote_entry(10, None, None);
-
-        let upload = decide_upload(
-            &local_larger,
-            Some(&remote),
-            DeltaPolicy::Mtime,
-            ConflictMode::Newer,
-        );
-        assert!(matches!(upload.action, SyncTreeAction::Copy));
-        let download_after_upload = decide_download(
-            &remote,
-            Some(&local_larger),
-            DeltaPolicy::Mtime,
-            ConflictMode::Newer,
-            true,
-        );
-        assert!(matches!(
-            download_after_upload.action,
-            SyncTreeAction::Skip(_)
-        ));
-
-        let upload = decide_upload(
-            &local_smaller,
-            Some(&remote),
-            DeltaPolicy::Mtime,
-            ConflictMode::Newer,
-        );
-        assert!(matches!(upload.action, SyncTreeAction::Skip(_)));
-        let download_after_skip = decide_download(
-            &remote,
-            Some(&local_smaller),
-            DeltaPolicy::Mtime,
-            ConflictMode::Newer,
-            false,
-        );
-        assert!(matches!(download_after_skip.action, SyncTreeAction::Copy));
     }
 
     /// With timestamps present, Newer still decides by mtime. Larger and Skip

@@ -407,13 +407,25 @@ impl CloudService {
             let action = self.resolve_action(config, c);
             if matches!(action, SyncAction::DeleteLocal | SyncAction::DeleteRemote) {
                 index_files.remove(&c.relative_path);
-            } else if let Some(entry) = Self::baseline_entry_for(
+            } else if let Some(mut entry) = Self::baseline_entry_for(
                 &action,
                 config.sync_direction,
                 c.local_info.as_ref(),
                 c.remote_info.as_ref(),
                 c.is_dir,
             ) {
+                // The next cycle reads the local side against this time with
+                // the local clock. A download keeps the remote time, which it
+                // stamped on the local copy; a backend that lists none (FTP
+                // `LIST` dates) leaves the downloaded file's own, read back
+                // from disk, or the local side would be compared by size alone
+                // and a same-size local edit would go unseen.
+                if matches!(action, SyncAction::Download) && !c.is_dir && entry.modified.is_none() {
+                    entry.modified = std::fs::metadata(config.local_folder.join(&c.relative_path))
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .map(DateTime::<Utc>::from);
+                }
                 index_files.insert(c.relative_path.clone(), entry);
             }
         }
@@ -531,7 +543,7 @@ impl CloudService {
             modify_window: crate::sync_core::mtime::ModifyWindow::LEGACY_FTP,
             ..Default::default()
         };
-        tracing::warn!("AeroCloud (FTP): {}", options.modify_window.describe());
+        log_size_only_window("AeroCloud (FTP)", &config, options.modify_window);
 
         let mut comparisons = build_comparison_results_with_index(
             local_files,
@@ -791,7 +803,7 @@ impl CloudService {
             ..Default::default()
         };
         if !options.modify_window.compares_times() {
-            tracing::warn!("AeroCloud: {}", options.modify_window.describe());
+            log_size_only_window("AeroCloud", config, options.modify_window);
         }
 
         let mut comparisons = build_comparison_results_with_index(
@@ -2015,6 +2027,37 @@ pub async fn sync_one_config(
     Ok(sync_result)
 }
 
+/// State that a folder pair is compared by size only: a warning the first
+/// time in this process, debug afterwards, so a folder synced every minute does
+/// not repeat the same warning in the log every cycle.
+fn log_size_only_window(
+    label: &str,
+    config: &CloudConfig,
+    window: crate::sync_core::mtime::ModifyWindow,
+) {
+    let pair = format!(
+        "{}\u{0}{}",
+        config.local_folder.display(),
+        config.remote_folder
+    );
+    if first_size_only_notice(pair) {
+        tracing::warn!("{label}: {}", window.describe());
+    } else {
+        tracing::debug!("{label}: {}", window.describe());
+    }
+}
+
+/// Whether this is the first size-only notice for `pair` in this process.
+fn first_size_only_notice(pair: String) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut warned| warned.insert(pair))
+        .unwrap_or(true)
+}
+
 impl Default for CloudService {
     fn default() -> Self {
         Self::new()
@@ -2293,6 +2336,16 @@ mod baseline_tests {
             DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
             "the local side needs a time of its own clock to be compared with"
         );
+    }
+
+    /// The size-only window is stated once per folder pair and process, not
+    /// every cycle of a folder synced every minute.
+    #[test]
+    fn a_size_only_window_is_noticed_once_per_pair() {
+        let pair = || "/l/notice-once\u{0}/r/notice-once".to_string();
+        assert!(first_size_only_notice(pair()));
+        assert!(!first_size_only_notice(pair()));
+        assert!(first_size_only_notice("/l/other\u{0}/r/other".to_string()));
     }
 
     #[test]

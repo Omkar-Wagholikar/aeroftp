@@ -1051,9 +1051,24 @@ export const runRemoteSync = async (
                 const entry = idx !== undefined ? journal.entries[idx] : undefined;
                 if (entry?.status !== 'completed') continue;
                 if (f.action === 'upload' || f.action === 'download') {
+                    // The next compare reads the local side against this time
+                    // with the local clock. A download keeps the remote time,
+                    // which it stamped on the local copy; a backend that lists
+                    // none (FTP LIST dates) leaves the downloaded file's own,
+                    // read back from disk, or the local side would be compared
+                    // by size alone and a same-size edit would go unseen.
+                    let modified = f.mtime;
+                    if (f.action === 'download' && modified == null) {
+                        const props = await invoke<{ modified: string | null } | undefined>(
+                            'get_file_properties',
+                            { path: `${localBase}/${f.relativePath}` },
+                        ).catch(() => undefined);
+                        // get_file_properties formats UTC without the zone.
+                        modified = props?.modified ? `${props.modified}Z` : null;
+                    }
                     mergedFiles[f.relativePath] = {
                         size: f.size,
-                        modified: f.mtime,
+                        modified,
                         is_dir: false,
                     };
                 } else {
