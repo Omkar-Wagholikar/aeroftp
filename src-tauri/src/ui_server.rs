@@ -30,6 +30,18 @@
 //! `Host` naming this origin (so a DNS-rebound page cannot read it), and a path
 //! that stays inside the asset root after decoding. Anything else is refused
 //! and its connection closed.
+//!
+//! What the limits in `Limits` cannot do is tell a local process from the
+//! webview. Any process on the machine can connect to 127.0.0.1, and one that
+//! keeps every slot in use (enough slow readers, each reading a byte now and
+//! then, or heads that take the full header timeout) starves the webview for
+//! as long as it keeps at it. A process of the same user is out of scope: it
+//! can already ptrace or kill the app. A process of another user could be told
+//! apart only by the owner of its socket, which Linux shows in /proc/net/tcp
+//! and through sock_diag netlink, and the strict Snap is allowed neither
+//! without the network-observe interface, which its snapcraft.yaml does not
+//! plug. A check that failed closed would leave every Snap install without a
+//! UI, and one that failed open there would not be a boundary.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
