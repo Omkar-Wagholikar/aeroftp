@@ -7492,6 +7492,58 @@ mod tests {
         assert!(matches!(up.action, SyncTreeAction::Skip(_)));
     }
 
+    /// Minor 4 (re-review of #949): `sync_tree` still let the larger copy win
+    /// `newer` wherever no date ordered the pair: under the size-only policy,
+    /// for a file whose date is missing on a backend that keeps dates, and for
+    /// dates the same within the window. None of them says which copy is
+    /// newer, so the pair is left alone in both directions, like the CLI.
+    #[test]
+    fn sync_tree_newer_is_never_decided_by_size() {
+        let window = ModifyWindow::default();
+        let local = |size, mtime: Option<&str>| crate::sync_core::LocalEntry {
+            rel_path: "a.txt".to_string(),
+            size,
+            mtime: mtime.map(str::to_string),
+            sha256: None,
+        };
+        let remote = |size, mtime: Option<&str>| crate::sync_core::RemoteEntry {
+            rel_path: "a.txt".to_string(),
+            size,
+            mtime: mtime.map(str::to_string),
+            checksum_alg: None,
+            checksum_hex: None,
+        };
+        let at = Some("2026-09-25T12:00:00Z");
+        let cases = [
+            (DeltaPolicy::SizeOnly, local(6000, at), remote(5120, at)),
+            (DeltaPolicy::Mtime, local(6000, None), remote(5120, at)),
+            (DeltaPolicy::Mtime, local(6000, at), remote(5120, at)),
+        ];
+        for (policy, local, remote) in cases {
+            let up =
+                super::decide_upload(&local, Some(&remote), policy, ConflictMode::Newer, window);
+            assert!(
+                matches!(up.action, SyncTreeAction::Skip(_)),
+                "{policy:?} {:?}: the upload copies",
+                local.mtime
+            );
+            let smaller_local = crate::sync_core::LocalEntry { size: 10, ..local };
+            let down = super::decide_download(
+                &remote,
+                Some(&smaller_local),
+                policy,
+                ConflictMode::Newer,
+                window,
+                false,
+            );
+            assert!(
+                matches!(down.action, SyncTreeAction::Skip(_)),
+                "{policy:?} {:?}: the download copies",
+                smaller_local.mtime
+            );
+        }
+    }
+
     /// `sync_tree` (MCP, AeroAgent) decided by the exact second: a copy one
     /// second off its source was uploaded again on every run, where the GUI
     /// compare and the CLI read the two as the same instant. It reads the

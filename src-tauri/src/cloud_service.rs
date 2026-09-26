@@ -2251,6 +2251,50 @@ mod baseline_tests {
         );
     }
 
+    /// Major 1 (re-review of #949): a download recorded the REMOTE side's time
+    /// as the baseline, and a backend listing no comparable time (FTP with
+    /// `LIST` dates) gives none. The local side, compared against the baseline
+    /// with the local clock, then had no time to compare and went by size
+    /// alone: a same-size local edit of every file that came from the server
+    /// went unseen, and the next remote change overwrote it. With no remote
+    /// time the baseline takes the downloaded file's own.
+    #[test]
+    fn a_download_without_a_remote_time_records_the_local_file_time() {
+        let root = tempfile::tempdir().expect("local root");
+        let file = root.path().join("f.txt");
+        std::fs::write(&file, b"payload").unwrap();
+        let landed = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(landed)
+            .unwrap();
+        let mut remote = fi(7, 0);
+        remote.modified = None;
+        let downloaded = cmp(
+            SyncStatus::RemoteNewer,
+            Some(fi(3, 1)),
+            Some(remote),
+            true,
+            false,
+        );
+        let mut config = cfg(
+            CompareDirection::Bidirectional,
+            false,
+            ConflictStrategy::AskUser,
+        );
+        config.local_folder = root.path().to_path_buf();
+        let files = CloudService::new().post_sync_baseline(&[downloaded], &config, None);
+        let entry = files.get("f.txt").expect("the download is recorded");
+        assert_eq!(entry.size, 7);
+        assert_eq!(
+            entry.modified,
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 0),
+            "the local side needs a time of its own clock to be compared with"
+        );
+    }
+
     #[test]
     fn kept_directory_is_tracked() {
         let entry = CloudService::baseline_entry_for(

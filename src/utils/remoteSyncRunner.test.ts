@@ -977,6 +977,35 @@ describe('remoteSyncRunner — GAP-6 sync index', () => {
         // Standalone directory recorded as a directory.
         expect(files['emptydir']).toMatchObject({ is_dir: true });
     });
+
+    // Major 1 (re-review of #949): a download recorded the remote side's
+    // time, and a backend listing no comparable time (FTP LIST dates) gives
+    // none, so the local side of that file was compared by size alone on the
+    // next run and a same-size local edit went unseen. With no remote time the
+    // index takes the downloaded file's own, read back from disk.
+    it('records the downloaded file time when the remote gives none', async () => {
+        let savedIndex: Record<string, unknown> | undefined;
+        const { invoke } = makeInvoke({
+            get_file_properties: () => ({ size: 7, modified: '2026-09-26T10:00:00' }),
+            save_sync_index_cmd: (args) => {
+                savedIndex = args?.index as Record<string, unknown>;
+            },
+        });
+        await runRemoteSync(
+            [
+                file('from-list.txt', 'download', { size: 7, mtime: null }),
+                file('dated.txt', 'download', { size: 9 }),
+            ],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, { writeIndex: true }),
+        );
+        const files = (savedIndex?.files ?? {}) as Record<string, { modified: string | null }>;
+        expect(files['from-list.txt']?.modified).toBe('2026-09-26T10:00:00Z');
+        // A remote time is kept: the download stamped it on the local copy.
+        expect(files['dated.txt']?.modified).toBe('2026-05-22T10:00:00Z');
+    });
 });
 
 describe('remoteSyncRunner — GAP-7 keep-both rename', () => {

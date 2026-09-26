@@ -28610,6 +28610,13 @@ thread_local! {
     /// only: a release binary has no way to reach it.
     static TEST_CONNECTED_PROVIDER: std::cell::RefCell<Option<Box<dyn StorageProvider>>> =
         const { std::cell::RefCell::new(None) };
+    /// Makes a connected provider for every `create_and_connect` on this
+    /// thread once the one-shot slot above is empty, so a command that opens
+    /// more connections than one (a sync's transfers) reaches the same tree.
+    #[allow(clippy::type_complexity)]
+    static TEST_PROVIDER_FACTORY: std::cell::RefCell<
+        Option<std::rc::Rc<dyn Fn() -> Box<dyn StorageProvider>>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 async fn create_and_connect(
@@ -28620,6 +28627,10 @@ async fn create_and_connect(
     #[cfg(test)]
     if let Some(provider) = TEST_CONNECTED_PROVIDER.with(|slot| slot.borrow_mut().take()) {
         return Ok((provider, "/".to_string()));
+    }
+    #[cfg(test)]
+    if let Some(make) = TEST_PROVIDER_FACTORY.with(|slot| slot.borrow().clone()) {
+        return Ok((make(), "/".to_string()));
     }
     create_and_connect_detailed(url, cli, format)
         .await
@@ -73519,6 +73530,49 @@ mod tests {
         );
     }
 
+    /// Minor 2 (re-review of #949): dates the same within the window do not
+    /// say which copy is newer either, and the larger one won there too,
+    /// against the guide's promise that the size never stands in for the date.
+    #[test]
+    fn newer_is_not_decided_by_size_when_the_dates_are_the_same() {
+        let w = ModifyWindow::Seconds { secs: 2 };
+        assert_eq!(
+            resolve_conflict("newer", 5000, Some(T0), 5120, Some(T0_PLUS_1), w),
+            "skip"
+        );
+        assert_eq!(
+            resolve_conflict("older", 5120, Some(T0), 5000, Some(T0_PLUS_1), w),
+            "skip"
+        );
+    }
+
+    /// Minor 1 (re-review of #949): `--update` leaves a destination that may
+    /// be newer. One whose date is the same within the window is not newer,
+    /// and a changed pair of that kind is transferred, as rsync does.
+    #[test]
+    fn update_transfers_a_changed_pair_whose_dates_are_the_same() {
+        let rule = SyncPairRule {
+            conflict_mode: "source",
+            skip_matching: false,
+            update: true,
+            modify_window: None,
+            checksum: false,
+        };
+        let w = ModifyWindow::Seconds { secs: 2 };
+        assert_eq!(
+            plan_one_way_pair(&rule, w, 10, Some(T0), 12, Some(T0_PLUS_1), None),
+            OneWayPair::Transfer
+        );
+        // A destination the dates cannot order still stays.
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        assert_eq!(
+            plan_one_way_pair(&rule, size_only, 10, Some(T0), 12, Some(T0_PLUS_1), None),
+            OneWayPair::Skip
+        );
+    }
+
     /// m2 (review of #949): `sync --local` copies source to destination, one
     /// way: `--direction upload` says exactly that and is accepted, `download`
     /// is refused.
@@ -78130,6 +78184,174 @@ mod tests {
         }
     }
 
+    /// The time [`SharedTreeProvider`] lists for every file it holds.
+    const SHARED_TREE_MTIME: &str = "2026-09-26T12:00:00";
+
+    /// A remote tree whose files hold bytes, shared by every connection a
+    /// command opens: uploads and downloads move the bytes, so a sync runs
+    /// for real and the next run reads what the previous one left. It lists
+    /// like FTP with `LIST` dates by default (no comparable time).
+    #[derive(Clone, Default)]
+    struct SharedTreeProvider {
+        /// Full path to bytes.
+        files: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+        /// The precision its times are listed with (`None`: size only).
+        precision: Option<std::time::Duration>,
+    }
+
+    impl SharedTreeProvider {
+        fn with_files(files: &[(&str, &[u8])]) -> Self {
+            let tree = Self::default();
+            tree.put(files);
+            tree
+        }
+
+        /// Replace (or add) files, as a change made on the server.
+        fn put(&self, files: &[(&str, &[u8])]) {
+            let mut held = self.files.lock().expect("tree");
+            for (path, bytes) in files {
+                held.insert(format!("/root/{path}"), bytes.to_vec());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for SharedTreeProvider {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Ftp
+        }
+        fn mtime_precision(&self) -> Option<std::time::Duration> {
+            self.precision
+        }
+        fn display_name(&self) -> String {
+            "shared-tree".to_string()
+        }
+        async fn connect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let held = self.files.lock().expect("tree");
+            let mut out: Vec<RemoteEntry> = Vec::new();
+            for (full, bytes) in held.iter() {
+                let Some(rest) = full.strip_prefix(&prefix) else {
+                    continue;
+                };
+                match rest.split_once('/') {
+                    None => {
+                        let mut entry =
+                            RemoteEntry::file(rest.to_string(), full.clone(), bytes.len() as u64);
+                        entry.modified = Some(SHARED_TREE_MTIME.to_string());
+                        out.push(entry);
+                    }
+                    Some((dir, _)) => {
+                        let dir_path = format!("{prefix}{dir}");
+                        if !out.iter().any(|entry| entry.path == dir_path) {
+                            out.push(RemoteEntry::directory(dir.to_string(), dir_path));
+                        }
+                    }
+                }
+            }
+            if out.is_empty() && path != "/root" {
+                return Err(ProviderError::NotFound(path.to_string()));
+            }
+            Ok(out)
+        }
+        async fn pwd(&mut self) -> Result<String, ProviderError> {
+            Ok("/".to_string())
+        }
+        async fn cd(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn cd_up(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn download(
+            &mut self,
+            remote_path: &str,
+            local_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            let bytes = self.download_to_bytes(remote_path).await?;
+            std::fs::write(local_path, bytes).map_err(|e| ProviderError::Other(e.to_string()))
+        }
+        async fn download_to_bytes(&mut self, remote_path: &str) -> Result<Vec<u8>, ProviderError> {
+            self.files
+                .lock()
+                .expect("tree")
+                .get(remote_path)
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(remote_path.to_string()))
+        }
+        async fn upload(
+            &mut self,
+            local_path: &str,
+            remote_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            let bytes =
+                std::fs::read(local_path).map_err(|e| ProviderError::Other(e.to_string()))?;
+            self.files
+                .lock()
+                .expect("tree")
+                .insert(remote_path.to_string(), bytes);
+            Ok(())
+        }
+        async fn mkdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn delete(&mut self, path: &str) -> Result<(), ProviderError> {
+            self.files
+                .lock()
+                .expect("tree")
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+        }
+        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("rmdir_recursive".to_string()))
+        }
+        async fn rename(&mut self, _from: &str, _to: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("rename".to_string()))
+        }
+        async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
+            let size = self.size(path).await?;
+            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            let mut entry = RemoteEntry::file(name, path.to_string(), size);
+            entry.modified = Some(SHARED_TREE_MTIME.to_string());
+            Ok(entry)
+        }
+        async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
+            self.files
+                .lock()
+                .expect("tree")
+                .get(path)
+                .map(|bytes| bytes.len() as u64)
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+        }
+        async fn exists(&mut self, path: &str) -> Result<bool, ProviderError> {
+            Ok(self.size(path).await.is_ok())
+        }
+        async fn keep_alive(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn server_info(&mut self) -> Result<String, ProviderError> {
+            Ok("shared-tree".to_string())
+        }
+    }
+
     static SESSION_TRANSFER_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
     /// Records the actual provider path selected by the shared CLI batch, with
@@ -79451,6 +79673,209 @@ mod tests {
             (1, 0),
             "the local edit is the newer copy"
         );
+    }
+
+    /// Minor 2 (re-review of #949): dates the same within the window order
+    /// nothing either; the snapshot decides there too, instead of the larger
+    /// copy (here the remote one, which did not change).
+    #[test]
+    fn newer_follows_the_side_that_changed_when_the_dates_are_the_same() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5000);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[5120,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let remote = MemTreeProvider::root_files(&[("a.txt", 5120)]);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let rule = SyncPairRule {
+            conflict_mode: "newer",
+            ..SOURCE_WINS
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], rule, &cli);
+        assert_eq!(
+            (stats.uploaded, stats.downloaded),
+            (1, 0),
+            "the local edit is the newer copy"
+        );
+    }
+
+    /// The real `cmd_sync` against a [`SharedTreeProvider`]: every connection
+    /// the run opens (the scan, each transfer) reaches the same tree.
+    fn run_sync_shared(
+        remote: &SharedTreeProvider,
+        local: &str,
+        dry_run: bool,
+        rule: SyncPairRule<'static>,
+        cli: &Cli,
+    ) -> SyncCycleStats {
+        let tree = remote.clone();
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("shared-tree-sync".to_string())
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    TEST_PROVIDER_FACTORY.with(|slot| {
+                        *slot.borrow_mut() = Some(std::rc::Rc::new(move || {
+                            Box::new(tree.clone()) as Box<dyn StorageProvider>
+                        }));
+                    });
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("test runtime")
+                        .block_on(cmd_sync(
+                            "memory://",
+                            local,
+                            "/root",
+                            "both",
+                            dry_run,
+                            false,
+                            &[],
+                            None,
+                            0,
+                            false,
+                            None,
+                            None,
+                            "",
+                            false,
+                            None,
+                            None,
+                            None,
+                            rule,
+                            false,
+                            cli,
+                            OutputFormat::Json,
+                            Arc::new(AtomicBool::new(false)),
+                            None,
+                            false,
+                        ))
+                })
+                .expect("spawn the command thread")
+                .join()
+                .expect("the command thread panicked")
+        })
+    }
+
+    const NEWER_WINS: SyncPairRule<'static> = SyncPairRule {
+        conflict_mode: "newer",
+        ..SOURCE_WINS
+    };
+
+    /// Critical 1 (re-review of #949): the bisync snapshot recorded every
+    /// path of the scan taken BEFORE the run, the pairs the run left alone
+    /// included. A pair no date could order was skipped, then recorded as
+    /// synced, and the next run read the remote side as the one that changed
+    /// and downloaded it over the local edit. A pair the run did not settle
+    /// keeps what the snapshot said before, here nothing.
+    #[test]
+    fn a_pair_left_open_stays_open_on_the_next_run() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("index.html", 5000);
+        let local = fixture.local();
+        let remote = SharedTreeProvider::with_files(&[("index.html", &[b'r'; 5120])]);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        for run in ["first", "second"] {
+            let stats = run_sync_shared(&remote, &local, false, NEWER_WINS, &cli);
+            assert_eq!(
+                (stats.exit_code, stats.uploaded, stats.downloaded),
+                (0, 0, 0),
+                "{run} run: no date orders the pair and nothing says which side changed"
+            );
+        }
+        assert_eq!(
+            std::fs::read(Path::new(&local).join("index.html")).unwrap(),
+            vec![b'x'; 5000],
+            "the local edit is still there"
+        );
+    }
+
+    /// Critical 1, second half: after a download the snapshot kept the local
+    /// file as it was BEFORE the run, so an undo made on the server afterwards
+    /// read as a local change, and the old copy would go back up over the
+    /// restore. The snapshot records the file the download left on disk.
+    #[test]
+    fn a_download_is_recorded_as_the_file_it_left_on_disk() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5120);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[5120,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let remote = SharedTreeProvider::with_files(&[("a.txt", &[b'r'; 5200])]);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let first = run_sync_shared(&remote, &local, false, NEWER_WINS, &cli);
+        assert_eq!(
+            (first.exit_code, first.uploaded, first.downloaded),
+            (0, 0, 1),
+            "the remote side changed since the snapshot"
+        );
+        // The change is undone on the server.
+        remote.put(&[("a.txt", &[b'u'; 5120])]);
+        let second = run_sync_shared(&remote, &local, true, NEWER_WINS, &cli);
+        assert_eq!(
+            (second.uploaded, second.downloaded),
+            (0, 1),
+            "the undo is the change, not the file the last run downloaded"
+        );
+    }
+
+    /// Minor 6 (re-review of #949): `sync --local` refused `--files-from` and
+    /// copied every file under `--files-from-raw`.
+    #[test]
+    fn local_to_local_refuses_files_from_raw() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 1);
+        let src = fixture.local();
+        let dst = tempfile::tempdir().expect("destination dir");
+        let dst_path = dst.path().to_string_lossy().into_owned();
+        let list = dst.path().join("list.txt");
+        std::fs::write(&list, "a.txt\n").unwrap();
+        let cli = Cli {
+            quiet: true,
+            files_from_raw: Some(list.to_string_lossy().into_owned()),
+            ..test_cli()
+        };
+        let target = dst_path.clone();
+        let code = on_big_stack_value(move || {
+            let parsed = Cli::try_parse_from([
+                "aeroftp-cli",
+                "sync",
+                src.as_str(),
+                target.as_str(),
+                "--local",
+            ])
+            .expect("parses");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(dispatch_sync(
+                    &parsed.command,
+                    &cli,
+                    OutputFormat::Json,
+                    Arc::new(AtomicBool::new(false)),
+                ))
+        });
+        assert_eq!(code, 5, "--files-from-raw is a flag the copier ignores");
+        assert!(!Path::new(&dst_path).join("a.txt").exists());
     }
 
     /// M3 (review of #949): `sync-doctor` states a size-only comparison.
