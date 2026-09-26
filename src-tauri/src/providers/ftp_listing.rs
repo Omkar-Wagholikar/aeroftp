@@ -1030,4 +1030,14 @@ mod tests {
             .expect("an MLSD date");
         assert_eq!(crate::parse_remote_mtime(&mlsd), Some(1_790_278_906));
     }
+    /// n1 (review of #949): a year-less Unix date is read in the year that
+    /// puts it nearest to now, the next year included: on the night of 31
+    /// December a server one hour ahead lists a file written on 1 January.
+    #[test]
+    fn a_year_less_date_just_past_new_year_reads_in_the_next_year() {
+        let now = NaiveDateTime::parse_from_str("2026-12-31 23:00", "%Y-%m-%d %H:%M").unwrap();
+        let entry = parse_listing_at("-rw-r--r-- 1 u g 1 Jan  1 00:30 f.txt", "/", now)
+            .expect("a Unix row");
+        assert_eq!(entry.modified.as_deref(), Some("2027-01-01 00:30"));
+    }
 }

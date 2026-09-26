@@ -73298,6 +73298,8 @@ mod tests {
             plan_one_way_pair(&skip, size_only, 10, Some(T0_PLUS_60), 12, Some(T0), None),
             OneWayPair::Skip
         );
+        // M2 (review of #949): --update protects a destination that may be
+        // newer; when the dates cannot order the pair it may be, so it stays.
         assert_eq!(
             plan_one_way_pair(
                 &one_way_rule("source", true),
@@ -73308,7 +73310,19 @@ mod tests {
                 Some(T0_PLUS_60),
                 None
             ),
-            OneWayPair::Transfer
+            OneWayPair::Skip
+        );
+        assert_eq!(
+            plan_one_way_pair(
+                &one_way_rule("source", true),
+                w,
+                10,
+                None,
+                12,
+                Some(T0),
+                None
+            ),
+            OneWayPair::Skip
         );
         // The same size under a size-only window is current.
         assert_eq!(
@@ -73370,6 +73384,58 @@ mod tests {
         assert_eq!(
             compare_mtime(Some("Sep 24 19:41"), Some(T0), w),
             std::cmp::Ordering::Equal
+        );
+    }
+
+    /// M1 (review of #949): `newer` and `older` cannot be decided by size when
+    /// the dates do not order the pair; the larger copy used to win.
+    #[test]
+    fn newer_is_not_decided_by_size_when_dates_do_not_order() {
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        assert_eq!(
+            resolve_conflict("newer", 5000, Some(T0), 5120, Some(T0_PLUS_60), size_only),
+            "skip"
+        );
+        assert_eq!(
+            resolve_conflict("older", 5120, Some(T0), 5000, Some(T0_PLUS_60), size_only),
+            "skip"
+        );
+        // Sizes stay the rule of the size modes.
+        assert_eq!(
+            resolve_conflict("larger", 5000, Some(T0), 5120, Some(T0_PLUS_60), size_only),
+            "download"
+        );
+    }
+
+    /// m2 (review of #949): `sync --local` copies source to destination, one
+    /// way: `--direction upload` says exactly that and is accepted, `download`
+    /// is refused.
+    #[test]
+    fn local_to_local_accepts_the_direction_it_performs() {
+        let flags = |direction| LocalToLocalFlags {
+            direction,
+            delete: false,
+            track_renames: false,
+            max_delete: false,
+            backup_dir: false,
+            compare_dest: false,
+            copy_dest: false,
+            from_reconcile: false,
+            conflict_mode: false,
+            skip_matching: false,
+            update: false,
+            modify_window: false,
+            checksum: false,
+            resync: false,
+            watch: false,
+        };
+        assert!(local_to_local_ignored_flags(&flags("upload")).is_empty());
+        assert!(local_to_local_ignored_flags(&flags("both")).is_empty());
+        assert_eq!(
+            local_to_local_ignored_flags(&flags("download")),
+            vec!["--direction"]
         );
     }
 
@@ -77753,6 +77819,17 @@ mod tests {
         /// Server-side checksums by full path; none means the backend offers
         /// none (`supports_checksum` is false).
         checksums: HashMap<String, HashMap<String, String>>,
+        /// The backend this tree pretends to be (SFTP when unset).
+        kind: Option<ProviderType>,
+        /// The precision its times are listed with, when not the declared one
+        /// for `kind` (`Some(None)`: no comparable time, size only).
+        precision: Option<Option<std::time::Duration>>,
+        /// `rmdir` removes the directory with everything under it, as the
+        /// object stores and most cloud APIs do.
+        recursive_rmdir: bool,
+        /// Full paths a listing leaves out although they are stored (a crypt
+        /// overlay's sentinels, a listing that is not authoritative).
+        hidden: std::collections::HashSet<String>,
     }
 
     impl MemTreeProvider {
@@ -77800,7 +77877,12 @@ mod tests {
             self
         }
         fn provider_type(&self) -> ProviderType {
-            ProviderType::Sftp
+            self.kind.unwrap_or(ProviderType::Sftp)
+        }
+        fn mtime_precision(&self) -> Option<std::time::Duration> {
+            self.precision.unwrap_or_else(|| {
+                ftp_client_gui_lib::providers::declared_mtime_precision(self.provider_type())
+            })
         }
         fn display_name(&self) -> String {
             "mem-tree".to_string()
@@ -77815,10 +77897,13 @@ mod tests {
             true
         }
         async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
-            self.dirs
+            let mut listing = self
+                .dirs
                 .get(path)
                 .cloned()
-                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))?;
+            listing.retain(|entry| !self.hidden.contains(&entry.path));
+            Ok(listing)
         }
         async fn pwd(&mut self) -> Result<String, ProviderError> {
             Ok("/".to_string())
@@ -77884,12 +77969,15 @@ mod tests {
             }
             match self.dirs.get(path) {
                 None => return Err(ProviderError::NotFound(path.to_string())),
-                Some(listing) if !listing.is_empty() => {
+                Some(listing) if !listing.is_empty() && !self.recursive_rmdir => {
                     return Err(ProviderError::Other(format!("{path}: not empty")))
                 }
                 Some(_) => {}
             }
-            self.dirs.remove(path);
+            // A recursive backend takes everything under it, listed or not.
+            let prefix = format!("{path}/");
+            self.dirs
+                .retain(|dir, _| dir != path && !dir.starts_with(&prefix));
             let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
             if let Some(listing) = self.dirs.get_mut(parent) {
                 listing.retain(|entry| entry.path != path);
@@ -78900,6 +78988,17 @@ mod tests {
         })
     }
 
+    /// Run `f` on a thread with a wide stack and return what it returns: clap
+    /// builds the whole command tree, more than a test thread's stack holds.
+    fn on_big_stack_value<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn the big-stack thread")
+            .join()
+            .expect("the big-stack thread panicked")
+    }
+
     /// The real `cmd_sync` against `remote` with the planning flags of `rule`.
     #[allow(clippy::too_many_arguments)]
     fn run_sync_rule(
@@ -79001,6 +79100,280 @@ mod tests {
         assert_eq!(
             *rmdirs.lock().unwrap(),
             vec!["/root/old/sub".to_string(), "/root/old".to_string()]
+        );
+    }
+
+    /// C2 (review of #949): `sync --delete` removed an emptied directory with
+    /// `rmdir`, which object stores and most cloud APIs run recursively, after
+    /// a listing that can leave stored objects out (a crypt overlay's
+    /// sentinels, a listing that is not authoritative). The object the listing
+    /// hid went with the directory, uncounted by `--max-delete`. A backend whose
+    /// `rmdir` is not known to refuse a non-empty directory keeps its
+    /// directories.
+    #[test]
+    fn an_emptied_directory_on_a_recursive_backend_is_left_alone() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        let mut remote =
+            MemTreeProvider::tree(&[("keep/a.txt", 1), ("old/x.txt", 1), ("old/sentinel", 1)]);
+        remote.mutable = true;
+        remote.kind = Some(ProviderType::S3);
+        remote.recursive_rmdir = true;
+        remote.hidden.insert("/root/old/sentinel".to_string());
+        let rmdirs = Arc::clone(&remote.rmdir_attempts);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(
+            remote,
+            &local,
+            "upload",
+            false,
+            true,
+            &[],
+            SOURCE_WINS,
+            &cli,
+        );
+        assert_eq!(stats.exit_code, 0);
+        assert!(
+            rmdirs.lock().unwrap().is_empty(),
+            "a recursive rmdir after a listing that hides objects deletes them: {:?}",
+            rmdirs.lock().unwrap()
+        );
+    }
+
+    /// A dry run removes no directory: it lists the candidates and stops.
+    #[test]
+    fn a_dry_run_removes_no_directory() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        let mut remote = MemTreeProvider::tree(&[("keep/a.txt", 1), ("old/sub/x.txt", 1)]);
+        remote.mutable = true;
+        let rmdirs = Arc::clone(&remote.rmdir_attempts);
+        let deletes = Arc::clone(&remote.delete_attempts);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(remote, &local, "upload", true, true, &[], SOURCE_WINS, &cli);
+        assert_eq!(stats.exit_code, 0);
+        assert!(deletes.lock().unwrap().is_empty());
+        assert!(rmdirs.lock().unwrap().is_empty());
+    }
+
+    /// `sync --direction download --delete` removes the LOCAL directories its
+    /// deletes emptied (a local `remove_dir` refuses a non-empty directory),
+    /// and never the `--backup-dir` the deleted files were copied into.
+    #[test]
+    fn download_delete_removes_the_local_directories_it_emptied_and_keeps_the_backups() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        std::fs::create_dir_all(Path::new(&local).join("old/sub")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        fixture.local_file("old/sub/x.txt", 1);
+        let backup = Path::new(&local).join(".bak");
+        let backup_str = backup.to_string_lossy().into_owned();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let excludes = vec![".bak".to_string()];
+        let stats = run_against_remote(MemTreeProvider::tree(&[("keep/a.txt", 1)]), || {
+            cmd_sync(
+                "memory://",
+                &local,
+                "/root",
+                "download",
+                false,
+                true,
+                &excludes,
+                None,
+                0,
+                false,
+                Some("1000"),
+                Some(backup_str.as_str()),
+                "",
+                false,
+                None,
+                None,
+                None,
+                SOURCE_WINS,
+                false,
+                &cli,
+                OutputFormat::Json,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+            )
+        });
+        assert_eq!(stats.exit_code, 0);
+        assert!(!Path::new(&local).join("old/sub/x.txt").exists());
+        assert!(
+            !Path::new(&local).join("old").exists(),
+            "the emptied tree goes"
+        );
+        assert!(backup.is_dir(), "the backup directory stays");
+        assert!(Path::new(&local).join("keep/a.txt").exists());
+    }
+
+    /// M2 (review of #949): `--update` is a one-way rule; `--direction both`
+    /// ignored it, which read as a protection the run did not give.
+    #[test]
+    fn update_is_refused_with_direction_both() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let code = on_big_stack_value(move || {
+            let parsed = Cli::try_parse_from([
+                "aeroftp-cli",
+                "sync",
+                "memory://",
+                local.as_str(),
+                "/root",
+                "--update",
+            ])
+            .expect("parses");
+            run_against_remote(MemTreeProvider::root_files(&[]), move || async move {
+                dispatch_sync(
+                    &parsed.command,
+                    &cli,
+                    OutputFormat::Json,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            })
+        });
+        assert_eq!(code, 5, "--update needs a one-way direction");
+    }
+
+    /// The flags reach the planner through `dispatch_sync`, not only clap:
+    /// with `--update` a destination copy that is newer is left alone, without
+    /// it the source wins (the fixture refuses the upload, so the attempt is
+    /// what the exit code shows).
+    #[test]
+    fn update_reaches_the_planner_through_dispatch() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 3);
+        let local = fixture.local();
+        let run = |extra: Option<&'static str>| {
+            let local = local.clone();
+            on_big_stack_value(move || {
+                let mut args = vec![
+                    "aeroftp-cli".to_string(),
+                    "sync".to_string(),
+                    "memory://".to_string(),
+                    local,
+                    "/root".to_string(),
+                    "--direction".to_string(),
+                    "upload".to_string(),
+                ];
+                args.extend(extra.map(str::to_string));
+                let parsed = Cli::try_parse_from(args).expect("parses");
+                let cli = Cli {
+                    quiet: true,
+                    ..test_cli()
+                };
+                let mut remote = MemTreeProvider::root_files(&[("a.txt", 5)]);
+                // The remote copy is newer than the local one (FIXTURE_MTIME).
+                for entry in remote.dirs.get_mut("/root").unwrap() {
+                    entry.modified = Some("2030-01-01T00:00:00".to_string());
+                }
+                run_against_remote(remote, move || async move {
+                    dispatch_sync(
+                        &parsed.command,
+                        &cli,
+                        OutputFormat::Json,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                })
+            })
+        };
+        assert_eq!(
+            run(Some("--update")),
+            0,
+            "--update leaves the newer remote copy"
+        );
+        assert_ne!(run(None), 0, "without --update the upload is attempted");
+    }
+
+    /// M1 (review of #949): with no comparable time (FTP without MLSD,
+    /// FileLu, a size-only window) `--conflict-mode newer` fell back to the
+    /// larger copy, and a local edit that shortened a file lost to the older,
+    /// larger remote one. The bisync snapshot says which side changed since
+    /// the last sync, and that side is the newer one.
+    #[test]
+    fn newer_follows_the_side_that_changed_when_dates_do_not_order() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5000);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            r#"{"synced_at":"2020-01-01T00:00:00Z","files":{"a.txt":[5120,""]}}"#,
+        )
+        .unwrap();
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 5120)]);
+        remote.precision = Some(None);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let rule = SyncPairRule {
+            conflict_mode: "newer",
+            ..SOURCE_WINS
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], rule, &cli);
+        assert_eq!(
+            (stats.uploaded, stats.downloaded),
+            (1, 0),
+            "the local edit is the newer copy"
+        );
+    }
+
+    /// M3 (review of #949): `sync-doctor` states a size-only comparison.
+    #[test]
+    fn sync_doctor_states_a_size_only_comparison() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 1);
+        let local = fixture.local();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 1)]);
+        remote.precision = Some(None);
+        let report = run_against_remote(remote, || {
+            sync_doctor_report(
+                "memory://",
+                &local,
+                "/root",
+                "upload",
+                false,
+                &[],
+                None,
+                0,
+                false,
+                "newer",
+                false,
+                false,
+                &cli,
+                OutputFormat::Json,
+            )
+        })
+        .unwrap_or_else(|code| panic!("sync-doctor failed with exit code {code}"));
+        assert!(
+            report.risks.iter().any(|risk| risk.contains("size only")),
+            "{:?}",
+            report.risks
         );
     }
 
