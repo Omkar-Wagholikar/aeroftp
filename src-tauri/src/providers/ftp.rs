@@ -5421,6 +5421,76 @@ mod late_reply_guard_tests {
         }
     }
 
+    /// End to end on the real crate: the server answers `RETR` with `150` and
+    /// the final `550` in ONE write and keeps the data connection open and
+    /// silent. suppaftp's reader pulls both replies while it collects the
+    /// `150`, so the refusal lives only in the reader's buffer and the socket
+    /// underneath is empty. The download must end on the refusal at once, not
+    /// wait out the thirty-minute data idle timeout. This is the path the
+    /// fork's `ControlSocket::buffered_reply_bytes` exists for: the watch reads
+    /// the buffer through it, and a peek on the socket sees nothing.
+    #[tokio::test]
+    async fn a_refusal_sent_with_the_150_ends_a_real_download_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"220 ready\r\n").await.unwrap();
+            // Kept open and silent: a closed data socket would end the wait by
+            // another road and the stall would never show.
+            let mut held_data = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let cmd = line.split_whitespace().next().unwrap_or("").to_uppercase();
+                let reply = match cmd.as_str() {
+                    "USER" => "331 password please\r\n".to_string(),
+                    "PASS" => "230 logged in\r\n".to_string(),
+                    "PWD" => "257 \"/\" is current\r\n".to_string(),
+                    "PASV" => format!(
+                        "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                        data_port / 256,
+                        data_port % 256
+                    ),
+                    "RETR" => {
+                        let (data, _) = data_listener.accept().await.unwrap();
+                        held_data.push(data);
+                        "150 Opening data connection.\r\n550 Failed to open file.\r\n".to_string()
+                    }
+                    _ => "200 ok\r\n".to_string(),
+                };
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        });
+        provider.connect().await.expect("the dial must succeed");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.download_to_bytes("/missing.bin"),
+        )
+        .await
+        .expect("the refusal in the reader's buffer must end the download, not the idle timeout");
+        let err = outcome.expect_err("a refused RETR is an error");
+        assert!(
+            err.to_string().contains("550") || err.to_string().contains("Failed to open"),
+            "the error must carry the server's refusal, got {err}"
+        );
+        server.abort();
+    }
+
     /// A reply that arrives AFTER the failure-path checks used to be read as
     /// the next command's own answer. The guard at the start of the next
     /// command must see it, drop the session and redial, so the second PWD
