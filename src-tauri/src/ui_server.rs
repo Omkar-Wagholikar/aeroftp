@@ -36,11 +36,12 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http_body_util::Full;
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
@@ -222,14 +223,22 @@ pub(crate) struct Limits {
     /// is closed after it: hyper runs the same timer while it waits for the next
     /// head. WebKit simply reconnects.
     pub header_read_timeout: Duration,
-    /// Connections served at once. At the cap the oldest idle connection is
-    /// closed to make room, and a new connection is closed at accept only when
-    /// every slot is answering a request. That confines a local connection
-    /// flood to this server instead of letting it exhaust the process's file
+    /// Connections served at once. At the cap one connection that has been
+    /// quiet for `min_idle_to_evict` is closed to make room; a new connection is
+    /// closed at accept when none has, when each one that has is already making
+    /// room for an earlier newcomer, or when the one chosen turns out to be busy
+    /// again by the time it is asked. That confines a local connection flood to
+    /// this server instead of letting it exhaust the process's file
     /// descriptors. Memory is not what it bounds: responses share the cached
     /// asset and are written without being copied, so a connection costs
     /// hyper's buffers whatever it asks for.
     pub max_connections: usize,
+    /// How long a connection must have been quiet (nothing read or written, no
+    /// request being answered) before it may be closed to make room at the
+    /// cap. A client sends its request right after connecting, and the next
+    /// one right after reading a response, so a connection in use is never
+    /// quiet this long, and a request already on its way is not cut off.
+    pub min_idle_to_evict: Duration,
     /// A response write that makes no progress for this long ends the
     /// connection. Without it a client that asks for a large asset and never
     /// reads keeps its connection slot forever, and enough of them hold every
@@ -250,6 +259,7 @@ impl Limits {
     pub(crate) const APP: Limits = Limits {
         header_read_timeout: Duration::from_secs(10),
         max_connections: 128,
+        min_idle_to_evict: Duration::from_secs(1),
         write_stall_timeout: Duration::from_secs(10),
         max_connection_age: Duration::from_secs(60),
         shutdown_grace: Duration::from_secs(10),
@@ -264,14 +274,17 @@ struct Site {
     /// `localhost` URL from this server.
     origin_host: String,
     stats: Stats,
+    /// The zero of every connection's activity clock.
+    epoch: Instant,
 }
 
 /// Running totals behind the summary line.
 #[derive(Default)]
 struct Stats {
-    /// Closed at accept: at the cap, with no connection idle.
+    /// Closed without being served: at the cap, with no connection that could
+    /// make room.
     refused: AtomicU64,
-    /// Idle connections closed to make room for a newcomer.
+    /// Quiet connections closed to make room for a newcomer.
     evicted: AtomicU64,
     /// Accepts that failed, usually for want of file descriptors.
     failed_accepts: AtomicU64,
@@ -312,8 +325,8 @@ impl Summary {
             .map(|error| format!(" (last: {error})"))
             .unwrap_or_default();
         log::warn!(
-            "UI server, last {}s: {refused} connections closed at the cap of {cap} with none idle, \
-             {evicted} idle ones closed to make room, {failed} failed accepts{accept_error}, \
+            "UI server, last {}s: {refused} connections closed at the cap of {cap} with none to make room, \
+             {evicted} quiet ones closed to make room, {failed} failed accepts{accept_error}, \
              {ended} connections ended",
             SUMMARY_PERIOD.as_secs()
         );
@@ -367,6 +380,7 @@ fn launch(
         nonce,
         origin_host: local.to_string(),
         stats: Stats::default(),
+        epoch: Instant::now(),
     });
     tauri::async_runtime::spawn(accept_loop(listener, site.clone(), limits));
     Ok((local, site))
@@ -410,14 +424,11 @@ async fn accept_loop(listener: std::net::TcpListener, site: Arc<Site>, limits: L
         accepted += 1;
         let admission = match slots.clone().try_acquire_owned() {
             Ok(slot) => Admission::Now(slot),
-            // An idle connection gives its slot up rather than the newcomer
-            // being refused, so holding every slot takes that many requests in
-            // flight, not that many open sockets.
-            Err(_) => match occupants.evict_oldest_idle() {
-                Some(handover) => {
-                    site.stats.evicted.fetch_add(1, Ordering::Relaxed);
-                    Admission::After(handover)
-                }
+            // A quiet connection gives its slot up rather than the newcomer
+            // being refused, so holding every slot takes that many connections
+            // in use, not that many open sockets.
+            Err(_) => match occupants.make_room(limits.min_idle_to_evict) {
+                Some(handover) => Admission::After(handover),
                 None => {
                     site.stats.refused.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -438,7 +449,8 @@ async fn accept_loop(listener: std::net::TcpListener, site: Arc<Site>, limits: L
 /// How a new connection gets its slot.
 enum Admission {
     Now(OwnedSemaphorePermit),
-    /// From an idle connection asked to close for it, once that one has.
+    /// From a quiet connection asked to close for it, once that one has. None
+    /// arrives if it was busy again by then.
     After(oneshot::Receiver<OwnedSemaphorePermit>),
 }
 
@@ -454,15 +466,21 @@ async fn serve(
         Admission::Now(slot) => slot,
         Admission::After(handover) => match handover.await {
             Ok(slot) => slot,
-            Err(_) => return,
+            Err(_) => {
+                site.stats.refused.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         },
     };
-    let tenancy = Tenancy::admit(occupants, slot, accepted);
+    let tenancy = Tenancy::admit(occupants, slot, Occupant::new(accepted, site.epoch));
     let occupant = tenancy.occupant.clone();
+    // Owned by `connection` below, which outlives every use of it here.
+    let socket = stream.as_raw_fd();
     let service = {
         let (site, occupant) = (site.clone(), occupant.clone());
         service_fn(move |request| {
             occupant.answering.store(true, Ordering::Relaxed);
+            occupant.touch();
             let answered = Answered(occupant.clone());
             let site = site.clone();
             async move {
@@ -488,22 +506,41 @@ async fn serve(
             service,
         );
     tokio::pin!(connection);
-    // Past its age, or asked to make room: the response in flight may finish
-    // within the grace (hyper closes an idle connection at once), then the
-    // connection is dropped.
-    let finished = tokio::select! {
-        served = connection.as_mut() => Some(served),
-        () = tokio::time::sleep(limits.max_connection_age) => None,
-        () = occupant.evict.notified() => None,
-    };
-    let served = match finished {
-        Some(served) => served,
-        None => {
-            connection.as_mut().graceful_shutdown();
-            tokio::time::timeout(limits.shutdown_grace, connection.as_mut())
-                .await
-                .unwrap_or(Ok(()))
+    let aged = tokio::time::sleep(limits.max_connection_age);
+    tokio::pin!(aged);
+    let served = loop {
+        // hyper first: whatever the client sent is read before a request to
+        // make room is weighed.
+        let wake = tokio::select! {
+            biased;
+            served = connection.as_mut() => Wake::Served(served),
+            () = aged.as_mut() => Wake::Aged,
+            () = occupant.evict.notified() => Wake::MakeRoom,
+        };
+        match wake {
+            Wake::Served(served) => break served,
+            Wake::Aged => {}
+            // Asked again here, by the connection itself, because the accept
+            // loop chose it from a snapshot: a request may have started since.
+            Wake::MakeRoom
+                if occupant.quiet_for(limits.min_idle_to_evict)
+                    && unread_bytes(socket) == Some(0) =>
+            {
+                site.stats.evicted.fetch_add(1, Ordering::Relaxed);
+            }
+            // Busy again: it stays, and the newcomer is refused.
+            Wake::MakeRoom => {
+                drop(lock(&occupant.successor).take());
+                continue;
+            }
         }
+        // Past its age, or making room: the response in flight may finish
+        // within the grace (hyper closes an idle connection at once), then the
+        // connection is dropped.
+        connection.as_mut().graceful_shutdown();
+        break tokio::time::timeout(limits.shutdown_grace, connection.as_mut())
+            .await
+            .unwrap_or(Ok(()));
     };
     // A client that went away, was too slow, or stayed too long: its own
     // connection ends, nothing else does.
@@ -513,6 +550,25 @@ async fn serve(
         }
     }
     site.stats.ended.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What woke a connection's task.
+enum Wake {
+    Served(Result<(), hyper::Error>),
+    Aged,
+    MakeRoom,
+}
+
+/// Bytes the client has sent that hyper has not read yet, if the socket says.
+fn unread_bytes(socket: RawFd) -> Option<usize> {
+    let mut unread: libc::c_int = 0;
+    // SAFETY: `socket` is a connection's socket, owned by the hyper
+    // connection its caller keeps alive across this call; FIONREAD only
+    // writes the one c_int it is given.
+    let status = unsafe { libc::ioctl(socket, libc::FIONREAD, &mut unread) };
+    (status == 0)
+        .then(|| usize::try_from(unread).ok())
+        .flatten()
 }
 
 /// How a client ends a connection on its own: it went quiet, left, reset,
@@ -540,16 +596,20 @@ fn ordinary_end(error: &hyper::Error) -> bool {
 }
 
 /// A connection holding a slot, as the accept loop sees it.
-#[derive(Default)]
 struct Occupant {
-    /// Its place in the accept order. The list below is in the order the
-    /// connection tasks first ran, which the runtime does not keep: it runs
-    /// the task spawned last first when it can.
+    /// Its place in the accept order.
     accepted: u64,
+    /// The zero of `last_active`.
+    epoch: Instant,
+    /// Milliseconds from `epoch` to the last byte read or written, the last
+    /// request or response, or the accept.
+    last_active: AtomicU64,
     /// A request arrived and hyper has not yet taken all of its response.
     answering: AtomicBool,
     /// hyper wrote to the socket and has not since found its buffer drained.
     unflushed: AtomicBool,
+    /// A response has been handed over at least once.
+    served_once: AtomicBool,
     /// Wakes the connection to close for a newcomer.
     evict: Notify,
     /// The newcomer waiting for this connection's slot.
@@ -557,31 +617,72 @@ struct Occupant {
 }
 
 impl Occupant {
-    /// Nothing in flight, so closing it loses nothing. It is a hint read
-    /// across threads: hyper's graceful shutdown closes an idle connection at
-    /// once and lets a request it is serving finish first, so a wrong guess
-    /// costs the newcomer time, never a response.
-    fn idle(&self) -> bool {
-        !self.answering.load(Ordering::Relaxed) && !self.unflushed.load(Ordering::Relaxed)
+    fn new(accepted: u64, epoch: Instant) -> Self {
+        let occupant = Self {
+            accepted,
+            epoch,
+            last_active: AtomicU64::new(0),
+            answering: AtomicBool::new(false),
+            unflushed: AtomicBool::new(false),
+            served_once: AtomicBool::new(false),
+            evict: Notify::new(),
+            successor: Mutex::new(None),
+        };
+        occupant.touch();
+        occupant
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_active.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Nothing in flight and nothing read or written for `quiet`, so closing
+    /// it loses no response and no request that had begun to arrive. A client
+    /// can still send a request in the instant it is closed, the race every
+    /// HTTP/1.1 server has with keep-alive; a client retries an idempotent
+    /// request that met it on a connection it had used before (RFC 9112
+    /// 9.3.1). The accept loop reads this as a hint and the connection asks it
+    /// again, with the socket's unread bytes, before it closes.
+    fn quiet_for(&self, quiet: Duration) -> bool {
+        let quiet = u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX);
+        let now = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        !self.answering.load(Ordering::Relaxed)
+            && !self.unflushed.load(Ordering::Relaxed)
+            && now.saturating_sub(self.last_active.load(Ordering::Relaxed)) >= quiet
     }
 }
 
-/// The connections holding slots.
+/// The connections holding slots, in no particular order.
 #[derive(Default)]
 struct Occupants(Mutex<Vec<Arc<Occupant>>>);
 
 impl Occupants {
-    /// Asks the oldest idle connection to close, and returns where its slot
-    /// will arrive once it has.
-    fn evict_oldest_idle(&self) -> Option<oneshot::Receiver<OwnedSemaphorePermit>> {
-        let occupants = lock(&self.0);
-        let oldest = occupants
+    /// The connection to close for a newcomer: one quiet for `quiet` and not
+    /// already making room for another. A connection that never answered a
+    /// request goes first (a preconnect, or a socket held open for its own
+    /// sake), then the one quiet the longest, then the one accepted first.
+    fn choose(&self, quiet: Duration) -> Option<Arc<Occupant>> {
+        lock(&self.0)
             .iter()
-            .filter(|occupant| occupant.idle() && lock(&occupant.successor).is_none())
-            .min_by_key(|occupant| occupant.accepted)?;
+            .filter(|occupant| occupant.quiet_for(quiet) && lock(&occupant.successor).is_none())
+            .min_by_key(|occupant| {
+                (
+                    occupant.served_once.load(Ordering::Relaxed),
+                    occupant.last_active.load(Ordering::Relaxed),
+                    occupant.accepted,
+                )
+            })
+            .cloned()
+    }
+
+    /// Asks the connection `choose` names to close, and returns where its slot
+    /// will arrive once it has.
+    fn make_room(&self, quiet: Duration) -> Option<oneshot::Receiver<OwnedSemaphorePermit>> {
+        let chosen = self.choose(quiet)?;
         let (handover, arrival) = oneshot::channel();
-        *lock(&oldest.successor) = Some(handover);
-        oldest.evict.notify_one();
+        *lock(&chosen.successor) = Some(handover);
+        chosen.evict.notify_one();
         Some(arrival)
     }
 }
@@ -596,11 +697,8 @@ struct Tenancy {
 }
 
 impl Tenancy {
-    fn admit(occupants: Arc<Occupants>, slot: OwnedSemaphorePermit, accepted: u64) -> Self {
-        let occupant = Arc::new(Occupant {
-            accepted,
-            ..Occupant::default()
-        });
+    fn admit(occupants: Arc<Occupants>, slot: OwnedSemaphorePermit, occupant: Occupant) -> Self {
+        let occupant = Arc::new(occupant);
         lock(&occupants.0).push(occupant.clone());
         Self {
             occupants,
@@ -632,6 +730,8 @@ struct Answered(Arc<Occupant>);
 
 impl Drop for Answered {
     fn drop(&mut self) {
+        self.0.served_once.store(true, Ordering::Relaxed);
+        self.0.touch();
         self.0.answering.store(false, Ordering::Relaxed);
     }
 }
@@ -668,8 +768,8 @@ struct StallGuard<S> {
     inner: S,
     stall: Duration,
     stalled_since: Option<Pin<Box<Sleep>>>,
-    /// Told when hyper writes and when its buffer has drained: half of what
-    /// makes the connection idle.
+    /// Told when bytes go either way and when hyper's buffer has drained:
+    /// most of what makes the connection quiet.
     occupant: Arc<Occupant>,
 }
 
@@ -686,6 +786,7 @@ impl<S> StallGuard<S> {
     fn wrote(&self, polled: &Poll<io::Result<usize>>) {
         if matches!(polled, Poll::Ready(Ok(written)) if *written > 0) {
             self.occupant.unflushed.store(true, Ordering::Relaxed);
+            self.occupant.touch();
         }
     }
 
@@ -720,7 +821,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for StallGuard<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        // A request beginning to arrive is activity even before hyper has
+        // the whole head.
+        if buf.filled().len() > before {
+            this.occupant.touch();
+        }
+        polled
     }
 }
 
@@ -895,7 +1004,6 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::time::Instant;
 
     const NONCE: &str = "test-nonce";
 
@@ -1350,9 +1458,10 @@ mod tests {
     /// With every slot answering a request, a newcomer is closed at accept:
     /// nothing in flight is cut short for it, and it is not left waiting.
     #[test]
-    fn at_the_cap_with_no_idle_connection_a_newcomer_is_closed() {
+    fn at_the_cap_with_no_quiet_connection_a_newcomer_is_closed() {
         let limits = Limits {
             max_connections: 1,
+            min_idle_to_evict: Duration::ZERO,
             ..Limits::APP
         };
         let (addr, _) = serve(limits);
@@ -1373,47 +1482,191 @@ mod tests {
         assert_eq!((status, body.len()), (200, big().len()));
     }
 
-    /// At the cap the oldest idle connection closes to make room, so a slot
-    /// is not held by a socket that merely stays open.
-    #[test]
-    fn at_the_cap_the_oldest_idle_connection_makes_room() {
-        let limits = Limits {
-            max_connections: 2,
-            ..Limits::APP
-        };
-        let (addr, _) = serve(limits);
-        let mut oldest = connect(addr);
-        let mut newer = connect(addr);
-        for stream in [&mut oldest, &mut newer] {
-            send(stream, "GET", "/index.html", host(addr));
-            assert_eq!(read_response(stream, false).0, 200);
-        }
-        let mut third = connect(addr);
-        send(&mut third, "GET", "/index.html", host(addr));
-        assert_eq!(read_response(&mut third, false).0, 200);
+    /// Closed by the server (EOF or reset), as opposed to still open: a read
+    /// that times out means the server kept it.
+    fn closed_by_server(stream: &mut TcpStream) -> bool {
         let mut rest = Vec::new();
-        let closed = oldest.read_to_end(&mut rest).is_ok() && rest.is_empty();
-        assert!(closed, "the oldest idle connection was kept");
-        send(&mut newer, "GET", "/assets/app.css", host(addr));
-        assert_eq!(read_response(&mut newer, false).0, 200);
+        match stream.read_to_end(&mut rest) {
+            Ok(_) => rest.is_empty(),
+            Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+        }
     }
 
-    /// A socket that never sends a request (a preconnect, or a flood) counts
-    /// as idle and gives its slot up at once.
+    fn get_ok(stream: &mut TcpStream, addr: SocketAddr, path: &str) {
+        send(stream, "GET", path, host(addr));
+        assert_eq!(read_response(stream, false).0, 200, "{path}");
+    }
+
+    /// Short enough for a test, long enough that a request in progress is
+    /// not mistaken for a quiet connection on a loaded runner.
+    const QUIET: Duration = Duration::from_millis(250);
+
+    /// At the cap the connection quiet the longest makes room, so a slot is
+    /// not held by a socket that merely stays open. Accepted first is not
+    /// quiet longest here: the connection accepted first was used last.
     #[test]
-    fn at_the_cap_a_silent_connection_makes_room() {
+    fn at_the_cap_the_connection_quiet_longest_makes_room() {
         let limits = Limits {
-            max_connections: 1,
+            max_connections: 2,
+            min_idle_to_evict: QUIET,
             ..Limits::APP
         };
         let (addr, _) = serve(limits);
+        let mut first = connect(addr);
+        let mut second = connect(addr);
+        get_ok(&mut second, addr, "/index.html");
+        std::thread::sleep(Duration::from_millis(50));
+        get_ok(&mut first, addr, "/index.html");
+        std::thread::sleep(QUIET * 2);
+        let mut third = connect(addr);
+        get_ok(&mut third, addr, "/index.html");
+        assert!(
+            closed_by_server(&mut second),
+            "the connection quiet longest was kept"
+        );
+        get_ok(&mut first, addr, "/assets/app.css");
+    }
+
+    /// A connection that never asked for anything (a preconnect, or a socket
+    /// held open for its own sake) goes before one that has served the app,
+    /// even when it was opened later.
+    #[test]
+    fn at_the_cap_a_connection_that_never_asked_goes_first() {
+        let limits = Limits {
+            max_connections: 2,
+            min_idle_to_evict: QUIET,
+            ..Limits::APP
+        };
+        let (addr, _) = serve(limits);
+        let mut used = connect(addr);
+        get_ok(&mut used, addr, "/index.html");
+        std::thread::sleep(Duration::from_millis(50));
         let mut silent = connect(addr);
+        std::thread::sleep(QUIET * 2);
+        let mut third = connect(addr);
+        get_ok(&mut third, addr, "/index.html");
+        assert!(
+            closed_by_server(&mut silent),
+            "the silent connection was kept"
+        );
+        get_ok(&mut used, addr, "/assets/app.css");
+    }
+
+    /// A connection just opened has a request on its way that the server may
+    /// not have read yet, and the client would not retry it on a connection
+    /// it never used: it is not closed for a newcomer, which is refused.
+    #[test]
+    fn at_the_cap_a_fresh_connection_is_kept() {
+        let limits = Limits {
+            max_connections: 1,
+            min_idle_to_evict: Duration::from_secs(2),
+            ..Limits::APP
+        };
+        let (addr, _) = serve(limits);
+        let mut fresh = connect(addr);
         std::thread::sleep(Duration::from_millis(100));
-        let mut next = connect(addr);
-        send(&mut next, "GET", "/index.html", host(addr));
-        assert_eq!(read_response(&mut next, false).0, 200);
-        let mut rest = Vec::new();
-        assert!(silent.read_to_end(&mut rest).is_ok() && rest.is_empty());
+        let mut newcomer = connect(addr);
+        assert!(
+            closed_by_server(&mut newcomer),
+            "the newcomer was kept waiting"
+        );
+        get_ok(&mut fresh, addr, "/index.html");
+    }
+
+    /// A keep-alive connection whose next request has begun to arrive is not
+    /// quiet, although hyper still counts it idle until the head is complete.
+    #[test]
+    fn at_the_cap_a_connection_receiving_a_request_is_kept() {
+        let limits = Limits {
+            max_connections: 1,
+            min_idle_to_evict: QUIET,
+            ..Limits::APP
+        };
+        let (addr, _) = serve(limits);
+        let mut kept = connect(addr);
+        get_ok(&mut kept, addr, "/index.html");
+        std::thread::sleep(QUIET * 2);
+        write!(
+            kept,
+            "GET /assets/app.css HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n",
+            addr.port()
+        )
+        .unwrap();
+        // Time for the server to read the partial head into hyper's buffer,
+        // where the socket's unread count no longer sees it.
+        std::thread::sleep(Duration::from_millis(50));
+        let mut newcomer = connect(addr);
+        assert!(
+            closed_by_server(&mut newcomer),
+            "the newcomer was kept waiting"
+        );
+        kept.write_all(b"\r\n").unwrap();
+        assert_eq!(read_response(&mut kept, false).0, 200);
+    }
+
+    /// The choice is made on the connections' state, not on the order the
+    /// list holds them in, which is the order their tasks first ran.
+    #[test]
+    fn the_connection_to_close_does_not_depend_on_the_list_order() {
+        let epoch = Instant::now() - Duration::from_secs(60);
+        let occupant = |accepted: u64, served_once: bool, last_active: u64| {
+            let occupant = Occupant::new(accepted, epoch);
+            occupant.served_once.store(served_once, Ordering::Relaxed);
+            occupant.last_active.store(last_active, Ordering::Relaxed);
+            Arc::new(occupant)
+        };
+        let quiet = Duration::from_secs(1);
+        let chosen = |list: Vec<Arc<Occupant>>| {
+            let occupants = Occupants(Mutex::new(list));
+            occupants.choose(quiet).map(|occupant| occupant.accepted)
+        };
+        // Same state: the one accepted first.
+        assert_eq!(
+            chosen(vec![
+                occupant(3, true, 0),
+                occupant(1, true, 0),
+                occupant(2, true, 0)
+            ]),
+            Some(1)
+        );
+        // Quiet longest, whatever the accept order.
+        assert_eq!(
+            chosen(vec![
+                occupant(1, true, 900),
+                occupant(3, true, 100),
+                occupant(2, true, 500)
+            ]),
+            Some(3)
+        );
+        // Never served goes before quiet longest.
+        assert_eq!(
+            chosen(vec![occupant(1, true, 0), occupant(2, false, 900)]),
+            Some(2)
+        );
+        // Active within `quiet`, answering, or already making room: never.
+        let busy = occupant(1, false, 0);
+        busy.answering.store(true, Ordering::Relaxed);
+        let promised = occupant(2, false, 0);
+        *lock(&promised.successor) = Some(oneshot::channel().0);
+        let recent = Occupant::new(3, epoch);
+        assert_eq!(chosen(vec![busy, promised, Arc::new(recent)]), None);
+    }
+
+    /// The socket's own count of what the client sent and the server has not
+    /// read, the last check before a quiet connection is closed.
+    #[test]
+    fn unread_bytes_counts_what_the_server_has_not_read() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(unread_bytes(server.as_raw_fd()), Some(0));
+        client.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unread_bytes(server.as_raw_fd()) == Some(0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(unread_bytes(server.as_raw_fd()), Some(16));
+        assert_eq!(unread_bytes(-1), None);
     }
 
     /// A refused request closes its connection, so a client (a DNS-rebound
@@ -1607,7 +1860,7 @@ mod tests {
             let mut stream = TokioIo::new(StallGuard::new(
                 server,
                 Duration::from_secs(1),
-                Arc::default(),
+                Arc::new(Occupant::new(0, Instant::now())),
             ));
             assert!(hyper::rt::Write::is_write_vectored(&stream));
             let parts = [io::IoSlice::new(b"head"), io::IoSlice::new(b"body")];
