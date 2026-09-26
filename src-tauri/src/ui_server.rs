@@ -91,7 +91,6 @@ pub(crate) struct ServedAsset {
 /// Where the bytes come from: Tauri's embedded assets in the app, a map in tests.
 pub(crate) trait AssetSource: Send + Sync + 'static {
     /// Every path the source holds, keyed as Tauri keys them (`/index.html`).
-    /// Empty for a source that reads a directory on disk, as a dev build does.
     fn paths(&self) -> Vec<String>;
     fn asset(&self, path: &str) -> Option<ServedAsset>;
 }
@@ -99,7 +98,8 @@ pub(crate) trait AssetSource: Send + Sync + 'static {
 impl<R: tauri::Runtime> AssetSource for tauri::AssetResolver<R> {
     fn paths(&self) -> Vec<String> {
         // Empty in a dev build with a `devUrl`: tauri-codegen embeds nothing
-        // there and `get` reads `frontendDist` from disk instead.
+        // there, which is one reason the app starts this server in a release
+        // build only.
         self.iter().map(|(path, _)| path.into_owned()).collect()
     }
 
@@ -122,16 +122,32 @@ impl<R: tauri::Runtime> AssetSource for tauri::AssetResolver<R> {
 /// request can fill a slot but never add one: a path outside the set is
 /// answered with `index.html`, as Tauri answers it.
 ///
+/// The cache lives as long as the process and holds every asset the webviews
+/// have asked for since it started, decompressed: about 20 MB once the main
+/// window is up (its bundle and styles), about 44 MB if every asset of today's
+/// `dist` is asked for (the Monaco workers are most of the rest). That is the
+/// most it can hold, since no request adds a key.
+///
 /// HTML pages are resolved per response instead: Tauri stamps a fresh CSP
 /// nonce into each one whenever asset CSP modification is enabled (it is off
 /// in tauri.conf.json today, a setting that can change), and the pages are
 /// about 1 KB each.
 ///
-/// A dev build embeds nothing and its resolver reads the frontend directory on
-/// each request, so nothing is cached there and a rebuilt file is served as is.
+/// An empty embedded set (a build that did not embed the frontend) answers
+/// every request with a 404; the resolver is never handed a request path.
 struct Frontend {
     source: Box<dyn AssetSource>,
-    cache: HashMap<String, OnceLock<Result<Prepared, StatusCode>>>,
+    cache: HashMap<String, Slot>,
+}
+
+/// One embedded asset's place in the cache.
+#[derive(Default)]
+struct Slot {
+    prepared: OnceLock<Result<Prepared, StatusCode>>,
+    /// A header of this asset that cannot be sent has been logged. It is a
+    /// build or configuration error, and an HTML page meets it again on
+    /// every request, so it is logged once.
+    reported: AtomicBool,
 }
 
 /// An asset ready to send: its bytes, shared, and the header values that
@@ -147,11 +163,17 @@ impl Prepared {
     /// No asset is a 404. A type or policy that is not a legal header value
     /// is a 500: sending the asset without its Content-Security-Policy would
     /// fail open.
-    fn new(asset: Option<ServedAsset>, key: &str) -> Result<Self, StatusCode> {
+    fn new(
+        asset: Option<ServedAsset>,
+        key: &str,
+        reported: &AtomicBool,
+    ) -> Result<Self, StatusCode> {
         let asset = asset.ok_or(StatusCode::NOT_FOUND)?;
         let header = |value: &str| {
             HeaderValue::from_str(value).map_err(|_| {
-                log::error!("UI asset {key} has a header that cannot be sent: {value:?}");
+                if !reported.swap(true, Ordering::Relaxed) {
+                    log::error!("UI asset {key} has a header that cannot be sent: {value:?}");
+                }
                 StatusCode::INTERNAL_SERVER_ERROR
             })
         };
@@ -177,7 +199,7 @@ impl Frontend {
                     format!("/{path}")
                 }
             })
-            .map(|path| (path, OnceLock::new()))
+            .map(|path| (path, Slot::default()))
             .collect();
         Self {
             source: Box::new(source),
@@ -202,16 +224,18 @@ impl Frontend {
 
     /// An asset already resolved, without leaving the reactor.
     fn cached(&self, key: &str) -> Option<Result<Prepared, StatusCode>> {
-        self.cache.get(key)?.get().cloned()
+        self.cache.get(key)?.prepared.get().cloned()
     }
 
-    /// Resolves `key` (an embedded key, or the request path in a dev build).
-    /// Blocks: it decompresses, or waits for the request that does.
+    /// Resolves the embedded asset `key`. Blocks: it decompresses, or waits
+    /// for the request that does.
     fn fetch(&self, key: &str) -> Result<Prepared, StatusCode> {
-        let resolve = || Prepared::new(self.source.asset(key), key);
-        match self.cache.get(key) {
-            Some(slot) if !key.ends_with(".html") => slot.get_or_init(resolve).clone(),
-            _ => resolve(),
+        let slot = self.cache.get(key).ok_or(StatusCode::NOT_FOUND)?;
+        let resolve = || Prepared::new(self.source.asset(key), key, &slot.reported);
+        if key.ends_with(".html") {
+            resolve()
+        } else {
+            slot.prepared.get_or_init(resolve).clone()
         }
     }
 }
@@ -290,15 +314,21 @@ struct Stats {
     failed_accepts: AtomicU64,
     /// Connections served to their end.
     ended: AtomicU64,
+    /// Of those, the ones that ended in an error other than the client going
+    /// quiet, leaving or sending something that is not a request.
+    errored: AtomicU64,
+    /// The last of those errors.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Stats {
-    fn totals(&self) -> [u64; 4] {
+    fn totals(&self) -> [u64; 5] {
         [
             &self.refused,
             &self.evicted,
             &self.failed_accepts,
             &self.ended,
+            &self.errored,
         ]
         .map(|total| total.load(Ordering::Relaxed))
     }
@@ -306,28 +336,30 @@ impl Stats {
 
 /// What the accept loop has already reported.
 struct Summary {
-    reported: [u64; 4],
+    reported: [u64; 5],
     accept_error: Option<io::Error>,
 }
 
 impl Summary {
     fn log(&mut self, stats: &Stats, cap: usize) {
         let totals = stats.totals();
-        let [refused, evicted, failed, ended] =
+        let [refused, evicted, failed, ended, errored] =
             std::array::from_fn(|i| totals[i] - self.reported[i]);
         self.reported = totals;
-        if refused + evicted + failed == 0 {
+        if refused + evicted + failed + errored == 0 {
             return;
         }
-        let accept_error = self
-            .accept_error
-            .take()
-            .map(|error| format!(" (last: {error})"))
-            .unwrap_or_default();
+        let last = |error: Option<String>| {
+            error
+                .map(|error| format!(" (last: {error})"))
+                .unwrap_or_default()
+        };
+        let accept_error = last(self.accept_error.take().map(|error| error.to_string()));
+        let connection_error = last(lock(&stats.last_error).take());
         log::warn!(
             "UI server, last {}s: {refused} connections closed at the cap of {cap} with none to make room, \
              {evicted} quiet ones closed to make room, {failed} failed accepts{accept_error}, \
-             {ended} connections ended",
+             {ended} connections ended, {errored} of them in an error{connection_error}",
             SUMMARY_PERIOD.as_secs()
         );
     }
@@ -372,7 +404,10 @@ fn launch(
     let local = listener.local_addr()?;
     let frontend = Frontend::new(source);
     match frontend.cache.len() {
-        0 => log::info!("UI server on {local} reads the frontend directory per request"),
+        0 => log::warn!(
+            "UI server on {local} has no embedded assets: this build did not embed the \
+             frontend, and every request will be answered with a 404"
+        ),
         assets => log::info!("UI server on {local} serves {assets} embedded assets"),
     }
     let site = Arc::new(Site {
@@ -538,10 +573,12 @@ async fn serve(
             .unwrap_or(Ok(()));
     };
     // A client that went away, was too slow, or stayed too long: its own
-    // connection ends, nothing else does.
+    // connection ends, nothing else does. Anything else is counted for the
+    // summary, never logged per connection.
     if let Err(error) = served {
         if !ordinary_end(&error) {
-            log::trace!("UI server connection ended: {error}");
+            site.stats.errored.fetch_add(1, Ordering::Relaxed);
+            *lock(&site.stats.last_error) = Some(error.to_string());
         }
     }
     site.stats.ended.fetch_add(1, Ordering::Relaxed);
@@ -579,9 +616,15 @@ fn unread_bytes(socket: RawFd) -> Option<usize> {
 
 /// How a client ends a connection on its own: it went quiet, left, reset,
 /// stopped reading, or sent something that is not a request. hyper answered
-/// what it could; a log line for each would let any local client write the log.
+/// what it could; nothing about them is worth reporting.
 fn ordinary_end(error: &hyper::Error) -> bool {
-    if error.is_timeout() || error.is_incomplete_message() || error.is_parse() {
+    // `is_shutdown`: the client was gone before the server shut its side down
+    // (ENOTCONN), the usual end of a connection closed to make room.
+    if error.is_timeout()
+        || error.is_incomplete_message()
+        || error.is_parse()
+        || error.is_shutdown()
+    {
         return true;
     }
     let mut cause = std::error::Error::source(error);
@@ -592,6 +635,7 @@ fn ordinary_end(error: &hyper::Error) -> bool {
                 io::ErrorKind::ConnectionReset
                     | io::ErrorKind::ConnectionAborted
                     | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
                     | io::ErrorKind::TimedOut
                     | io::ErrorKind::UnexpectedEof
             );
@@ -913,15 +957,11 @@ impl Site {
     }
 
     async fn resolve(self: &Arc<Self>, path: String) -> Result<Prepared, StatusCode> {
-        let key = if self.frontend.cache.is_empty() {
-            path
-        } else {
-            let key = self.frontend.key(&path).ok_or(StatusCode::NOT_FOUND)?;
-            if let Some(cached) = self.frontend.cached(key) {
-                return cached;
-            }
-            key.to_string()
-        };
+        let key = self.frontend.key(&path).ok_or(StatusCode::NOT_FOUND)?;
+        if let Some(cached) = self.frontend.cached(key) {
+            return cached;
+        }
+        let key = key.to_string();
         // Resolving decompresses the embedded asset: keep it off the reactor.
         let site = self.clone();
         tokio::task::spawn_blocking(move || site.frontend.fetch(&key))
@@ -1018,11 +1058,6 @@ mod tests {
     #[derive(Default)]
     struct MapSource {
         assets: HashMap<String, (Bytes, &'static str, Option<&'static str>)>,
-        /// Behaves like a dev build: no embedded set, every request reaches it.
-        disk: bool,
-        /// Answers every path, as Tauri's resolver does with its fallbacks: a
-        /// request that reached it unchecked would show as a 200.
-        catch_all: bool,
         /// How long each resolution takes, as a decompression does.
         delay: Duration,
         asked: Asked,
@@ -1030,19 +1065,13 @@ mod tests {
 
     impl AssetSource for MapSource {
         fn paths(&self) -> Vec<String> {
-            if self.disk {
-                Vec::new()
-            } else {
-                self.assets.keys().cloned().collect()
-            }
+            self.assets.keys().cloned().collect()
         }
 
         fn asset(&self, path: &str) -> Option<ServedAsset> {
             self.asked.lock().unwrap().push(path.to_string());
             std::thread::sleep(self.delay);
-            let fallback = self.catch_all.then_some("/index.html");
-            let found = self.assets.get(path).or_else(|| self.assets.get(fallback?));
-            found.map(|(bytes, mime, csp)| ServedAsset {
+            self.assets.get(path).map(|(bytes, mime, csp)| ServedAsset {
                 bytes: bytes.clone(),
                 mime_type: mime.to_string(),
                 csp: csp.map(str::to_string),
@@ -1383,18 +1412,10 @@ mod tests {
 
     #[test]
     fn paths_cannot_leave_the_asset_root() {
-        // Both resolvers answer anything that reaches them: the embedded one
-        // with `index.html`, the dev build's from disk (modelled by a
-        // catch-all). So a climbing path that got through would be a 200.
-        let mut disk = site();
-        disk.disk = true;
-        disk.catch_all = true;
-        for (addr, asked) in [serve(Limits::APP), serve_source(disk, Limits::APP)] {
-            refuses_climbing_paths(addr, &asked);
-        }
-    }
-
-    fn refuses_climbing_paths(addr: SocketAddr, asked: &Asked) {
+        // Any path that got past `asset_path` would be answered: with its
+        // asset, or with `index.html` as a path outside the set is. So a
+        // climbing path that got through would be a 200, not a 404.
+        let (addr, asked) = serve(Limits::APP);
         for path in [
             "/../etc/passwd",
             "/assets/../../etc/passwd",
@@ -1854,23 +1875,20 @@ mod tests {
         );
     }
 
-    /// A dev build has no embedded set: its resolver reads `dist` on disk, so
-    /// every request goes through to it and nothing is kept.
+    /// A build with nothing embedded answers 404 and never hands a request
+    /// path to the resolver, which in a dev build would read it from disk.
     #[test]
-    fn a_dev_build_reads_every_request_through() {
-        let mut source = site();
-        source.disk = true;
-        let (addr, asked) = serve_source(source, Limits::APP);
-        let mut stream = connect(addr);
-        for _ in 0..2 {
-            send(&mut stream, "GET", "/assets/app.css", host(addr));
-            assert_eq!(read_response(&mut stream, false).2, b"body{}");
+    fn a_build_without_embedded_assets_serves_nothing() {
+        let (addr, asked) = serve_source(MapSource::default(), Limits::APP);
+        for path in ["/", "/index.html", "/assets/app.css"] {
+            let mut stream = connect(addr);
+            send(&mut stream, "GET", path, host(addr));
+            assert_eq!(read_response(&mut stream, false).0, 404, "{path}");
         }
-        send(&mut stream, "GET", "/settings", host(addr));
-        assert_eq!(read_response(&mut stream, false).0, 404);
-        assert_eq!(
-            asked.lock().unwrap().as_slice(),
-            ["/assets/app.css", "/assets/app.css", "/settings"]
+        assert!(
+            asked.lock().unwrap().is_empty(),
+            "{:?}",
+            asked.lock().unwrap()
         );
     }
 

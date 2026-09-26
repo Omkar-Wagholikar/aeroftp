@@ -18358,17 +18358,23 @@ pub fn run() {
             // Serve the frontend on the fixed loopback origin. `ui_server`
             // replaced tauri-plugin-localhost, whose tiny_http core could leave
             // a cold-start request unread until another connection closed (a
-            // blank main window); the module doc has the measurement.
+            // blank main window); the module doc has the measurement. A dev
+            // build does not start it: it embeds no frontend and its webviews
+            // load the Vite server (`devUrl`), so it would serve nobody, and
+            // it would hold the port an installed release needs.
             #[cfg(target_os = "linux")]
-            if let Err(error) = ui_server::start(
-                app.asset_resolver(),
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                localhost_nonce.clone(),
-                ui_server::Limits::APP,
-            ) {
-                // Not fatal here: the ownership check below names the problem
-                // to the user (usually another process holding the port).
-                log::error!("AeroFTP UI server could not bind 127.0.0.1:{port}: {error}");
+            if !cfg!(dev) {
+                if let Err(error) = ui_server::start(
+                    app.asset_resolver(),
+                    std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    localhost_nonce.clone(),
+                    ui_server::Limits::APP,
+                ) {
+                    // Not fatal here: the ownership check below names the
+                    // problem to the user (usually another process holding the
+                    // port).
+                    log::error!("AeroFTP UI server could not bind 127.0.0.1:{port}: {error}");
+                }
             }
 
             // A plain TCP connect would also accept another user's server that
