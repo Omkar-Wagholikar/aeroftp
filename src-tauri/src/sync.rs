@@ -7359,6 +7359,107 @@ mod tests {
         );
     }
 
+    /// C1 (review of #949): under a size-only window (an FTP LIST listing,
+    /// FileLu) the index compare read the LOCAL side against its baseline with
+    /// that window too, so a local edit of the same size was invisible: the
+    /// remote change then won as RemoteNewer and was downloaded over the local
+    /// edit, and a same-size local edit was never uploaded. The baseline's time
+    /// is a local mtime, and local times always compare.
+    #[test]
+    fn a_same_size_local_edit_is_seen_against_the_baseline_under_a_size_only_window() {
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-09-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let at = |secs: i64| Some(t0 + chrono::Duration::seconds(secs));
+        let mut index = SyncIndex::new("/l".to_string(), "/r".to_string());
+        for name in ["a.txt", "b.txt"] {
+            index.files.insert(
+                name.to_string(),
+                serde_json::from_value(serde_json::json!({
+                    "size": 10,
+                    "modified": "2026-09-25T12:00:00Z",
+                    "is_dir": false
+                }))
+                .unwrap(),
+            );
+        }
+        let local = HashMap::from([
+            ("a.txt".to_string(), mk_file_info("a.txt", 10, at(3600))),
+            ("b.txt".to_string(), mk_file_info("b.txt", 10, at(3600))),
+        ]);
+        let remote = HashMap::from([
+            ("a.txt".to_string(), mk_file_info("a.txt", 12, at(60))),
+            ("b.txt".to_string(), mk_file_info("b.txt", 10, at(30))),
+        ]);
+        let options = CompareOptions {
+            modify_window: ModifyWindow::SizeOnly {
+                reason: crate::sync_core::mtime::SizeOnlyReason::FtpListDates,
+            },
+            ..CompareOptions::default()
+        };
+        let report = classify_with_summary(local, remote, &options, Some(&index));
+        let status = |name: &str| {
+            report
+                .differences
+                .iter()
+                .find(|row| row.relative_path == name)
+                .map(|row| row.status.clone())
+        };
+        assert_eq!(
+            status("a.txt"),
+            Some(SyncStatus::Conflict),
+            "edited on both sides"
+        );
+        assert_eq!(
+            status("b.txt"),
+            Some(SyncStatus::LocalNewer),
+            "edited locally"
+        );
+    }
+
+    /// M1 (review of #949): `newer` in `sync_tree` cannot be decided by size
+    /// when the dates do not order the pair; the larger copy used to win.
+    #[test]
+    fn sync_tree_newer_is_not_decided_by_size_when_dates_do_not_order() {
+        let size_only = ModifyWindow::SizeOnly {
+            reason: crate::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        let local = crate::sync_core::LocalEntry {
+            rel_path: "a.txt".to_string(),
+            size: 5000,
+            mtime: Some("2026-09-25T13:00:00Z".to_string()),
+            sha256: None,
+        };
+        let remote = crate::sync_core::RemoteEntry {
+            rel_path: "a.txt".to_string(),
+            size: 5120,
+            mtime: Some("2026-09-25T12:00:00Z".to_string()),
+            checksum_alg: None,
+            checksum_hex: None,
+        };
+        let down = super::decide_download(
+            &remote,
+            Some(&local),
+            DeltaPolicy::Mtime,
+            ConflictMode::Newer,
+            size_only,
+            false,
+        );
+        assert!(matches!(down.action, SyncTreeAction::Skip(_)));
+        let bigger_local = crate::sync_core::LocalEntry {
+            size: 6000,
+            ..local
+        };
+        let up = super::decide_upload(
+            &bigger_local,
+            Some(&remote),
+            DeltaPolicy::Mtime,
+            ConflictMode::Newer,
+            size_only,
+        );
+        assert!(matches!(up.action, SyncTreeAction::Skip(_)));
+    }
+
     /// `sync_tree` (MCP, AeroAgent) decided by the exact second: a copy one
     /// second off its source was uploaded again on every run, where the GUI
     /// compare and the CLI read the two as the same instant. It reads the
