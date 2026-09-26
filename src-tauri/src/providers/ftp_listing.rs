@@ -480,7 +480,9 @@ fn unix_list_date(
     if let Some((h, m)) = time_or_year.split_once(':') {
         let time = NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, 0)?;
         let latest = now + chrono::Duration::days(1);
-        let date = [now.year(), now.year() - 1]
+        // The year that puts the date nearest to now, up to a day ahead: the
+        // next year too, for a server east of us just past New Year.
+        let date = [now.year() + 1, now.year(), now.year() - 1]
             .into_iter()
             .filter_map(|year| NaiveDate::from_ymd_opt(year, month, day))
             .find(|date| date.and_time(time) <= latest)?;

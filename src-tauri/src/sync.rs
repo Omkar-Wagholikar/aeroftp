@@ -122,7 +122,8 @@ pub struct CompareReport {
     pub differences: Vec<FileComparison>,
     pub summary: CompareSummary,
     /// How modification times were compared: within a window, or not at all
-    /// (size only, with the reason). The GUI states the size-only case.
+    /// (size only, with the reason), for a frontend to state the size-only
+    /// case. The Compare and Plan views do not show it yet.
     pub modify_window: ModifyWindow,
 }
 
@@ -1923,6 +1924,19 @@ fn decide_upload_by_mtime(
         };
     }
 
+    // A backend that keeps no comparable time cannot say which copy is
+    // newer: `newer` leaves the pair alone instead of letting the larger copy
+    // win. A per-file missing time on a backend that keeps times still falls
+    // back to the sizes, as before.
+    if matches!(mode, ConflictMode::Newer) && !window.compares_times() && local_size != remote_size
+    {
+        return SyncTreeDecision {
+            action: SyncTreeAction::Skip(
+                "the backend keeps no comparable time: cannot tell which copy is newer".to_string(),
+            ),
+            decision_policy: DeltaPolicy::SizeOnly,
+        };
+    }
     decide_upload_by_size(local_size, remote_size, mode)
 }
 
@@ -1956,6 +1970,19 @@ fn decide_download_by_mtime(
         };
     }
 
+    // A backend that keeps no comparable time cannot say which copy is
+    // newer: `newer` leaves the pair alone instead of letting the larger copy
+    // win. A per-file missing time on a backend that keeps times still falls
+    // back to the sizes, as before.
+    if matches!(mode, ConflictMode::Newer) && !window.compares_times() && remote_size != local_size
+    {
+        return SyncTreeDecision {
+            action: SyncTreeAction::Skip(
+                "the backend keeps no comparable time: cannot tell which copy is newer".to_string(),
+            ),
+            decision_policy: DeltaPolicy::SizeOnly,
+        };
+    }
     decide_download_by_size(remote_size, local_size, mode)
 }
 
@@ -3327,10 +3354,15 @@ pub fn classify_with_summary(
                 // ciphertext size), so size is not a reliable change signal for
                 // it and comparing it would flag every file as changed every
                 // cycle. Such providers fall back to timestamp only.
+                // The baseline's time is a LOCAL mtime (a download records the
+                // remote side, whose time the downloaded file keeps), so the
+                // local side is read with two local clocks: under a size-only
+                // pair window it would stop seeing a same-size local edit, and
+                // the remote change would then overwrite it.
                 let local_changed = (options.compare_size && l.size != cached.size)
                     || (l.modified.is_some()
                         && cached.modified.is_some()
-                        && !timestamps_equal(l.modified, cached.modified, options.modify_window));
+                        && !timestamps_equal(l.modified, cached.modified, ModifyWindow::LOCAL));
                 let remote_changed = (options.compare_size && r.size != cached.size)
                     || (r.modified.is_some()
                         && cached.modified.is_some()

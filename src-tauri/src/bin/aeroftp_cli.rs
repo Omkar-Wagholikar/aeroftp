@@ -47078,7 +47078,9 @@ fn plan_one_way_pair(
         Some(std::cmp::Ordering::Greater) => OneWayPair::Transfer,
         Some(std::cmp::Ordering::Less) if rule.update => OneWayPair::Skip,
         Some(std::cmp::Ordering::Less) => OneWayPair::Transfer,
-        _ if rule.conflict_mode == "skip" => OneWayPair::Skip,
+        // `--update` protects a destination that may be newer, and one the
+        // dates cannot order may be: it stays, like a `skip` conflict.
+        _ if rule.update || rule.conflict_mode == "skip" => OneWayPair::Skip,
         _ => OneWayPair::Transfer,
     }
 }
@@ -47223,6 +47225,20 @@ fn sync_orphan_dir_candidates<'a>(
     out
 }
 
+/// Whether `rmdir` on this backend refuses a directory that is not empty, by
+/// protocol: FTP `RMD` and SFTP `rmdir` do. Object stores and most cloud APIs
+/// delete a directory with everything in it, and a listing can leave stored
+/// objects out (a crypt overlay's sentinels, a listing that is not
+/// authoritative), so an "emptied" directory there is not removed. The crypt
+/// and compress overlays forward `rmdir` to the backend's own, and report its
+/// type, so they answer as the backend underneath.
+fn sync_rmdir_refuses_non_empty(provider: ProviderType) -> bool {
+    matches!(
+        provider,
+        ProviderType::Ftp | ProviderType::Ftps | ProviderType::Sftp
+    )
+}
+
 /// Whether `dir` is the `--backup-dir` directory or inside it: the empty
 /// directories a `sync --delete` removes never include the backups.
 fn sync_backup_dir_holds(backup_dir: Option<&str>, dir: &Path) -> bool {
@@ -47252,11 +47268,14 @@ struct LocalToLocalFlags<'a> {
     checksum: bool,
     resync: bool,
     watch: bool,
+    files_from: bool,
 }
 
 fn local_to_local_ignored_flags(f: &LocalToLocalFlags) -> Vec<&'static str> {
     let mut out = Vec::new();
-    if f.direction != "both" {
+    // The copier copies source to destination: `upload` says so, `both` is
+    // the default nobody typed; `download` would be the opposite direction.
+    if f.direction == "download" {
         out.push("--direction");
     }
     for (set, name) in [
@@ -47274,12 +47293,47 @@ fn local_to_local_ignored_flags(f: &LocalToLocalFlags) -> Vec<&'static str> {
         (f.checksum, "--checksum"),
         (f.resync, "--resync"),
         (f.watch, "--watch"),
+        (f.files_from, "--files-from"),
     ] {
         if set {
             out.push(name);
         }
     }
     out
+}
+
+/// The side of a pair that changed since the last bisync snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedSide {
+    Local,
+    Remote,
+}
+
+/// Which side changed since the last bisync snapshot, when exactly one did.
+/// The snapshot records the size both sides had and the LOCAL mtime, so the
+/// local side is read by size and time (two local clocks) and the remote side
+/// by size alone: the question is asked only when the remote dates do not
+/// order the pair.
+fn bisync_changed_side(
+    snapshot: Option<&BisyncSnapshot>,
+    path: &str,
+    local_size: u64,
+    local_mtime: Option<&str>,
+    remote_size: u64,
+) -> Option<ChangedSide> {
+    let (size, mtime) = snapshot?.files.get(path)?;
+    let local_changed = local_size != *size
+        || matches!(
+            ModifyWindow::LOCAL
+                .order_text(local_mtime, Some(mtime.as_str()).filter(|m| !m.is_empty())),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+        );
+    let remote_changed = remote_size != *size;
+    match (local_changed, remote_changed) {
+        (true, false) => Some(ChangedSide::Local),
+        (false, true) => Some(ChangedSide::Remote),
+        _ => None,
+    }
 }
 
 /// Resolve a conflict between local and remote file for --direction both.
@@ -47293,10 +47347,14 @@ fn resolve_conflict(
     window: ModifyWindow,
 ) -> &'static str {
     match conflict_mode {
-        "newer" | "newest" => match compare_mtime(local_mtime, remote_mtime, window) {
-            std::cmp::Ordering::Greater => "upload",
-            std::cmp::Ordering::Less => "download",
-            std::cmp::Ordering::Equal => {
+        // Dates that cannot be ordered (a backend with no comparable time,
+        // a date missing or unreadable) cannot say which copy is newer: the
+        // pair is left alone rather than handed to the larger copy.
+        "newer" | "newest" => match window.order_text(local_mtime, remote_mtime) {
+            None => "skip",
+            Some(std::cmp::Ordering::Greater) => "upload",
+            Some(std::cmp::Ordering::Less) => "download",
+            Some(std::cmp::Ordering::Equal) => {
                 // mtime equal but size differs - fallback to larger wins
                 if local_size > remote_size {
                     "upload"
@@ -47307,10 +47365,11 @@ fn resolve_conflict(
                 }
             }
         },
-        "older" | "oldest" => match compare_mtime(local_mtime, remote_mtime, window) {
-            std::cmp::Ordering::Less => "upload",
-            std::cmp::Ordering::Greater => "download",
-            std::cmp::Ordering::Equal => {
+        "older" | "oldest" => match window.order_text(local_mtime, remote_mtime) {
+            None => "skip",
+            Some(std::cmp::Ordering::Less) => "upload",
+            Some(std::cmp::Ordering::Greater) => "download",
+            Some(std::cmp::Ordering::Equal) => {
                 if local_size < remote_size {
                     "upload"
                 } else if remote_size < local_size {
@@ -48672,8 +48731,21 @@ async fn cmd_sync(
                     skipped += 1;
                 } else {
                     // Conflict: file exists on both sides with different content
-                    let action =
-                        resolve_conflict(conflict_mode, *size, lm, *rsize, rm, modify_window);
+                    // When the dates cannot order the pair, the last bisync
+                    // snapshot says which side changed since, and for
+                    // `newer` / `older` that side decides.
+                    let by_snapshot = if modify_window.order_text(lm, rm).is_none() {
+                        bisync_changed_side(prev_snapshot.as_ref(), path, *size, lm, *rsize)
+                    } else {
+                        None
+                    };
+                    let action = match (conflict_mode, by_snapshot) {
+                        ("newer" | "newest", Some(ChangedSide::Local))
+                        | ("older" | "oldest", Some(ChangedSide::Remote)) => "upload",
+                        ("newer" | "newest", Some(ChangedSide::Remote))
+                        | ("older" | "oldest", Some(ChangedSide::Local)) => "download",
+                        _ => resolve_conflict(conflict_mode, *size, lm, *rsize, rm, modify_window),
+                    };
                     match action {
                         "upload" => {
                             to_upload.push(path);
@@ -48949,8 +49021,8 @@ async fn cmd_sync(
                 if let Some((lsize, lmtime)) = local_map.get(path) {
                     let lm = apply_default_time(*lmtime, default_time_ref);
                     if csize == *lsize
-                        && compare_mtime(cmtime.as_deref(), lm, local_window)
-                            == std::cmp::Ordering::Equal
+                        && local_window.order_text(cmtime.as_deref(), lm)
+                            == Some(std::cmp::Ordering::Equal)
                     {
                         if is_copy {
                             // Copy from compare-dest to local instead of downloading
@@ -49078,40 +49150,48 @@ async fn cmd_sync(
 
     // The directories a one-way --delete leaves empty on the destination:
     // candidates now (for the dry run too), each removed after the file
-    // deletes only when it lists empty then.
-    let orphan_dirs: Vec<String> =
-        if delete && reconcile_plan.is_none() && matches!(direction, "upload" | "download") {
-            let (deleted, source_paths): (&[&str], Vec<&str>) = if direction == "upload" {
-                (&to_delete_remote, local_map.keys().copied().collect())
-            } else {
-                (&to_delete_local, remote_map.keys().copied().collect())
-            };
-            let mut dirs = Vec::new();
-            for dir in sync_orphan_dir_candidates(deleted, source_paths, &exclude_matchers, |d| {
-                bound.covers(d)
-            }) {
-                if validate_relative_path(&dir).is_none() {
-                    continue;
-                }
-                // A directory the source has, empty or not, stays. On a remote
-                // source only a NotFound answer counts as absent.
-                let source_has_it = if direction == "upload" {
-                    Path::new(local).join(&dir).is_dir()
-                } else {
-                    let remote_dir = format!("{}/{}", remote.trim_end_matches('/'), dir);
-                    !matches!(
-                        provider.stat(&remote_dir).await,
-                        Err(ProviderError::NotFound(_))
-                    )
-                };
-                if !source_has_it {
-                    dirs.push(dir);
-                }
-            }
-            dirs
+    // deletes only when it lists empty then. A remote destination takes part
+    // only where `rmdir` refuses a directory that is not empty
+    // (`sync_rmdir_refuses_non_empty`): elsewhere the removal would take with
+    // it whatever the listing did not show.
+    let removes_dirs = direction == "download"
+        || (direction == "upload" && sync_rmdir_refuses_non_empty(provider.provider_type()));
+    let orphan_dirs: Vec<String> = if delete
+        && removes_dirs
+        && reconcile_plan.is_none()
+        && matches!(direction, "upload" | "download")
+    {
+        let (deleted, source_paths): (&[&str], Vec<&str>) = if direction == "upload" {
+            (&to_delete_remote, local_map.keys().copied().collect())
         } else {
-            Vec::new()
+            (&to_delete_local, remote_map.keys().copied().collect())
         };
+        let mut dirs = Vec::new();
+        for dir in sync_orphan_dir_candidates(deleted, source_paths, &exclude_matchers, |d| {
+            bound.covers(d)
+        }) {
+            if validate_relative_path(&dir).is_none() {
+                continue;
+            }
+            // A directory the source has, empty or not, stays. On a remote
+            // source only a NotFound answer counts as absent.
+            let source_has_it = if direction == "upload" {
+                Path::new(local).join(&dir).is_dir()
+            } else {
+                let remote_dir = format!("{}/{}", remote.trim_end_matches('/'), dir);
+                !matches!(
+                    provider.stat(&remote_dir).await,
+                    Err(ProviderError::NotFound(_))
+                )
+            };
+            if !source_has_it {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    } else {
+        Vec::new()
+    };
 
     // KE-A5: Apply --order-by to the transfer queue BEFORE the dry-run
     // gate so the printed/JSON plan reflects the order that the live
@@ -49996,8 +50076,11 @@ async fn cmd_sync(
     }
 
     // Directories the deletes left empty, deepest first. Each is listed again
-    // and removed only when that listing is empty, with a call that does not
-    // recurse, so nothing the scan did not see goes with it.
+    // and removed only when that listing is empty, with a call that refuses a
+    // directory that is not empty (a local `remove_dir`, FTP `RMD`, SFTP
+    // `rmdir`), so an entry the listing did not show makes the removal fail
+    // instead of going with it. A failure is a note, not an error: the files
+    // the run was asked to sync are synced.
     let mut dirs_deleted: u32 = 0;
     for dir in &orphan_dirs {
         if cancelled.load(Ordering::Relaxed) {
@@ -50011,7 +50094,10 @@ async fn cmd_sync(
             match provider.rmdir(&remote_dir).await {
                 Ok(()) => dirs_deleted += 1,
                 Err(ProviderError::NotFound(_)) => {}
-                Err(e) => errors.push(format!("remove empty remote directory {}: {}", dir, e)),
+                Err(e) if !quiet => {
+                    eprintln!("Note: kept remote directory {dir}: {e}");
+                }
+                Err(_) => {}
             }
         } else {
             let local_dir = Path::new(local).join(dir);
@@ -50025,7 +50111,10 @@ async fn cmd_sync(
             match std::fs::remove_dir(&local_dir) {
                 Ok(()) => dirs_deleted += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => errors.push(format!("remove empty local directory {}: {}", dir, e)),
+                Err(e) if !quiet => {
+                    eprintln!("Note: kept local directory {dir}: {e}");
+                }
+                Err(_) => {}
             }
         }
     }
@@ -58172,6 +58261,18 @@ async fn sync_doctor_report(
     }
 
     let mut risks = Vec::new();
+    // What `sync` would compare the files by: stated, like the run does.
+    checks.push(serde_json::json!({
+        "name": "modify_window",
+        "ok": window.compares_times(),
+        "window": window,
+    }));
+    if !window.compares_times() {
+        risks.push(format!(
+            "files compared by size only: {}; a same-size edit is not seen",
+            window.describe()
+        ));
+    }
     if let Some(cfg) = doctor_cfg.as_ref() {
         push_s3_doctor_checks(&mut checks, &mut risks, "remote", cfg);
     }
@@ -61789,6 +61890,7 @@ async fn dispatch_sync(
             checksum: *checksum,
             resync: *resync,
             watch: *watch,
+            files_from: cli.files_from.is_some(),
         });
         if !ignored.is_empty() {
             print_error(
@@ -61828,6 +61930,14 @@ async fn dispatch_sync(
             };
         if let (Some(notice), false) = (notice, cli.quiet) {
             eprintln!("{notice}");
+        }
+        if *update && direction == "both" {
+            print_error(
+                format,
+                "--update applies to --direction upload or download: a two-way sync decides by its conflict mode",
+                5,
+            );
+            return 5;
         }
         let pair_rule = SyncPairRule {
             conflict_mode: &conflict_mode,
@@ -73430,6 +73540,7 @@ mod tests {
             checksum: false,
             resync: false,
             watch: false,
+            files_from: false,
         };
         assert!(local_to_local_ignored_flags(&flags("upload")).is_empty());
         assert!(local_to_local_ignored_flags(&flags("both")).is_empty());
@@ -73459,10 +73570,11 @@ mod tests {
             checksum: false,
             resync: false,
             watch: false,
+            files_from: false,
         };
         assert!(local_to_local_ignored_flags(&none).is_empty());
         let all = LocalToLocalFlags {
-            direction: "upload",
+            direction: "download",
             delete: true,
             track_renames: true,
             max_delete: true,
@@ -73477,6 +73589,7 @@ mod tests {
             checksum: true,
             resync: true,
             watch: true,
+            files_from: true,
         };
         assert_eq!(
             local_to_local_ignored_flags(&all),
@@ -73496,6 +73609,7 @@ mod tests {
                 "--checksum",
                 "--resync",
                 "--watch",
+                "--files-from",
             ]
         );
     }

@@ -531,6 +531,7 @@ impl CloudService {
             modify_window: crate::sync_core::mtime::ModifyWindow::LEGACY_FTP,
             ..Default::default()
         };
+        tracing::warn!("AeroCloud (FTP): {}", options.modify_window.describe());
 
         let mut comparisons = build_comparison_results_with_index(
             local_files,
@@ -789,6 +790,9 @@ impl CloudService {
             ),
             ..Default::default()
         };
+        if !options.modify_window.compares_times() {
+            tracing::warn!("AeroCloud: {}", options.modify_window.describe());
+        }
 
         let mut comparisons = build_comparison_results_with_index(
             local_files,

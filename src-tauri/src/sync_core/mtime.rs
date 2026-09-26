@@ -103,6 +103,13 @@ impl ModifyWindow {
         )
     }
 
+    /// Two local clocks: the local filesystem against itself, or a local file
+    /// against the local mtime a sync baseline recorded. Always comparable,
+    /// whatever the remote side keeps.
+    pub const LOCAL: Self = Self::Seconds {
+        secs: DEFAULT_MODIFY_WINDOW.as_secs(),
+    };
+
     /// The legacy FTP session (`crate::ftp::FtpManager`) lists with `LIST`
     /// only, so its dates are never comparable.
     pub const LEGACY_FTP: Self = Self::SizeOnly {
