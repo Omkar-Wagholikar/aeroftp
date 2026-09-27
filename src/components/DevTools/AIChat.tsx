@@ -11,8 +11,8 @@ import { AISettings, AIProviderType } from '../../types/ai';
 import { resolveModelContext, shouldUseOpenAIResponses } from '../../types/aiModelRegistry';
 import { reconcileProviderModels, reconcileProviderNames, resolveProviderModel } from '../../types/aiModelDiscovery';
 import { AEROAGENT_VERSION } from '../../utils/aeroagentVersion';
-import { AgentToolCall, AGENT_TOOLS, toNativeDefinitions, isSafeTool, getToolByName, getToolByNameFromAll } from '../../types/tools';
-import { PluginManifest, allPluginTools, findPluginForTool } from '../../types/plugins';
+import { AgentToolCall, isSafeTool, getToolByName } from '../../types/tools';
+import { PluginManifest } from '../../types/plugins';
 import { ToolApproval } from './ToolApproval';
 import { BatchToolApproval } from './BatchToolApproval';
 import { type Conversation, cleanupHistory, loadSession } from '../../utils/chatHistory';
@@ -25,7 +25,8 @@ import { resolveRoutedModels } from './aiChatModelRouting';
 import { appendAssistantTurn, appendToolResult, assertToolResultsComplete, hasStructuredTurn, nativeTurnMatches, requiresNativeTurn, type NativeTurn } from './aiChatNativeTurn';
 import { analyzeToolError } from './aiChatToolRetry';
 import { buildExecutionLevels, executePipeline } from './aiChatToolPipeline';
-import { ToolMacro, resolveMacroSteps, macrosToToolDefinitions, isMacroCall, getMacroName, DEFAULT_MACROS, MAX_TOTAL_MACRO_STEPS, createMacroStepCounter, MacroStepCounter } from './aiChatToolMacros';
+import { ToolMacro, resolveMacroSteps, DEFAULT_MACROS, MAX_TOTAL_MACRO_STEPS, createMacroStepCounter, MacroStepCounter } from './aiChatToolMacros';
+import { buildToolRegistry, resolveRegisteredTool, resolveMacroStep, ToolExposure, TOOL_EXPOSURE_GUIDE, assertToolExecutionCurrent, recordToolDispatch } from './aiChatToolRegistry';
 import { validateToolArgs } from './aiChatToolValidation';
 import { computeTokenInfo } from './aiChatTokenInfo';
 import { useAIChatImages } from './useAIChatImages';
@@ -109,6 +110,8 @@ type BackendApprovalGrant = {
 type ExecuteToolOptions = {
     rememberForSession?: boolean;
     panelApproved?: boolean;
+    turnScope?: string;
+    macroState?: { failed: boolean };
 };
 
 type VoiceCaptureRefs = {
@@ -741,6 +744,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         setIsAutoExecuting(false);
         setIsLoading(false);
         activeTurnRef.current = null;
+        toolExposureRef.current = null;
         multiStepContextRef.current = null;
         streamingMsgIdRef.current = null;
     }, []);
@@ -832,6 +836,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
     const autoStopRef = useRef(false);
     const activeTurnRef = useRef<string | null>(null);
+    const toolExposureRef = useRef<ToolExposure | null>(null);
     // Track executed tool signatures to detect duplicate consecutive calls across multi-step restarts
     const executedToolSignaturesRef = useRef(new Set<string>());
     const multiStepContextRef = useRef<{
@@ -894,12 +899,12 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         });
     }, []);
 
-    // Merge built-in tools with plugin tools (enforce minimum medium danger for plugins)
-    const pluginTools = allPluginTools(pluginManifests).map(t => ({
-        ...t,
-        dangerLevel: t.dangerLevel === 'safe' ? 'medium' as const : t.dangerLevel,
-    }));
-    const allTools = [...AGENT_TOOLS, ...pluginTools, ...macrosToToolDefinitions(macros)];
+    const toolRegistry = useMemo(() => buildToolRegistry(pluginManifests, macros), [pluginManifests, macros]);
+    const toolRegistryRef = useRef(toolRegistry);
+    toolRegistryRef.current = toolRegistry;
+    const allTools = toolRegistry.map(entry => entry.tool);
+
+    const isLoadedTool = (name: string) => toolExposureRef.current?.permits(activeTurnRef.current, name, toolRegistryRef.current) === true;
 
     /** Auto-approval logic based on unified agent mode and session memory. */
     const isAutoApproved = useCallback((toolName: string) => {
@@ -1397,22 +1402,32 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     }, [cleanupVoiceCapture]);
 
     // Execute a tool via unified provider-agnostic command (built-in or plugin)
-    // SECURITY: Check built-in tools FIRST to prevent plugin name hijacking
+    // Typed registry ownership chooses dispatch; backend approval remains authoritative.
     const executeToolByName = async (
         toolName: string,
         args: Record<string, unknown>,
         options: ExecuteToolOptions = {},
     ): Promise<unknown> => {
-        const isBuiltIn = AGENT_TOOLS.some(t => t.name === toolName);
+        const entry = resolveRegisteredTool(toolRegistryRef.current, toolName);
+        if (!entry) throw new Error('Unknown or changed tool identity');
+        const assertCurrent = () => assertToolExecutionCurrent(entry, toolRegistryRef.current, options.turnScope, activeTurnRef.current);
+        assertCurrent();
+        if (entry.source.kind === 'discovery') {
+            const exposure = toolExposureRef.current;
+            if (!exposure || exposure.scope !== activeTurnRef.current) throw new Error('Tool discovery turn expired');
+            return exposure.search(args.query);
+        }
+        const isBuiltIn = entry.source.kind === 'builtin';
         if (!isBuiltIn) {
-            const plugin = findPluginForTool(pluginManifests, toolName);
+            const plugin = entry.source.kind === 'plugin' ? entry.source : undefined;
             if (plugin) {
                 const invokePluginTool = async (approvalGrantId?: string): Promise<unknown> => {
+                    assertCurrent();
                     dispatchAIStatus('tool-execution');
                     try {
                         return await invoke('execute_plugin_tool', {
-                            pluginId: plugin.id,
-                            toolName,
+                            pluginId: plugin.ownerId,
+                            toolName: plugin.toolName,
                             argsJson: JSON.stringify(args),
                             sessionId: activeConversationId || undefined,
                             approvalGrantId,
@@ -1423,9 +1438,10 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                 };
 
                 const preparePluginApproval = async (): Promise<BackendApprovalPreparation> => {
+                    assertCurrent();
                     return await invoke<BackendApprovalPreparation>('prepare_plugin_tool_approval', {
-                        pluginId: plugin.id,
-                        toolName,
+                        pluginId: plugin.ownerId,
+                        toolName: plugin.toolName,
                         argsJson: JSON.stringify(args),
                         sessionId: activeConversationId || undefined,
                     });
@@ -1449,6 +1465,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     const mode = agentModeRef.current;
                     const skipNativeDialog = !!options.panelApproved && (mode === 'expert' || mode === 'extreme');
 
+                    assertCurrent();
                     const grant = await invoke<BackendApprovalGrant>('grant_ai_tool_approval', {
                         requestId: preparation.requestId,
                         rememberForSession: !!options.rememberForSession && preparation.allowSessionGrant,
@@ -1464,7 +1481,10 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             }
         }
 
+        if (!isBuiltIn) throw new Error('Tool is not a backend operation');
+
         const invokeBuiltInTool = async (approvalGrantId?: string): Promise<unknown> => {
+            assertCurrent();
             dispatchAIStatus('tool-execution');
             try {
                 return await invoke('execute_ai_tool', {
@@ -1480,6 +1500,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         };
 
         const prepareApproval = async (): Promise<BackendApprovalPreparation> => {
+            assertCurrent();
             return await invoke<BackendApprovalPreparation>('prepare_ai_tool_approval', {
                 toolName,
                 args,
@@ -1510,6 +1531,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             const mode = agentModeRef.current;
             const skipNativeDialog = !!options.panelApproved && (mode === 'expert' || mode === 'extreme');
 
+            assertCurrent();
             const grant = await invoke<BackendApprovalGrant>('grant_ai_tool_approval', {
                 requestId: preparation.requestId,
                 rememberForSession: !!options.rememberForSession && preparation.allowSessionGrant,
@@ -1531,10 +1553,11 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         _stepCounter?: MacroStepCounter,
         options: ExecuteToolOptions = {},
     ): Promise<string | null> => {
-        const tool = getToolByName(toolCall.toolName) || getToolByNameFromAll(toolCall.toolName, allTools);
+        const registered = resolveRegisteredTool(toolRegistryRef.current, toolCall.toolName);
+        const tool = registered?.tool;
 
         // Handle macro tool calls
-        if (isMacroCall(toolCall.toolName)) {
+        if (registered?.source.kind === 'macro') {
             if (_macroDepth >= 5) {
                 const errMsg: Message = {
                     id: crypto.randomUUID(),
@@ -1550,8 +1573,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             // Initialize step counter at top-level macro call
             const stepCounter = _stepCounter || createMacroStepCounter();
 
-            const macroName = getMacroName(toolCall.toolName);
-            const macro = macros.find(m => m.name === macroName);
+            const macro = registered.source.macro;
+            const macroName = macro.name;
             if (!macro) {
                 const errMsg: Message = {
                     id: crypto.randomUUID(),
@@ -1566,6 +1589,14 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
             // Resolve template variables and execute steps sequentially
             const steps = resolveMacroSteps(macro, toolCall.args);
+            for (const step of steps) {
+                const resolved = resolveMacroStep(toolRegistryRef.current, step.toolName);
+                if (!resolved) {
+                    if (options.macroState) options.macroState.failed = true;
+                    return `Error: unknown or ambiguous macro step ${step.toolName}`;
+                }
+                step.toolName = resolved.tool.name;
+            }
             // Check for unresolved template variables
             const unresolvedVars = steps.flatMap(s =>
                 Object.entries(s.args)
@@ -1585,7 +1616,9 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             }
 
             let lastResult: string | null = null;
+            const macroState = options.macroState || { failed: false };
             for (const step of steps) {
+                if (options.turnScope && activeTurnRef.current !== options.turnScope) return 'Error: execution cancelled';
                 if (++stepCounter.total > MAX_TOTAL_MACRO_STEPS) {
                     const errMsg: Message = {
                         id: crypto.randomUUID(),
@@ -1597,33 +1630,16 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     setPendingToolCalls([]);
                     return null;
                 }
-                // SECURITY: Check if step tool has high danger level: require explicit approval
-                const stepTool = getToolByName(step.toolName) || getToolByNameFromAll(step.toolName, allTools);
-                if (stepTool && stepTool.dangerLevel === 'high') {
-                    const pendingStep: AgentToolCall = {
-                        id: crypto.randomUUID(),
-                        toolName: step.toolName,
-                        args: step.args,
-                        status: 'pending',
-                    };
-                    setPendingToolCalls(prev => [...prev, pendingStep]);
-                    const warnMsg: Message = {
-                        id: crypto.randomUUID(),
-                        role: 'assistant',
-                        content: `Macro step "${step.toolName}" requires approval (danger: high)`,
-                        timestamp: new Date(),
-                    };
-                    setMessages(prev => [...prev, warnMsg]);
-                    return lastResult; // Pause macro execution, user must approve remaining steps
-                }
+                // The wrapper is conservative; each child still obtains its own backend
+                // approval. Never manufacture a native child call/result ID in this loop.
                 const stepCall: AgentToolCall = {
                     id: crypto.randomUUID(),
                     toolName: step.toolName,
                     args: step.args,
                     status: 'approved',
                 };
-                lastResult = await executeTool(stepCall, _macroDepth + 1, stepCounter);
-                if (!lastResult) break; // Stop on failure
+                lastResult = await executeTool(stepCall, _macroDepth + 1, stepCounter, { turnScope: options.turnScope, macroState });
+                if (!lastResult || macroState.failed || options.turnScope && activeTurnRef.current !== options.turnScope) break;
             }
             return lastResult;
         }
@@ -1675,6 +1691,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
             // Check for soft failures (tool returned success: false)
             if (result && typeof result === 'object' && 'success' in (result as Record<string, unknown>) && !(result as Record<string, unknown>).success) {
+                if (options.macroState) options.macroState.failed = true;
                 const softError = String(
                     (result as Record<string, unknown>).message
                     || (codingToolResultData ? 'Coding tool validation failed' : t('ai.error.operationFailed')),
@@ -1741,6 +1758,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             setPendingToolCalls([]);
             return formattedResult;
         } catch (error: any) {
+            if (options.macroState) options.macroState.failed = true;
             const errorStr = error.message || error.toString();
             const strategy = analyzeToolError(toolCall.toolName, toolCall.args, errorStr);
 
@@ -1903,7 +1921,12 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         tc: AgentToolCall, history: Array<Record<string, unknown>>, scope: unknown, options?: ExecuteToolOptions,
     ): Promise<string> => {
         if (autoStopRef.current || activeTurnRef.current !== scope) return 'Error: execution cancelled';
-        const result = await executeTool(tc, 0, undefined, options);
+        if (!recordToolDispatch(toolExposureRef.current, scope, toolRegistryRef.current, tc.toolName, tc.args, executedToolSignaturesRef.current)) {
+            const content = 'Error: tool is not loaded for this turn or its identity changed. Use tool_search first.';
+            appendToolResult(history, tc.id, content);
+            return content;
+        }
+        const result = await executeTool(tc, 0, undefined, { ...options, turnScope: typeof scope === 'string' ? scope : undefined });
         if (autoStopRef.current || activeTurnRef.current !== scope) return 'Error: execution cancelled';
         if (options?.rememberForSession && result !== null) sessionApprovedToolsRef.current.add(tc.toolName);
         const content = result ?? 'Error: tool failed or was not approved';
@@ -1949,7 +1972,10 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     native_turn?: NativeTurn;
                     tool_calls?: Array<{ id: string; name: string; arguments: unknown }>;
                 }>('ai_chat', {
-                    request: { ...aiRequest, messages: messageHistory },
+                    request: { ...aiRequest, messages: messageHistory,
+                        ...(aiRequest.tools && toolExposureRef.current && toolExposureRef.current.scope === aiRequest.turn_scope
+                            ? { tools: toolExposureRef.current.definitions() } : {}),
+                    },
                 });
 
                 if (autoStopRef.current || activeTurnRef.current !== aiRequest.turn_scope) return;
@@ -2010,17 +2036,13 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     setMessages(prev => [...prev, finalMsg]);
                     break;
                 }
-                // Track these calls as executed
-                for (const tc of allToolsParsedMS) {
-                    executedToolSignaturesRef.current.add(`${tc.tool}::${JSON.stringify(tc.args)}`);
-                }
 
                 // Separate safe vs approval-required
-                for (const call of allToolsParsedMS.filter(call => !getToolByNameFromAll(call.tool, allTools))) {
-                    appendToolResult(messageHistory, call.id, 'Error: unknown tool');
+                for (const call of allToolsParsedMS.filter(call => !isLoadedTool(call.tool))) {
+                    appendToolResult(messageHistory, call.id, 'Error: tool not loaded or identity changed; call tool_search first');
                 }
-                const safeMS = allToolsParsedMS.filter(p => isAutoApproved(p.tool) && getToolByNameFromAll(p.tool, allTools));
-                const approvalMS = allToolsParsedMS.filter(p => !isAutoApproved(p.tool) && getToolByNameFromAll(p.tool, allTools));
+                const safeMS = allToolsParsedMS.filter(p => isAutoApproved(p.tool) && isLoadedTool(p.tool));
+                const approvalMS = allToolsParsedMS.filter(p => !isAutoApproved(p.tool) && isLoadedTool(p.tool));
 
                 // All safe tools: execute in parallel
                 stepCount++;
@@ -2032,7 +2054,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                 const levels = buildExecutionLevels(safeToolCalls);
                 const results = await executePipeline(levels, tc => executeToolWithHistory(tc, messageHistory, aiRequest.turn_scope));
                 const combinedResult = results.filter(Boolean).join('\n---\n')
-                    || (allToolsParsedMS.some(call => !getToolByNameFromAll(call.tool, allTools)) ? 'Error: unknown tool' : '');
+                    || (allToolsParsedMS.some(call => !isLoadedTool(call.tool)) ? 'Error: tool not loaded or identity changed; call tool_search first' : '');
 
                 if (autoStopRef.current || activeTurnRef.current !== aiRequest.turn_scope) return;
 
@@ -2124,6 +2146,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         autoStopRef.current = false;
         const turnScope = crypto.randomUUID();
         activeTurnRef.current = turnScope;
+        toolExposureRef.current = new ToolExposure(turnScope, toolRegistryRef.current);
         multiStepContextRef.current = null;
         setPendingToolCalls([]);
 
@@ -2240,18 +2263,18 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     activeFilePanel, isCloudConnection,
                     editorFileName, editorFilePath,
                     ragIndex: ragIndexRef.current,
-                    macros,
+                    macros: [], // Deferred macro schemas are returned by tool_search.
                     agentMemory: relevantAgentMemory || agentMemory,
                     codingPlanBlock: codingPlanBlock || undefined,
                     smartContextBlock: smartContextBlock || undefined,
                     ...workspaceToSystemPromptContext(workspaceCtx),
                 });
-                // Build extra tool definitions for system prompt (plugin + macro, not built-in)
-                const extraToolDefs = toNativeDefinitions([...pluginTools, ...macrosToToolDefinitions(macros)]);
+                const exposure = toolExposureRef.current;
+                if (!exposure || exposure.scope !== turnScope) return;
                 const systemPrompt = buildSystemPrompt(settings, contextBlock, activeModel.providerType, budgetMode, activeModel.modelName, {
-                    extraTools: extraToolDefs,
+                    selectedTools: exposure.tools(),
                     promptProfile,
-                });
+                }) + '\n\n' + TOOL_EXPOSURE_GUIDE;
 
                 // Build message history (images only on the current user message)
                 const currentUserMsg: Record<string, unknown> = {
@@ -2346,7 +2369,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     temperature: settings.advancedSettings?.temperature ?? preset.temperature,
                     ...(() => { const rawTopP = settings.advancedSettings?.topP ?? preset.topP; return rawTopP != null ? { top_p: Math.max(0, Math.min(1, rawTopP)) } : {}; })(),
                     ...(() => { const rawTopK = settings.advancedSettings?.topK ?? preset.topK; return rawTopK != null ? { top_k: Math.max(1, Math.min(500, Math.round(rawTopK))) } : {}; })(),
-                    ...(useNativeTools ? { tools: toNativeDefinitions(allTools) } : {}),
+                    ...(useNativeTools ? { tools: exposure.definitions() } : {}),
                     ...(thinkingBudget !== undefined ? { thinking_budget: thinkingBudget } : {}),
                     ...(settings.advancedSettings?.webSearchEnabled ? { web_search: true } : {}),
                     ...(useOpenAIResponses ? { use_responses_api: true } : {}),
@@ -2547,11 +2570,11 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
                     if (allToolsParsed.length > 0) {
                         // Separate safe (auto-execute) vs approval-required tools
-                        for (const call of allToolsParsed.filter(call => !getToolByNameFromAll(call.tool, allTools))) {
-                            appendToolResult(messageHistory, call.id, 'Error: unknown tool');
+                        for (const call of allToolsParsed.filter(call => !isLoadedTool(call.tool))) {
+                            appendToolResult(messageHistory, call.id, 'Error: tool not loaded or identity changed; call tool_search first');
                         }
-                        const safeCalls = allToolsParsed.filter(p => isAutoApproved(p.tool) && getToolByNameFromAll(p.tool, allTools));
-                        const approvalCalls = allToolsParsed.filter(p => !isAutoApproved(p.tool) && getToolByNameFromAll(p.tool, allTools));
+                        const safeCalls = allToolsParsed.filter(p => isAutoApproved(p.tool) && isLoadedTool(p.tool));
+                        const approvalCalls = allToolsParsed.filter(p => !isAutoApproved(p.tool) && isLoadedTool(p.tool));
 
                         // Execute safe tools in parallel
                         if (safeCalls.length > 0) {
@@ -2561,10 +2584,6 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                 args: sc.args,
                                 status: 'approved' as const,
                             }));
-                            // Track initial tool signatures for duplicate detection
-                            for (const sc of safeToolCalls) {
-                                executedToolSignaturesRef.current.add(`${sc.toolName}::${JSON.stringify(sc.args)}`);
-                            }
                             const levels = buildExecutionLevels(safeToolCalls);
                             const results = await executePipeline(levels, tc => executeToolWithHistory(tc, messageHistory, aiRequest.turn_scope));
                             const combinedResult = results.filter(Boolean).join('\n---\n');
@@ -2574,8 +2593,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             }
                         }
 
-                        if (safeCalls.length === 0 && approvalCalls.length === 0 && hasStructuredTurn(messageHistory) && !autoStopRef.current) {
-                            await executeMultiStep('Error: unknown tool', aiRequest, messageHistory, modelInfo, modelDef);
+                        if (safeCalls.length === 0 && approvalCalls.length === 0 && !autoStopRef.current) {
+                            await executeMultiStep('Error: tool not loaded or identity changed; call tool_search first', aiRequest, messageHistory, modelInfo, modelDef);
                             return;
                         }
 
@@ -2659,20 +2678,16 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     }
 
                     if (allToolsParsedNS.length > 0) {
-                        for (const call of allToolsParsedNS.filter(call => !getToolByNameFromAll(call.tool, allTools))) {
-                            appendToolResult(messageHistory, call.id, 'Error: unknown tool');
+                        for (const call of allToolsParsedNS.filter(call => !isLoadedTool(call.tool))) {
+                            appendToolResult(messageHistory, call.id, 'Error: tool not loaded or identity changed; call tool_search first');
                         }
-                        const safeCalls = allToolsParsedNS.filter(p => isAutoApproved(p.tool) && getToolByNameFromAll(p.tool, allTools));
-                        const approvalCalls = allToolsParsedNS.filter(p => !isAutoApproved(p.tool) && getToolByNameFromAll(p.tool, allTools));
+                        const safeCalls = allToolsParsedNS.filter(p => isAutoApproved(p.tool) && isLoadedTool(p.tool));
+                        const approvalCalls = allToolsParsedNS.filter(p => !isAutoApproved(p.tool) && isLoadedTool(p.tool));
 
                         if (safeCalls.length > 0) {
                             const safeToolCalls = safeCalls.map(sc => ({
                                 id: sc.id, toolName: sc.tool, args: sc.args, status: 'approved' as const,
                             }));
-                            // Track initial tool signatures for duplicate detection
-                            for (const sc of safeToolCalls) {
-                                executedToolSignaturesRef.current.add(`${sc.toolName}::${JSON.stringify(sc.args)}`);
-                            }
                             const levels = buildExecutionLevels(safeToolCalls);
                             const results = await executePipeline(levels, tc => executeToolWithHistory(tc, messageHistory, aiRequest.turn_scope));
                             const combinedResult = results.filter(Boolean).join('\n---\n');
@@ -2682,8 +2697,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             }
                         }
 
-                        if (safeCalls.length === 0 && approvalCalls.length === 0 && hasStructuredTurn(messageHistory) && !autoStopRef.current) {
-                            await executeMultiStep('Error: unknown tool', aiRequest, messageHistory, modelInfo, modelDef);
+                        if (safeCalls.length === 0 && approvalCalls.length === 0 && !autoStopRef.current) {
+                            await executeMultiStep('Error: tool not loaded or identity changed; call tool_search first', aiRequest, messageHistory, modelInfo, modelDef);
                             return;
                         }
 
@@ -3109,8 +3124,6 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                 onApprove={async (rememberForSession?: boolean) => {
                                     setIsLoading(true);
                                     const tc0 = pendingToolCalls[0];
-                                    // Track approved tool signature for duplicate detection
-                                    executedToolSignaturesRef.current.add(`${tc0.toolName}::${JSON.stringify(tc0.args)}`);
                                     const context = multiStepContextRef.current;
                                     if (!context || activeTurnRef.current !== context.aiRequest.turn_scope) { setIsLoading(false); return; }
                                     const toolResult = await executeToolWithHistory(tc0, context.messageHistory, context.aiRequest.turn_scope, { rememberForSession, panelApproved: true });
@@ -3145,10 +3158,6 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                 sessionId={activeConversationId || undefined}
                                 onApproveAll={async () => {
                                     setIsLoading(true);
-                                    // Track all approved tool signatures for duplicate detection
-                                    for (const tc of pendingToolCalls) {
-                                        executedToolSignaturesRef.current.add(`${tc.toolName}::${JSON.stringify(tc.args)}`);
-                                    }
                                     const levels = buildExecutionLevels(pendingToolCalls);
                                     // The user approved these in the panel: in expert mode that
                                     // is the confirmation, so no second one per tool.

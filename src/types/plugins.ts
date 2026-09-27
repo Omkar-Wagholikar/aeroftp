@@ -11,6 +11,7 @@ export interface PluginToolDef {
     parameters: AIToolParameter[];
     dangerLevel: DangerLevel;
     command: string;
+    integrity?: string;
 }
 
 export interface PluginManifest {

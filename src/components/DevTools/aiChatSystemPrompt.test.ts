@@ -61,3 +61,14 @@ describe('buildSystemPrompt prompt profiles', () => {
         expect(prompt).toContain('Workspace checkpoint, patch, and git tools are available for coding work');
     });
 });
+
+it('uses the selected catalog for default and custom text-tool prompts', () => {
+    const selectedTools = [{ name: 'tool_search', description: 'Load tools', parameters: [], dangerLevel: 'safe' as const }];
+    for (const custom of [false, true]) {
+        const settings = { ...baseSettings, advancedSettings: { ...baseSettings.advancedSettings, useCustomPrompt: custom, customSystemPrompt: 'Custom prompt' } };
+        const prompt = buildSystemPrompt(settings, '', 'ollama', 'full', 'test', { selectedTools });
+        expect(prompt).toContain('- tool_search: Load tools');
+        expect(prompt).not.toContain('- local_read:');
+        expect(prompt).not.toContain('- local_delete:');
+    }
+});

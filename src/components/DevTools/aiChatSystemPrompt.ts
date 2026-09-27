@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
-import { generateToolsPrompt } from '../../types/tools';
+import { generateToolsPrompt, type AITool } from '../../types/tools';
 import { AISettings, AIProviderType } from '../../types/ai';
 import { ProjectContext, BudgetMode } from '../../types/contextIntelligence';
 import { PROVIDER_PROFILES, ProviderPromptProfile, getOllamaPromptStyle } from './aiProviderProfiles';
@@ -14,6 +14,7 @@ export type AgentPromptProfile = 'file_manager' | 'coding_agent';
 export interface BuildSystemPromptOptions {
     extraTools?: Array<{name: string; description: string; parameters?: Record<string, unknown>}>;
     promptProfile?: AgentPromptProfile;
+    selectedTools?: AITool[];
 }
 
 export interface SystemPromptContext {
@@ -335,7 +336,7 @@ export function buildSystemPrompt(
             : PROVIDER_PROFILES.openai;
         const toolSection = profile.toolFormat === 'native'
             ? ''
-            : `\n\n## Tools\nWhen you need to use a tool, respond with:\nTOOL: tool_name\nARGS: {"param": "value"}\n\nAvailable tools:\n${generateToolsPrompt(extraTools)}`;
+            : `\n\n## Tools\nWhen you need to use a tool, respond with:\nTOOL: tool_name\nARGS: {"param": "value"}\n\nAvailable tools:\n${generateToolsPrompt(extraTools, options.selectedTools)}`;
         const profileSection = promptProfile === 'coding_agent'
             ? `\n\n## Active Agent Profile: Coding Agent\n${CODING_AGENT_CAPABILITIES}\n\nBehavior:\n${CODING_AGENT_BEHAVIOR_RULES}\n\nResponse format:\n${CODING_AGENT_RESPONSE_FORMAT}`
             : '';
@@ -354,7 +355,7 @@ export function buildSystemPrompt(
 
     const toolSection = profile.toolFormat === 'native'
         ? '' // Native function calling: no text format needed in prompt
-        : `\n\n## Tools\nWhen you need to use a tool, respond with:\nTOOL: tool_name\nARGS: {"param": "value"}\n\nWhen you need to use multiple tools, list them consecutively:\nTOOL: tool_name_1\nARGS: {"param1": "value1"}\n\nTOOL: tool_name_2\nARGS: {"param2": "value2"}\n\nAvailable tools:\n${generateToolsPrompt(extraTools)}`;
+        : `\n\n## Tools\nWhen you need to use a tool, respond with:\nTOOL: tool_name\nARGS: {"param": "value"}\n\nWhen you need to use multiple tools, list them consecutively:\nTOOL: tool_name_1\nARGS: {"param1": "value1"}\n\nTOOL: tool_name_2\nARGS: {"param2": "value2"}\n\nAvailable tools:\n${generateToolsPrompt(extraTools, options.selectedTools)}`;
 
     // Token-aware protocol expertise (#71)
     let protocolSection = PROTOCOL_EXPERTISE;
