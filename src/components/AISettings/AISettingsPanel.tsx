@@ -1987,13 +1987,14 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
 
                 {/* Footer */}
                 <div className="px-6 py-4 border-t border-gray-700 flex justify-between items-center">
-                    <div className="text-sm text-gray-500">
-                        <div>{t('ai.aeroAgent')} {AEROAGENT_VERSION}</div>
-                        <div className="text-xs">
+                    <div className="flex items-center gap-2 text-xs text-gray-500">
+                        <span>{t('ai.aeroAgent')} {AEROAGENT_VERSION}</span>
+                        <span aria-hidden="true">|</span>
+                        <span>
                             {t('ai.settings.providersEnabled', {
                                 count: settings.providers.filter((p) => p.isEnabled).length,
                             })}
-                        </div>
+                        </span>
                     </div>
                     <button onClick={onClose} className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg text-sm transition-colors">
                         {t('ai.settings.done')}
