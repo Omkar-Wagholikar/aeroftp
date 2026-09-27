@@ -1736,6 +1736,15 @@ enum Commands {
     /// Run inside a Flatpak with a native `~/.config/aeroftp` present, this
     /// copies it into the sandbox (copy-only, never overwriting). Outside a
     /// Flatpak it is a no-op. Restart AeroFTP afterwards to load the import.
+    /// The host vault and saved servers come in only when the sandbox has no
+    /// vault of its own, and the output says whether they did.
+    ///
+    /// Exit codes: 0 when files were imported, when no file was copied (each
+    /// file the import would copy already has a file with the same name in the
+    /// sandbox, or the host config holds nothing the import copies), with
+    /// --status, and outside a Flatpak;
+    /// 1 when there is no host config, or when the copy failed (files copied
+    /// before the error stay in the sandbox).
     FlatpakImport {
         /// Only report whether an import is available; do not apply it.
         #[arg(long)]
@@ -38754,9 +38763,9 @@ fn cmd_flatpak_import(status_only: bool, format: OutputFormat) -> i32 {
             ),
             OutputFormat::Text => match (st.available, st.source) {
                 (true, Some(src)) => println!("Import available from {}", src.display()),
-                _ => {
-                    println!("No host configuration to import (none present, or already decided).")
-                }
+                _ => println!(
+                    "No host configuration to import (none present, nothing in it to import, or already decided)."
+                ),
             },
         }
         return 0;
@@ -38764,25 +38773,15 @@ fn cmd_flatpak_import(status_only: bool, format: OutputFormat) -> i32 {
 
     match portable::flatpak_host_import_apply(true) {
         Ok(report) => {
+            let imported = report.imported();
             match format {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::json!({
-                        "imported": report.imported,
-                        "source": path_str(report.source),
-                        "target": path_str(report.target),
-                        "requires_restart": report.imported,
-                    })
-                ),
-                OutputFormat::Text => {
-                    if report.imported {
-                        println!(
-                            "Imported host configuration into the sandbox. Restart AeroFTP to load it."
-                        );
-                    } else {
-                        println!("Nothing to import.");
-                    }
+                OutputFormat::Json => {
+                    // The GUI command's fields, plus the restart flag of the CLI.
+                    let mut json = report.to_json();
+                    json["requires_restart"] = serde_json::Value::Bool(imported);
+                    println!("{json}");
                 }
+                OutputFormat::Text => println!("{}", flatpak_import_summary(&report)),
             }
             0
         }
@@ -38790,6 +38789,126 @@ fn cmd_flatpak_import(status_only: bool, format: OutputFormat) -> i32 {
             print_error(format, &format!("flatpak-import failed: {e}"), 1);
             1
         }
+    }
+}
+
+/// The text `flatpak-import` prints after an accepted import: how many files it
+/// copied, and what happened to the host vault and saved servers.
+fn flatpak_import_summary(report: &ftp_client_gui_lib::portable::FlatpakImportReport) -> String {
+    use ftp_client_gui_lib::portable::HostVault;
+
+    let source = report
+        .source
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if report.imported() {
+        let files = format!(
+            "Imported {} {} from {} into the sandbox",
+            report.copied,
+            if report.copied == 1 { "file" } else { "files" },
+            source
+        );
+        match report.vault {
+            HostVault::Imported => format!(
+                "{files}, including your saved servers and vault. Restart AeroFTP to load them."
+            ),
+            HostVault::Skipped => format!(
+                "{files}, but not your saved servers and vault: this Flatpak install already has its own vault, and existing files are never overwritten. Restart AeroFTP to load what was imported."
+            ),
+            HostVault::Absent => format!(
+                "{files}, but your existing configuration held no saved servers or vault the import could copy. Restart AeroFTP to load what was imported."
+            ),
+        }
+    } else if report.vault == HostVault::Skipped {
+        format!(
+            "No file was copied from {source}, so your saved servers and vault were not imported: this Flatpak install already has its own vault and a file with the same name for each file the import would copy, and existing files are never overwritten."
+        )
+    } else if report.nothing_importable {
+        format!(
+            "Nothing to import: {source} holds no file the import copies (it copies files only, never SQLite sidecar files or symbolic links)."
+        )
+    } else {
+        // The copy skips a file by name, never by content, so this says what it
+        // saw: a file with the same name, not the same file. And it never copies
+        // symbolic links or SQLite sidecars, so the claim covers only the files
+        // it would copy: a linked file on the host is not "already here".
+        format!(
+            "No file was copied: this Flatpak install already has a file with the same name for each file the import would copy from {source}, and existing files are never overwritten."
+        )
+    }
+}
+
+#[cfg(test)]
+mod flatpak_import_summary_tests {
+    use super::flatpak_import_summary;
+    use ftp_client_gui_lib::portable::{FlatpakImportReport, HostVault};
+    use std::path::PathBuf;
+
+    fn report(copied: usize, vault: HostVault) -> FlatpakImportReport {
+        FlatpakImportReport {
+            copied,
+            vault,
+            nothing_importable: false,
+            source: Some(PathBuf::from("/home/u/.config/aeroftp")),
+            target: Some(PathBuf::from(
+                "/home/u/.var/app/app.aeroftp.AeroFTP/config/aeroftp",
+            )),
+        }
+    }
+
+    #[test]
+    fn flatpak_import_says_the_vault_stayed_behind() {
+        let text = flatpak_import_summary(&report(2, HostVault::Skipped));
+        assert!(
+            text.starts_with("Imported 2 files from /home/u/.config/aeroftp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("but not your saved servers and vault: this Flatpak install already has its own vault"),
+            "{text}"
+        );
+
+        // The claim covers the files the import copies, not every host file:
+        // symbolic links and SQLite sidecars are never copied.
+        assert_eq!(
+            flatpak_import_summary(&report(0, HostVault::Skipped)),
+            "No file was copied from /home/u/.config/aeroftp, so your saved servers and vault were not imported: this Flatpak install already has its own vault and a file with the same name for each file the import would copy, and existing files are never overwritten."
+        );
+    }
+
+    #[test]
+    fn flatpak_import_says_no_file_was_copied_not_that_none_was_needed() {
+        // The copy skips by name, never by content, and never copies symbolic
+        // links or SQLite sidecars: the claim is about the files it would copy.
+        assert_eq!(
+            flatpak_import_summary(&report(0, HostVault::Absent)),
+            "No file was copied: this Flatpak install already has a file with the same name for each file the import would copy from /home/u/.config/aeroftp, and existing files are never overwritten."
+        );
+    }
+
+    #[test]
+    fn flatpak_import_of_a_config_with_nothing_to_copy_says_nothing_to_import() {
+        let mut empty = report(0, HostVault::Absent);
+        empty.nothing_importable = true;
+        assert_eq!(
+            flatpak_import_summary(&empty),
+            "Nothing to import: /home/u/.config/aeroftp holds no file the import copies (it copies files only, never SQLite sidecar files or symbolic links)."
+        );
+    }
+
+    #[test]
+    fn flatpak_import_says_whether_the_servers_and_vault_came() {
+        let text = flatpak_import_summary(&report(3, HostVault::Imported));
+        assert!(
+            text.contains("including your saved servers and vault"),
+            "{text}"
+        );
+        // A user who expects the servers after the restart is told none came.
+        assert_eq!(
+            flatpak_import_summary(&report(1, HostVault::Absent)),
+            "Imported 1 file from /home/u/.config/aeroftp into the sandbox, but your existing configuration held no saved servers or vault the import could copy. Restart AeroFTP to load what was imported."
+        );
     }
 }
 
