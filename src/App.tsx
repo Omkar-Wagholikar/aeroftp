@@ -19,8 +19,12 @@ import {
   AeroVaultOverlaySession,
   DeltaEligibilityProbeResult,
   SyncDirection, VerifyPolicy, DeltaTransferStats,
-  CompareReport, RetryPolicy, SyncJournal, CompressionMode
+  CompareReport, RetryPolicy, SyncJournal
 } from './types';
+import type { CryptSecretForm } from './types';
+import { bannerOverlayParams } from './utils/rcloneCryptBanner';
+import { overlayWarningTitleKey } from './utils/overlayWarningTitle';
+import { refusalFor, type OverlayRefusal } from './utils/overlayRefusal';
 
 interface DownloadFolderParams {
   remote_path: string;
@@ -51,8 +55,8 @@ interface ConnectedRemoteRunOptions {
   retryPolicy?: RetryPolicy;
   /** Stop transferring once this many bytes have moved. 0 = unlimited. */
   transferBudget?: number;
-  /** Archive-before-mutation strategy; null/"disabled" turns it off. */
-  versioningStrategy?: string | null;
+  /** Versioned backup folder (validated); null/undefined turns it off. */
+  versionedBackup?: { dir: string } | null;
   /** Resume an interrupted journal instead of starting fresh. */
   resumeJournal?: SyncJournal;
   /** Saved-server id, enables the CO-5 SFTP eligibility probe. */
@@ -64,14 +68,6 @@ interface ConnectedRemoteRunOptions {
    * caller (verify `none`, the maniac retry policy).
    */
   maniac?: boolean;
-  /**
-   * GAP-9b: parallel-streams + compression preset, threaded into
-   * RemoteSyncConfig as first-class config. The concurrent execution that
-   * consumes them is owned by APPENDIX-DAG-ENGINE Fase 2; until then the run
-   * stays sequential (legacy SyncPanel parity).
-   */
-  parallelStreams?: number;
-  compressionMode?: CompressionMode;
   /** P3 EC: from PlanTabContent onExecute via AeroSyncRuntime. */
   errorCorrection?: { enabled: boolean; pct: number } | null;
 }
@@ -88,8 +84,8 @@ interface LocalLocalRunOptions {
   retryPolicy?: RetryPolicy;
   /** Stop transferring once this many bytes have moved. 0 = unlimited. */
   transferBudget?: number;
-  /** Archive-before-mutation strategy; null/"disabled" turns it off. */
-  versioningStrategy?: string | null;
+  /** Versioned backup folder (validated); null/undefined turns it off. */
+  versionedBackup?: { dir: string } | null;
   /** Resume an interrupted journal instead of starting fresh. */
   resumeJournal?: SyncJournal;
   /** Maniac mode: drop the journal, run the mandatory post-sync verify sweep. */
@@ -105,6 +101,9 @@ interface ProviderCryptOverlayApply {
   directoryNameEncryption?: boolean | null;
   password: string;
   salt?: string | null;
+  /** rclone-crypt: how `password` / `salt` are written; null = not known (read automatically). */
+  passwordForm?: CryptSecretForm | null;
+  saltForm?: CryptSecretForm | null;
   /** AeroCrypt Tier 1 optional keyfile second factor (local path, resolved to a digest backend-side). */
   keyfilePath?: string | null;
   profileId?: string | null;
@@ -240,6 +239,8 @@ import { DeltaEligibilityDialog } from './components/AeroSync/DeltaEligibilityDi
 import type { AeroSyncTab, AeroSyncContext, AeroSyncRuntime } from './components/AeroSync/types';
 import { RemoteSyncResultDialog } from './components/AeroSync/RemoteSyncResultDialog';
 import { CanaryResultDialog, type CanaryResult } from './components/Sync/CanaryResultDialog';
+import { SPEED_PRESETS } from './components/Sync/syncConstants';
+import { AEROSYNC_DEFAULT_BACKUP_DIR, aeroSyncCompareOptions, appliedCompareFilters } from './utils/aeroSyncExcludes';
 import { VaultPanel } from './components/VaultPanel';
 import { CryptomatorBrowser } from './components/CryptomatorBrowser';
 import { RcloneCryptUnlock } from './components/RcloneCryptUnlock';
@@ -471,12 +472,13 @@ import { describeScanIncompleteError, isScanIncompleteError } from './utils/scan
 import { useTranslation } from './i18n';
 
 // Components
-import { ConfirmDialog, InputDialog, ArchivePasswordDialog, SyncNavDialog, PropertiesDialog, FileProperties, ChecksumCapability, MultiFilePropertiesDialog, MultiFileProperties, MasterPasswordSetupDialog } from './components/Dialogs';
+import { ConfirmDialog, InputDialog, ArchivePasswordDialog, SyncNavDialog, PropertiesDialog, FileProperties, ChecksumAlgorithm, ChecksumCapability, MultiFilePropertiesDialog, MultiFileProperties, MasterPasswordSetupDialog } from './components/Dialogs';
 import { TransferToastContainer, dispatchTransferToast, toggleTransferToast } from './components/Transfer/TransferToastContainer';
 import { runExtractWithToast } from './utils/extractToast';
 import { archiveStem, dispatchGeneralExtract, isWrongPasswordError, resolveUniqueExtractDir } from './utils/extractOrchestrator';
 import { formatExtractDetails, formatCompressDetails } from './utils/archiveSizeReport';
 import { findGvfsMtpMount, isGvfsMtpPath } from './utils/gvfsMtpMount';
+import { acceptFlatpakImport, flatpakImportResultDialog, flatpakOfferHandlers } from './utils/flatpakImport';
 import { GlobalTooltip } from './components/GlobalTooltip';
 import { TransferProgressBar } from './components/TransferProgressBar';
 import { ImageThumbnail } from './components/ImageThumbnail';
@@ -1230,7 +1232,11 @@ const App: React.FC = () => {
   const [lockedOverlayProfile, setLockedOverlayProfile] = useState<{
     savedServerId: string;
     kind: 'rclone-crypt' | 'aerocrypt';
+    /** Why the backend refused it, when it said (rclone-crypt: how to answer). */
+    reason?: string;
   } | null>(null);
+  // The last refusal the auto-unlock saw, read when the locked banner is armed.
+  const overlayRefusalRef = useRef<OverlayRefusal | null>(null);
   const [overlayDecrypting, setOverlayDecrypting] = useState(false);
   // The owner of the active (or in-progress) encrypted overlay. Both the provider
   // decorator state and the decryption animation are gated on
@@ -1935,9 +1941,11 @@ const App: React.FC = () => {
   // one-time decision marker, so `available` is true only inside a Flatpak, when a
   // native config exists, and when the user has not decided yet. We wait for
   // `vaultBootComplete` and skip while a lock/setup dialog is up so the import
-  // offer never fights the first-run master-password flow; on a genuinely fresh
-  // sandbox (default AutoKeyring, no master password) neither is up, so the offer
-  // wins and brings the real vault in. `hasOfferedRef` guards StrictMode.
+  // offer never fights the first-run master-password flow. By then
+  // `init_credential_store` has created this install's own vault, which the
+  // import never overwrites, so on a fresh sandbox the host vault and the saved
+  // servers encrypted under it stay behind, and the result dialog says so.
+  // `flatpakImportOfferedRef` guards StrictMode.
   const flatpakImportOfferedRef = useRef(false);
   useEffect(() => {
     if (!vaultBootComplete || isAppLocked || showMasterPasswordSetup) return;
@@ -1949,28 +1957,31 @@ const App: React.FC = () => {
           'flatpak_config_import_status'
         );
         if (!st?.available) return;
+        const offer = flatpakOfferHandlers({
+          accept: acceptFlatpakImport,
+          decline: async () => {
+            try { await invoke('flatpak_config_import_apply', { accept: false }); } catch { /* ignore */ }
+          },
+          // A dialog, not a toast: toasts can be switched off, and the user
+          // just made a decision whose result they must see.
+          showOutcome: (outcome) => {
+            const result = flatpakImportResultDialog(outcome, t);
+            setConfirmDialog({
+              message: result.message,
+              confirmLabel: result.confirmLabel,
+              confirmColor: 'blue',
+              onConfirm: result.restart ? () => { invoke('restart_app'); } : () => setConfirmDialog(null),
+              onCancel: () => setConfirmDialog(null),
+            });
+          },
+          close: () => setConfirmDialog(null),
+        });
         setConfirmDialog({
           message: t('flatpak.importBody'),
           confirmLabel: t('flatpak.importAccept'),
           confirmColor: 'blue',
-          onConfirm: async () => {
-            try {
-              await invoke('flatpak_config_import_apply', { accept: true });
-            } catch (e) {
-              console.warn('flatpak import failed', e);
-            }
-            setConfirmDialog({
-              message: t('flatpak.importedBody'),
-              confirmLabel: t('flatpak.restartNow'),
-              confirmColor: 'blue',
-              onConfirm: () => { invoke('restart_app'); },
-              onCancel: () => setConfirmDialog(null),
-            });
-          },
-          onCancel: async () => {
-            try { await invoke('flatpak_config_import_apply', { accept: false }); } catch { /* ignore */ }
-            setConfirmDialog(null);
-          },
+          onConfirm: offer.onConfirm,
+          onCancel: offer.onCancel,
         });
       } catch {
         // Not in a Flatpak, or backend not ready: silently ignore.
@@ -4252,6 +4263,9 @@ const App: React.FC = () => {
       protocol,
       providerId: connectionParams.providerId || activeSession?.providerId,
       initialPath: activeSession?.serverInitialPath || quickConnectDirs.remoteDir,
+      // From the session, not the global connectionParams, whose
+      // savedServerId can be stale (see resolveLiveProfile).
+      saved: !!(activeSession?.savedServerId || activeSession?.connectionParams?.savedServerId),
     };
   }, [isConnected, sessions, activeSessionId, connectionParams, quickConnectDirs.remoteDir]);
 
@@ -5634,6 +5648,8 @@ const App: React.FC = () => {
         directoryNameEncryption: params.directoryNameEncryption ?? true,
         password: params.password,
         salt: params.salt || null,
+        passwordForm: params.passwordForm ?? null,
+        saltForm: params.saltForm ?? null,
         keyfilePath: params.keyfilePath || null,
         // Headerless AeroCrypt REQUIRES the profile id to persist/read its vault
         // config in the keystore (no remote marker). Every caller sets it; not
@@ -5647,12 +5663,12 @@ const App: React.FC = () => {
     // Backend returns ApplyOverlayResult { scope, markerRestored, warning, … };
     // tolerate a plain string for forward/back compat during hot reload.
     const appliedScope = typeof result === 'string' ? result : result.scope;
-    // Only auto-toast the missing-marker rebuild safety warning.
-    // Legacy JSON→TSV is a retrocompatible design update: opt-in via the
-    // AEROCRYPT badge context menu "Convert marker", never a connect nag.
+    // The backend's one-time notices (the AeroCrypt marker notices, or an
+    // rclone-crypt key under which no name decrypts), titled by what they are
+    // about rather than all as a restored marker.
     if (typeof result !== 'string' && result.warning) {
       notify.warning(
-        t('aerocryptNative.markerMissingRestoredTitle'),
+        t(overlayWarningTitleKey(params.kind, result.markerRestored)),
         result.warning,
       );
     }
@@ -5788,6 +5804,8 @@ const App: React.FC = () => {
     savedServerId?: string,
   ): Promise<{ vaultId: string; prefix: 'rclone_crypt_provider' | 'aerocrypt_provider' } | null> => {
     if (!savedServerId) return null;
+    // Only this attempt's refusal may reach the locked banner.
+    overlayRefusalRef.current = null;
     try {
       const profiles = await loadSavedServerProfiles();
       const profile = profiles.find((p) => p.id === savedServerId);
@@ -5838,6 +5856,10 @@ const App: React.FC = () => {
             directoryNameEncryption: binding.directoryNameEncryption ?? true,
             password,
             salt: salt || null,
+            // No forms here: the backend reads them from the saved profile
+            // (profileId), by the rule every other reader uses.
+            passwordForm: null,
+            saltForm: null,
             keyfilePath: keyfilePath || null,
             profileId: savedServerId,
             // Headed intent from the saved profile: missing remote marker is
@@ -5861,6 +5883,10 @@ const App: React.FC = () => {
           humanLog.updateEntry(overlayLogIdRef.current, { status: 'error', message: t('activity.overlay_failed') });
           overlayLogIdRef.current = null;
         }
+        // rclone-crypt opens with any key, so a failure here is a secret it
+        // refuses to guess at (or one it cannot read). The locked banner shows
+        // why, with how to answer it; a toast would close before it is read.
+        overlayRefusalRef.current = { savedServerId, kind: binding.kind, reason: String(e) };
         throw e;
       }
     } catch (e) {
@@ -5926,13 +5952,17 @@ const App: React.FC = () => {
         // arm". The second case must NOT look like a plain listing with no
         // recovery: keep the path-bar capability badge and surface a locked
         // affordance so the user can re-enter the password in-panel.
-        let locked: { savedServerId: string; kind: 'rclone-crypt' | 'aerocrypt' } | null = null;
+        let locked: { savedServerId: string; kind: 'rclone-crypt' | 'aerocrypt'; reason?: string } | null = null;
         try {
           const profiles = await loadSavedServerProfiles();
           const profile = profiles.find((p) => p.id === savedId);
           const binding = profile?.aeroCryptOverlay;
           if (binding?.enabled) {
-            locked = { savedServerId: savedId, kind: binding.kind };
+            locked = {
+              savedServerId: savedId,
+              kind: binding.kind,
+              reason: refusalFor(overlayRefusalRef.current, savedId),
+            };
             markSessionOverlayKind({ savedServerId: savedId }, binding.kind, binding.remoteScope ?? null);
           }
         } catch {
@@ -8431,6 +8461,7 @@ const App: React.FC = () => {
               setLockedOverlayProfile({
                 savedServerId: targetSession.savedServerId,
                 kind: targetOverlay.kind,
+                reason: refusalFor(overlayRefusalRef.current, targetSession.savedServerId),
               });
               lockSessionCryptOverlay({ sessionId });
             } else {
@@ -10805,7 +10836,18 @@ const App: React.FC = () => {
   // dialog opens immediately with a scanning placeholder and is refreshed
   // when the async scan resolves. When no comparable pair is mounted the
   // dialog still opens (Sync tab is always usable).
-  const openAeroSync = useCallback((initialTab: AeroSyncTab = 'compare') => {
+  /**
+   * Open AeroSync on the current pair and start its compare. `userExcludes`
+   * are the Plan tab's own patterns, added to the defaults the compare always
+   * skips, and `backupDir` is the versioned-backup folder the compare leaves
+   * out on both sides; the Plan's Rescan calls this again with the edited
+   * values, and the result records which ones it was computed with.
+   */
+  const openAeroSync = useCallback((
+    initialTab: AeroSyncTab = 'compare',
+    userExcludes: string[] = [],
+    backupDir: string = AEROSYNC_DEFAULT_BACKUP_DIR,
+  ) => {
     // Bump the compare token: any recursive scan still in flight from a
     // previous open is now stale and will discard its own result.
     const mySeq = ++aeroSyncCompareSeqRef.current;
@@ -10847,29 +10889,23 @@ const App: React.FC = () => {
           pairKind: 'local-local',
           initialSource: leftPath,
           initialDestination: rightPath,
+          ...appliedCompareFilters(canRecurse ? 'recursive' : 'flat', userExcludes, backupDir),
         },
       });
 
       if (canRecurse) {
         void (async () => {
           let resolved: CompareResult;
+          // The flat fallback below classifies panel listings and applies no
+          // exclusions and no backup folder, so it must not be reported as
+          // having applied them: the Plan then blocks Execute until a rescan
+          // works, rather than let Mirror delete what the compare never hid.
+          let applied = appliedCompareFilters('recursive', userExcludes, backupDir);
           try {
             const report = await invoke<CompareReport>('compare_local_directories', {
               leftPath,
               rightPath,
-              options: {
-                compare_timestamp: true,
-                compare_size: true,
-                compare_checksum: false,
-                exclude_patterns: [
-                  'node_modules', '.git', '.DS_Store', 'Thumbs.db',
-                  '__pycache__', '*.pyc', '.env', 'target',
-                  // Never surface EC parity sidecars as orphan/data in AeroSync compare,
-                  // even when EC is off but sidecars from a prior EC-on run still exist.
-                  '*.aerocorrect',
-                ],
-                direction: 'bidirectional',
-              },
+              options: aeroSyncCompareOptions(userExcludes, backupDir),
               progressId: scanProgressId,
             });
             // Both sides are local: local_info = left, remote_info = right.
@@ -10886,6 +10922,7 @@ const App: React.FC = () => {
               notify.error(t('aerosync.title') || 'AeroSync', describeScanIncompleteError(err));
             } else {
               // Recursive scan failed: fall back to the flat top-level classify.
+              applied = appliedCompareFilters('flat', userExcludes, backupDir);
               resolved = compareEntries(
                 localFiles.map(toCompareEntry),
                 localFiles2.map(toCompareEntry),
@@ -10896,7 +10933,7 @@ const App: React.FC = () => {
           if (aeroSyncCompareSeqRef.current !== mySeq) return;
           setAeroSync((prev) =>
             prev
-              ? { ...prev, context: { ...prev.context, compareResult: resolved, compareLoading: false } }
+              ? { ...prev, context: { ...prev.context, compareResult: resolved, compareLoading: false, ...applied } }
               : prev,
           );
         })();
@@ -10962,12 +10999,18 @@ const App: React.FC = () => {
           activeProfileName: activeUnifiedRemoteProfile?.name,
           isProvider: isProviderConn,
           excludePatterns: [],
+          compareExcludes: userExcludes,
+          compareBackupDir: backupDir,
           protocol: activeUnifiedRemoteProfile?.protocol,
+          activeProfileInitialPath: activeUnifiedRemoteProfile?.initialPath,
+          activeProfileSaved: activeUnifiedRemoteProfile?.saved,
         },
       });
 
       void (async () => {
         let resolved: CompareResult;
+        // See the local-local branch: the flat fallback applies no exclusions.
+        let applied = appliedCompareFilters('recursive', userExcludes, backupDir);
         try {
           const compareArgs: Record<string, unknown> = {
             localPath: currentLocalPath,
@@ -10975,19 +11018,7 @@ const App: React.FC = () => {
             ...(isProviderConn && cryptCompareActive && compareCryptVaultId
               ? { cryptVaultId: compareCryptVaultId, cryptKind: compareCryptKind }
               : {}),
-            options: {
-              compare_timestamp: true,
-              compare_size: true,
-              compare_checksum: false,
-              exclude_patterns: [
-                'node_modules', '.git', '.DS_Store', 'Thumbs.db',
-                '__pycache__', '*.pyc', '.env', 'target',
-                // Never surface EC parity sidecars as orphan/data in AeroSync compare,
-                // even when EC is off but sidecars from a prior EC-on run still exist.
-                '*.aerocorrect',
-              ],
-              direction: 'bidirectional',
-            },
+            options: aeroSyncCompareOptions(userExcludes, backupDir),
             progressId: scanProgressId,
           };
           const report = await invoke<CompareReport>(
@@ -11019,6 +11050,7 @@ const App: React.FC = () => {
           } else {
             // Recursive scan failed: fall back to the flat top-level
             // classify so the Compare tab still shows something actionable.
+            applied = appliedCompareFilters('flat', userExcludes, backupDir);
             const localEntries = localFiles.map(toCompareEntry);
             const remoteEntries = remoteFiles.map(toCompareEntry);
             resolved = leftLocal
@@ -11031,7 +11063,7 @@ const App: React.FC = () => {
         if (aeroSyncCompareSeqRef.current !== mySeq) return;
         setAeroSync((prev) =>
           prev
-            ? { ...prev, context: { ...prev.context, compareResult: resolved, compareLoading: false } }
+            ? { ...prev, context: { ...prev.context, compareResult: resolved, compareLoading: false, ...applied } }
             : prev,
         );
       })();
@@ -11145,7 +11177,7 @@ const App: React.FC = () => {
       },
       verifyPolicy: opts.verifyPolicy,
       deltaSyncEnabled: opts.deltaSyncEnabled,
-      versioningStrategy: opts.versioningStrategy ?? null,
+      versionedBackup: opts.versionedBackup ?? null,
       transferBudget: opts.transferBudget ?? 0,
       direction: opts.direction,
       uploadLimitKbps: readLimit('aerosync.bandwidth.upload'),
@@ -11153,9 +11185,6 @@ const App: React.FC = () => {
       // GAP-9a: Maniac drops the journal and runs a post-sync verify sweep.
       journalEnabled: !opts.maniac,
       postSyncVerification: opts.maniac === true,
-      // GAP-9b: threaded config — consumed by APPENDIX-DAG-ENGINE Fase 2.
-      parallelStreams: opts.parallelStreams,
-      compressionMode: opts.compressionMode,
       // P3: EC control from Plan tab (Backup default) reaches runner unchanged.
       errorCorrection: opts.errorCorrection,
       authenticatedRemoteContent: isCryptOverlayActive(),
@@ -11318,7 +11347,7 @@ const App: React.FC = () => {
       verifyPolicy: opts.verifyPolicy,
       // `copy_local_file` is a plain filesystem copy: no delta path.
       deltaSyncEnabled: false,
-      versioningStrategy: opts.versioningStrategy ?? null,
+      versionedBackup: opts.versionedBackup ?? null,
       transferBudget: opts.transferBudget ?? 0,
       direction: opts.direction,
       // Maniac drops the journal and runs a post-sync verify sweep.
@@ -11533,7 +11562,7 @@ const App: React.FC = () => {
         verifyPolicy,
         retryPolicy: runtime.retryPolicy,
         transferBudget: runtime.transferBudget,
-        versioningStrategy: runtime.versioningStrategy,
+        versionedBackup: runtime.versionedBackup,
         maniac: runtime.speedMode === 'maniac',
       });
       return;
@@ -11561,15 +11590,13 @@ const App: React.FC = () => {
         closeAeroSync();
         runConnectedRemoteSync(runFiles, runDirs, {
           direction,
-          deltaSyncEnabled: runtime.speedMode !== 'normal',
+          deltaSyncEnabled: SPEED_PRESETS[runtime.speedMode].deltaSyncEnabled,
           verifyPolicy,
           retryPolicy: runtime.retryPolicy,
           transferBudget: runtime.transferBudget,
-          versioningStrategy: runtime.versioningStrategy,
+          versionedBackup: runtime.versionedBackup,
           profileId: context.activeProfileId,
           maniac: runtime.speedMode === 'maniac',
-          parallelStreams: runtime.parallelStreams,
-          compressionMode: runtime.compressionMode,
           // P3: thread EC (only populated for backup preset from Plan tab)
           errorCorrection: runtime.errorCorrection,
         });
@@ -14430,11 +14457,19 @@ const App: React.FC = () => {
             importLocalStorage: true,
           });
           if (result.localStorage && Object.keys(result.localStorage).length > 0) {
+            let preferencesError: string | null = null;
             try {
               const { applyLocalStorage } = await import('./utils/keystoreLocalStorage');
-              await applyLocalStorage(result.localStorage);
+              preferencesError = (await applyLocalStorage(result.localStorage)).error;
             } catch (e) {
-              console.warn('Failed to apply restored localStorage:', e);
+              preferencesError = e instanceof Error ? e.message : String(e);
+            }
+            if (preferencesError) {
+              console.warn('Failed to apply restored localStorage:', preferencesError);
+              notify.warning(
+                t('settings.importKeystore') || 'Import Keystore',
+                t('settings.keystorePreferencesFailed', { error: preferencesError }),
+              );
             }
           }
           await refreshProfilesFromImportedKeystore();
@@ -15988,6 +16023,7 @@ const App: React.FC = () => {
             onExecutePreset={executeSyncPresetPlan}
             onResumeJournal={handleResumeJournal}
             onDismissJournal={handleDismissJournal}
+            onRescan={({ userExcludes, backupDir }) => openAeroSync('plan', userExcludes, backupDir)}
           />
         )}
         <DeltaEligibilityDialog
@@ -16171,7 +16207,7 @@ const App: React.FC = () => {
               }
               setPropertiesDialog(null);
             }}
-            onCalculateChecksum={async (algorithm: 'md5' | 'sha1' | 'sha256' | 'sha512' | 'blake3') => {
+            onCalculateChecksum={async (algorithm: ChecksumAlgorithm) => {
               if (!propertiesDialog) return;
               setPropertiesDialog(prev => prev ? { ...prev, checksum: { ...prev.checksum, calculating: true } } : null);
               try {
@@ -16189,7 +16225,10 @@ const App: React.FC = () => {
                   // engine still never sees these: the overlay keeps
                   // `supports_checksum()` false, so no comparison against a
                   // local plaintext hash can be built on them.
-                  const map = await invoke<Record<string, string>>('provider_checksum', { path: propertiesDialog.path });
+                  // The algorithm is passed because FTP computes the digest on
+                  // request and must select it with OPTS HASH first; every
+                  // other backend returns what it stores regardless.
+                  const map = await invoke<Record<string, string>>('provider_checksum', { path: propertiesDialog.path, algorithm });
                   setPropertiesDialog(prev => {
                     if (!prev) return null;
                     const next = { ...prev.checksum, calculating: false };
@@ -16583,6 +16622,8 @@ const App: React.FC = () => {
                       directoryNameEncryption: details.directoryNameEncryption,
                       password: details.password,
                       salt: details.salt || null,
+                      passwordForm: details.passwordForm,
+                      saltForm: details.saltForm,
                       profileId: sessions.find(s => s.id === activeSessionId)?.savedServerId
                         ?? lockedOverlayProfile?.savedServerId
                         ?? null,
@@ -16684,6 +16725,11 @@ const App: React.FC = () => {
                 <div className="text-xs opacity-80">
                   {t('aerocrypt.lockedOverlayDesc')}
                 </div>
+                {lockedOverlayProfile.reason && (
+                  <div className="text-xs mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap break-words select-text">
+                    {lockedOverlayProfile.reason}
+                  </div>
+                )}
               </div>
             </div>
             <div className="flex gap-2 justify-end">
@@ -16731,14 +16777,7 @@ const App: React.FC = () => {
                     setCryptOverlayOwner({ savedServerId: null, sessionId: activeSessionId });
                     await activateProviderCryptOverlay(
                       { sessionId: activeSessionId ?? undefined },
-                      {
-                        kind: 'rclone-crypt',
-                        remoteScope: banner.initialPath ?? '',
-                        filenameEncryption: banner.filenameEncryption || 'standard',
-                        directoryNameEncryption: banner.directoryNameEncryption !== false,
-                        password: banner.password,
-                        salt: banner.salt || null,
-                      },
+                      bannerOverlayParams(banner),
                       activeSessionId,
                     );
                     await loadRemoteFiles(undefined, true, true);

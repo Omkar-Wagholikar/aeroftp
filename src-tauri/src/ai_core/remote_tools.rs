@@ -1210,7 +1210,7 @@ fn reject_oversize_edit_download(data_len: usize) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn edit_temp_path(path: &str) -> String {
+pub(crate) fn edit_temp_path(path: &str) -> String {
     // Keep the staging file beside the target without copying its leaf:
     // an existing name may contain characters forbidden for new objects.
     let parent = path.rsplit_once('/').map(|(parent, _)| parent);
@@ -1231,10 +1231,15 @@ async fn edit(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> {
     let find = get_str(args, "find")?;
     let replace = get_str(args, "replace")?;
     let first_only = get_bool_opt(args, "first").unwrap_or(false);
+    let allow_non_atomic = get_bool_opt(args, "allow_non_atomic").unwrap_or(false);
 
     let backend = ctx.remote_backend(&server).await.map_err(backend_error)?;
     let entry = backend.stat(&path).await.map_err(ToolError::Exec)?;
     reject_uneditable_entry(&entry)?;
+    // The edit publishes a new file in the target's place: over a link that
+    // is a regular file where the link was, and the file it points to left
+    // as it was. Refused before anything is read or written.
+    crate::providers::refuse_edit_of_symlink(&entry, &path).map_err(ToolError::Exec)?;
 
     // Capped, streaming download: the backend refuses mid-read once the buffer
     // would cross MAX_EDIT_BYTES, so a server that under-reports its size in
@@ -1296,17 +1301,43 @@ async fn edit(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> {
     // Asked before the temporary exists, not after: a backend that cannot put
     // one file over another refuses while the server is still untouched, so
     // the refusal the agent reads can say that nothing was written (G119).
+    // `allow_non_atomic` accepts the set-aside replace, and only on a backend
+    // whose replace does set the previous file aside: on any other the
+    // replace would refuse the taken name after the temporary was uploaded.
     if !backend
         .supports_atomic_replace()
         .await
         .map_err(ToolError::Exec)?
     {
-        return Err(ToolError::Exec(format!(
-            "cannot edit `{path}` in place: this server offers no atomic way to put one \
-             file over another, and doing it in two steps would leave a moment with no \
-             file at all. Nothing was written and `{path}` is unchanged."
-        )));
+        const OPT_IN: &str = "`allow_non_atomic` true";
+        let sets_aside = backend
+            .replace_sets_aside()
+            .await
+            .map_err(ToolError::Exec)?;
+        if allow_non_atomic && !sets_aside {
+            return Err(ToolError::Exec(crate::providers::opt_in_cannot_set_aside(
+                &path, OPT_IN,
+            )));
+        }
+        if !allow_non_atomic {
+            let mut refusal = format!(
+                "cannot edit `{path}` in place: this server offers no atomic way to put one \
+                 file over another, and doing it in two steps would leave a moment with no \
+                 file at all. Nothing was written and `{path}` is unchanged."
+            );
+            if sets_aside {
+                refusal.push(' ');
+                refusal.push_str(&crate::providers::set_aside_opt_in_hint(OPT_IN));
+            }
+            return Err(ToolError::Exec(refusal));
+        }
     }
+
+    // The new file does not inherit the mode of the one it replaces (on SFTP
+    // it gets the server default): it is set on the temporary before the
+    // replace, where the backend reports one and can set it.
+    let can_chmod = backend.supports_chmod().await.map_err(ToolError::Exec)?;
+    let original = crate::providers::EditOriginal::of(&entry, can_chmod);
 
     let temp_path = edit_temp_path(&path);
     reject_restricted_leaf(backend.as_ref(), &temp_path).await?;
@@ -1317,6 +1348,19 @@ async fn edit(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> {
         let _ = backend.delete(&temp_path).await;
         return Err(ToolError::Exec(e));
     }
+    // Best effort: a refused chmod does not fail an edit that is otherwise
+    // done, and the answer says what was not kept.
+    let not_kept = match &original {
+        crate::providers::EditOriginal::Nothing => None,
+        crate::providers::EditOriginal::Unreadable(permissions) => Some(
+            crate::providers::edit_permissions_not_readable(&path, permissions),
+        ),
+        crate::providers::EditOriginal::Mode(mode) => backend
+            .chmod(&temp_path, *mode)
+            .await
+            .err()
+            .map(|error| crate::providers::edit_mode_not_kept(&path, *mode, &error)),
+    };
     // `replace` and not `rename`: the destination exists by definition here,
     // and `rename` keeps refusing that case so an ordinary move cannot
     // destroy a file the caller did not mean to lose.
@@ -1325,13 +1369,18 @@ async fn edit(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> {
         return Err(ToolError::Exec(e));
     }
 
-    Ok(json!({
+    let mut answer = json!({
         "server": server,
         "path": path,
         "replacements": replacements,
         "bytes_before": bytes_before,
         "bytes_after": bytes_after
-    }))
+    });
+    if let Some(warning) = not_kept {
+        tracing::warn!("{warning}");
+        answer["warnings"] = json!([warning]);
+    }
+    Ok(answer)
 }
 
 /// `remote_versions`: browse and manage a file's version history.
@@ -2738,12 +2787,49 @@ async fn speed(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> {
     }))
 }
 
+/// A runnable `aeroftp-cli sync` line for a tool result. The profile goes
+/// first (`sync LOCAL REMOTE` alone reads LOCAL as the URL, and the command
+/// fails), and only flags `sync` really has follow. Every value is one quoted
+/// shell argument (`shell_quote::shell_arg`). `server` empty means the GUI's
+/// active connection, which has no name to put here, so the line carries the
+/// `NAME` placeholder the CLI `sync-doctor` uses.
+pub fn suggest_sync_command(
+    server: &str,
+    local_dir: &str,
+    remote_dir: &str,
+    flags: &str,
+) -> String {
+    use crate::shell_quote::shell_arg;
+    let profile = if server.is_empty() {
+        "NAME".to_string()
+    } else {
+        shell_arg(server)
+    };
+    format!(
+        "aeroftp-cli sync --profile {} {} {}{}",
+        profile,
+        shell_arg(local_dir),
+        shell_arg(remote_dir),
+        flags
+    )
+}
+
 async fn sync_doctor(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> {
     let server = normalize_server(args)?;
     let local_dir = get_str(args, "local_dir")?;
     let remote_dir = get_str(args, "remote_dir")?;
     validate_remote_path(&remote_dir, "remote_dir")?;
     let direction = get_str_opt(args, "direction").unwrap_or_else(|| "both".to_string());
+    // A fixed set: the value is written into the suggested command line.
+    if !matches!(direction.as_str(), "upload" | "download" | "both") {
+        return Err(ToolError::InvalidArgs {
+            tool: "aeroftp_sync_doctor".to_string(),
+            reason: format!(
+                "direction must be upload, download or both, got '{}'",
+                direction
+            ),
+        });
+    }
     let delete = get_bool_opt(args, "delete").unwrap_or(false);
     let track_renames = get_bool_opt(args, "track_renames").unwrap_or(false);
     let checksum = get_bool_opt(args, "checksum").unwrap_or(false);
@@ -2868,7 +2954,12 @@ async fn sync_doctor(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError
         risks.push("track-renames is disabled; moved files may be recopied".to_string());
     }
     if checksum {
-        risks.push("checksum is enabled; verification will be slower but stricter".to_string());
+        // `sync` compares size and mtime and has no --checksum; content
+        // verification is `check --checksum`, run after the sync.
+        risks.push(
+            "checksum requested: sync compares size and mtime; verify contents afterwards with `aeroftp-cli check --checksum`"
+                .to_string(),
+        );
     }
     if !remote_root_ok {
         risks.push("remote path could not be listed".to_string());
@@ -2877,19 +2968,20 @@ async fn sync_doctor(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError
         risks.push("both sides are empty; sync will be a no-op".to_string());
     }
 
-    let suggested_next_command = format!(
-        "aeroftp-cli sync \"{}\" \"{}\" --direction {} --dry-run --json{}{}{}",
-        local_dir.replace('"', "\\\""),
-        remote_dir.replace('"', "\\\""),
-        direction,
-        if delete { " --delete" } else { "" },
-        if track_renames {
-            " --track-renames"
-        } else {
-            ""
-        },
-        if checksum { " --checksum" } else { "" },
-    );
+    let mut flags = format!(" --direction {} --dry-run --json", direction);
+    if delete {
+        flags.push_str(" --delete");
+    }
+    if track_renames {
+        flags.push_str(" --track-renames");
+    }
+    for pattern in &exclude {
+        flags.push_str(&format!(
+            " --exclude {}",
+            crate::shell_quote::shell_arg(pattern)
+        ));
+    }
+    let suggested_next_command = suggest_sync_command(&server, &local_dir, &remote_dir, &flags);
 
     Ok(json!({
         "server": server,
@@ -3495,11 +3587,8 @@ async fn reconcile(ctx: &dyn ToolCtx, args: &Value) -> Result<Value, ToolError> 
     }
 
     let elapsed = started.elapsed().as_secs_f64();
-    let suggested_next_command = format!(
-        "aeroftp-cli sync \"{}\" \"{}\" --dry-run --json",
-        local_dir.replace('"', "\\\""),
-        remote_dir.replace('"', "\\\""),
-    );
+    let suggested_next_command =
+        suggest_sync_command(&server, &local_dir, &remote_dir, " --dry-run --json");
 
     let status = if differ_g.is_empty() && missing_remote_g.is_empty() && missing_local_g.is_empty()
     {
@@ -3730,6 +3819,21 @@ mod tests {
         /// that refuses control characters), switchable so a test can stand
         /// on the encoding side of the rule (Box/Dropbox/Jottacloud/OpenDrive).
         provider_type: Option<ProviderType>,
+        /// What `supports_atomic_replace` answers. True, matching the trait
+        /// default, unless a test stands on a set-aside backend.
+        atomic_replace: bool,
+        /// What `replace_sets_aside` answers. False, matching the trait
+        /// default: with `atomic_replace` false too, this is a backend whose
+        /// replace is its rename.
+        sets_aside: bool,
+        /// Unix mode per path, reported by `stat` as `-rw-r--r--`. A new
+        /// path gets 0644, the server default; `rename` moves the mode of
+        /// the file it moves, as an SFTP posix-rename does.
+        modes: Mutex<std::collections::HashMap<String, u32>>,
+        /// What `supports_chmod` answers.
+        chmod_supported: bool,
+        /// When set, `chmod` fails with this message.
+        chmod_fails_with: Option<String>,
     }
 
     impl FakeBackend {
@@ -3773,6 +3877,11 @@ mod tests {
                 mkdir_calls: Mutex::new(Vec::new()),
                 symlinks: std::collections::HashSet::new(),
                 provider_type: Some(ProviderType::Ftp),
+                atomic_replace: true,
+                sets_aside: false,
+                modes: Mutex::new(std::collections::HashMap::new()),
+                chmod_supported: false,
+                chmod_fails_with: None,
             }
         }
 
@@ -3811,6 +3920,23 @@ mod tests {
                 .ok_or_else(|| format!("not found: {path}"))?;
             let mut e = entry(path, is_dir, size);
             e.is_symlink = self.symlinks.contains(path);
+            e.permissions = self.modes.lock().unwrap().get(path).map(|mode| {
+                let bit = |mask: u32, letter: char| if mode & mask != 0 { letter } else { '-' };
+                [
+                    '-',
+                    bit(0o400, 'r'),
+                    bit(0o200, 'w'),
+                    bit(0o100, 'x'),
+                    bit(0o040, 'r'),
+                    bit(0o020, 'w'),
+                    bit(0o010, 'x'),
+                    bit(0o004, 'r'),
+                    bit(0o002, 'w'),
+                    bit(0o001, 'x'),
+                ]
+                .iter()
+                .collect()
+            });
             Ok(e)
         }
         async fn download_to_bytes(&self, _path: &str) -> Result<Vec<u8>, String> {
@@ -3853,6 +3979,11 @@ mod tests {
             Ok(data)
         }
         async fn upload_from_bytes(&self, data: &[u8], path: &str) -> Result<(), String> {
+            self.modes
+                .lock()
+                .unwrap()
+                .entry(path.to_string())
+                .or_insert(0o644);
             self.uploads
                 .lock()
                 .unwrap()
@@ -3891,6 +4022,22 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| "unused".to_string()))
         }
+        async fn supports_atomic_replace(&self) -> Result<bool, String> {
+            Ok(self.atomic_replace)
+        }
+        async fn replace_sets_aside(&self) -> Result<bool, String> {
+            Ok(self.sets_aside)
+        }
+        async fn supports_chmod(&self) -> Result<bool, String> {
+            Ok(self.chmod_supported)
+        }
+        async fn chmod(&self, path: &str, mode: u32) -> Result<(), String> {
+            if let Some(msg) = &self.chmod_fails_with {
+                return Err(msg.clone());
+            }
+            self.modes.lock().unwrap().insert(path.to_string(), mode);
+            Ok(())
+        }
         async fn rename(&self, from: &str, to: &str) -> Result<(), String> {
             if let Some(msg) = &self.rename_fails_with {
                 return Err(msg.clone());
@@ -3905,6 +4052,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(to.to_string(), data);
+            let moved = self.modes.lock().unwrap().remove(from);
+            if let Some(mode) = moved {
+                self.modes.lock().unwrap().insert(to.to_string(), mode);
+            }
             self.renames
                 .lock()
                 .unwrap()
@@ -4070,6 +4221,84 @@ mod tests {
         .unwrap_err();
         assert!(format!("{err:?}").contains("remote provider unavailable"));
         assert!(fake.remote_files.lock().unwrap().is_empty());
+    }
+
+    /// Split a command line the way `sh` does, by having `sh` print each
+    /// argument NUL-terminated.
+    #[cfg(unix)]
+    fn shell_split(line: &str) -> Vec<String> {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {line}"))
+            .output()
+            .expect("run sh");
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The suggested `sync` line carries values the caller chose. A real shell
+    /// splits it: a hostile profile name, local path and exclude pattern each
+    /// come back as one argument, byte for byte, and nothing runs. A direction
+    /// outside the fixed set is refused before it can reach the line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sync_doctor_suggestion_keeps_hostile_values_as_text() {
+        let fake = Arc::new(FakeBackend::sample());
+        let ctx = test_ctx(Arc::clone(&fake));
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let marker = tmp.path().join("pwned");
+        let local_dir = tmp.path().join(format!("$(touch {})", marker.display()));
+        std::fs::create_dir_all(&local_dir).expect("local dir");
+        let out = sync_doctor(
+            &ctx,
+            &json!({
+                "server": "`touch pwned` it's!",
+                "local_dir": local_dir.to_string_lossy(),
+                "remote_dir": "/root",
+                "direction": "download",
+                "exclude": ["$(rm -rf ~)"],
+            }),
+        )
+        .await
+        .expect("doctor runs");
+        let line = out["suggested_next_command"]
+            .as_str()
+            .expect("a suggestion");
+        let args = shell_split(line);
+        assert!(!marker.exists(), "a substitution ran: {line}");
+        assert_eq!(
+            args[..6],
+            [
+                "aeroftp-cli".to_string(),
+                "sync".to_string(),
+                "--profile".to_string(),
+                "`touch pwned` it's!".to_string(),
+                local_dir.to_string_lossy().into_owned(),
+                "/root".to_string(),
+            ],
+            "{line}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--exclude" && w[1] == "$(rm -rf ~)"),
+            "{args:?}"
+        );
+
+        let err = sync_doctor(
+            &ctx,
+            &json!({
+                "server": "s",
+                "local_dir": local_dir.to_string_lossy(),
+                "remote_dir": "/root",
+                "direction": "both; rm -rf ~",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("direction must be upload, download or both"));
     }
 
     /// Parent creation must reject a new restricted component before mkdir.
@@ -4716,6 +4945,204 @@ mod tests {
                 .unwrap()
                 .contains_key(&temp_path),
             "rename failure cleanup must remove the staged temp"
+        );
+    }
+
+    /// A set-aside backend refuses `edit` until `allow_non_atomic` is set,
+    /// and then publishes with `replace` rather than writing nothing.
+    #[tokio::test]
+    async fn edit_allow_non_atomic_replaces_when_the_backend_cannot() {
+        let mut fake = FakeBackend::sample();
+        fake.atomic_replace = false;
+        fake.sets_aside = true;
+        fake.downloads
+            .insert("/root/a.txt".to_string(), b"old text".to_vec());
+        let backend = Arc::new(fake);
+        let ctx = test_ctx(Arc::clone(&backend));
+
+        let err = edit(
+            &ctx,
+            &json!({
+                "server": "s",
+                "path": "/root/a.txt",
+                "find": "old",
+                "replace": "new",
+            }),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allow_non_atomic"),
+            "the refusal must name the opt-in, got: {msg}"
+        );
+        assert!(backend.uploads.lock().unwrap().is_empty());
+
+        let value = edit(
+            &ctx,
+            &json!({
+                "server": "s",
+                "path": "/root/a.txt",
+                "find": "old",
+                "replace": "new",
+                "allow_non_atomic": true,
+            }),
+        )
+        .await
+        .expect("opted-in edit publishes with replace");
+        assert_eq!(value["replacements"], json!(1));
+        assert_eq!(
+            backend
+                .remote_files
+                .lock()
+                .unwrap()
+                .get("/root/a.txt")
+                .map(Vec::as_slice),
+            Some(b"new text".as_slice())
+        );
+    }
+
+    /// M1 of the 4.2.1 closeout: on a backend whose replace is its rename
+    /// (Box, 4shared, Internxt, WorkDrive, GitHub, SFTP without
+    /// posix-rename...) `allow_non_atomic` uploaded the temporary, the
+    /// replace refused the taken name, and the temporary was deleted again:
+    /// something was written. The opt-in is now refused before the upload,
+    /// and neither refusal offers an opt-in that cannot work there.
+    #[tokio::test]
+    async fn edit_allow_non_atomic_refuses_a_rename_only_backend_before_it_uploads() {
+        let mut fake = FakeBackend::sample();
+        fake.atomic_replace = false;
+        fake.downloads
+            .insert("/root/a.txt".to_string(), b"old text".to_vec());
+        let backend = Arc::new(fake);
+        let ctx = test_ctx(Arc::clone(&backend));
+        let args = |allow_non_atomic: bool| {
+            json!({
+                "server": "s",
+                "path": "/root/a.txt",
+                "find": "old",
+                "replace": "new",
+                "allow_non_atomic": allow_non_atomic,
+            })
+        };
+
+        let opted_in = edit(&ctx, &args(true)).await.unwrap_err().to_string();
+        assert!(
+            backend.uploads.lock().unwrap().is_empty(),
+            "the opt-in must be refused before anything is staged: {opted_in}"
+        );
+        assert!(
+            backend.renames.lock().unwrap().is_empty(),
+            "nothing may be published: {opted_in}"
+        );
+        assert!(
+            opted_in.contains("Nothing was written")
+                && opted_in.contains("set the previous file aside"),
+            "the refusal must say why the opt-in cannot work here: {opted_in}"
+        );
+
+        let default = edit(&ctx, &args(false)).await.unwrap_err().to_string();
+        assert!(backend.uploads.lock().unwrap().is_empty());
+        assert!(
+            !default.contains("allow_non_atomic"),
+            "a rename-only backend must not be offered the opt-in: {default}"
+        );
+    }
+
+    fn edit_args() -> Value {
+        json!({
+            "server": "s",
+            "path": "/root/a.txt",
+            "find": "old",
+            "replace": "new",
+        })
+    }
+
+    /// M-A of the 4.2.1 closeout: the edit publishes a NEW file over the
+    /// target, so the mode of the old one was lost (on SFTP a 0600 `.env`
+    /// came back with the server default, 0644). It is copied onto the
+    /// temporary before the replace.
+    #[tokio::test]
+    async fn edit_keeps_the_mode_of_the_file_it_replaces() {
+        let mut fake = FakeBackend::sample();
+        fake.downloads
+            .insert("/root/a.txt".to_string(), b"old text".to_vec());
+        fake.chmod_supported = true;
+        fake.modes
+            .lock()
+            .unwrap()
+            .insert("/root/a.txt".to_string(), 0o600);
+        let backend = Arc::new(fake);
+        let ctx = test_ctx(Arc::clone(&backend));
+
+        let value = edit(&ctx, &edit_args()).await.expect("edit");
+
+        assert_eq!(value["replacements"], json!(1));
+        assert_eq!(
+            backend.modes.lock().unwrap().get("/root/a.txt").copied(),
+            Some(0o600),
+            "the edited file must keep its mode, not the server default"
+        );
+        assert!(value.get("warnings").is_none(), "{value}");
+    }
+
+    /// A chmod the server refuses does not fail an edit that is otherwise
+    /// done, and the answer says what was not kept.
+    #[tokio::test]
+    async fn edit_says_which_permissions_it_could_not_keep() {
+        let mut fake = FakeBackend::sample();
+        fake.downloads
+            .insert("/root/a.txt".to_string(), b"old text".to_vec());
+        fake.chmod_supported = true;
+        fake.chmod_fails_with = Some("SITE CHMOD refused".to_string());
+        fake.modes
+            .lock()
+            .unwrap()
+            .insert("/root/a.txt".to_string(), 0o600);
+        let backend = Arc::new(fake);
+        let ctx = test_ctx(Arc::clone(&backend));
+
+        let value = edit(&ctx, &edit_args()).await.expect("edit");
+
+        assert_eq!(
+            backend
+                .remote_files
+                .lock()
+                .unwrap()
+                .get("/root/a.txt")
+                .map(Vec::as_slice),
+            Some(b"new text".as_slice())
+        );
+        let warning = value["warnings"][0].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("0600") && warning.contains("SITE CHMOD refused"),
+            "the answer must name the mode that was not kept and why: {value}"
+        );
+    }
+
+    /// The replace would put a regular file in the link's place and leave
+    /// the file it points to unchanged. A link is refused before anything
+    /// is read or written.
+    #[tokio::test]
+    async fn edit_refuses_a_symlink_before_it_downloads() {
+        let mut fake = FakeBackend::sample();
+        fake.downloads
+            .insert("/root/a.txt".to_string(), b"old text".to_vec());
+        fake.symlinks.insert("/root/a.txt".to_string());
+        let backend = Arc::new(fake);
+        let ctx = test_ctx(Arc::clone(&backend));
+
+        let outcome = edit(&ctx, &edit_args()).await;
+
+        assert!(
+            backend.uploads.lock().unwrap().is_empty()
+                && backend.renames.lock().unwrap().is_empty(),
+            "nothing may be staged over a link: {outcome:?}"
+        );
+        let text = outcome.unwrap_err().to_string();
+        assert!(
+            text.contains("symbolic link") && text.contains("Nothing was written"),
+            "{text}"
         );
     }
 

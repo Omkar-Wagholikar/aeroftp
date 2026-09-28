@@ -784,6 +784,27 @@
             "keystoreBackup": "Vault Backup",
             "exportKeystore": "I-export ang Keystore",
             "importKeystore": "Mag-import ng Keystore",
+            "keystorePreviewButton": "Suriin ang mga pagbabago",
+            "keystorePreviewLoading": "Binabasa ang backup...",
+            "keystorePreviewTitle": "Mga profile ng server sa backup na ito",
+            "keystorePreviewNone": "Hindi binabago ng pag-import ng backup na ito ang iyong mga profile ng server.",
+            "keystorePreviewUnchanged": "Walang pagbabago: {count}",
+            "keystorePreviewReplaces": "Pinapalitan ng backup na ito ang listahan ng server mo: aalisin ang mga profile na nasa device na ito lang maliban kung itatabi mo.",
+            "keystorePreviewAdded": "Bago",
+            "keystorePreviewRemoved": "Nasa device na ito lang",
+            "keystorePreviewChanged": "Binago",
+            "keystorePreviewCredentials": "Magkaiba ang mga kredensyal",
+            "keystorePreviewOtherFields": "Binago rin: {fields}",
+            "keystoreDecisionAdd": "Idagdag",
+            "keystoreDecisionSkip": "Laktawan",
+            "keystoreDecisionRemove": "Alisin",
+            "keystoreDecisionKeep": "Itabi",
+            "keystoreDecisionUseBackup": "Gamitin ang backup",
+            "keystoreDecisionKeepLocal": "Itabi ang bersyon sa device na ito",
+            "keystoreDecisionKeepBoth": "Itabi pareho",
+            "keystoreCopyName": "{name} (mula sa backup)",
+            "keystorePreviewLocalFromVault": "Hindi mabasa ang listahan ng mga profile ng server ng device na ito, kaya ang paghahambing ay gumagamit ng listahan ng server na naka-save sa vault.",
+            "keystoreDecisionsFailed": "Tapos na ang pag-import, pero hindi nailapat ang mga pinili mo para sa mga profile ng server: {error}",
             "exportKeystoreDesc": "I-export ang lahat ng naka-encrypt na kredensyal sa backup file",
             "importKeystoreDesc": "Mag-import ng mga kredensyal mula sa backup file",
             "keystoreExported": "Matagumpay na na-export ang keystore ({count} entry)",
@@ -1172,7 +1193,8 @@
             "uiTokensReload": "I-reload",
             "uiTokensReset": "I-clear ang mga override",
             "uiTokensApplied": "Mga na-apply na override: {count}",
-            "uiTokensRejected": "Mga tinanggihang entry: {count}"
+            "uiTokensRejected": "Mga tinanggihang entry: {count}",
+            "keystorePreferencesFailed": "Tapos na ang pag-import, pero hindi naibalik ang mga kagustuhan mo sa app: {error}"
         },
         "devtools": {
             "title": "AeroTools",
@@ -2142,9 +2164,6 @@
                 "disk_error": "Error sa disk",
                 "unknown": "Hindi alam"
             },
-            "parallelStreams": "Streams",
-            "parallelSequential": "Sequential",
-            "parallelStreamLabel": "streams",
             "schedulerTitle": "Sync Scheduler",
             "schedulerEnabled": "I-enable ang Scheduler",
             "schedulerResume": "Ipagpatuloy",
@@ -2159,10 +2178,6 @@
             "watcherBackend": "Backend",
             "watcherInotifyWarning": "Mataas na bilang ng directory - maaaring lumampas sa inotify limit",
             "watcherPolling": "Gumagamit ng poll mode (mas mabagal ngunit pangkalahatan)",
-            "compressionToggle": "Kompresyon",
-            "compressionAuto": "Auto",
-            "compressionOn": "Naka-on",
-            "compressionOff": "Naka-off",
             "multiPathAdd": "Magdagdag ng Path Pair",
             "multiPathEmpty": "Walang naka-configure na path pairs",
             "templateExport": "I-export ang Template",
@@ -2175,9 +2190,9 @@
             "rollbackRestore": "Ibalik",
             "rollbackEmpty": "Walang available na mga snapshot",
             "speedManiac": "Maniac",
-            "speedManiacTooltip": "8 streams + LAHAT ng kaligtasan ay naka-disable - walang journal, walang verify, walang retry",
+            "speedManiacTooltip": "Walang journal, walang beripikasyon habang tumatakbo, binabalewala ang limitasyon ng bandwidth, 2 mabilis na retry. Bineberipika ang mga na-download na file pagkatapos ng run.",
             "maniacWarningTitle": "MANIAC MODE",
-            "maniacWarningBody": "Walang journal. Walang beripikasyon. Walang retry. Pinakamataas na bilis. Kung may mabigo, nawala na. Isang buong beripikasyon scan ay tatakbo pagkatapos ng sync.",
+            "maniacWarningBody": "Walang journal at walang beripikasyon habang tumatakbo, binabalewala ang limitasyon ng bandwidth, at 2 mabilis na retry lang ang nakukuha ng bigong file. Pagkatapos ng run, bineberipika ang mga na-download na file; hindi ang mga na-upload.",
             "maniacConfirm": "Nauunawaan ko, magpatuloy",
             "maniacPostSyncReport": "Beripikasyon pagkatapos ng sync: {ok} OK, {mismatches} hindi tugma, {failed} nabigo",
             "rollback": "Rollback",
@@ -2188,7 +2203,6 @@
             "templateExportDesc": "I-save ang kasalukuyang sync configuration bilang nababagong .aerosync template",
             "templateImportDesc": "Mag-load ng .aerosync template upang ilapat ang sync configuration nito",
             "maniacActive": "Aktibo",
-            "speedStreams": "{count} stream",
             "actionUploaded": "Na-upload",
             "actionDownloaded": "Na-download",
             "actionDeleted": "Tinanggal",
@@ -2246,9 +2260,8 @@
             "aerosyncScriptUnmappedFields": "Hindi kilalang metadata fields",
             "aerosyncScriptApplyButton": "I-save bilang preset",
             "aerosyncScriptAppliedToast": "Na-save ang na-import na preset. Buksan ang AeroSync upang gamitin ito.",
-            "compressionHint": "Kino-compress ang data habang inililipat para mapabilis ang transfer; hindi ito nag-iimbak ng mga naka-compress na file sa destinasyon. Nilalaktawan ng Auto ang mga format na naka-compress na (zip, jpg, mp4, at iba pa).",
             "canaryDryRun": "Walang inililipat: ipinapakita nito kung ano ang gagawin ng isang buong sync, kinakalkula mula sa sample. Ito ang katumbas na GUI ng utos na aeroftp-cli sync --dry-run (at ng --dry-run ng rclone).",
-            "templateImportPathPairs": "Nagtatakda ang template na ito ng {count} nagagamit na path pair. Isa lang eksakto ang inilalapat ng AeroFTP, kaya walang na-import. I-edit ang template para maiwan ang isang pares, pagkatapos ay i-import itong muli.",
+            "templateImportPathPairs": "Mga magagamit na lokal/remote na path pair sa template na ito: {count}. Gumagana ang isang AeroSync window sa eksaktong isang pares, kaya walang na-import. I-edit ang template para iisang pares na lang ang matira, pagkatapos ay i-import itong muli.",
             "templateNamePlaceholder": "hal. Backup tuwing gabi sa S3",
             "templateDescPlaceholder": "Para saan ang template na ito (opsyonal)"
         },
@@ -2421,7 +2434,8 @@
                 "rejectAllCalls": "Tanggihan lahat ng tool calls",
                 "rejectExecution": "Tanggihan ang tool execution",
                 "toggleDetails": "I-toggle ang mga detalye",
-                "allowSession": "Payagan para sa session na ito"
+                "allowSession": "Payagan para sa session na ito",
+                "nonAtomicReplace": "Hindi atomikong pagpapalit: pansamantalang nawawala ang file"
             },
             "settings": {
                 "title": "AI Settings",
@@ -5089,7 +5103,7 @@
             "toolbarButton": "AeroSync",
             "tabCompare": "Ihambing",
             "tabPlan": "Plano",
-            "tabSync": "I-sync",
+            "tabSync": "Lokal na mirror",
             "compareWontFitTitle": "Lampas sa mga limitasyon ng {name}: {count}",
             "compareWontFitHint": "Mas malaki ang mga file na ito kaysa sa dokumentadong limitasyon sa laki ng provider, o mas mahaba ang pangalan o path nila kaysa sa tinatanggap nito. Mabibigo ang sync sa mga ito: palitan ang pangalan, ilipat o hatiin muna.",
             "compareWontFitTooLarge": "{size}, limitasyon {limit}",
@@ -5097,6 +5111,78 @@
             "compareWontFitNameChars": "pangalang lampas {count} character",
             "compareWontFitPathBytes": "path na lampas {count} byte",
             "compareWontFitPathChars": "path na lampas {count} character",
+            "presetDefault": "Default",
+            "actionLabel": {
+                "skip": "Laktawan",
+                "copy-to-right": "Kopyahin → kanan",
+                "copy-to-left": "Kopyahin ← kaliwa",
+                "overwrite-right": "Patungan sa kanan",
+                "overwrite-left": "Patungan sa kaliwa",
+                "delete-right": "Burahin sa kanan",
+                "delete-left": "Burahin sa kaliwa",
+                "rename-to-right": "Panatilihin ang dalawa → kanan",
+                "rename-to-left": "Panatilihin ang dalawa ← kaliwa",
+                "conflict-skip": "Salungatan (laktawan)"
+            },
+            "conflictPolicyOption": {
+                "skip": {
+                    "label": "Laktawan",
+                    "tagline": "Hinahayaang hindi nagagalaw ang mga salungatan sa magkabilang panig."
+                },
+                "rename": {
+                    "label": "Panatilihin ang dalawa",
+                    "tagline": "Kinokopya ang bersyon ng pinagmulan na may hulaping petsa at oras."
+                },
+                "newer-wins": {
+                    "label": "Mas bago ang panalo",
+                    "tagline": "Ang panig na may mas bagong oras ng pagbabago ang papatong sa kabila."
+                },
+                "older-wins": {
+                    "label": "Mas luma ang panalo",
+                    "tagline": "Ang mas lumang panig ang papatong sa mas bago (para sa pag-archive)."
+                },
+                "larger-wins": {
+                    "label": "Mas malaki ang panalo",
+                    "tagline": "Ang panig na may mas malaking sukat ang papatong sa mas maliit."
+                },
+                "smaller-wins": {
+                    "label": "Mas maliit ang panalo",
+                    "tagline": "Ang mas maliit na panig ang papatong sa mas malaki."
+                }
+            },
+            "bucketName": {
+                "only-left": "Nasa kaliwa lamang",
+                "newer-left": "Mas bago sa kaliwa",
+                "only-right": "Nasa kanan lamang",
+                "newer-right": "Mas bago sa kanan",
+                "conflict": "Salungatan",
+                "same": "Pareho"
+            },
+            "bucketDescription": {
+                "only-left": "Nasa panel ng pinagmulan, wala sa destinasyon.",
+                "newer-left": "Nasa magkabilang panig, mas bago ang tatak ng oras ng kopya sa pinagmulan.",
+                "only-right": "Nasa destinasyon, wala sa panel ng pinagmulan.",
+                "newer-right": "Nasa magkabilang panig, mas bago ang tatak ng oras ng kopya sa destinasyon.",
+                "conflict": "Nasa magkabilang panig ang entry pero magkaiba ang sukat kahit magkalapit ang mga tatak ng oras.",
+                "same": "Tugma ang mga entry ayon sa aktibong patakaran sa paghahambing."
+            },
+            "comparePolicy": {
+                "sizeOnly": "Sukat lamang",
+                "mtimeOnly": "Tatak ng oras lamang",
+                "sizeAndMtime": "Sukat + tatak ng oras"
+            },
+            "compareTable": {
+                "name": "Pangalan",
+                "leftSize": "Sukat sa kaliwa",
+                "rightSize": "Sukat sa kanan",
+                "leftModified": "Binago sa kaliwa",
+                "rightModified": "Binago sa kanan",
+                "folder": "folder",
+                "noEntries": "Walang entry.",
+                "countedNotListed": "Binilang pero hindi inilista: iniuulat ng pag-scan ang magkakaparehong file bilang kabuuan sa halip na tig-iisang hilera, para manatiling mabilis ang malalaking puno ng folder.",
+                "shown": "Ipinapakita: {shown} sa {total}",
+                "moreNotListed": "Binilang pero hindi inilista: {count}"
+            },
             "compareUnavailable": "Magbukas ng pangalawang panel o malayuang koneksyon upang ihambing.",
             "planUnavailable": "Kailangan ng resulta ng paghahambing bago pumili ng preset. Buksan muna ang tab na Ihambing.",
             "totalEntries": "Kabuuang mga entry",
@@ -5133,7 +5219,7 @@
             "ignoredForMirror": "BINALEWALA PARA SA MIRROR",
             "versionedBackup": "Naka-version na backup",
             "enable": "Paganahin",
-            "versionedBackupHint": "Kunin ang kopya ng destinasyon sa direktoryong ito bago ang bawat pag-overwrite o pagtanggal.",
+            "versionedBackupHint": "Bago ma-overwrite o mabura ang isang file, inililipat ang kopya nito sa destinasyon papunta sa {dir}, sa isang folder na ipinangalan sa petsa at oras ng run.",
             "actionable": "Maaksyunan",
             "reportCopiedRight": "Kinopya sa kanan",
             "reportCopiedLeft": "Kinopya sa kaliwa",
@@ -5155,7 +5241,6 @@
             "executePreset": "Isagawa ang preset",
             "execute": "Isagawa",
             "sync": {
-                "title": "AeroSync: lokal sa lokal",
                 "description": "Sinasalamin ang lokal na source directory papunta sa lokal na destinasyon. Ang mga file na ≥ 1 MiB ay gumagamit ng built-in na delta engine; ang mas maliliit na file ay gumagamit ng direktang kopya.",
                 "source": "Pinagmulan",
                 "destination": "Destinasyon",
@@ -5211,7 +5296,7 @@
             "speedMode_fast": "Mabilis",
             "speedMode_turbo": "Turbo",
             "speedMode_extreme": "Sukdulan",
-            "speedModeHint": "Mga parallel stream + preset ng compression na inilapat sa pagtakbo.",
+            "speedModeHint": "Itinatakda ang patakaran sa retry. Mula Mabilis pataas, ipinapadala bilang delta ang mga nagbagong file kung sinusuportahan ng server (SFTP na may rsync).",
             "verifyPolicy": "Patakaran sa pagberipika",
             "verifyPolicy_none": "Wala",
             "verifyPolicy_size_only": "Sukat lamang",
@@ -5256,7 +5341,45 @@
             "errorCorrection": "Pagwawasto ng Error",
             "errorCorrectionHint": "Nag-iimbak ng maliit na .aerocorrect parity file sa tabi ng bawat naka-backup na file, upang ang isang remote na kopyang nasira ng bit-rot ay maaayos sa susunod na pull, nang walang orihinal.",
             "outOfSyncItemsPct": "Mga item na hindi naka-sync",
-            "outOfSyncBytesPct": "Mga byte na hindi naka-sync"
+            "outOfSyncBytesPct": "Mga byte na hindi naka-sync",
+            "exclude": {
+                "label": "Mga pattern ng pagbubukod",
+                "hint": "Pinaghihiwalay ng kuwit o bagong linya, halimbawa cache, *.tmp o build/output. Laging hindi kasama: {list}."
+            },
+            "cli": {
+                "title": "Parehong pagtakbo mula sa command line",
+                "copy": "Kopyahin",
+                "copied": "Nakopya",
+                "copyFailed": "Nabigo ang pagkopya",
+                "none": "Walang eksaktong katumbas sa CLI: {reason}",
+                "reason": {
+                    "localPair": "para sa dalawang lokal na folder, pinapatakbo ng CLI ang sarili nitong mirror, na hindi pinapansin ang mga setting ng direksyon, pagbura at salungatan.",
+                    "unsavedServer": "hindi naka-save na server ang koneksyong ito, at kailangan ng CLI ng isa para pangalanan ito gamit ang --profile.",
+                    "overwritesNewer": "ino-overwrite ng CLI ang kopya sa destinasyon na iba ang laki kahit mas bago ito, na hindi kailanman ginagawa ng preset na ito.",
+                    "twoWay": "itinuturing ng CLI na salungatan ang dalawang kopyang pareho ang laki pero magkaiba ang oras at ino-overwrite ang mas luma; itinuturing ng planong ito na pareho sila kung nasa loob ng 30 segundo.",
+                    "canary": "walang Canary na pagsubok ang CLI.",
+                    "versionedBackup": "hindi pa itinatago ng CLI ang mga backup sa parehong ayos.",
+                    "transferBudget": "kapag naubos ang budget, humihinto ang planong ito, kasama ang mga pagbura; nililimitahan lang ng CLI ang mga paglipat at nagbubura pa rin.",
+                    "remotePath": "tinutukoy ng CLI ang remote na folder batay sa panimulang folder ng naka-save na server at mapupunta sa ibang folder.",
+                    "exclusions": "iba ang pagtutugma ng CLI sa mga pattern ng pagbubukod, kaya hindi nito lalaktawan ang lahat ng nilalaktawan ng planong ito (node_modules, .git at iba pa)."
+                }
+            },
+            "rescan": "I-scan muli",
+            "rescanNeeded": "Ginawa ang paghahambing gamit ang ibang pagbubukod o ibang backup na folder. I-scan muli bago patakbuhin.",
+            "backup": {
+                "checking": "Sinusuri kung paano naglilipat ng mga file ang server na ito...",
+                "serverCopy": "Hindi sinusuportahan ng server na ito ang paglipat: bawat itinatagong kopya ay kinokopya sa server at saka binubura. Katumbas iyon ng buong kopya ng bawat file na itinatago, sa dalawang magkahiwalay na hakbang.",
+                "clientCopy": "Hindi sinusuportahan ng server na ito ang paglipat: bawat itinatagong kopya ay dina-download, ina-upload sa backup folder at saka binubura. Bawat file na itinatago ay dumadaan nang dalawang beses sa computer na ito, sa magkahiwalay na hakbang.",
+                "unsupported": "Hindi kayang ilipat ng server na ito ang mga file sa ibang folder, kaya hindi ito makapagtatago ng mga lumang kopya. I-off ang naka-version na backup para tumakbo.",
+                "checkFailed": "Hindi matanong ang server kung paano ito naglilipat ng mga file. Kumonekta muli, o i-off ang naka-version na backup para tumakbo.",
+                "nested": "Nasa loob ng {folder} ang backup folder, kung saan nagsusulat ang sync na ito. Pumili ng folder sa labas nito.",
+                "invalid": {
+                    "empty": "Maglagay ng pangalan para sa backup folder.",
+                    "absolute": "Gumamit ng folder sa loob ng destinasyon, hindi absolute path.",
+                    "parent": "Hindi puwedeng maglaman ng '..' ang backup folder.",
+                    "name": "Hindi valid ang pangalang ito ng backup folder."
+                }
+            }
         },
         "accountLock": {
             "title": "Pumili ng account",
@@ -5502,7 +5625,12 @@
             "defaultSaltNeedsStronger": "Maglagay ng malakas na binuong password para i-on ang default na salt.",
             "defaultSaltOneSaltNote": "Iisa lang ang salt: 32 byte, pampubliko, pareho para sa bawat vault na gumagamit ng default na salt.",
             "defaultSaltValueLabel": "Pampublikong default na salt (AeroCrypt v3), SHA-256 ng",
-            "defaultSaltTierMeaning": "Ang default na salt ay nangangahulugang ang password lamang ang nagbubukas ng vault: wala nang iba pang dapat dalhin, at wala nang iba pang nagpoprotekta rito."
+            "defaultSaltTierMeaning": "Ang default na salt ay nangangahulugang ang password lamang ang nagbubukas ng vault: wala nang iba pang dapat dalhin, at wala nang iba pang nagpoprotekta rito.",
+            "pastedObscured": "Na-paste mula sa rclone.conf (nakakubli)",
+            "pastedObscuredHint": "Piliin lamang ang \"Na-paste mula sa rclone.conf\" kung kinopya mo ang value na ito mula sa isang rclone.conf file, kung saan ito itinatago ng rclone nang nakakubli.",
+            "formNotRecorded": "Hindi naitala: na-save ang value na ito bago nagtanong ang AeroFTP. Piliin kung paano ito inilagay; ang value na in-import ng AeroFTP mula sa rclone.conf ay na-save bilang na-type.",
+            "secretFormTyped": "Na-type",
+            "secretFormChangeConfirm": "Binabago nito kung paano binabasa ang naka-save na value, at kaya pati ang key na nagbubukas sa mga file: tanging ang tamang pagpili ang magbubukas sa mga ito. Baguhin ang pagpiling ito?"
         },
         "modalGuard": {
             "busyTitle": "May isinasagawang operasyon",
@@ -5767,10 +5895,17 @@
             }
         },
         "flatpak": {
-            "importBody": "May natagpuang umiiral na configuration ang AeroFTP sa iyong home folder. Ang Flatpak install na ito ay gumagamit ng sarili nitong hiwalay na storage, kaya hindi pa nakikita rito ang iyong mga na-save na server at naka-encrypt na vault. Iimport ba ang mga ito ngayon? Kinokopya lang ang mga file, walang na-o-overwrite, at na-a-unlock ang iyong vault dito sa parehong paraan tulad ngayon.",
+            "importBody": "May natagpuang umiiral na configuration ang AeroFTP sa iyong home folder. Ang Flatpak install na ito ay gumagamit ng sarili nitong hiwalay na storage, kaya hindi pa nakikita rito ang iyong mga na-save na server at naka-encrypt na vault. I-import ba ang iyong configuration ngayon? Kinokopya lang ang mga file, at hindi kailanman na-o-overwrite ang file na mayroon na ang Flatpak install na ito.",
             "importAccept": "Import",
             "importedBody": "Na-import ang iyong configuration. I-restart ang AeroFTP para i-load ang iyong mga server at vault.",
-            "restartNow": "I-restart ngayon"
+            "restartNow": "I-restart ngayon",
+            "importNothingBody": "Walang file na nakopya: mayroon nang file na may parehong pangalan ang Flatpak install na ito para sa bawat file na kokopyahin sana ng pag-import, at hindi kailanman na-o-overwrite ang mga umiiral na file.",
+            "importFailedBody": "Huminto ang pag-import dahil sa error: {error}. Ang mga file na na-kopya na sa Flatpak install na ito ay nananatili roon, at walang na-overwrite. Muling iaalok ng AeroFTP ang pag-import sa susunod na pagsisimula.",
+            "importedNoVaultBody": "Na-import ang iyong configuration, pero wala itong na-save na server o vault na maaaring kopyahin ng pag-import. I-restart ang AeroFTP para i-load ang na-import.",
+            "importedVaultSkippedBody": "Na-import ang bahagi ng iyong configuration, pero hindi ang iyong mga na-save na server at vault: may sarili nang vault ang Flatpak install na ito, at hindi kailanman na-o-overwrite ang mga umiiral na file. I-restart ang AeroFTP para i-load ang na-import.",
+            "importNothingVaultSkippedBody": "Walang file na nakopya, kaya hindi na-import ang iyong mga na-save na server at vault: may sarili nang vault ang Flatpak install na ito at mayroon na rin itong file na may parehong pangalan para sa bawat file na kokopyahin sana ng pag-import, at hindi kailanman na-o-overwrite ang mga umiiral na file.",
+            "importUnreadableResult": "hindi nagawang basahin ng AeroFTP ang resulta ng pag-import",
+            "importNothingToImportBody": "Walang file na nakopya: walang file sa iyong umiiral na configuration na kinokopya ng pag-import (hindi kailanman kinokopya ang mga simbolikong link at pansamantalang file ng SQLite)."
         },
         "picker": {
             "unavailable": {

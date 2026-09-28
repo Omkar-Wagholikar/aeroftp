@@ -11,11 +11,18 @@ use globset::GlobBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
+use suppaftp::tokio::{
+    AsyncRustlsConnector, AsyncRustlsFtpStream, AsyncRustlsStream, TransferStream,
+};
 use suppaftp::types::FileType;
 use suppaftp::{FtpError, Status};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
+
+/// The data connection of one transfer. It finishes itself: `finish()` closes
+/// it (TLS `close_notify`, then FIN) and reads the completion reply on the
+/// control channel.
+type FtpTransfer = TransferStream<AsyncRustlsStream>;
 
 use super::checksum_matrix;
 use super::multi_thread::{
@@ -70,8 +77,9 @@ pub struct FtpProvider {
     mlsd_broken: bool,
     /// Whether server supports MFMT (RFC 3659) for setting remote file mtime
     mfmt_supported: bool,
-    /// Whether server supports HASH, XMD5, XCRC, or XSHA1 for remote checksums
-    hash_supported: Option<String>,
+    /// Remote digest commands the server advertised in FEAT, and the
+    /// algorithm `HASH` has selected on this session.
+    hash: FtpHashSupport,
     /// Set to true if ExplicitIfAvailable mode fell back to plaintext
     pub tls_downgraded: bool,
     /// Buffer size for download/upload (default: 8 KB)
@@ -105,7 +113,7 @@ impl FtpProvider {
             mlst_supported: false,
             mlsd_broken: false,
             mfmt_supported: false,
-            hash_supported: None,
+            hash: FtpHashSupport::default(),
             tls_downgraded: false,
             buffer_size: FTP_DOWNLOAD_BUFFER_DEFAULT,
             connection_spec: None,
@@ -335,6 +343,14 @@ impl FtpProvider {
     /// a `426 Failure reading network stream` into a completed transfer. What
     /// stands is the reason for the cap, not the list of clients that share
     /// it.
+    ///
+    /// Uploads depend on the cap too. An upload never reads its data
+    /// connection, and under TLS 1.3 a server sends a NewSessionTicket on
+    /// every one: closing a socket with unread bytes makes the kernel send a
+    /// reset instead of a FIN, and the tail of the file is lost (a `426`, or a
+    /// truncated file confirmed with `226`). `finish()` shuts down and closes
+    /// without reading, so raising the cap needs a drain before the close.
+    /// `the_ftps_connector_negotiates_tls_1_2` fails if the cap is raised.
     fn make_tls_connector(&self) -> Result<AsyncRustlsConnector, ProviderError> {
         // Name the crypto backend explicitly rather than relying on rustls'
         // process-level default. Both `aws-lc-rs` and `ring` are in the
@@ -399,6 +415,25 @@ impl FtpProvider {
     // also reports the rows it could not read. MLSD still comes through here.
     fn parse_mlsd_entry(&self, line: &str, base_path: &str) -> Option<RemoteEntry> {
         super::ftp_listing::parse_mlsd_entry(line, base_path)
+    }
+
+    /// The error of the reply that ends a transfer, read after the data. A
+    /// refusal there (`4xx`, `5xx`: `451`, `452`, `552`) is the server's
+    /// verdict on this transfer, not a session out of step, and it is phrased
+    /// without the "invalid response" that `is_stale_data_connection_error`
+    /// reads as one: the callers that reconnect and try again on a stale
+    /// session sent the whole file a second time for a refusal.
+    fn transfer_verdict_error(err: FtpError) -> ProviderError {
+        match err {
+            FtpError::UnexpectedResponse(response)
+                if matches!(response.status.code() / 100, 4 | 5) =>
+            {
+                ProviderError::TransferFailed(format!(
+                    "the server refused the transfer: {response}"
+                ))
+            }
+            other => ProviderError::TransferFailed(other.to_string()),
+        }
     }
 
     fn is_stale_data_connection_error(err: &ProviderError) -> bool {
@@ -721,6 +756,51 @@ impl FtpProvider {
         }
 
         Ok(entries)
+    }
+
+    /// Whether the server is known to hold an item at `to` other than
+    /// `from`. When the listing cannot be read (a write-only folder whose
+    /// LIST is refused, a dropped data connection) SIZE asks for `to` alone
+    /// and needs no listing: a server that answers it holds a file there,
+    /// the one item a Unix server's RNTO would overwrite. A look that still
+    /// cannot be made answers no: it is unknown, not occupied, and the rename
+    /// goes out as it did before the look existed. Narrowed, not closed: a
+    /// server that refuses both LIST and SIZE there overwrites a file the
+    /// look could not see. Refusing instead would make every rename in such
+    /// a folder fail.
+    ///
+    /// A rename that only changes the letter case needs its own look: on a
+    /// case-insensitive server a stat of the new spelling finds the source
+    /// itself. There the parent listing decides, since it names each entry
+    /// as stored: only an entry spelled exactly like `to` is another item.
+    async fn holds_another_item_at(&mut self, from: &str, to: &str) -> bool {
+        if from.to_lowercase() != to.to_lowercase() {
+            return match self.stat(to).await {
+                Ok(_) => true,
+                Err(ProviderError::NotFound(_)) => false,
+                Err(_) => self.size(to).await.is_ok(),
+            };
+        }
+        let (parent, name) = match to.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some((parent, name)) => (parent, name),
+            None => ("", to),
+        };
+        match self.list(parent).await {
+            Ok(entries) => entries.iter().any(|entry| entry.name == name),
+            Err(_) => false,
+        }
+    }
+
+    /// RNFR `from`, RNTO `to`.
+    async fn rename_on_server(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
+        self.redial_if_a_reply_is_pending().await?;
+        let stream = self.stream_mut()?;
+        stream
+            .rename(from, to)
+            .await
+            .map_err(|e| ProviderError::ServerError(e.to_string()))?;
+        Ok(())
     }
 
     /// CWD into `target`, returning where the SERVER says we were.
@@ -1063,7 +1143,12 @@ impl FtpProvider {
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| "/".to_string());
-                if let Some(entry) = self.parse_mlsd_entry(mlst_line.trim(), &parent) {
+                if let Some(mut entry) = self.parse_mlsd_entry(mlst_line.trim(), &parent) {
+                    // Facts without a size, which RFC 3659 allows: ask SIZE,
+                    // as below for a LIST row.
+                    if !entry.is_dir && super::ftp_listing::size_is_unreadable(&entry) {
+                        self.read_size_into(path, &mut entry).await;
+                    }
                     return Ok(entry);
                 }
             }
@@ -1098,11 +1183,19 @@ impl FtpProvider {
         // fix, it is the proven one put where all three surfaces reach it, and
         // the CLI helper goes away in the same change.
         if !entry.is_dir && entry.size == 0 {
-            if let Ok(size) = self.size_inner(path).await {
-                entry.size = size;
-            }
+            self.read_size_into(path, &mut entry).await;
         }
         Ok(entry)
+    }
+
+    /// Ask SIZE for `entry`'s size. What it answers is the file's size, so a
+    /// marker saying the listing could not read one no longer applies; when
+    /// SIZE fails, the entry is left as it was.
+    async fn read_size_into(&mut self, path: &str, entry: &mut RemoteEntry) {
+        if let Ok(size) = self.size_inner(path).await {
+            entry.size = size;
+            entry.metadata.remove(super::ftp_listing::SIZE_UNREADABLE);
+        }
     }
 
     async fn size_inner(&mut self, path: &str) -> Result<u64, ProviderError> {
@@ -1212,6 +1305,23 @@ impl StorageProvider for FtpProvider {
             .await
             .map_err(|e| ProviderError::AuthenticationFailed(e.to_string()))?;
 
+        // Implicit FTPS encrypts the session from the first byte, but a server
+        // keeps the data connections in the clear until the client asks for
+        // them to be protected, as in explicit FTPS (RFC 4217: `PBSZ 0`, then
+        // `PROT P`). suppaftp's implicit connect wraps every data connection
+        // in TLS without sending either, so against a server that honours the
+        // default (vsftpd) every transfer died in the data handshake.
+        if matches!(self.config.tls_mode, FtpTlsMode::Implicit) {
+            for command in ["PBSZ 0", "PROT P"] {
+                stream
+                    .custom_command(command, &[Status::CommandOk])
+                    .await
+                    .map_err(|e| {
+                        ProviderError::ConnectionFailed(format!("{command} refused: {e}"))
+                    })?;
+            }
+        }
+
         // Set binary transfer mode
         stream
             .transfer_type(FileType::Binary)
@@ -1246,30 +1356,19 @@ impl StorageProvider for FtpProvider {
                 self.mlsd_supported = server_supports_mlsd && !self.mlsd_broken;
                 self.mlst_supported = features.contains_key("MLST");
                 self.mfmt_supported = features.contains_key("MFMT");
-                // B3: Detect hash/checksum commands (prefer HASH > XMD5 > XCRC > XSHA1)
-                self.hash_supported = if features.contains_key("HASH") {
-                    Some("HASH".to_string())
-                } else if features.contains_key("XMD5") {
-                    Some("XMD5".to_string())
-                } else if features.contains_key("XCRC") {
-                    Some("XCRC".to_string())
-                } else if features.contains_key("XSHA1") {
-                    Some("XSHA1".to_string())
-                } else {
-                    None
-                };
+                self.hash = FtpHashSupport::from_features(&features);
                 tracing::debug!(
-                    "FTP FEAT: MLSD={}, MFMT={}, HASH={:?}",
+                    "FTP FEAT: MLSD={}, MFMT={}, digests={:?}",
                     self.mlsd_supported,
                     self.mfmt_supported,
-                    self.hash_supported
+                    self.hash
                 );
             }
             Err(_) => {
                 self.mlsd_supported = false;
                 self.mlst_supported = false;
                 self.mfmt_supported = false;
-                self.hash_supported = None;
+                self.hash = FtpHashSupport::default();
             }
         };
 
@@ -1538,15 +1637,13 @@ impl StorageProvider for FtpProvider {
                 break;
             }
         }
-        let data_stream = channel.finish()?;
         let bytes_read = data.len();
 
         // Finalize the stream
-        let stream = self.stream.as_mut().ok_or(ProviderError::NotConnected)?;
-        stream
-            .finalize_retr_stream(data_stream)
-            .await
-            .map_err(|e| ProviderError::TransferFailed(e.to_string()))?;
+        channel
+            .close()
+            .await?
+            .map_err(Self::transfer_verdict_error)?;
 
         if bytes_read as u64 > limit {
             return Err(ProviderError::TransferFailed(format!(
@@ -1706,14 +1803,31 @@ impl StorageProvider for FtpProvider {
         self.rmdir(path).await
     }
 
+    /// RNFR/RNTO, after refusing an occupied destination. The trait promises
+    /// no overwrite, and RNTO onto an existing file replaces it on most Unix
+    /// servers (vsftpd, ProFTPD and Pure-FTPd rename over it) while others
+    /// refuse. FTP has no conditional rename, so the destination is looked up
+    /// first; a file written there between the look and the RNTO is still
+    /// overwritten on the servers that overwrite.
     async fn rename(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
-        self.redial_if_a_reply_is_pending().await?;
-        let stream = self.stream_mut()?;
-        stream
-            .rename(from, to)
-            .await
-            .map_err(|e| ProviderError::ServerError(e.to_string()))?;
-        Ok(())
+        let (from, to) = (from.trim_end_matches('/'), to.trim_end_matches('/'));
+        if from == to {
+            return Ok(());
+        }
+        if self.holds_another_item_at(from, to).await {
+            return Err(ProviderError::AlreadyExists(to.to_string()));
+        }
+        self.rename_on_server(from, to).await
+    }
+
+    /// RNFR/RNTO without the look: where the server renames over an existing
+    /// file it does so in one step (the POSIX rename it maps to is atomic);
+    /// where it refuses, so does this.
+    async fn replace(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
+        if from.trim_end_matches('/') == to.trim_end_matches('/') {
+            return Ok(());
+        }
+        self.rename_on_server(from, to).await
     }
 
     async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
@@ -1914,17 +2028,15 @@ impl StorageProvider for FtpProvider {
 
         // The channel is released AFTER the local flush, not before: its `Drop`
         // is the only thing that poisons the session, and a flush that fails
-        // between the two would otherwise drop an unfinalised stream while
-        // leaving the session alive, with the `226` unread for the next command
-        // to collect as its own answer.
+        // between the two would otherwise drop an unfinished stream while
+        // leaving the session alive. suppaftp 12 drains that `226` before the
+        // next command, so it is no longer read as that command's answer, but
+        // the transfer's own verdict would be lost with it.
         file.flush().await.map_err(ProviderError::IoError)?;
-        let data_stream = channel.finish()?;
-
-        let stream = self.stream.as_mut().ok_or(ProviderError::NotConnected)?;
-        stream
-            .finalize_retr_stream(data_stream)
-            .await
-            .map_err(|e| ProviderError::TransferFailed(e.to_string()))?;
+        channel
+            .close()
+            .await?
+            .map_err(Self::transfer_verdict_error)?;
 
         Ok(())
     }
@@ -2012,24 +2124,14 @@ impl StorageProvider for FtpProvider {
         }
 
         channel.flush().await?;
-        // The same end-of-data signal as `upload_single`: our close, then the
-        // server's, bounded so a server that never closes cannot hang the resume
-        // where it can no longer hang the upload.
-        channel.shutdown().await?;
-
-        let mut data_stream = channel.finish()?;
-        let _ = tokio::time::timeout(DATA_DRAIN_BUDGET, drain_to_eof(&mut data_stream)).await;
-
-        let stream = self.stream.as_mut().ok_or(ProviderError::NotConnected)?;
-        if let Err(e) = stream
-            .finalize_put_stream(AlreadyShutDown(data_stream))
-            .await
-        {
+        // The end of data as `upload_single` signals it: `close` sends our
+        // close_notify and FIN after the last byte, then reads the 226.
+        if let Err(e) = channel.close().await? {
             // The finalise is the last word on the transfer. A failure here
             // leaves the control channel mid-sentence, and the guard is already
             // settled, so nothing else would discard it: do it here.
             self.stream = None;
-            return Err(ProviderError::TransferFailed(e.to_string()));
+            return Err(Self::transfer_verdict_error(e));
         }
 
         if let Some(progress) = on_progress {
@@ -2058,47 +2160,52 @@ impl StorageProvider for FtpProvider {
     }
 
     fn supports_checksum(&self) -> bool {
-        self.hash_supported.is_some()
+        self.hash.any()
+    }
+
+    /// MLSD dates are UTC to the second (RFC 3659). A session that lists with
+    /// `LIST` (no MLSD, or MLSD that broke, which never comes back) reads the
+    /// server's local time with no zone, so its dates are not comparable.
+    fn mtime_precision(&self) -> Option<std::time::Duration> {
+        self.mlsd_supported
+            .then_some(std::time::Duration::from_secs(1))
     }
 
     /// Narrowed to what THIS server advertised in FEAT, which is the whole
-    /// point on FTP: the matrix lists the four algorithms the protocol can
-    /// carry, but a server offering only `XCRC` can produce CRC32 and nothing
-    /// else, and the user should read that instead of clicking to find out.
-    /// `HASH` alone is negotiated per request (the server picks the
-    /// algorithm), so it keeps the flag and the full list.
+    /// point on FTP: the matrix lists the algorithms the protocol can carry,
+    /// but a server whose `HASH` line lists SHA-1 and SHA-256, or which
+    /// offers only `XCRC`, can produce those and nothing else, and the user
+    /// should read that instead of clicking to find out. A `HASH` line that
+    /// lists no algorithm says nothing about them, so the matrix stands.
     fn checksum_capability(&self, _path: &str) -> ChecksumCapability {
-        let Some(cmd) = self.hash_supported.as_deref() else {
+        if !self.hash.any() {
             return ChecksumCapability::default();
-        };
+        }
         let base = checksum_matrix::capability(self.provider_type());
-        match cmd {
-            "HASH" => base,
-            "XMD5" => ChecksumCapability {
-                algorithms: vec!["md5".to_string()],
-                negotiated: false,
-                ..base
-            },
-            "XSHA1" => ChecksumCapability {
-                algorithms: vec!["sha1".to_string()],
-                negotiated: false,
-                ..base
-            },
-            "XCRC" => ChecksumCapability {
-                algorithms: vec!["crc32".to_string()],
-                negotiated: false,
-                ..base
-            },
-            _ => ChecksumCapability::default(),
+        match self.hash.offered() {
+            Some(algorithms) => ChecksumCapability { algorithms, ..base },
+            None => base,
         }
     }
 
+    /// With no algorithm asked for, SHA-256 when the server offers it, since
+    /// that is the one the sync engine compares; otherwise whatever the
+    /// server has selected for `HASH`, or its first legacy verb.
     async fn checksum(
         &mut self,
         path: &str,
     ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
         self.redial_if_a_reply_is_pending().await?;
-        self.remote_checksum(path).await
+        self.remote_checksum(path, None).await
+    }
+
+    async fn checksum_for(
+        &mut self,
+        path: &str,
+        algorithm: &str,
+    ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
+        self.redial_if_a_reply_is_pending().await?;
+        self.remote_checksum(path, Some(algorithm)).await
     }
 
     fn transfer_optimization_hints(&self) -> super::TransferOptimizationHints {
@@ -2272,18 +2379,41 @@ impl StorageProvider for FtpProvider {
             }
             total_read += n;
         }
-        let data_stream = channel.finish()?;
+        let read_whole = total_read == len as usize;
         buf.truncate(total_read);
 
-        // Bounded FTP reads intentionally stop before EOF. Some servers will report an
-        // error while finalizing that partial RETR; when that happens we proactively
-        // disconnect so the disposable chunk connection cannot be reused in a bad state.
-        let finalize_result = {
-            let stream = self.stream.as_mut().ok_or(ProviderError::NotConnected)?;
-            stream.finalize_retr_stream(data_stream).await
-        };
-        if finalize_result.is_err() {
+        if read_whole {
+            // Bounded FTP reads intentionally stop before EOF. The bytes asked
+            // for arrived whole, over TCP or TLS, and what the server says about
+            // the early close concerns only the part it did not send; servers
+            // say different things (`426` on vsftpd and ProFTPD, a `150 ...
+            // seconds (measured here)` rate line on Pure-FTPd, which reuses the
+            // code of its last reply). Any reply is accepted, and a session
+            // that did not end on `226` or `250` is closed rather than trusted. A server
+            // that never answers is not waited for past the budget: the
+            // dropped close takes the session.
+            match tokio::time::timeout(EARLY_STOP_BUDGET, channel.close()).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(err))) => {
+                    tracing::debug!(
+                        "reading a range of {path}: {err} after the range was read whole"
+                    );
+                    let _ = self.disconnect().await;
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+            return Ok(buf);
+        }
+
+        // A read that ended SHORT of the range is another matter: a file that
+        // ends inside the range is confirmed with `226`, and an error after a
+        // short read is the server cutting the transfer, so those bytes are not
+        // the range.
+        if let Err(err) = channel.close().await? {
             let _ = self.disconnect().await;
+            return Err(ProviderError::TransferFailed(format!(
+                "reading a range of {path}: the server ended the transfer after {total_read} of {len} bytes: {err}"
+            )));
         }
 
         Ok(buf)
@@ -2319,6 +2449,248 @@ fn canonical_hash_key(server_algo: &str) -> String {
         _ => return norm.to_ascii_lowercase(),
     }
     .to_string()
+}
+
+/// The legacy digest verbs, each bound to one algorithm, in the order a
+/// caller with no preference is served by them.
+const LEGACY_HASH_VERBS: &[(&str, &str)] = &[("XMD5", "md5"), ("XCRC", "crc32"), ("XSHA1", "sha1")];
+
+/// The algorithms the digest tab can show, in the order it lists them.
+/// Anything else a server advertises is left out of the capability.
+const FTP_OFFERED_ORDER: &[&str] = &["md5", "sha1", "sha256", "sha512", "crc32"];
+
+/// How draft-bryan-ftp-hash spells an algorithm, for a `HASH` line that
+/// lists none and so gives no spelling of its own.
+fn draft_hash_label(key: &str) -> Option<&'static str> {
+    match key {
+        "md5" => Some("MD5"),
+        "sha1" => Some("SHA-1"),
+        "sha256" => Some("SHA-256"),
+        "sha512" => Some("SHA-512"),
+        "crc32" => Some("CRC32"),
+        _ => None,
+    }
+}
+
+/// What a server offers for remote digests, read from FEAT.
+///
+/// `HASH` (draft-bryan-ftp-hash) computes with the algorithm the CLIENT has
+/// selected with `OPTS HASH`, from the list the FEAT line gives, with the
+/// current one marked `*`: `HASH SHA-1;SHA-256*;SHA-512;MD5`. A client that
+/// never selects gets the server's current algorithm for every request,
+/// whatever it wanted. The legacy verbs (`XMD5`, `XSHA1`, `XCRC`) take no
+/// selection: each computes its own algorithm.
+#[derive(Debug, Clone, Default)]
+struct FtpHashSupport {
+    /// `HASH` is advertised.
+    hash: bool,
+    /// The algorithms its FEAT line lists, in the server's own spelling,
+    /// which is what `OPTS HASH` has to send back. Empty when the line lists
+    /// none.
+    hash_algorithms: Vec<String>,
+    /// The algorithm `HASH` uses right now on this session: the one FEAT
+    /// marks `*`, then the last one `OPTS HASH` selected. `None` when not
+    /// known, and then the algorithm is always selected before hashing.
+    /// Reset with the rest of this struct at every `connect()`, which reads
+    /// FEAT again on the new session.
+    hash_selected: Option<String>,
+    /// The legacy verbs advertised, from [`LEGACY_HASH_VERBS`].
+    legacy: Vec<&'static str>,
+}
+
+/// How one digest request goes on the wire.
+#[derive(Debug, PartialEq)]
+enum HashRoute {
+    /// `HASH`, after `OPTS HASH <select>` when `select` is set.
+    Hash { select: Option<String> },
+    /// A legacy verb and the canonical key of the algorithm it computes.
+    Legacy(&'static str, &'static str),
+}
+
+impl FtpHashSupport {
+    fn from_features(features: &suppaftp::types::Features) -> Self {
+        let (hash_algorithms, hash_selected) = features
+            .get("HASH")
+            .and_then(|value| value.as_deref())
+            .map(parse_hash_feat)
+            .unwrap_or_default();
+        Self {
+            hash: features.contains_key("HASH"),
+            hash_algorithms,
+            hash_selected,
+            legacy: LEGACY_HASH_VERBS
+                .iter()
+                .map(|(verb, _)| *verb)
+                .filter(|verb| features.contains_key(*verb))
+                .collect(),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.hash || !self.legacy.is_empty()
+    }
+
+    /// The canonical keys this server can produce, in the digest tab's
+    /// order, or `None` when a `HASH` line without a list leaves that
+    /// unknown.
+    fn offered(&self) -> Option<Vec<String>> {
+        if self.hash && self.hash_algorithms.is_empty() {
+            return None;
+        }
+        let mut keys: Vec<String> = self
+            .hash_algorithms
+            .iter()
+            .map(|label| canonical_hash_key(label))
+            .collect();
+        keys.extend(
+            LEGACY_HASH_VERBS
+                .iter()
+                .filter(|(verb, _)| self.legacy.contains(verb))
+                .map(|(_, key)| key.to_string()),
+        );
+        Some(
+            FTP_OFFERED_ORDER
+                .iter()
+                .filter(|key| keys.iter().any(|k| k == *key))
+                .map(|key| key.to_string())
+                .collect(),
+        )
+    }
+
+    /// How to compute the algorithm with canonical key `key`: `HASH` when its
+    /// FEAT line lists it, the legacy verb bound to it otherwise, and `HASH`
+    /// in the draft's spelling when the line lists nothing, letting the
+    /// server refuse. `None` when the server has no way to compute it.
+    fn route(&self, key: &str) -> Option<HashRoute> {
+        let listed = if self.hash {
+            self.hash_algorithms
+                .iter()
+                .find(|label| canonical_hash_key(label) == key)
+                .cloned()
+        } else {
+            None
+        };
+        let label = match listed {
+            Some(label) => label,
+            None => {
+                if let Some(&(verb, key)) = LEGACY_HASH_VERBS
+                    .iter()
+                    .find(|(verb, k)| *k == key && self.legacy.contains(verb))
+                {
+                    return Some(HashRoute::Legacy(verb, key));
+                }
+                if !(self.hash && self.hash_algorithms.is_empty()) {
+                    return None;
+                }
+                draft_hash_label(key)?.to_string()
+            }
+        };
+        let already_selected = self
+            .hash_selected
+            .as_deref()
+            .is_some_and(|selected| selected.eq_ignore_ascii_case(&label));
+        Some(HashRoute::Hash {
+            select: (!already_selected).then_some(label),
+        })
+    }
+
+    /// The route for a caller with no preference: SHA-256 when the server
+    /// lists it or has it selected, because that is the digest the sync
+    /// engine compares; otherwise `HASH` with whatever the server has
+    /// selected, or the first legacy verb.
+    fn default_route(&self) -> Option<HashRoute> {
+        let sha256_known = self
+            .hash_algorithms
+            .iter()
+            .chain(self.hash_selected.iter())
+            .any(|label| canonical_hash_key(label) == "sha256");
+        if self.hash && sha256_known {
+            return self.route("sha256");
+        }
+        if self.hash {
+            return Some(HashRoute::Hash { select: None });
+        }
+        LEGACY_HASH_VERBS
+            .iter()
+            .find(|(verb, _)| self.legacy.contains(verb))
+            .map(|&(verb, key)| HashRoute::Legacy(verb, key))
+    }
+}
+
+/// The algorithms a FEAT `HASH` line lists, in the server's spelling, and the
+/// one it marks `*` as currently selected.
+fn parse_hash_feat(value: &str) -> (Vec<String>, Option<String>) {
+    let mut algorithms = Vec::new();
+    let mut selected = None;
+    for entry in value.split(';') {
+        let entry = entry.trim();
+        let (label, is_selected) = match entry.strip_suffix('*') {
+            Some(label) => (label.trim(), true),
+            None => (entry, false),
+        };
+        if label.is_empty() {
+            continue;
+        }
+        if is_selected {
+            selected = Some(label.to_string());
+        }
+        algorithms.push(label.to_string());
+    }
+    (algorithms, selected)
+}
+
+/// The lines of an FTP reply without their status code, last line first.
+/// suppaftp hands a custom command's reply back whole, `213 ` and line
+/// endings included, and a multi-line reply puts its answer on the final
+/// line: ProFTPD's mod_digest opens with `213-Computing SHA-1 digest`.
+fn reply_lines(body: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            let bytes = line.as_bytes();
+            let coded = bytes.len() >= 4
+                && bytes[..3].iter().all(u8::is_ascii_digit)
+                && matches!(bytes[3], b' ' | b'-');
+            if coded {
+                line[4..].trim().to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .rev()
+        .collect()
+}
+
+fn is_hex_digest(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A `HASH` reply, `<algo> <start>-<end> <hex> <path>`, as the canonical key
+/// of the algorithm it names and the lowercase digest. `None` for anything
+/// else, rather than a field taken from the wrong position.
+fn parse_hash_reply(body: &[u8]) -> Option<(String, String)> {
+    reply_lines(body).iter().find_map(|line| {
+        let fields: Vec<&str> = line.splitn(4, ' ').collect();
+        let (algo, hex) = match fields.as_slice() {
+            [algo, _range, hex, ..] => (*algo, *hex),
+            _ => return None,
+        };
+        is_hex_digest(hex).then(|| (canonical_hash_key(algo), hex.to_ascii_lowercase()))
+    })
+}
+
+/// A legacy verb's reply, `<code> <HEX>`, some servers appending the path.
+fn parse_legacy_reply(body: &[u8]) -> Option<String> {
+    reply_lines(body).iter().find_map(|line| {
+        let token = line.split_whitespace().next()?;
+        let token = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .unwrap_or(token);
+        is_hex_digest(token).then(|| token.to_ascii_lowercase())
+    })
 }
 
 /// How long a data transfer may go without a single byte arriving.
@@ -2364,52 +2736,6 @@ const OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 const LIST_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 
 const DATA_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
-
-/// How long an upload waits for the server to close the data connection after
-/// our FIN before reading the 226 anyway. A compliant server closes as soon as
-/// it has read to EOF, so this only bounds a server that never does.
-const DATA_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Read a data stream until the peer's EOF, discarding the bytes: the only
-/// thing a STOR data connection can carry back is the close itself.
-async fn drain_to_eof<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) {
-    use tokio::io::AsyncReadExt;
-    let mut sink = [0u8; 1024];
-    while let Ok(n) = stream.read(&mut sink).await {
-        if n == 0 {
-            break;
-        }
-    }
-}
-
-/// A data stream that has already been shut down and drained: suppaftp's
-/// `finalize_put_stream` calls `shutdown()` on what it is given, and a second
-/// shutdown on a socket the peer has already closed can fail with "not
-/// connected" after a transfer that succeeded. Writes still go through, so a
-/// misuse is loud rather than silent.
-struct AlreadyShutDown<S>(S);
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for AlreadyShutDown<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(cx)
-    }
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
 
 /// How long the data may stay silent AFTER the server has spoken on control.
 ///
@@ -2488,16 +2814,15 @@ enum DataStep {
 impl FtpProvider {
     /// The one way out of a data transfer that has failed.
     ///
-    /// Leaving a data loop early drops the `DataStream` and never calls
-    /// `finalize`, so inside `suppaftp` the private `data_connection_open`
-    /// stays true and the completion reply stays unread on the control
-    /// channel. What happens next depends on what the caller does next, and
-    /// one of the two is bad: another data command trips
-    /// `guard_multiple_data_connections` and is recognised as a stale
-    /// connection, which reconnects and works, while a CONTROL command reads
-    /// the stale `226 Transfer complete` as its own reply and fails saying the
-    /// previous operation succeeded. An error that names the success of
-    /// something else is the worst kind of message to hand a user.
+    /// Leaving a data loop early drops the transfer without `finish()`. Under
+    /// suppaftp 10 that left the completion reply unread, and the next CONTROL
+    /// command read the stale `226 Transfer complete` as its own reply and
+    /// failed saying the previous operation succeeded. suppaftp 12 flags the
+    /// reply of a dropped transfer as pending and drains it before the next
+    /// command, so that message is gone, but the drain has no deadline, it
+    /// only logs a failed verdict, and a download keeps the server sending
+    /// until it notices the closed socket. ABOR stops the server and reads the
+    /// verdict, under a budget.
     ///
     /// Those exits were rare before this change and are not any more: a
     /// deadline and a refusal were added to five loops. A defect made common by
@@ -2518,9 +2843,10 @@ impl FtpProvider {
     /// dropped from outside never reaches it: dropping an async fn runs the
     /// destructors of its locals and none of the code that follows. The
     /// transfer executor wraps a download in `tokio::time::timeout` and lets
-    /// the future fall on expiry, so on that path the session is left exactly
-    /// as this function exists to prevent, and the retry that follows reuses
-    /// the same connection. Moving that deadline inside the data loop would
+    /// the future fall on expiry, so on that path the transfer is dropped
+    /// without ABOR: suppaftp drains its reply before the next command on the
+    /// same connection, with no deadline of its own, and the retry that follows
+    /// reuses that connection. Moving that deadline inside the data loop would
     /// turn it into an ordinary error return and bring it back through here,
     /// which is where the shared data-loop primitive will put it anyway.
     ///
@@ -2529,10 +2855,7 @@ impl FtpProvider {
     /// STOR, and because a shared data-loop primitive is being built on top of
     /// these call sites: five copies would have to be unified and re-reviewed
     /// one by one.
-    async fn abandon_transfer<S>(&mut self, data_stream: S) -> SessionAfterAbandon
-    where
-        S: tokio::io::AsyncRead + Unpin + 'static,
-    {
+    async fn abandon_transfer(&mut self, data_stream: FtpTransfer) -> SessionAfterAbandon {
         // Five seconds, and the asymmetry here points the OPPOSITE way to the
         // one on the transfer deadlines above, which is worth saying because
         // the two constants sit near each other and a reader who assumes they
@@ -2572,17 +2895,19 @@ impl FtpProvider {
 /// a door that a closure would have kept shut: the caller's body is full of `?`,
 /// and an early return there drops this value without running any cleanup,
 /// because dropping a future does not execute what follows the await. That is
-/// the same shape as the executor dropping a download mid-RETR, which is how a
-/// session ends up answering the next question with the previous answer.
+/// the same shape as the executor dropping a download mid-RETR, which under
+/// suppaftp 10 left a session answering the next question with the previous
+/// answer; suppaftp 12 drains that reply first, but the transfer's verdict is
+/// lost and the session's state is nobody's.
 /// `Drop` cannot abort: aborting has to speak on the wire and `Drop` is not
 /// async. So it does the one thing it can do synchronously, and takes the
 /// session away. The next operation dials again instead of inheriting a channel
 /// whose state nobody knows. A session that is thrown away costs a reconnect; a
 /// session in an unknown state costs a wrong answer delivered as a right one.
-struct DataChannel<'p, S> {
+struct DataChannel<'p> {
     provider: &'p mut FtpProvider,
-    /// `None` once the stream has been handed back or given away.
-    data: Option<S>,
+    /// `None` once the stream has been closed or given away.
+    data: Option<FtpTransfer>,
     watch: ControlWatch,
     /// Named in the error, so a failure says which operation was in flight.
     operation: &'static str,
@@ -2592,11 +2917,13 @@ struct DataChannel<'p, S> {
     settled: bool,
 }
 
-impl<'p, S> DataChannel<'p, S>
-where
-    S: tokio::io::AsyncRead + Unpin + 'static,
-{
-    fn new(provider: &'p mut FtpProvider, data: S, operation: &'static str, path: &str) -> Self {
+impl<'p> DataChannel<'p> {
+    fn new(
+        provider: &'p mut FtpProvider,
+        data: FtpTransfer,
+        operation: &'static str,
+        path: &str,
+    ) -> Self {
         Self {
             provider,
             data: Some(data),
@@ -2623,13 +2950,16 @@ where
                 .stream
                 .as_ref()
                 .ok_or(ProviderError::NotConnected)?;
-            let control = stream.get_ref();
+            // The control channel, locked for this one read: the data reads
+            // never take that lock, and `finish` / `abort`, which do, run only
+            // after the guard is dropped at the end of this block.
+            let control = stream.get_ref().await;
             // Replies the control reader has already pulled off the socket
             // and not yet consumed. A peek on the bare socket is blind to
             // them, and they are exactly where a fast refusal hides.
-            let buffered = stream.buffered_reply_bytes();
+            let buffered = control.buffered_reply_bytes();
             let data = data.as_mut().ok_or(ProviderError::NotConnected)?;
-            FtpProvider::read_watching_control(data, control, buffered, buf, watch).await
+            FtpProvider::read_watching_control(data, &control, buffered, buf, watch).await
         };
         match step {
             Ok(DataStep::Read(n)) => Ok(n),
@@ -2664,11 +2994,19 @@ where
         self.settled = true;
     }
 
-    /// The transfer ended on its own terms: hand the stream back so the caller
-    /// finalises it exactly as it did before.
-    fn finish(mut self) -> Result<S, ProviderError> {
+    /// The transfer ended on its own terms: close the data stream and read
+    /// the server's verdict on it, and give that verdict to the caller, who
+    /// decides what it means for this transfer.
+    ///
+    /// The verdict is read under the guard. A caller dropped while it waits
+    /// (a cancelled transfer) leaves a reply owed on the control channel,
+    /// which suppaftp 12 would wait for before the next command, with no
+    /// deadline: until the verdict is in, `Drop` takes the session.
+    async fn close(mut self) -> Result<suppaftp::FtpResult<()>, ProviderError> {
+        let data = self.data.take().ok_or(ProviderError::NotConnected)?;
+        let verdict = data.finish().await;
         self.settled = true;
-        self.data.take().ok_or(ProviderError::NotConnected)
+        Ok(verdict)
     }
 }
 
@@ -2680,13 +3018,7 @@ where
 /// same for the upload path, which until now had five exits that returned
 /// while the server still considered the data channel open.
 ///
-/// The bound adds `AsyncWrite` to the one `read` already needs, and the upload
-/// stream satisfies both: the resume path reads from it too, to drain the tail
-/// after its own shutdown. That is why this half could always have existed.
-impl<'p, S> DataChannel<'p, S>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
-{
+impl DataChannel<'_> {
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), ProviderError> {
         let outcome = match self.data.as_mut() {
             Some(data) => data.write_all(buf).await,
@@ -2703,15 +3035,7 @@ where
         self.settle_write(outcome, "Flush error").await
     }
 
-    async fn shutdown(&mut self) -> Result<(), ProviderError> {
-        let outcome = match self.data.as_mut() {
-            Some(data) => data.shutdown().await,
-            None => return Err(ProviderError::NotConnected),
-        };
-        self.settle_write(outcome, "Data close error").await
-    }
-
-    /// One place decides what a write failure does, so the three above cannot
+    /// One place decides what a write failure does, so the two above cannot
     /// drift apart: give the channel away, then report.
     async fn settle_write(
         &mut self,
@@ -2728,7 +3052,7 @@ where
     }
 }
 
-impl<'p, S> Drop for DataChannel<'p, S> {
+impl Drop for DataChannel<'_> {
     fn drop(&mut self) {
         if !self.settled {
             // Nothing here can await, so the session cannot be closed politely.
@@ -2831,7 +3155,7 @@ impl FtpProvider {
     async fn after_timed_out_open(&mut self, operation: &'static str, path: &str) -> ProviderError {
         let queued = match self.stream.as_ref() {
             Some(stream) => {
-                let control = stream.get_ref();
+                let control = stream.get_ref().await;
                 let mut probe = [0u8; 1];
                 let mut got = tokio::io::ReadBuf::new(&mut probe);
                 std::future::poll_fn(|cx| {
@@ -2987,13 +3311,13 @@ impl FtpProvider {
     async fn redial_if_a_reply_is_pending(&mut self) -> Result<(), ProviderError> {
         let pending = match self.stream.as_ref() {
             Some(stream) => {
-                if !stream.buffered_reply_bytes().is_empty() {
+                let control = stream.get_ref().await;
+                if !control.buffered_reply_bytes().is_empty() {
                     true
                 } else {
                     // The reader's buffer is empty; the socket may still hold
                     // a reply the reader never pulled. One non-blocking peek,
                     // the same probe `after_timed_out_open` uses.
-                    let control = stream.get_ref();
                     let mut probe = [0u8; 1];
                     let mut got = tokio::io::ReadBuf::new(&mut probe);
                     std::future::poll_fn(|cx| {
@@ -3171,7 +3495,7 @@ impl FtpProvider {
     ///
     /// A reply is only acted on when it is a refusal. 4yz and 5yz end the wait;
     /// 2yz is the ordinary completion reply, which arrives on this channel too
-    /// and must be left alone for `finalize_retr_stream` to consume, or the
+    /// and must be left alone for `finish` to consume, or the
     /// tail of a perfectly good transfer would be thrown away.
     ///
     /// TWO PLACES are watched, because a reply can wait in either. `control`
@@ -3217,15 +3541,10 @@ impl FtpProvider {
             // and the reader's buffer, which the peek cannot see.
             let mut probe = [0u8; 1];
             let mut got = tokio::io::ReadBuf::new(&mut probe);
-            // Polled exactly once and always Ready: "is there something now",
-            // never "wait until there is".
-            let queued = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(match control.poll_peek(cx, &mut got) {
-                    std::task::Poll::Ready(Ok(bytes)) => bytes,
-                    _ => 0,
-                })
-            })
-            .await;
+            let queued = match Self::peek_once(control, &mut got).await {
+                std::task::Poll::Ready(Ok(bytes)) => bytes,
+                _ => 0,
+            };
             return if queued > 0 || !buffered.is_empty() {
                 Ok(DataStep::ControlRefused)
             } else {
@@ -3246,32 +3565,70 @@ impl FtpProvider {
                 }
             };
         }
-        tokio::select! {
-            biased;
-            _ = control.readable() => {
-                // Non-blocking on purpose: `readable()` can wake spuriously,
-                // and an awaiting `peek` would then stall the data loop it was
-                // meant to protect.
-                let mut probe = [0u8; 1];
-                let mut got = tokio::io::ReadBuf::new(&mut probe);
-                let peeked = std::future::poll_fn(|cx| control.poll_peek(cx, &mut got))
-                    .await
-                    .unwrap_or(0);
-                let first = got.filled().first().copied();
-                match first {
-                    Some(b'4') | Some(b'5') if peeked > 0 => Ok(DataStep::ControlRefused),
-                    // Anything else: a completion reply, a TLS record whose
-                    // content cannot be read, or a spurious wake. The server
-                    // spoke or may have; either way the classification is not
-                    // available and the deadline takes over.
-                    _ => {
-                        *watch = ControlWatch::Spoke;
-                        Self::read_with_deadline(data, buf, DATA_IDLE_AFTER_CONTROL_SPOKE).await
+        // A wake whose peek finds nothing is looked at once more before it is
+        // taken for the server having spoken. On Windows tokio clears read
+        // readiness after a short read only on epoll and kqueue, so the
+        // readiness the read of the `150` left is still set at the first data
+        // read of every transfer: that wake is empty, and taking it for a
+        // reply ran the whole transfer on the short deadline. The peek that
+        // found nothing cleared the readiness, so the second `readable()`
+        // waits for real bytes; a second empty wake goes to the deadline, and
+        // the loop cannot spin.
+        let mut looked_again = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = control.readable() => {
+                    // Non-blocking on purpose: `readable()` can wake spuriously,
+                    // and an awaiting `peek` would then stall the data loop it
+                    // was meant to protect.
+                    let mut probe = [0u8; 1];
+                    let mut got = tokio::io::ReadBuf::new(&mut probe);
+                    let peeked = Self::peek_once(control, &mut got).await;
+                    match peeked {
+                        std::task::Poll::Pending if !looked_again => {
+                            looked_again = true;
+                            continue;
+                        }
+                        std::task::Poll::Ready(Ok(bytes))
+                            if bytes > 0 && matches!(got.filled().first(), Some(b'4' | b'5')) =>
+                        {
+                            return Ok(DataStep::ControlRefused);
+                        }
+                        // Anything else: a completion reply, a TLS record whose
+                        // content cannot be read, or a spurious wake. The server
+                        // spoke or may have; either way the classification is
+                        // not available and the deadline takes over.
+                        _ => {
+                            *watch = ControlWatch::Spoke;
+                            return Self::read_with_deadline(
+                                data,
+                                buf,
+                                DATA_IDLE_AFTER_CONTROL_SPOKE,
+                            )
+                            .await;
+                        }
                     }
                 }
+                step = Self::read_with_deadline(data, buf, DATA_IDLE_TIMEOUT) => return step,
             }
-            step = Self::read_with_deadline(data, buf, DATA_IDLE_TIMEOUT) => step,
         }
+    }
+
+    /// Peek the control socket once: "is there something now", never "wait
+    /// until there is" (an awaited peek could wait on a channel with nothing
+    /// to say). Outside the task's cooperative budget, which the control lock
+    /// in `DataChannel::read` also draws on: with the budget spent the peek
+    /// would answer `Pending` whatever is queued, and a refusal already in the
+    /// socket would be read up to the short deadline late.
+    async fn peek_once(
+        control: &tokio::net::TcpStream,
+        got: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        tokio::task::unconstrained(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(control.poll_peek(cx, got))
+        }))
+        .await
     }
 
     /// One data read that cannot wait for ever.
@@ -3350,17 +3707,13 @@ impl FtpProvider {
 
         // Released after the commit, for the reason given in `resume_download`:
         // `commit` renames and fsyncs, so it fails on a full disk or across
-        // devices, and until the channel is given up its `Drop` is what keeps
-        // that failure from leaving a live session with an unread `226`.
+        // devices, and until the channel is given up its `Drop` is what takes
+        // the session when that failure drops an unfinished transfer.
         atomic.commit().await.map_err(ProviderError::IoError)?;
-        let data_stream = channel.finish()?;
-
-        // Finalize the stream - need to get stream again after the borrow
-        let stream = self.stream.as_mut().ok_or(ProviderError::NotConnected)?;
-        stream
-            .finalize_retr_stream(data_stream)
-            .await
-            .map_err(|e| ProviderError::TransferFailed(e.to_string()))?;
+        channel
+            .close()
+            .await?
+            .map_err(Self::transfer_verdict_error)?;
 
         Ok(())
     }
@@ -3388,7 +3741,13 @@ impl FtpProvider {
         let mut file = tokio::fs::File::open(local_path)
             .await
             .map_err(ProviderError::IoError)?;
-        let total_size = file.metadata().await.map_err(ProviderError::IoError)?.len();
+        let local_meta = file.metadata().await.map_err(ProviderError::IoError)?;
+        let total_size = local_meta.len();
+        // The time MFMT stamps on the remote at the end, read from the open
+        // file as the upload starts. Read from the path once it is over, it was
+        // the time of a save made meanwhile, lent to bytes that are not that
+        // save's: a sync then read the pair as identical.
+        let local_modified = local_meta.modified().ok();
 
         // Open streaming upload channel (PASV + STOR), under the same cap as the
         // reads: the two unbounded awaits live in `data_command`, which every
@@ -3397,20 +3756,43 @@ impl FtpProvider {
             Ok(opened) => opened,
             Err(err) => return Err(self.refused_store(remote_path, err)),
         };
-        let mut data_stream = match opened {
+        let data_stream = match opened {
             Some(data_stream) => data_stream,
             None => return Err(self.after_timed_out_open("uploading", remote_path).await),
         };
 
+        // Every way out before the end aborts the transfer and fails the
+        // upload. Dropping the data connection instead closes it cleanly, and
+        // the server reads that as the end of the file: it stores the part it
+        // received as the whole file and confirms it with `226`. ABOR asks it
+        // to abort, and its verdict is read under a budget; a server blocked in
+        // the read (vsftpd by default) may still store and confirm the part,
+        // then answer the ABOR, so the guarantee is the client's error, not the
+        // server's file. The channel aborts for a failed write; the local read
+        // is not a channel operation, so its failure aborts here. A caller that
+        // drops this upload (a cancelled transfer) cannot abort, since that has
+        // to speak on the wire: the channel's `Drop` takes the session instead,
+        // so no later command waits, with no deadline, for this transfer's
+        // reply.
+        let mut channel = DataChannel::new(self, data_stream, "uploading", remote_path);
+
         // Write in 64KB chunks for optimal throughput
         let mut chunk = [0u8; 65536];
         let mut total_written: u64 = 0;
-
         loop {
-            let n = file
-                .read(&mut chunk)
-                .await
-                .map_err(ProviderError::IoError)?;
+            let n = match file.read(&mut chunk).await {
+                Ok(n) => n,
+                Err(e) => {
+                    channel.abandon().await;
+                    drop(channel);
+                    // The ABOR can draw two replies (vsftpd: `226` for the part
+                    // it stored, then `225 No transfer to ABOR`), and the
+                    // second one may land after the next command has started,
+                    // to be read as its answer: the session is not handed on.
+                    self.stream = None;
+                    return Err(ProviderError::IoError(e));
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -3419,66 +3801,51 @@ impl FtpProvider {
                 n as u64,
             )
             .await;
-            data_stream
-                .write_all(&chunk[..n])
-                .await
-                .map_err(|e| ProviderError::TransferFailed(format!("Data write error: {}", e)))?;
+            channel.write_all(&chunk[..n]).await?;
             total_written += n as u64;
             if let Some(ref progress) = on_progress {
                 progress(total_written, total_size);
             }
         }
-
         // Flush all (TLS) buffers to the wire
-        data_stream
-            .flush()
-            .await
-            .map_err(|e| ProviderError::TransferFailed(format!("Flush error: {}", e)))?;
+        channel.flush().await?;
 
-        // End of data, with a signal instead of a guess. This used to sleep
-        // `min(2 s, size / 4096 ms)` on TLS connections so the kernel could
-        // drain the last records before close_notify: a fixed two seconds on
-        // every upload of 8 MiB or more, which the DAG engine review measured
-        // as a constant 3 s overshoot on a 10 s rate-capped upload (rclone:
-        // 0.8 s). The real signal is the server closing the data connection
-        // once it has read to EOF, so we send our close_notify and FIN, read
-        // until the server's EOF (bounded, so a server that never closes
-        // cannot hang the upload), and only then let suppaftp read the 226.
-        // The wrapper keeps suppaftp's own `shutdown()` from touching a socket
-        // that is already fully closed on both sides.
-        data_stream
-            .shutdown()
-            .await
-            .map_err(|e| ProviderError::TransferFailed(format!("Data close error: {}", e)))?;
-        let _ = tokio::time::timeout(DATA_DRAIN_BUDGET, drain_to_eof(&mut data_stream)).await;
-
-        // Finalize: reads 226 from the control channel (the stream is closed).
-        stream
-            .finalize_put_stream(AlreadyShutDown(data_stream))
-            .await
-            .map_err(|e| ProviderError::TransferFailed(e.to_string()))?;
+        // End of data. `close` sends our close_notify and FIN after the last
+        // byte, closes the socket and reads the 226: the server writes the
+        // file once it reads that EOF, and it has nothing to send on a STOR
+        // data connection before it (the TLS 1.2 cap in `make_tls_connector`
+        // keeps TLS 1.3 post-handshake tickets off it), so closing does not
+        // race unread bytes into a reset. It replaces our own shutdown, drain to the
+        // server's EOF and second shutdown kept harmless by a wrapper: under
+        // suppaftp 12 a second shutdown of a socket closed on both sides
+        // fails with "not connected", and `finish` reports that failure for
+        // an upload even after a 226. A shutdown error is still reported, as
+        // before. Over TLS it can hide the server's refusal (M3, suppaftp's
+        // own semantics): a server that rejects the file at the end (`552`)
+        // and resets the data connection makes our close_notify fail with a
+        // broken pipe, which is what `finish` returns, and the stale-session
+        // check then retries the upload against a permanent refusal. Plain
+        // TCP is not affected: a shutdown after a reset is Ok, and the `552`
+        // is read. The fix belongs in the fork or upstream: the reply first,
+        // the shutdown error only when the reply is Ok.
+        channel
+            .close()
+            .await?
+            .map_err(Self::transfer_verdict_error)?;
 
         // Preserve local file's mtime on the remote file via MFMT (draft-somers-ftp-mfxx).
         // MFMT is a standalone FTP command, NOT a SITE sub-command.
         // Best practice: FileZilla, WinSCP, lftp all do this after upload.
         if self.mfmt_supported {
-            if let Ok(local_meta) = std::fs::metadata(local_path) {
-                if let Ok(mtime) = local_meta.modified() {
-                    if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                        let dt = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0);
-                        if let Some(dt) = dt {
-                            let mfmt_time = dt.format("%Y%m%d%H%M%S").to_string();
-                            if let Some(stream) = self.stream.as_mut() {
-                                // MFMT <time-val> <pathname>: expects 213 response
-                                let cmd = format!("MFMT {} {}", mfmt_time, remote_path);
-                                if let Err(e) =
-                                    stream.custom_command(&cmd, &[suppaftp::Status::File]).await
-                                {
-                                    tracing::debug!("FTP MFMT failed (non-fatal): {}", e);
-                                }
-                            }
-                        }
-                    }
+            let mfmt_time = local_modified
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|duration| chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0))
+                .map(|dt| dt.format("%Y%m%d%H%M%S").to_string());
+            if let (Some(mfmt_time), Some(stream)) = (mfmt_time, self.stream.as_mut()) {
+                // MFMT <time-val> <pathname>: expects 213 response
+                let cmd = format!("MFMT {} {}", mfmt_time, remote_path);
+                if let Err(e) = stream.custom_command(&cmd, &[suppaftp::Status::File]).await {
+                    tracing::debug!("FTP MFMT failed (non-fatal): {}", e);
                 }
             }
         }
@@ -3486,68 +3853,96 @@ impl FtpProvider {
         Ok(())
     }
 
-    /// Compute a remote file checksum using the best available command.
-    /// Returns a map like {"MD5": "abc123..."} or {"CRC32": "..."} etc.
+    /// Compute a remote file checksum on the server, never by downloading.
+    ///
+    /// `wanted` is a canonical key (`md5`, `sha256`, ...). It is served by
+    /// `HASH` when the server lists it, after selecting it with `OPTS HASH`
+    /// unless the session already has it selected, or else by the legacy
+    /// verb bound to it. An algorithm the server does not offer yields an
+    /// empty map, without sending anything: hashing with another one would
+    /// cost the server a full read of the file for an answer nobody asked
+    /// for. With no `wanted`, see [`FtpHashSupport::default_route`].
+    ///
+    /// The digest is keyed by the algorithm the reply names, not by the one
+    /// asked for, so a server that ignores the selection cannot pass one
+    /// digest off as another.
     pub async fn remote_checksum(
         &mut self,
         path: &str,
+        wanted: Option<&str>,
     ) -> Result<std::collections::HashMap<String, String>, ProviderError> {
-        let hash_cmd = self.hash_supported.clone().ok_or_else(|| {
-            ProviderError::Other("Server does not support hash commands".to_string())
-        })?;
-
-        let stream = self.stream_mut()?;
-
-        let (cmd_str, default_algo) = match hash_cmd.as_str() {
-            "HASH" => (format!("HASH {}", path), "SHA-256"),
-            "XMD5" => (format!("XMD5 {}", path), "MD5"),
-            "XCRC" => (format!("XCRC {}", path), "CRC32"),
-            "XSHA1" => (format!("XSHA1 {}", path), "SHA-1"),
-            _ => {
-                return Err(ProviderError::Other(format!(
-                    "Unknown hash command: {}",
-                    hash_cmd
-                )))
-            }
+        if !self.hash.any() {
+            return Err(ProviderError::Other(
+                "Server does not support hash commands".to_string(),
+            ));
+        }
+        let route = match wanted {
+            Some(key) => self.hash.route(key),
+            None => self.hash.default_route(),
+        };
+        let mut result = std::collections::HashMap::new();
+        let Some(route) = route else {
+            return Ok(result);
         };
 
-        let response = stream
-            .custom_command(
-                &cmd_str,
-                &[suppaftp::Status::File, suppaftp::Status::CommandOk],
-            )
-            .await
-            .map_err(|e| Self::classify_data_failure("hashing", path, e))?;
-
-        let body = String::from_utf8_lossy(&response.body).into_owned();
-        let mut result = std::collections::HashMap::new();
-
-        if hash_cmd == "HASH" {
-            // RFC draft HASH response: "<algo> <range> <hash> <path>"
-            // e.g. "SHA-256 0-EOF abc123def456 /path/to/file.txt"
-            let parts: Vec<&str> = body.splitn(4, ' ').collect();
-            if parts.len() >= 3 {
-                result.insert(
-                    canonical_hash_key(parts[0]),
-                    parts[2].trim().to_ascii_lowercase(),
-                );
-            } else {
-                result.insert(
-                    canonical_hash_key(default_algo),
-                    body.trim().to_ascii_lowercase(),
-                );
+        match route {
+            HashRoute::Hash { select } => {
+                if let Some(label) = select {
+                    self.stream_mut()?
+                        .custom_command(format!("OPTS HASH {label}"), &[Status::CommandOk])
+                        .await
+                        .map_err(|e| {
+                            ProviderError::ServerError(format!(
+                                "The server refused OPTS HASH {label}: {e}"
+                            ))
+                        })?;
+                    self.hash.hash_selected = Some(label);
+                }
+                let response = self
+                    .stream_mut()?
+                    .custom_command(format!("HASH {path}"), &[Status::File, Status::CommandOk])
+                    .await
+                    .map_err(|e| Self::classify_data_failure("hashing", path, e))?;
+                let (key, hex) = parse_hash_reply(&response.body).ok_or_else(|| {
+                    ProviderError::ServerError(format!(
+                        "Unrecognised HASH reply: {}",
+                        String::from_utf8_lossy(&response.body).trim()
+                    ))
+                })?;
+                result.insert(key, hex);
             }
-        } else {
-            // XMD5/XCRC/XSHA1: response is just the hex hash
-            result.insert(
-                canonical_hash_key(default_algo),
-                body.trim().to_ascii_lowercase(),
-            );
+            HashRoute::Legacy(verb, key) => {
+                let response = self
+                    .stream_mut()?
+                    .custom_command(
+                        format!("{verb} {path}"),
+                        &[
+                            Status::File,
+                            Status::CommandOk,
+                            Status::RequestedFileActionOk,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| Self::classify_data_failure("hashing", path, e))?;
+                let hex = parse_legacy_reply(&response.body).ok_or_else(|| {
+                    ProviderError::ServerError(format!(
+                        "Unrecognised {verb} reply: {}",
+                        String::from_utf8_lossy(&response.body).trim()
+                    ))
+                })?;
+                result.insert(key.to_string(), hex);
+            }
         }
 
         Ok(result)
     }
 }
+
+/// How long a transfer the client stopped before its end waits for the
+/// server's word on that early close. The bytes asked for are already in, so
+/// the wait decides nothing about them: a server that never answers (no
+/// `426`, no rate line) must not hold the read until its idle timeout.
+const EARLY_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// PD-FTP-1 per-range writer. Dials a fresh independent FTP connection from
 /// `spec`, REST+RETR from `start`, and streams **exactly** `end - start + 1`
@@ -3653,15 +4048,18 @@ async fn ftp_download_one_range(
     out.flush().await.map_err(ProviderError::IoError)?;
     out.sync_all().await.map_err(ProviderError::IoError)?;
 
-    // The bounded RETR intentionally stopped before EOF; finalizing that
-    // partial RETR may error. The connection is disposable (one per range),
-    // so disconnect regardless: the same posture as `read_range`.
-    let finalize_result = {
-        let stream = worker.stream.as_mut().ok_or(ProviderError::NotConnected)?;
-        stream.finalize_retr_stream(data_stream).await
-    };
-    let _ = finalize_result;
+    // The bounded RETR intentionally stopped before EOF, and the window's
+    // bytes are all in (the strict gate above): what the server says about
+    // the early close concerns the part it did not send, and servers say
+    // different things (`426`, or Pure-FTPd's `150 ... (measured here)` rate
+    // line), so any reply is accepted, and none is waited for past the
+    // budget. The connection is disposable (one per range), so disconnect
+    // regardless: the same posture as `read_range`.
+    let finished = tokio::time::timeout(EARLY_STOP_BUDGET, data_stream.finish()).await;
     let _ = worker.disconnect().await;
+    if let Ok(Err(err)) = finished {
+        tracing::debug!("FTP range at offset {start}: {err} after the window was read whole");
+    }
 
     Ok(ConcurrentRangeOutcome::Completed)
 }
@@ -4107,6 +4505,33 @@ mod tests {
     // evidence that the move preserved behaviour. Fixes belong to a later
     // change, which will edit this baseline deliberately and say why.
 
+    /// MLSD dates are UTC to the second; a session that lists with LIST
+    /// (no MLSD, or MLSD that broke) reads server-local dates with no zone.
+    /// The sync reads the answer per session: compared within 2 s, or by
+    /// size only with the FTP reason stated.
+    #[test]
+    fn mtime_precision_follows_the_listing_the_session_reads() {
+        use crate::sync_core::mtime::{ModifyWindow, SizeOnlyReason};
+        let mut provider = charac_provider();
+        provider.mlsd_supported = false;
+        assert_eq!(provider.mtime_precision(), None);
+        assert_eq!(
+            ModifyWindow::against_provider(None, &provider),
+            ModifyWindow::SizeOnly {
+                reason: SizeOnlyReason::FtpListDates
+            }
+        );
+        provider.mlsd_supported = true;
+        assert_eq!(
+            provider.mtime_precision(),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            ModifyWindow::against_provider(None, &provider),
+            ModifyWindow::Seconds { secs: 2 }
+        );
+    }
+
     fn charac_provider() -> FtpProvider {
         FtpProvider::new(FtpConfig {
             host: "test".to_string(),
@@ -4208,9 +4633,13 @@ mod tests {
 
     fn charac_table() -> String {
         let p = charac_provider();
+        // The present a year-less Unix date is read against, fixed so the
+        // baseline does not age.
+        let charac_now =
+            chrono::NaiveDateTime::parse_from_str("2026-09-25 12:00", "%Y-%m-%d %H:%M").unwrap();
         let mut out = String::new();
         for (line, base) in CHARAC_LIST_ROWS {
-            let rendered = match super::super::ftp_listing::parse_listing(line, base) {
+            let rendered = match super::super::ftp_listing::parse_listing_at(line, base, charac_now) {
                 None => "<none>".to_string(),
                 Some(e) => format!(
                     "name={:?} path={:?} dir={} size={} sym={} link={:?} perms={:?} owner={:?} group={:?} mod={:?}",
@@ -4245,23 +4674,23 @@ mod tests {
     }
 
     const CHARAC_BASELINE: &str = r#"LIST "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 projects" @ "/"
-  name="projects" path="/projects" dir=true size=4096 sym=false link=None perms=Some("drwxr-xr-x") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="projects" path="/projects" dir=true size=4096 sym=false link=None perms=Some("drwxr-xr-x") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 notes.txt" @ "/"
-  name="notes.txt" path="/notes.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="notes.txt" path="/notes.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 my report.txt" @ "/"
-  name="my report.txt" path="/my report.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="my report.txt" path="/my report.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 a  b.txt" @ "/"
-  name="a  b.txt" path="/a  b.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="a  b.txt" path="/a  b.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "01-23-24  10:30AM  12345  my  file.txt" @ "/"
-  name="my  file.txt" path="/my  file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("01-23-24 10:30AM")
+  name="my  file.txt" path="/my  file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24  10:30AM  ????  odd.txt" @ "/"
-  name="odd.txt" path="/odd.txt" dir=false size=0 sym=false link=None perms=None owner=None group=None mod=Some("01-23-24 10:30AM")
+  name="odd.txt" path="/odd.txt" dir=false size=0 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "lrwxrwxrwx    1 user     group           7 Jan 20 10:00 link -> target" @ "/"
-  name="link" path="/link" dir=false size=7 sym=true link=Some("target") perms=Some("lrwxrwxrwx") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="link" path="/link" dir=false size=7 sym=true link=Some("target") perms=Some("lrwxrwxrwx") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "lrwxrwxrwx    1 user     group           7 Jan 20 10:00 dangling" @ "/"
-  name="dangling" path="/dangling" dir=false size=7 sym=true link=None perms=Some("lrwxrwxrwx") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="dangling" path="/dangling" dir=false size=7 sym=true link=None perms=Some("lrwxrwxrwx") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group        ???? Jan 20 10:00 odd.txt" @ "/"
-  name="odd.txt" path="/odd.txt" dir=false size=0 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="odd.txt" path="/odd.txt" dir=false size=0 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r-- 1 user group 123 Jan 20 10:00" @ "/"
   <none>
 LIST "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 ." @ "/"
@@ -4269,23 +4698,23 @@ LIST "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 ." @ "/"
 LIST "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 .." @ "/"
   <none>
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 f.txt" @ "/scope"
-  name="f.txt" path="/scope/f.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="f.txt" path="/scope/f.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 f.txt" @ "/scope/"
-  name="f.txt" path="/scope/f.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("Jan 20 10:00")
+  name="f.txt" path="/scope/f.txt" dir=false size=123 sym=false link=None perms=Some("-rw-r--r--") owner=Some("user") group=Some("group") mod=Some("2026-01-20 10:00")
 LIST "" @ "/"
   <none>
 LIST "total 12" @ "/"
   <none>
 LIST "01-23-24  10:30AM       <DIR>          folder" @ "/"
-  name="folder" path="/folder" dir=true size=0 sym=false link=None perms=None owner=None group=None mod=Some("01-23-24 10:30AM")
+  name="folder" path="/folder" dir=true size=0 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24  10:30AM           12345      file.txt" @ "/"
-  name="file.txt" path="/file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("01-23-24 10:30AM")
+  name="file.txt" path="/file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "01-23-2024  10:30AM         12345      file.txt" @ "/"
-  name="file.txt" path="/file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("01-23-2024 10:30AM")
+  name="file.txt" path="/file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24  10:30AM           12345      my file.txt" @ "/"
-  name="my file.txt" path="/my file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("01-23-24 10:30AM")
+  name="my file.txt" path="/my file.txt" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24 10:30AM 12345 a b c d e f" @ "/"
-  name="a b c d e f" path="/a b c d e f" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("01-23-24 10:30AM")
+  name="a b c d e f" path="/a b c d e f" dir=false size=12345 sym=false link=None perms=None owner=None group=None mod=Some("2024-01-23 10:30")
 LIST "not-a-date 10:30AM <DIR> folder" @ "/"
   <none>
 LIST "drwxr-xr-x 2 1001 1001 4096 Jul 21 09:41 ." @ "/"
@@ -4310,7 +4739,12 @@ MLSD "no-facts-here" @ "/"
     #[test]
     fn test_parse_unix_listing() {
         let line = "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 projects";
-        let entry = super::super::ftp_listing::parse_unix_listing(line, "/").unwrap();
+        let entry = super::super::ftp_listing::parse_unix_listing(
+            line,
+            "/",
+            chrono::Utc::now().naive_utc(),
+        )
+        .unwrap();
 
         assert_eq!(entry.name, "projects");
         assert!(entry.is_dir);
@@ -4457,6 +4891,126 @@ MLSD "no-facts-here" @ "/"
         assert_eq!(canonical_hash_key("CRC32"), "crc32");
         // Unknown algo degrades, never dropped.
         assert_eq!(canonical_hash_key("Whirlpool"), "whirlpool");
+    }
+
+    #[test]
+    fn hash_feat_line_gives_the_list_and_the_selected_algorithm() {
+        let (algorithms, selected) = parse_hash_feat("SHA-1;SHA-256*;SHA-512;MD5");
+        assert_eq!(algorithms, vec!["SHA-1", "SHA-256", "SHA-512", "MD5"]);
+        assert_eq!(selected.as_deref(), Some("SHA-256"));
+
+        // Spacing and a trailing separator are tolerated; no `*` means the
+        // selection is unknown, not the first entry.
+        let (algorithms, selected) = parse_hash_feat(" SHA-1 ; MD5 ;");
+        assert_eq!(algorithms, vec!["SHA-1", "MD5"]);
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn hash_reply_is_parsed_past_its_code_and_by_position() {
+        assert_eq!(
+            parse_hash_reply(b"213 SHA-256 0-49 169CD22282DA7F147CB491E559E9DD a file.txt\r\n"),
+            Some((
+                "sha256".to_string(),
+                "169cd22282da7f147cb491e559e9dd".to_string()
+            ))
+        );
+        // The shape that used to come back as {"213": "0-49"}: the range is
+        // not a digest, so a reply missing its digest is refused, not read.
+        assert_eq!(parse_hash_reply(b"213 SHA-256 0-49\r\n"), None);
+        assert_eq!(parse_hash_reply(b"213 SHA-256 0-49 not-hex file\r\n"), None);
+    }
+
+    /// The replies of ProFTPD 1.3.8 with mod_digest, verbatim: both digest
+    /// replies are multi-line, and the answer is on the last line.
+    #[test]
+    fn proftpd_mod_digest_replies_are_read_from_their_final_line() {
+        assert_eq!(
+            parse_hash_reply(
+                b"213-Computing SHA-1 digest\r\n213 SHA-1 0-11 2aae6c35c94fcfb415dbe95f408b9ce91ee846ed hello.txt\r\n"
+            ),
+            Some(("sha1".to_string(), "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".to_string()))
+        );
+        assert_eq!(
+            parse_legacy_reply(b"250-Computing CRC32 digest\r\n250 0D4A1185\r\n").as_deref(),
+            Some("0d4a1185")
+        );
+        let (algorithms, selected) = parse_hash_feat("CRC32;MD5;SHA-1*;SHA-256;SHA-512;");
+        assert_eq!(
+            algorithms,
+            vec!["CRC32", "MD5", "SHA-1", "SHA-256", "SHA-512"]
+        );
+        assert_eq!(selected.as_deref(), Some("SHA-1"));
+    }
+
+    #[test]
+    fn legacy_reply_is_the_bare_digest() {
+        assert_eq!(
+            parse_legacy_reply(b"250 5EB63BBBE01EEED093CB22BB8F5ACDC3\r\n").as_deref(),
+            Some("5eb63bbbe01eeed093cb22bb8f5acdc3")
+        );
+        assert_eq!(
+            parse_legacy_reply(b"213 0x0D4A1185 /hello.txt\r\n").as_deref(),
+            Some("0d4a1185")
+        );
+        assert_eq!(parse_legacy_reply(b"250 File not found\r\n"), None);
+    }
+
+    fn hash_support(feat: &[(&str, Option<&str>)]) -> FtpHashSupport {
+        let features: suppaftp::types::Features = feat
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.map(str::to_string)))
+            .collect();
+        FtpHashSupport::from_features(&features)
+    }
+
+    #[test]
+    fn a_listed_algorithm_is_selected_in_the_servers_spelling_unless_already_selected() {
+        let support = hash_support(&[("HASH", Some("sha-1;sha-256*;md5"))]);
+        assert_eq!(
+            support.route("sha1"),
+            Some(HashRoute::Hash {
+                select: Some("sha-1".to_string())
+            })
+        );
+        assert_eq!(
+            support.route("sha256"),
+            Some(HashRoute::Hash { select: None })
+        );
+        assert_eq!(support.route("sha512"), None);
+        assert_eq!(
+            support.default_route(),
+            Some(HashRoute::Hash { select: None })
+        );
+    }
+
+    #[test]
+    fn an_unlisted_hash_line_asks_in_the_drafts_spelling_after_the_legacy_verbs() {
+        let support = hash_support(&[("HASH", None), ("XMD5", None)]);
+        assert_eq!(support.route("md5"), Some(HashRoute::Legacy("XMD5", "md5")));
+        assert_eq!(
+            support.route("sha512"),
+            Some(HashRoute::Hash {
+                select: Some("SHA-512".to_string())
+            })
+        );
+        assert_eq!(support.route("blake3"), None);
+        // No list and nothing selected: the server's own choice, unselected.
+        assert_eq!(
+            support.default_route(),
+            Some(HashRoute::Hash { select: None })
+        );
+        assert_eq!(support.offered(), None);
+    }
+
+    #[test]
+    fn without_hash_the_default_is_the_first_legacy_verb() {
+        let support = hash_support(&[("XSHA1", None), ("XCRC", None)]);
+        assert_eq!(
+            support.default_route(),
+            Some(HashRoute::Legacy("XCRC", "crc32"))
+        );
+        assert!(!hash_support(&[("MLSD", None)]).any());
     }
 
     #[test]
@@ -4658,6 +5212,45 @@ mod data_channel_watch_tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = l.accept().await.unwrap();
         (client, server)
+    }
+
+    /// Verification of the last round of #950: tokio clears read readiness
+    /// after a short read only on epoll and kqueue, so on Windows the
+    /// readiness the read of the `150` leaves is still set at the first data
+    /// read of every transfer. Its peek finds nothing, and that empty wake was
+    /// taken for the server having spoken: the whole transfer ran on the 30 s
+    /// deadline, and a slow server quiet for longer failed. Linux keeps the
+    /// readiness the same way after a `try_read` that took everything, which
+    /// is how this test leaves it. Before the peek was polled once, the same
+    /// setup waited on the silent control channel for ever.
+    ///
+    /// The clock is virtual, so the 31 s the data take pass at once.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_left_by_the_150_does_not_shorten_the_data_deadline() {
+        let (mut data, mut data_peer) = silent_pair().await;
+        let (control, mut control_peer) = silent_pair().await;
+        control_peer.write_all(b"150 opening\r\n").await.unwrap();
+        control.readable().await.unwrap();
+        let mut reply = [0u8; 64];
+        let n = control.try_read(&mut reply).unwrap();
+        assert_eq!(&reply[..n], b"150 opening\r\n");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+            data_peer.write_all(b"late").await.unwrap();
+            // Kept open: an end of file would be an answer too.
+            std::future::pending::<()>().await;
+        });
+
+        let mut buf = [0u8; 64];
+        let mut watch = ControlWatch::Quiet;
+        let step = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            FtpProvider::read_watching_control(&mut data, &control, &[], &mut buf, &mut watch),
+        )
+        .await
+        .expect("the read waited on a control channel with nothing to say");
+        assert!(matches!(step, Ok(DataStep::Read(4))), "{step:?}");
+        drop(control_peer);
     }
 
     /// A wait that simply ended is not a refusal, and must not be reported as
@@ -4928,7 +5521,7 @@ mod data_channel_watch_tests {
     /// 226 arrives on the same channel, and treating it like a refusal would
     /// throw away the tail of a transfer that was working. The watch switches
     /// itself off instead, so the loop cannot spin on a socket that stays
-    /// readable, and the reply is left in place for `finalize_retr_stream`.
+    /// readable, and the reply is left in place for `finish`.
     #[tokio::test]
     async fn a_completion_reply_is_left_alone_and_the_data_keeps_flowing() {
         let (mut data_client, mut data_server) = silent_pair().await;
@@ -5067,48 +5660,6 @@ mod live_listing_timeout {
 }
 
 #[cfg(test)]
-mod data_drain_tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// The drain returns when the peer closes, and consumes nothing else the
-    /// caller cares about (a STOR data connection carries nothing back).
-    #[tokio::test]
-    async fn drain_to_eof_returns_at_the_peers_close() {
-        let (mut ours, mut theirs) = tokio::io::duplex(64);
-        let server = tokio::spawn(async move {
-            theirs.write_all(b"late bytes").await.unwrap();
-            drop(theirs);
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), drain_to_eof(&mut ours))
-            .await
-            .expect("the drain must end when the peer closes");
-        server.await.unwrap();
-        let mut rest = Vec::new();
-        assert_eq!(ours.read_to_end(&mut rest).await.unwrap(), 0);
-    }
-
-    /// The wrapper lets writes and flushes through and swallows only the
-    /// shutdown, which the caller has already done on the real stream.
-    #[tokio::test]
-    async fn already_shut_down_forwards_writes_and_neutralises_shutdown() {
-        let (ours, mut theirs) = tokio::io::duplex(64);
-        let mut wrapped = AlreadyShutDown(ours);
-        wrapped.write_all(b"data").await.unwrap();
-        wrapped.flush().await.unwrap();
-        wrapped
-            .shutdown()
-            .await
-            .expect("a second shutdown is a no-op");
-        let mut buf = [0u8; 4];
-        theirs.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"data");
-        // The inner stream is still writable: the wrapper did not close it.
-        wrapped.write_all(b"more").await.unwrap();
-    }
-}
-
-#[cfg(test)]
 mod late_reply_guard_tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -5170,6 +5721,76 @@ mod late_reply_guard_tests {
                 }
             }
         }
+    }
+
+    /// End to end on the real crate: the server answers `RETR` with `150` and
+    /// the final `550` in ONE write and keeps the data connection open and
+    /// silent. suppaftp's reader pulls both replies while it collects the
+    /// `150`, so the refusal lives only in the reader's buffer and the socket
+    /// underneath is empty. The download must end on the refusal at once, not
+    /// wait out the thirty-minute data idle timeout. This is the path the
+    /// fork's `ControlSocket::buffered_reply_bytes` exists for: the watch reads
+    /// the buffer through it, and a peek on the socket sees nothing.
+    #[tokio::test]
+    async fn a_refusal_sent_with_the_150_ends_a_real_download_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"220 ready\r\n").await.unwrap();
+            // Kept open and silent: a closed data socket would end the wait by
+            // another road and the stall would never show.
+            let mut held_data = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let cmd = line.split_whitespace().next().unwrap_or("").to_uppercase();
+                let reply = match cmd.as_str() {
+                    "USER" => "331 password please\r\n".to_string(),
+                    "PASS" => "230 logged in\r\n".to_string(),
+                    "PWD" => "257 \"/\" is current\r\n".to_string(),
+                    "PASV" => format!(
+                        "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                        data_port / 256,
+                        data_port % 256
+                    ),
+                    "RETR" => {
+                        let (data, _) = data_listener.accept().await.unwrap();
+                        held_data.push(data);
+                        "150 Opening data connection.\r\n550 Failed to open file.\r\n".to_string()
+                    }
+                    _ => "200 ok\r\n".to_string(),
+                };
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        });
+        provider.connect().await.expect("the dial must succeed");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.download_to_bytes("/missing.bin"),
+        )
+        .await
+        .expect("the refusal in the reader's buffer must end the download, not the idle timeout");
+        let err = outcome.expect_err("a refused RETR is an error");
+        assert!(
+            err.to_string().contains("550") || err.to_string().contains("Failed to open"),
+            "the error must carry the server's refusal, got {err}"
+        );
+        server.abort();
     }
 
     /// A reply that arrives AFTER the failure-path checks used to be read as
@@ -5282,5 +5903,1502 @@ mod late_reply_guard_tests {
             .await
             .expect("the second connection must be dialed")
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rename_contract_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// How a scripted server differs from the default one.
+    #[derive(Clone, Copy, Default)]
+    struct Quirks {
+        /// Names match whatever their letter case (MLST of `/A.TXT` finds
+        /// `/a.txt`), as on Windows servers.
+        case_insensitive: bool,
+        /// A write-only drop folder: no MLST/MLSD, and LIST is refused.
+        listing_denied: bool,
+        /// MLST answers without a `size` fact.
+        mlst_without_size: bool,
+        /// SIZE is refused.
+        size_refused: bool,
+    }
+
+    /// One scripted control connection of a server that holds the files
+    /// `files` in `/`, advertises MLST and MLSD, answers MLST on the control
+    /// channel and MLSD over a PASV data connection, and renames on
+    /// RNFR/RNTO over an existing file, as vsftpd does, unless `quirks` says
+    /// otherwise. Every RNFR and RNTO is logged.
+    async fn serve_connection(
+        stream: TcpStream,
+        files: Arc<Mutex<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
+        quirks: Quirks,
+    ) {
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        if write.write_all(b"220 ready\r\n").await.is_err() {
+            return;
+        }
+        let mut data: Option<TcpListener> = None;
+        let mut rename_from = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let (cmd, argument) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            let cmd = cmd.to_uppercase();
+            let argument = argument.trim().to_string();
+            let present =
+                |path: &str| {
+                    files.lock().unwrap().iter().any(|f| {
+                        f == path || (quirks.case_insensitive && f.eq_ignore_ascii_case(path))
+                    })
+                };
+            let reply = match cmd.as_str() {
+                "USER" => "331 password please\r\n".to_string(),
+                "PASS" => "230 logged in\r\n".to_string(),
+                "FEAT" if quirks.listing_denied => "211-Features:\r\n UTF8\r\n211 End\r\n".to_string(),
+                "FEAT" => "211-Features:\r\n MLST type*;size*;modify*;\r\n MLSD\r\n211 End\r\n"
+                    .to_string(),
+                "LIST" | "NLST" | "MLSD" | "MLST" if quirks.listing_denied => {
+                    "550 Permission denied\r\n".to_string()
+                }
+                "PWD" => "257 \"/\" is current\r\n".to_string(),
+                "MLST" if argument == "/" || argument.is_empty() => {
+                    "250-Listing /\r\n type=dir; /\r\n250 End\r\n".to_string()
+                }
+                "MLST" if present(&argument) && quirks.mlst_without_size => format!(
+                    "250-Listing {argument}\r\n type=file;modify=20240101000000; {argument}\r\n250 End\r\n"
+                ),
+                "MLST" if present(&argument) => format!(
+                    "250-Listing {argument}\r\n type=file;size=3;modify=20240101000000; {argument}\r\n250 End\r\n"
+                ),
+                "MLST" => "550 No such file or directory\r\n".to_string(),
+                "SIZE" if quirks.size_refused => "550 SIZE not allowed\r\n".to_string(),
+                "SIZE" if present(&argument) => "213 3\r\n".to_string(),
+                "SIZE" => "550 No such file\r\n".to_string(),
+                "PASV" => {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    data = Some(listener);
+                    format!(
+                        "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                        port / 256,
+                        port % 256
+                    )
+                }
+                "MLSD" => {
+                    if write.write_all(b"150 Opening data connection\r\n").await.is_err() {
+                        return;
+                    }
+                    if let Some(listener) = data.take() {
+                        if let Ok((mut socket, _)) = listener.accept().await {
+                            let listing: String = files
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .map(|f| {
+                                    format!(
+                                        "type=file;size=3;modify=20240101000000; {}\r\n",
+                                        f.trim_start_matches('/')
+                                    )
+                                })
+                                .collect();
+                            let _ = socket.write_all(listing.as_bytes()).await;
+                            let _ = socket.shutdown().await;
+                        }
+                    }
+                    "226 Transfer complete\r\n".to_string()
+                }
+                "RNFR" => {
+                    log.lock().unwrap().push(format!("RNFR {argument}"));
+                    rename_from = argument;
+                    "350 Ready for RNTO\r\n".to_string()
+                }
+                "RNTO" => {
+                    log.lock().unwrap().push(format!("RNTO {argument}"));
+                    let mut files = files.lock().unwrap();
+                    files.retain(|f| {
+                        !(f == &argument
+                            || f == &rename_from
+                            || (quirks.case_insensitive && f.eq_ignore_ascii_case(&rename_from)))
+                    });
+                    files.push(argument);
+                    "250 Renamed\r\n".to_string()
+                }
+                "QUIT" => {
+                    let _ = write.write_all(b"221 bye\r\n").await;
+                    return;
+                }
+                _ => "200 ok\r\n".to_string(),
+            };
+            if write.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A connected provider on a scripted server holding `/a.txt` and
+    /// `/b.txt`. Returns it and the RNFR/RNTO log.
+    async fn provider_on_scripted_server() -> (FtpProvider, Arc<Mutex<Vec<String>>>) {
+        provider_on_server_with(&["/a.txt", "/b.txt"], Quirks::default()).await
+    }
+
+    /// A connected provider on a scripted server holding `files`, with
+    /// `quirks`. Returns it and the RNFR/RNTO log.
+    async fn provider_on_server_with(
+        files: &[&str],
+        quirks: Quirks,
+    ) -> (FtpProvider, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let files = Arc::new(Mutex::new(
+            files.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+        ));
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_connection(
+                    stream,
+                    Arc::clone(&files),
+                    Arc::clone(&seen),
+                    quirks,
+                ));
+            }
+        });
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        });
+        provider
+            .connect()
+            .await
+            .expect("connect to the scripted server");
+        (provider, log)
+    }
+
+    /// `stat` on a server whose MLST sends no `size` fact asks SIZE, as it
+    /// does for a LIST row, and the size it reads there is exact: the entry
+    /// carries no marker. It returned the 0 of the missing fact, which the
+    /// CLI's `--immutable` compared as a size. When SIZE is refused too, the
+    /// 0 stays, marked as a size that could not be read.
+    #[tokio::test]
+    async fn stat_reads_the_size_mlst_did_not_send() {
+        use crate::providers::ftp_listing::SIZE_UNREADABLE;
+        let quirks = Quirks {
+            mlst_without_size: true,
+            ..Quirks::default()
+        };
+        let (mut provider, _) = provider_on_server_with(&["/a.txt"], quirks).await;
+        let entry = provider.stat("/a.txt").await.expect("stat");
+        assert_eq!(entry.size, 3, "{entry:?}");
+        assert!(!entry.metadata.contains_key(SIZE_UNREADABLE), "{entry:?}");
+
+        let quirks = Quirks {
+            mlst_without_size: true,
+            size_refused: true,
+            ..Quirks::default()
+        };
+        let (mut provider, _) = provider_on_server_with(&["/a.txt"], quirks).await;
+        let entry = provider.stat("/a.txt").await.expect("stat");
+        assert_eq!(entry.size, 0, "{entry:?}");
+        assert!(entry.metadata.contains_key(SIZE_UNREADABLE), "{entry:?}");
+    }
+
+    /// RNTO onto an existing file replaces it on vsftpd, ProFTPD and
+    /// Pure-FTPd: a rename onto `/b.txt` destroyed it and answered Ok.
+    #[tokio::test]
+    async fn rename_refuses_an_existing_destination_before_rnfr() {
+        let (mut provider, log) = provider_on_scripted_server().await;
+        let outcome = provider.rename("/a.txt", "/b.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+            "{outcome:?}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn rename_onto_a_free_name_sends_rnfr_and_rnto() {
+        let (mut provider, log) = provider_on_scripted_server().await;
+        provider.rename("/a.txt", "/c.txt").await.expect("rename");
+        assert_eq!(*log.lock().unwrap(), ["RNFR /a.txt", "RNTO /c.txt"]);
+    }
+
+    /// `replace` keeps what rename did before the look: RNFR/RNTO, which
+    /// the server performs over the existing file.
+    #[tokio::test]
+    async fn replace_renames_over_an_existing_destination() {
+        let (mut provider, log) = provider_on_scripted_server().await;
+        provider.replace("/a.txt", "/b.txt").await.expect("replace");
+        assert_eq!(*log.lock().unwrap(), ["RNFR /a.txt", "RNTO /b.txt"]);
+    }
+
+    /// On a case-insensitive server MLST of `/Readme.TXT` finds the source
+    /// `/readme.txt` itself, so a rename that only changes the letter case
+    /// was refused as AlreadyExists.
+    #[tokio::test]
+    async fn a_case_only_rename_on_a_case_insensitive_server_goes_through() {
+        let quirks = Quirks {
+            case_insensitive: true,
+            ..Quirks::default()
+        };
+        let (mut provider, log) = provider_on_server_with(&["/readme.txt"], quirks).await;
+        provider
+            .rename("/readme.txt", "/Readme.TXT")
+            .await
+            .expect("a case-only rename");
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["RNFR /readme.txt", "RNTO /Readme.TXT"]
+        );
+    }
+
+    /// On a case-sensitive server the two spellings are two files, and the
+    /// other one is not overwritten.
+    #[tokio::test]
+    async fn a_case_only_rename_onto_a_distinct_file_is_refused() {
+        let (mut provider, log) =
+            provider_on_server_with(&["/readme.txt", "/Readme.TXT"], Quirks::default()).await;
+        let outcome = provider.rename("/readme.txt", "/Readme.TXT").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+            "{outcome:?}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+    }
+
+    /// In a write-only drop folder the listing is refused, so the look for an
+    /// occupied destination can never answer "free": every rename failed. A
+    /// look that cannot be made is unknown, not occupied, and the rename goes
+    /// out as it did before the look existed.
+    #[tokio::test]
+    async fn a_refused_listing_does_not_block_the_rename() {
+        let quirks = Quirks {
+            listing_denied: true,
+            ..Quirks::default()
+        };
+        let (mut provider, log) = provider_on_server_with(&["/a.txt"], quirks).await;
+        provider
+            .rename("/a.txt", "/c.txt")
+            .await
+            .expect("the rename goes out");
+        assert_eq!(*log.lock().unwrap(), ["RNFR /a.txt", "RNTO /c.txt"]);
+    }
+
+    /// Where the listing is refused, the look answered "unknown" and the
+    /// RNTO went out over an existing file, which vsftpd replaces. SIZE needs
+    /// no listing: a file it finds is refused before RNFR.
+    #[tokio::test]
+    async fn a_refused_listing_still_refuses_a_file_that_size_finds() {
+        let quirks = Quirks {
+            listing_denied: true,
+            ..Quirks::default()
+        };
+        let (mut provider, log) = provider_on_server_with(&["/a.txt", "/b.txt"], quirks).await;
+        let outcome = provider.rename("/a.txt", "/b.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+            "{outcome:?}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "{:?}", log.lock().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod hash_negotiation_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Digests of `hello world`, one per algorithm, so a digest computed with
+    /// the wrong algorithm cannot pass for the one that was asked for.
+    const DIGESTS: &[(&str, &str)] = &[
+        ("MD5", "5eb63bbbe01eeed093cb22bb8f5acdc3"),
+        ("SHA-1", "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"),
+        (
+            "SHA-256",
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        ),
+        (
+            "SHA-512",
+            "309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f",
+        ),
+        ("CRC32", "0d4a1185"),
+    ];
+
+    /// Every command line the scripted server received, in order.
+    type CommandLog = Arc<Mutex<Vec<String>>>;
+
+    fn digest(label: &str) -> &'static str {
+        DIGESTS
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(label))
+            .map(|(_, hex)| *hex)
+            .expect("a digest for every algorithm the script offers")
+    }
+
+    /// What the scripted server advertises and how it answers.
+    #[derive(Clone, Copy)]
+    struct Script {
+        /// FEAT lines, verbatim.
+        feat: &'static [&'static str],
+        /// What `OPTS HASH` accepts.
+        hash_algos: &'static [&'static str],
+        /// What `HASH` uses before any `OPTS HASH`.
+        selected: &'static str,
+        /// The code the legacy verbs answer with: `250` for ProFTPD's
+        /// mod_digest and Serv-U, `213` for others.
+        legacy_code: &'static str,
+    }
+
+    const HASH_SERVER: Script = Script {
+        feat: &["HASH SHA-1;SHA-256*;MD5"],
+        hash_algos: &["SHA-1", "SHA-256", "MD5"],
+        selected: "SHA-256",
+        legacy_code: "250",
+    };
+
+    /// One scripted control connection speaking draft-bryan-ftp-hash.
+    /// `OPTS HASH <algo>` selects one of the script's algorithms and answers
+    /// `501` for anything else; `HASH <path>` answers in the draft's shape,
+    /// `213 <algo> <range> <hex> <path>`, with whichever algorithm is
+    /// selected. The legacy verbs answer `<code> <HEX>`. Every command line
+    /// is logged, so a test can read the conversation.
+    async fn serve(stream: TcpStream, script: Script, log: CommandLog) {
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        if write.write_all(b"220 ready\r\n").await.is_err() {
+            return;
+        }
+        let mut selected = script.selected;
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                _ => return,
+            };
+            log.lock().unwrap().push(line.clone());
+            let (cmd, argument) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+            let legacy = |label: &str| {
+                format!(
+                    "{} {}\r\n",
+                    script.legacy_code,
+                    digest(label).to_ascii_uppercase()
+                )
+            };
+            let reply = match cmd.to_ascii_uppercase().as_str() {
+                "USER" => "331 password please\r\n".to_string(),
+                "PASS" => "230 logged in\r\n".to_string(),
+                "PWD" => "257 \"/\" is current\r\n".to_string(),
+                "FEAT" => {
+                    let mut reply = "211-Features:\r\n".to_string();
+                    for line in script.feat {
+                        reply.push_str(&format!(" {line}\r\n"));
+                    }
+                    reply.push_str("211 End\r\n");
+                    reply
+                }
+                "OPTS" => match argument.split_once(' ') {
+                    Some((option, algo)) if option.eq_ignore_ascii_case("HASH") => match script
+                        .hash_algos
+                        .iter()
+                        .find(|a| a.eq_ignore_ascii_case(algo))
+                    {
+                        Some(found) => {
+                            selected = found;
+                            format!("200 {found}\r\n")
+                        }
+                        None => "501 Unknown algorithm\r\n".to_string(),
+                    },
+                    _ => "200 ok\r\n".to_string(),
+                },
+                "HASH" => format!("213 {selected} 0-10 {} {argument}\r\n", digest(selected)),
+                "XMD5" => legacy("MD5"),
+                "XSHA1" => legacy("SHA-1"),
+                "XCRC" => legacy("CRC32"),
+                "QUIT" => {
+                    let _ = write.write_all(b"221 bye\r\n").await;
+                    return;
+                }
+                _ => "200 ok\r\n".to_string(),
+            };
+            if write.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Connect a provider to a fresh scripted server. The log is returned
+    /// cleared of the login exchange, so it holds only what the test caused.
+    async fn connected(script: Script) -> (FtpProvider, CommandLog, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let server_log = Arc::clone(&log);
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                serve(stream, script, server_log).await;
+            }
+        });
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        });
+        provider
+            .connect()
+            .await
+            .expect("the scripted server accepts the login");
+        log.lock().unwrap().clear();
+        (provider, log, server)
+    }
+
+    async fn finish(mut provider: FtpProvider, server: tokio::task::JoinHandle<()>) {
+        let _ = provider.disconnect().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("the scripted server ends when the client hangs up")
+            .unwrap();
+    }
+
+    fn digest_commands(log: &CommandLog) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|line| {
+                let upper = line.to_ascii_uppercase();
+                upper.starts_with("OPTS HASH")
+                    || upper.starts_with("HASH ")
+                    || upper.starts_with('X')
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The reply to `HASH` starts with its status code. Read as the first
+    /// field it became the algorithm, and the range became the digest, so a
+    /// server answering in the draft's own shape produced `{"213": "0-10"}`
+    /// and no algorithm at all, not even the one the server had selected.
+    #[tokio::test]
+    async fn the_hash_reply_is_read_past_its_status_code() {
+        let (mut provider, _log, server) = connected(HASH_SERVER).await;
+
+        let map = provider.checksum("/hello.txt").await.expect("HASH answers");
+
+        assert_eq!(
+            map.get("sha256").map(String::as_str),
+            Some(digest("SHA-256")),
+            "the selected algorithm's digest, under its own key: {map:?}"
+        );
+        assert!(
+            !map.contains_key("213"),
+            "the status code is not an algorithm: {map:?}"
+        );
+        finish(provider, server).await;
+    }
+
+    /// What the reporting user saw: every algorithm failed because AeroFTP
+    /// never selected one. Each request must select its algorithm with
+    /// `OPTS HASH` before `HASH`, in the server's own spelling, and skip the
+    /// selection when the session already has that algorithm selected.
+    #[tokio::test]
+    async fn each_algorithm_is_selected_with_opts_hash_before_hash() {
+        let (mut provider, log, server) = connected(HASH_SERVER).await;
+
+        for (key, label) in [("md5", "MD5"), ("sha1", "SHA-1"), ("sha256", "SHA-256")] {
+            let map = provider
+                .checksum_for("/hello.txt", key)
+                .await
+                .expect("HASH answers");
+            assert_eq!(
+                map.get(key).map(String::as_str),
+                Some(digest(label)),
+                "{key} must come back as the {label} digest: {map:?}"
+            );
+        }
+        // SHA-256 is selected now: asking again must not select it again.
+        provider
+            .checksum_for("/hello.txt", "sha256")
+            .await
+            .expect("HASH answers");
+
+        assert_eq!(
+            digest_commands(&log),
+            vec![
+                "OPTS HASH MD5",
+                "HASH /hello.txt",
+                "OPTS HASH SHA-1",
+                "HASH /hello.txt",
+                "OPTS HASH SHA-256",
+                "HASH /hello.txt",
+                "HASH /hello.txt",
+            ]
+        );
+        finish(provider, server).await;
+    }
+
+    /// The legacy verbs answer `<code> <HEX>`. With `213` the whole reply
+    /// line used to come back as the digest, `213 5eb6...`, which the
+    /// Properties dialog displayed as the file's MD5: a wrong value presented
+    /// as a correct one. With `250`, the code ProFTPD's mod_digest and Serv-U
+    /// use, the reply was refused outright. Each verb must also serve its own
+    /// algorithm, not the one the server happened to be probed for first.
+    #[tokio::test]
+    async fn legacy_verbs_return_the_bare_digest_of_the_algorithm_asked_for() {
+        // Every shape is tried before anything is asserted, so a failure
+        // reports all of them rather than the first.
+        let mut wrong = Vec::new();
+        for legacy_code in ["250", "213"] {
+            let (mut provider, log, server) = connected(Script {
+                feat: &["XMD5", "XSHA1", "XCRC"],
+                hash_algos: &[],
+                selected: "MD5",
+                legacy_code,
+            })
+            .await;
+
+            for (key, label, verb) in [
+                ("md5", "MD5", "XMD5"),
+                ("sha1", "SHA-1", "XSHA1"),
+                ("crc32", "CRC32", "XCRC"),
+            ] {
+                match provider.checksum_for("/hello.txt", key).await {
+                    Ok(map) if map.get(key).map(String::as_str) == Some(digest(label)) => {}
+                    other => wrong.push(format!(
+                        "{verb} answering {legacy_code} must yield the bare {label} digest, got {other:?}"
+                    )),
+                }
+            }
+            let sent = digest_commands(&log);
+            if sent != ["XMD5 /hello.txt", "XSHA1 /hello.txt", "XCRC /hello.txt"] {
+                wrong.push(format!("answering {legacy_code}, the client sent {sent:?}"));
+            }
+            finish(provider, server).await;
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// An algorithm the server does not offer is not requested at all:
+    /// hashing with another one costs the server a full read of the file for
+    /// an answer nobody asked for. A legacy verb covering it is used instead
+    /// when the server advertises one.
+    #[tokio::test]
+    async fn an_algorithm_the_server_does_not_offer_is_never_requested() {
+        let without_md5 = Script {
+            feat: &["HASH SHA-1;SHA-256*"],
+            hash_algos: &["SHA-1", "SHA-256"],
+            ..HASH_SERVER
+        };
+        let (mut provider, log, server) = connected(without_md5).await;
+        let map = provider
+            .checksum_for("/hello.txt", "md5")
+            .await
+            .expect("an unoffered algorithm is an empty answer, not an error");
+        assert!(
+            map.is_empty(),
+            "nothing computed for an unoffered algorithm: {map:?}"
+        );
+        assert!(
+            digest_commands(&log).is_empty(),
+            "nothing sent: {:?}",
+            digest_commands(&log)
+        );
+        finish(provider, server).await;
+
+        let (mut provider, log, server) = connected(Script {
+            feat: &["HASH SHA-1;SHA-256*", "XMD5"],
+            ..without_md5
+        })
+        .await;
+        let map = provider
+            .checksum_for("/hello.txt", "md5")
+            .await
+            .expect("XMD5 answers");
+        assert_eq!(map.get("md5").map(String::as_str), Some(digest("MD5")));
+        assert_eq!(digest_commands(&log), vec!["XMD5 /hello.txt"]);
+        finish(provider, server).await;
+    }
+
+    /// The Checksum tab offers what FEAT advertised, not what the protocol
+    /// could carry: a server listing SHA-1, SHA-256 and SHA-512 has no MD5
+    /// row to click, and a server offering only legacy verbs has exactly
+    /// their algorithms.
+    #[tokio::test]
+    async fn the_capability_is_what_feat_advertised() {
+        let (provider, _log, server) = connected(Script {
+            feat: &["HASH SHA-1;SHA-256*;SHA-512"],
+            hash_algos: &["SHA-1", "SHA-256", "SHA-512"],
+            ..HASH_SERVER
+        })
+        .await;
+        assert_eq!(
+            provider.checksum_capability("/hello.txt").algorithms,
+            vec!["sha1", "sha256", "sha512"]
+        );
+        finish(provider, server).await;
+
+        let (provider, _log, server) = connected(Script {
+            feat: &["XCRC", "XMD5"],
+            hash_algos: &[],
+            ..HASH_SERVER
+        })
+        .await;
+        assert_eq!(
+            provider.checksum_capability("/hello.txt").algorithms,
+            vec!["md5", "crc32"]
+        );
+        finish(provider, server).await;
+    }
+
+    /// The same contract against a real `HASH` implementation: ProFTPD with
+    /// mod_digest, whose replies are multi-line and whose legacy verbs answer
+    /// `250`. A lab that reproduces it: `debian:bookworm-slim` with
+    /// `proftpd-core`, `LoadModule mod_digest.c`, `DigestEngine on`,
+    /// `DigestAlgorithms all`, and a user whose home holds `hello.txt`
+    /// containing `hello world` without a newline. Run with
+    /// `AEROFTP_FTP_HASH_LIVE_HOST`, `_USER` and `_PASS` set.
+    #[tokio::test]
+    #[ignore = "live FTP HASH test against a ProFTPD mod_digest lab; run explicitly"]
+    async fn live_proftpd_mod_digest_serves_each_algorithm_asked_for() {
+        let env = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set for the live test"))
+        };
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: env("AEROFTP_FTP_HASH_LIVE_HOST"),
+            port: 21,
+            username: env("AEROFTP_FTP_HASH_LIVE_USER"),
+            password: env("AEROFTP_FTP_HASH_LIVE_PASS").into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        });
+        provider.connect().await.expect("the lab accepts the login");
+
+        assert_eq!(
+            provider.checksum_capability("hello.txt").algorithms,
+            vec!["md5", "sha1", "sha256", "sha512", "crc32"]
+        );
+        for (key, label) in [
+            ("md5", "MD5"),
+            ("sha256", "SHA-256"),
+            ("sha512", "SHA-512"),
+            ("crc32", "CRC32"),
+            ("sha1", "SHA-1"),
+        ] {
+            let map = provider
+                .checksum_for("hello.txt", key)
+                .await
+                .unwrap_or_else(|e| panic!("{key}: {e}"));
+            assert_eq!(
+                map.get(key).map(String::as_str),
+                Some(digest(label)),
+                "{key}: {map:?}"
+            );
+        }
+        let map = provider.checksum("hello.txt").await.expect("HASH answers");
+        assert_eq!(
+            map.get("sha256").map(String::as_str),
+            Some(digest("SHA-256"))
+        );
+        let _ = provider.disconnect().await;
+    }
+}
+
+/// The verdict of a transfer, end to end on the real crate: what the server
+/// says after the data, and what the session can still do afterwards.
+#[cfg(test)]
+mod transfer_verdict_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// How the scripted server ends each transfer.
+    #[derive(Clone)]
+    struct Script {
+        /// RETR: the bytes sent on the data connection before it closes.
+        retr_payload: Vec<u8>,
+        /// RETR: the reply(ies) once the whole payload was written.
+        retr_reply: &'static str,
+        /// RETR: the reply(ies) when the client closed the data connection
+        /// before the payload was written, as a real server answers an early
+        /// close (it cannot complain before the client has closed).
+        retr_reply_after_early_close: &'static str,
+        /// STOR: the reply once the data connection ends, unless the client
+        /// sent ABOR first. Empty: the server never answers.
+        stor_reply: &'static str,
+        /// STOR: the server takes the data connection and never reads it, so
+        /// the client's writes stall once the socket buffers are full.
+        stor_stalls: bool,
+        /// STOR: an ABOR is answered as vsftpd blocked in the read answers
+        /// it: `226` for the part it stored, then `225` about 100 ms later.
+        stor_abor_late: bool,
+    }
+
+    /// What the scripted server records in its log when the client closed the
+    /// data connection before the payload was written.
+    const EARLY_CLOSE_SEEN: &str = "(the client closed the data connection early)";
+
+    /// A server that answers every control connection it is given with
+    /// `script`, recording each command line in `log`, and each early close.
+    async fn scripted_server(script: Script) -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let server_log = Arc::clone(&log);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve(
+                    stream,
+                    Arc::clone(&data_listener),
+                    script.clone(),
+                    Arc::clone(&server_log),
+                ));
+            }
+        });
+        (port, log)
+    }
+
+    async fn serve(
+        stream: TcpStream,
+        data_listener: Arc<TcpListener>,
+        script: Script,
+        log: Arc<Mutex<Vec<String>>>,
+    ) {
+        let data_port = data_listener.local_addr().unwrap().port();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        if write.write_all(b"220 ready\r\n").await.is_err() {
+            return;
+        }
+        while let Ok(Some(line)) = lines.next_line().await {
+            log.lock().unwrap().push(line.clone());
+            let cmd = line.split_whitespace().next().unwrap_or("").to_uppercase();
+            let reply = match cmd.as_str() {
+                "USER" => "331 password please\r\n".to_string(),
+                "PASS" => "230 logged in\r\n".to_string(),
+                "PWD" => "257 \"/\" is current\r\n".to_string(),
+                "REST" => "350 restarting\r\n".to_string(),
+                "PASV" => format!(
+                    "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                    data_port / 256,
+                    data_port % 256
+                ),
+                "RETR" => {
+                    let (mut data, _) = data_listener.accept().await.unwrap();
+                    if write.write_all(b"150 opening\r\n").await.is_err() {
+                        return;
+                    }
+                    // The client may close early: a failed write is its choice,
+                    // and the server's answer to it.
+                    let complete = data.write_all(&script.retr_payload).await.is_ok();
+                    drop(data);
+                    if !complete {
+                        log.lock().unwrap().push(EARLY_CLOSE_SEEN.to_string());
+                    }
+                    if complete {
+                        script.retr_reply.to_string()
+                    } else {
+                        script.retr_reply_after_early_close.to_string()
+                    }
+                }
+                "STOR" | "APPE" => {
+                    let (mut data, _) = data_listener.accept().await.unwrap();
+                    if write.write_all(b"150 send it\r\n").await.is_err() {
+                        return;
+                    }
+                    if script.stor_stalls {
+                        // Held, never read, until the client goes away.
+                        let _ = lines.next_line().await;
+                        drop(data);
+                        return;
+                    }
+                    let _ = data.read_to_end(&mut Vec::new()).await;
+                    // A client that gives up sends ABOR before it closes the
+                    // data connection, so the ABOR is already on its way.
+                    match tokio::time::timeout(Duration::from_millis(200), lines.next_line()).await
+                    {
+                        Ok(Ok(Some(next))) => {
+                            log.lock().unwrap().push(next.clone());
+                            if !next.to_uppercase().starts_with("ABOR") {
+                                return;
+                            }
+                            if script.stor_abor_late {
+                                if write
+                                    .write_all(b"226 Transfer complete.\r\n")
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                "225 No transfer to ABOR.\r\n".to_string()
+                            } else {
+                                "426 transfer aborted\r\n226 ABOR successful\r\n".to_string()
+                            }
+                        }
+                        _ => script.stor_reply.to_string(),
+                    }
+                }
+                _ => "200 ok\r\n".to_string(),
+            };
+            if write.write_all(reply.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn connected(port: u16) -> FtpProvider {
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        });
+        provider.connect().await.expect("the dial must succeed");
+        provider
+    }
+
+    /// A server that fails a download after sending its data: the reply after
+    /// the stream is the verdict, and the download is an error. Dropping the
+    /// stream instead of finishing it would read the transfer as done.
+    #[tokio::test]
+    async fn a_download_the_server_fails_after_the_data_is_an_error() {
+        for reply in [
+            "426 Connection closed; transfer aborted.\r\n",
+            "451 Requested action aborted: local error.\r\n",
+        ] {
+            let (port, _) = scripted_server(Script {
+                retr_payload: b"0123456789".to_vec(),
+                retr_reply: reply,
+                retr_reply_after_early_close: reply,
+                stor_reply: "226 done\r\n",
+                stor_stalls: false,
+                stor_abor_late: false,
+            })
+            .await;
+            let mut provider = connected(port).await;
+            let dir = tempfile::tempdir().unwrap();
+            let local = dir.path().join("f.bin");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                provider.download("/f.bin", local.to_str().unwrap(), None),
+            )
+            .await
+            .expect("the download must end");
+            assert!(outcome.is_err(), "{reply:?} was read as success");
+        }
+    }
+
+    /// The same for an upload: `451`, `452` and `552` after the data refuse
+    /// the file, and the upload is an error. Sent once (verification of the
+    /// last round of #950): the refusal read as "invalid response" was taken
+    /// for a stale session, and the whole file went up a second time.
+    #[tokio::test]
+    async fn an_upload_the_server_refuses_after_the_data_is_an_error() {
+        for reply in [
+            "451 Requested action aborted: local error.\r\n",
+            "452 Insufficient storage space.\r\n",
+            "552 Exceeded storage allocation.\r\n",
+        ] {
+            let (port, log) = scripted_server(Script {
+                retr_payload: Vec::new(),
+                retr_reply: "226 done\r\n",
+                retr_reply_after_early_close: "426 Connection closed; transfer aborted.\r\n",
+                stor_reply: reply,
+                stor_stalls: false,
+                stor_abor_late: false,
+            })
+            .await;
+            let mut provider = connected(port).await;
+            let dir = tempfile::tempdir().unwrap();
+            let local = dir.path().join("f.bin");
+            std::fs::write(&local, b"payload").unwrap();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                provider.upload(local.to_str().unwrap(), "/f.bin", None),
+            )
+            .await
+            .expect("the upload must end");
+            assert!(outcome.is_err(), "{reply:?} was read as success");
+            let stors = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with("STOR"))
+                .count();
+            assert_eq!(stors, 1, "{reply:?}: the file was sent again");
+        }
+    }
+
+    /// Verification of the fifth and sixth rounds of #949: MFMT stamped the
+    /// remote with the time read from the path once the upload was over,
+    /// which is the time of a save made meanwhile, lent to bytes that are not
+    /// that save's: a sync then read the pair as identical. It stamps the time
+    /// read from the open file as the upload starts. Here the path is given
+    /// another file, with another time, while the server waits after the data
+    /// for a possible ABOR.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mfmt_stamps_the_time_the_upload_started_from() {
+        let (port, log) = scripted_server(Script {
+            retr_payload: Vec::new(),
+            retr_reply: "226 done\r\n",
+            retr_reply_after_early_close: "426 Connection closed; transfer aborted.\r\n",
+            stor_reply: "226 done\r\n",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let mut provider = connected(port).await;
+        provider.mfmt_supported = true;
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = |path: &std::path::Path, secs: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        let local = dir.path().join("f.bin");
+        std::fs::write(&local, b"payload").unwrap();
+        stamp(&local, 1_700_000_000);
+        let saved = dir.path().join("saved");
+        std::fs::write(&saved, b"a later save").unwrap();
+        stamp(&saved, 1_800_000_000);
+        let saver = {
+            let (log, local, saved) = (Arc::clone(&log), local.clone(), saved.clone());
+            tokio::spawn(async move {
+                while !log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.starts_with("STOR"))
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                std::fs::rename(&saved, &local).unwrap();
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            provider.upload(local.to_str().unwrap(), "/f.bin", None),
+        )
+        .await
+        .expect("the upload must end")
+        .expect("the upload succeeds");
+        saver.await.unwrap();
+        let mfmt = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|line| line.starts_with("MFMT"))
+            .cloned();
+        assert_eq!(
+            mfmt.as_deref(),
+            Some("MFMT 20231114221320 /f.bin"),
+            "the time of the file that was sent (2023-11-14 22:13:20), not of the later save"
+        );
+    }
+
+    /// A range the server cuts short and then fails (`451`) is an error, not
+    /// a shorter read: only a file that really ends inside the range (`226`)
+    /// may return fewer bytes than asked.
+    #[tokio::test]
+    async fn a_range_the_server_cuts_short_is_an_error() {
+        let (port, _) = scripted_server(Script {
+            retr_payload: vec![b'x'; 40],
+            retr_reply: "451 Requested action aborted: local error.\r\n",
+            retr_reply_after_early_close: "426 Connection closed; transfer aborted.\r\n",
+            stor_reply: "226 done\r\n",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let mut provider = connected(port).await;
+        let cut = provider.read_range("/f.bin", 0, 100).await;
+        assert!(cut.is_err(), "a truncated range was returned as Ok");
+
+        let (port, _) = scripted_server(Script {
+            retr_payload: vec![b'x'; 40],
+            retr_reply: "226 done\r\n",
+            retr_reply_after_early_close: "426 Connection closed; transfer aborted.\r\n",
+            stor_reply: "226 done\r\n",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let mut provider = connected(port).await;
+        let short = provider.read_range("/f.bin", 0, 100).await.unwrap();
+        assert_eq!(
+            short.len(),
+            40,
+            "a file shorter than the range is read whole"
+        );
+    }
+
+    /// A range that stops before the end of the file gets the server's
+    /// complaint about the early close (here `426` and a `226` after it): the
+    /// session is dropped, and the next operation dials a fresh one instead of
+    /// reading the leftover `226` as its own reply.
+    #[tokio::test]
+    async fn a_range_that_stops_before_the_end_leaves_the_provider_usable() {
+        // Far more than the socket buffers hold, so the server is still
+        // writing when the client closes, and answers the early close.
+        let (port, _) = scripted_server(Script {
+            retr_payload: vec![b'x'; 64 * 1024 * 1024],
+            retr_reply: "226 done\r\n",
+            retr_reply_after_early_close:
+                "426 Connection closed; transfer aborted.\r\n226 closing\r\n",
+            stor_reply: "226 done\r\n",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let mut provider = connected(port).await;
+        let first = provider.read_range("/f.bin", 0, 10).await.unwrap();
+        assert_eq!(first, vec![b'x'; 10]);
+        let second = tokio::time::timeout(
+            Duration::from_secs(10),
+            provider.read_range("/f.bin", 10, 10),
+        )
+        .await
+        .expect("the next read must end");
+        assert_eq!(second.unwrap(), vec![b'x'; 10]);
+    }
+
+    /// What servers say after the client stopped a transfer early: vsftpd and
+    /// ProFTPD `426`; Pure-FTPd a rate line that reuses the code of its last
+    /// reply, the `150`; and any error a server may choose.
+    const WORDS_ON_AN_EARLY_CLOSE: [&str; 4] = [
+        "426 Connection closed; transfer aborted.\r\n",
+        "150 0.012 seconds (measured here), 1.00 Mbytes per second\r\n",
+        "451 Requested action aborted: local error.\r\n",
+        "550 Permission denied.\r\n",
+    ];
+
+    /// Verification of the fix rounds of #950: only a `426` was accepted after
+    /// a range read whole, and Pure-FTPd answers an early close with a rate
+    /// line on the `150` it sent before the data, so every range that stopped
+    /// before the end of a large file failed there. The bytes asked for are in
+    /// once the range is read whole; whatever the server says then concerns
+    /// the part it did not send.
+    #[tokio::test]
+    async fn a_range_read_whole_accepts_any_word_on_the_early_close() {
+        for word in WORDS_ON_AN_EARLY_CLOSE {
+            // The word goes where the server sees the early close. Where it
+            // does not (Windows, whose send buffer takes the whole payload),
+            // a refusal written right after the data can reach the control
+            // watch before the data is read, and a `226` is the only reply
+            // valid there: the test then passes without the word.
+            let (port, log) = scripted_server(Script {
+                retr_payload: vec![b'x'; 64 * 1024 * 1024],
+                retr_reply: "226 done\r\n",
+                retr_reply_after_early_close: word,
+                stor_reply: "226 done\r\n",
+                stor_stalls: false,
+                stor_abor_late: false,
+            })
+            .await;
+            let mut provider = connected(port).await;
+            let read = tokio::time::timeout(
+                Duration::from_secs(10),
+                provider.read_range("/f.bin", 0, 10),
+            )
+            .await
+            .expect("the read must end");
+            assert_eq!(read.ok(), Some(vec![b'x'; 10]), "{word:?}");
+            // None of the words is `226` or `250`: where the server saw the
+            // early close and answered it, the session is not handed on.
+            let saw_early_close = log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line == EARLY_CLOSE_SEEN);
+            // Everywhere but Windows the payload outgrows the send buffer and
+            // the server sees the close, so the check below never goes quiet.
+            #[cfg(not(windows))]
+            assert!(
+                saw_early_close,
+                "{word:?}: the server never saw the early close"
+            );
+            if saw_early_close {
+                assert!(provider.stream.is_none(), "{word:?}");
+            }
+        }
+    }
+
+    /// A server that says nothing at all after the early close is not waited
+    /// for past the budget: the bytes are in.
+    #[tokio::test]
+    async fn an_early_close_the_server_never_answers_is_not_waited_for() {
+        let (port, _) = scripted_server(Script {
+            retr_payload: vec![b'x'; 64 * 1024 * 1024],
+            retr_reply: "",
+            retr_reply_after_early_close: "",
+            stor_reply: "226 done\r\n",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let mut provider = connected(port).await;
+        let read = tokio::time::timeout(
+            EARLY_STOP_BUDGET + Duration::from_secs(5),
+            provider.read_range("/f.bin", 0, 10),
+        )
+        .await
+        .expect("the read waited for a reply that never comes");
+        assert_eq!(read.ok(), Some(vec![b'x'; 10]));
+    }
+
+    /// One window of the parallel download, against a server that ends it
+    /// with `early_close_reply` after the window stopped reading.
+    async fn one_window_answered_with(
+        early_close_reply: &'static str,
+    ) -> Result<(), ProviderError> {
+        // The reply goes where the server sees the early close. Where it does
+        // not (Windows, whose send buffer takes the whole payload), the
+        // complete branch answers `226`, the only reply valid there.
+        let (port, _) = scripted_server(Script {
+            retr_payload: vec![b'x'; 64 * 1024 * 1024],
+            retr_reply: "226 done\r\n",
+            retr_reply_after_early_close: early_close_reply,
+            stor_reply: "226 done\r\n",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("f.bin.aerotmp");
+        std::fs::write(&temp, b"").unwrap();
+        let spec = FtpConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::None,
+            verify_cert: false,
+            initial_path: None,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            ftp_download_one_range(
+                spec,
+                "/f.bin".to_string(),
+                64 * 1024,
+                0,
+                10 * 1024 * 1024 - 1,
+                temp,
+                Arc::new(AtomicU64::new(0)),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("the window must end")
+        .map(|_| ())
+    }
+
+    /// A window of the parallel download read whole accepts whatever the
+    /// server says about its early close, Pure-FTPd's rate line included:
+    /// only a `426` was accepted, and every window but the last failed there
+    /// with no fallback.
+    #[tokio::test]
+    async fn a_parallel_window_read_whole_accepts_any_word_on_the_early_close() {
+        for word in WORDS_ON_AN_EARLY_CLOSE {
+            assert!(one_window_answered_with(word).await.is_ok(), "{word:?}");
+        }
+    }
+
+    /// A window read whole is not held by a server that says nothing about
+    /// its early close: the reply is not waited for past the budget.
+    #[tokio::test]
+    async fn a_parallel_window_the_server_never_answers_is_not_waited_for() {
+        assert!(one_window_answered_with("").await.is_ok());
+    }
+
+    /// A local read error in the middle of an upload used to drop the data
+    /// connection: the server saw a clean end of file, stored what it had
+    /// received as the whole file and confirmed it with `226`, which the next
+    /// command then consumed unseen. The transfer is aborted instead, and the
+    /// upload fails. m1 (verification of the fix rounds of #950): the ABOR
+    /// can draw two replies, vsftpd's `226` for the part it stored and then
+    /// `225`, the second after the next command has started, which read it as
+    /// its own answer; the session is not handed on, both with that order and
+    /// with `426` then `226`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_read_error_mid_upload_aborts_the_transfer() {
+        for stor_abor_late in [false, true] {
+            let (port, log) = scripted_server(Script {
+                retr_payload: Vec::new(),
+                retr_reply: "226 done\r\n",
+                retr_reply_after_early_close: "426 Connection closed; transfer aborted.\r\n",
+                stor_reply: "226 done\r\n",
+                stor_stalls: false,
+                stor_abor_late,
+            })
+            .await;
+            let mut provider = connected(port).await;
+            // Opening a directory succeeds on Unix and reading it fails: the
+            // failure comes after STOR has opened the data connection.
+            let dir = tempfile::tempdir().unwrap();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                provider.upload(dir.path().to_str().unwrap(), "/f.bin", None),
+            )
+            .await
+            .expect("the upload must end");
+            assert!(outcome.is_err());
+            assert!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.starts_with("ABOR")),
+                "the server was never told: {:?}",
+                log.lock().unwrap()
+            );
+            assert!(
+                provider.stream.is_none(),
+                "the session was handed on with an ABOR reply still owed (late: {stor_abor_late})"
+            );
+            // A fresh session answers the next command.
+            provider.connect().await.expect("the redial must succeed");
+            let pwd = tokio::time::timeout(Duration::from_secs(10), provider.pwd())
+                .await
+                .expect("the next command must end");
+            assert_eq!(pwd.unwrap(), "/");
+        }
+    }
+
+    /// A TLS acceptor for a loopback server with a fresh self-signed
+    /// certificate, offering every version rustls supports.
+    fn loopback_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key = rustls_pki_types::PrivateKeyDer::Pkcs8(
+            rustls_pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certified.cert.der().clone()], key)
+        .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// Implicit FTPS negotiates the data channel's protection like explicit
+    /// FTPS does. The session is encrypted from the first byte, but a server
+    /// keeps its data connections in the clear until `PBSZ 0` and `PROT P`
+    /// (RFC 4217), while the client wraps them in TLS: every transfer then
+    /// died in the data handshake (`tls handshake eof` against vsftpd).
+    #[tokio::test]
+    async fn implicit_ftps_asks_for_protected_data_connections() {
+        let acceptor = loopback_tls_acceptor();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_log = Arc::clone(&log);
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let (read, mut write) = tokio::io::split(tls);
+            let mut lines = BufReader::new(read).lines();
+            write.write_all(b"220 ready\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                server_log.lock().unwrap().push(line.clone());
+                let cmd = line.split_whitespace().next().unwrap_or("").to_uppercase();
+                let reply = match cmd.as_str() {
+                    "USER" => "331 password please\r\n",
+                    "PASS" => "230 logged in\r\n",
+                    "PWD" => "257 \"/\" is current\r\n",
+                    "QUIT" => "221 bye\r\n",
+                    _ => "200 ok\r\n",
+                };
+                if write.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = write.flush().await;
+            }
+        });
+
+        let mut provider = FtpProvider::new(FtpConfig {
+            host: "localhost".to_string(),
+            port,
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::Implicit,
+            verify_cert: false,
+            initial_path: None,
+        });
+        tokio::time::timeout(Duration::from_secs(10), provider.connect())
+            .await
+            .expect("the dial must end")
+            .expect("the dial must succeed");
+        let sent = log.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|line| line == "PBSZ 0"),
+            "no PBSZ: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|line| line == "PROT P"),
+            "no PROT P: {sent:?}"
+        );
+    }
+
+    /// FTPS stays on TLS 1.2, and not only for session reuse: an upload never
+    /// reads its data connection, and the TLS 1.3 tickets a server sends on
+    /// it would turn the close into a reset that loses the end of the file.
+    /// A server offering TLS 1.3 gets a TLS 1.2 handshake.
+    #[tokio::test]
+    async fn the_ftps_connector_negotiates_tls_1_2() {
+        use suppaftp::tokio::AsyncTlsConnector;
+
+        let acceptor = loopback_tls_acceptor();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            tls.get_ref().1.protocol_version()
+        });
+
+        let provider = FtpProvider::new(FtpConfig {
+            host: "localhost".to_string(),
+            port: addr.port(),
+            username: "u".to_string(),
+            password: "p".to_string().into(),
+            tls_mode: FtpTlsMode::Explicit,
+            verify_cert: false,
+            initial_path: None,
+        });
+        let connector = provider.make_tls_connector().unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _client = connector
+            .connect("localhost", tcp)
+            .await
+            .expect("the handshake");
+        assert_eq!(
+            server.await.unwrap(),
+            Some(rustls::ProtocolVersion::TLSv1_2)
+        );
+    }
+
+    /// CodeRabbit on #950: an upload dropped mid-write (a cancelled transfer)
+    /// left the session in place, its data channel open and its reply owed,
+    /// and the next command would have waited for that reply with no
+    /// deadline. The session is taken: the next operation dials again.
+    #[tokio::test]
+    async fn an_upload_dropped_mid_write_takes_the_session() {
+        let (port, _) = scripted_server(Script {
+            retr_payload: Vec::new(),
+            retr_reply: "226 done\r\n",
+            retr_reply_after_early_close: "426 Connection closed; transfer aborted.\r\n",
+            stor_reply: "226 done\r\n",
+            stor_stalls: true,
+            stor_abor_late: false,
+        })
+        .await;
+        let mut provider = connected(port).await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("f.bin");
+        // More than the socket buffers hold, so the writes stall.
+        std::fs::write(&local, vec![0u8; 64 * 1024 * 1024]).unwrap();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(500),
+            provider.upload(local.to_str().unwrap(), "/f.bin", None),
+        )
+        .await
+        .is_err();
+        assert!(
+            dropped,
+            "the upload was meant to stall until it was dropped"
+        );
+        assert!(
+            provider.stream.is_none(),
+            "the session outlived an upload dropped mid-write"
+        );
+    }
+
+    /// The same once the data is sent and the server's verdict is awaited,
+    /// on every transfer that reads one through the channel: dropped there,
+    /// each left a reply owed on a session it handed on.
+    #[tokio::test]
+    async fn a_transfer_dropped_while_its_verdict_is_owed_takes_the_session() {
+        let (port, _) = scripted_server(Script {
+            retr_payload: b"0123456789".to_vec(),
+            // The verdict never comes.
+            retr_reply: "",
+            retr_reply_after_early_close: "",
+            stor_reply: "",
+            stor_stalls: false,
+            stor_abor_late: false,
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("f.bin").to_str().unwrap().to_string();
+        let wait = Duration::from_millis(500);
+        for op in [
+            "download",
+            "download_to_bytes",
+            "read_range",
+            "resume_download",
+            "upload",
+            "resume_upload",
+        ] {
+            std::fs::write(&local, b"012").unwrap();
+            let mut provider = connected(port).await;
+            let dropped = match op {
+                "download" => tokio::time::timeout(wait, provider.download("/f.bin", &local, None))
+                    .await
+                    .is_err(),
+                "download_to_bytes" => {
+                    tokio::time::timeout(wait, provider.download_to_bytes("/f.bin"))
+                        .await
+                        .is_err()
+                }
+                "read_range" => tokio::time::timeout(wait, provider.read_range("/f.bin", 0, 100))
+                    .await
+                    .is_err(),
+                "resume_download" => {
+                    tokio::time::timeout(wait, provider.resume_download("/f.bin", &local, 3, None))
+                        .await
+                        .is_err()
+                }
+                "upload" => tokio::time::timeout(wait, provider.upload(&local, "/f.bin", None))
+                    .await
+                    .is_err(),
+                "resume_upload" => {
+                    tokio::time::timeout(wait, provider.resume_upload(&local, "/f.bin", 1, None))
+                        .await
+                        .is_err()
+                }
+                _ => unreachable!(),
+            };
+            assert!(dropped, "{op}: meant to be waiting for the verdict");
+            assert!(
+                provider.stream.is_none(),
+                "{op}: the session outlived a transfer dropped with its verdict owed"
+            );
+        }
     }
 }

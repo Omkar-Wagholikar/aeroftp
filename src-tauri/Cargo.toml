@@ -75,14 +75,14 @@ futures-util = "0.3"
 # localhost server, and Windows and macOS use `WebviewUrl::App`, which is why
 # only Linux regressed. The schemes differ,
 # `make_relative` fails, and the third clause asks whether "http" is a
-# registered URI scheme, which it is not: tauri-plugin-localhost runs an HTTP
-# server rather than registering a scheme.
+# registered URI scheme, which it is not: `ui_server` (formerly
+# tauri-plugin-localhost) runs an HTTP server rather than registering a scheme.
 #
 # The obvious remedy is self-defeating, which is worth writing down because it
 # looks correct. Making `get_app_url()` return the HTTP URL requires
 # `frontendDist` to be a URL, and tauri-codegen maps `FrontendDist::Url` to an
-# EMPTY embedded asset set, which is exactly what tauri-plugin-localhost serves
-# through `app.asset_resolver()`. The app would start and answer 404.
+# EMPTY embedded asset set, which is exactly what `ui_server` serves through
+# `app.asset_resolver()`. The app would start and answer 404.
 #
 # Discarded alternative, recorded so it is not re-evaluated from scratch:
 # stop embedding the frontend and serve it from disk with our own server. That
@@ -106,7 +106,7 @@ tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-suppaftp = { version = "=10.0.2", features = ["tokio", "tokio-rustls-aws-lc-rs", "deprecated"] }
+suppaftp = { version = "=12.1.0", features = ["tokio", "tokio-rustls-aws-lc-rs", "deprecated"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
@@ -323,10 +323,16 @@ windows = { version = "0.58", features = [
 winreg = "0.56"
 
 # Linux-only dependencies
-# - tauri-plugin-localhost: WebKitGTK workaround (Monaco ESM, xterm.js, canvas, iframe CSS)
+# - hyper, hyper-util, http-body-util: `ui_server`, the loopback server the
+#   webviews load the frontend from (WebKitGTK needs an HTTP origin for Monaco
+#   ESM, xterm.js, canvas and iframe CSS). It replaced tauri-plugin-localhost,
+#   whose tiny_http 0.12 core could leave a cold-start request unread. All three
+#   were already in the tree through reqwest; only features are added here.
 # - fuser: FUSE virtual filesystem mount (macOS requires macFUSE installed by user)
 [target.'cfg(target_os = "linux")'.dependencies]
-tauri-plugin-localhost = "2"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 # T-DEBT-13c: bumped from 0.16 to 0.17. Breaking changes consumed in
 # `mod fuse_mount` (cli.rs): all `Filesystem` trait methods migrated
 # from `&mut self` to `&self`, integer args switched to newtypes
@@ -359,6 +365,7 @@ posix-acl = { version = "1.2.0", optional = true }
 acl-sys = { version = "1.2.2", optional = true }
 
 [dev-dependencies]
+rcgen = "0.14"                                                       # Self-signed certificates for the loopback TLS tests
 
 [features]
 default = ["aerorsync", "local-stt"]
@@ -456,46 +463,60 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # time -- exit 1 means still needed, exit 0 means this section can go.
 [patch.crates-io]
 n0-mainline = { git = "https://github.com/axpdev-lab/n0-mainline", rev = "25ee35e827f642635a1028606f0bbd4e9c530ae0" }
-# suppaftp: the v10.0.2 release commit plus ONE method,
-# `buffered_reply_bytes()`, on the tokio stream, so the data-channel watch in
-# `providers/ftp.rs` can see a reply that the control reader has already
-# pulled off the socket. A server that sends `150` and the final reply in one
-# segment leaves the socket empty and the refusal inside the BufReader, and a
-# peek on the bare socket is blind to it: the transfer then waits out the
-# full data idle timeout for an answer that arrived with the first one. The
-# fork can be audited at a glance: `git diff v10.0.2` shows only that method.
+# suppaftp: the v12.1.0 release commit plus ONE method,
+# `ControlSocket::buffered_reply_bytes()`, on the tokio control guard, so the
+# data-channel watch in `providers/ftp.rs` can see a reply that the control
+# reader has already pulled off the socket. A server that sends `150` and the
+# final reply in one segment leaves the socket empty and the refusal inside
+# the BufReader, and a peek on the bare socket is blind to it: the transfer
+# then waits out the full data idle timeout for an answer that arrived with
+# the first one. The fork can be audited at a glance:
+# `git diff c841f5e6 8d7c78f6` (c841f5e6 is upstream's v12.1.0 tag, which the
+# fork does not carry) shows only that method, its two tests and a doc note.
+#
+# WHERE THE PIN LIVES: commit 8d7c78f6 on branch `aeroftp/v12.1.0` of
+# axpdev-lab/suppaftp and, because a branch can move and a rev it no longer
+# reaches stops resolving for every uncached build, under the annotated tag
+# `aeroftp-v12.1.0-buffered-reply-bytes-8d7c78f6`. The 4.2.0 pin (v10.0.2 plus
+# the same method, 2d39fadc) has `aeroftp-v10.0.2-buffered-reply-bytes-2d39fad`.
+# Nothing on the fork stops a tag or a branch from moving yet: a ruleset on
+# `refs/tags/aeroftp-*` and the `aeroftp/*` branches is the owner's call; an
+# upstream pull request starts from a new branch, never by rewriting these.
 #
 # EXIT CONDITION: delete this entry as soon as an upstream release exposes
 # the reader's buffered bytes (or an equivalent readiness) on the tokio
 # stream. Pinned by `rev` on purpose, for the same reason as n0-mainline
 # above.
 #
-# UPSTREAM: NOTHING FILED as of 2026-09-01, and the branch being ready is not
+# UPSTREAM: NOTHING FILED as of 2026-09-26, and the branch being ready is not
 # the same as the contribution being ready. suppaftp asks for an issue first
 # (CONTRIBUTING.md), and its PR checklist wants tests and a local
-# `just check_code`, neither of which exists for this method yet. It also has
-# a binding AI_POLICY.md: disclosure is mandatory and must go through their PR
-# template, and the contributor has to be a person who understands the change
-# and answers review in their own words. The branch `buffered-reply-bytes` is
-# pushed on axpdev-lab/suppaftp and the issue text, the disclosure wording and
-# the remaining work are in `BATON-suppaftp-upstream-pr.md` outside this repo.
-# Filing it is an action on somebody else's repository under somebody's name,
-# so it belongs to the account owner rather than to whoever edits this file.
+# `just check_code`. The tests exist now (two tokio tests in `control.rs`,
+# seen red under a mutation of the method); `just check_code` has not been
+# run, because its tools (just, dprint, cargo-deny) are not installed where
+# the branch was built. It also has a binding AI_POLICY.md: disclosure is
+# mandatory and must go through their PR template, and the contributor has to
+# be a person who understands the change and answers review in their own
+# words. The issue text, the disclosure wording and the remaining work are in
+# the release 4.2.1 S-lane handoff under `docs/dev`,
+# outside the public tree. Filing it is an action on somebody else's
+# repository under somebody's name, so it belongs to the account owner rather
+# than to whoever edits this file.
 #
 # COST OF STAYING FORKED, stated because it is easy to forget once it builds:
 # `cargo audit` matches advisories by crate name and version against the
 # crates.io index, and a git source is not that. So for as long as this entry
 # exists, suppaftp is outside the advisory scanning the released version would
 # get, and a RUSTSEC advisory landing on it may not turn the audit lane red.
-# The pin is v10.0.2 plus one method, so the exposure is that of v10.0.2, but
+# The pin is v12.1.0 plus one method, so the exposure is that of v12.1.0, but
 # nothing here will TELL us if that changes. That is a reason to file upstream
 # rather than to keep the fork comfortable.
 #
-# When it is sent, REPLACE the two lines above with its URL. That is the
+# When it is sent, REPLACE the "NOTHING FILED" line above with its URL. That is the
 # whole point of writing the state here: "we will upstream it" is a sentence
 # nobody can check six months later, while "not opened as of a date" and a
 # link are both things a reader can verify in a second. A fork does not
 # become permanent because the exit condition is missing; it becomes
 # permanent because the exit condition is written in a form nobody can
 # verify.
-suppaftp = { git = "https://github.com/axpdev-lab/suppaftp", rev = "2d39fadca96b4be37998c3097cb97c36b39231e1" }
+suppaftp = { git = "https://github.com/axpdev-lab/suppaftp", rev = "8d7c78f67827a8b980e0eee4d0550615183b862e" }

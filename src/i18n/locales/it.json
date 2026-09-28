@@ -1225,6 +1225,27 @@
             "keystoreBackup": "Backup Vault",
             "exportKeystore": "Esporta Keystore",
             "importKeystore": "Importa Keystore",
+            "keystorePreviewButton": "Rivedi le modifiche",
+            "keystorePreviewLoading": "Lettura del backup...",
+            "keystorePreviewTitle": "Profili server in questo backup",
+            "keystorePreviewNone": "L'importazione di questo backup non cambia i tuoi profili server.",
+            "keystorePreviewUnchanged": "Invariati: {count}",
+            "keystorePreviewReplaces": "Questo backup sostituisce l'elenco dei server: i profili presenti solo su questo dispositivo vengono rimossi se non li conservi.",
+            "keystorePreviewAdded": "Nuovo",
+            "keystorePreviewRemoved": "Solo su questo dispositivo",
+            "keystorePreviewChanged": "Modificato",
+            "keystorePreviewCredentials": "Credenziali diverse",
+            "keystorePreviewOtherFields": "Modificati anche: {fields}",
+            "keystoreDecisionAdd": "Aggiungi",
+            "keystoreDecisionSkip": "Salta",
+            "keystoreDecisionRemove": "Rimuovi",
+            "keystoreDecisionKeep": "Conserva",
+            "keystoreDecisionUseBackup": "Usa il backup",
+            "keystoreDecisionKeepLocal": "Tieni la versione del dispositivo",
+            "keystoreDecisionKeepBoth": "Tieni entrambi",
+            "keystoreCopyName": "{name} (dal backup)",
+            "keystorePreviewLocalFromVault": "Non è stato possibile leggere l'elenco dei profili server di questo dispositivo, quindi il confronto usa l'elenco dei server salvato nel vault.",
+            "keystoreDecisionsFailed": "L'importazione è terminata, ma le tue scelte sui profili server non sono state applicate: {error}",
             "exportKeystoreDesc": "Esporta tutte le credenziali crittografate in un file di backup",
             "importKeystoreDesc": "Importa credenziali da un file di backup",
             "importKeystorePrompt": "Inserisci la password usata per cifrare questo backup del keystore.",
@@ -1593,7 +1614,8 @@
             "uiTokensReload": "Ricarica",
             "uiTokensReset": "Cancella override",
             "uiTokensApplied": "Sostituzioni applicate: {count}",
-            "uiTokensRejected": "Voci rifiutate: {count}"
+            "uiTokensRejected": "Voci rifiutate: {count}",
+            "keystorePreferencesFailed": "L'importazione è terminata, ma le tue preferenze dell'app non sono state ripristinate: {error}"
         },
         "appearance": {
             "patternCross": "Croce",
@@ -2336,9 +2358,6 @@
                 "disk_error": "Errore disco",
                 "unknown": "Sconosciuto"
             },
-            "parallelStreams": "Stream",
-            "parallelSequential": "Sequenziale",
-            "parallelStreamLabel": "stream",
             "schedulerTitle": "Pianificazione sincronizzazione",
             "schedulerEnabled": "Abilita pianificazione",
             "schedulerResume": "Riprendi",
@@ -2353,10 +2372,6 @@
             "watcherBackend": "Backend",
             "watcherInotifyWarning": "Numero elevato di directory - potrebbe superare il limite inotify",
             "watcherPolling": "Utilizzo modalità polling (più lenta ma universale)",
-            "compressionToggle": "Compressione",
-            "compressionAuto": "Auto",
-            "compressionOn": "Attiva",
-            "compressionOff": "Disattiva",
             "multiPathAdd": "Aggiungi coppia percorsi",
             "multiPathEmpty": "Nessuna coppia di percorsi configurata",
             "templateExport": "Esporta template",
@@ -2369,21 +2384,19 @@
             "rollbackRestore": "Ripristina",
             "rollbackEmpty": "Nessuno snapshot disponibile",
             "speedManiac": "Maniac",
-            "speedManiacTooltip": "8 stream + TUTTE le sicurezze disabilitate - no journal, no verifica, no retry",
+            "speedManiacTooltip": "Niente journal, nessuna verifica durante l'esecuzione, limiti di banda ignorati, 2 retry rapidi. I file scaricati vengono verificati dopo l'esecuzione.",
             "maniacWarningTitle": "MANIAC MODE",
-            "maniacWarningBody": "Nessun journal. Nessuna verifica. Nessun retry. Velocità massima assoluta. Se qualcosa fallisce, è perso. Una scansione di verifica completa verrà eseguita al termine della sincronizzazione.",
+            "maniacWarningBody": "Niente journal e nessuna verifica durante l'esecuzione, i limiti di banda sono ignorati e un file non riuscito ha solo 2 retry rapidi. Dopo l'esecuzione i file scaricati vengono verificati, quelli caricati no.",
             "maniacConfirm": "Comprendo, procedi",
             "maniacPostSyncReport": "Verifica post-sync: {ok} OK, {mismatches} non corrispondenti, {failed} falliti",
             "rollback": "Rollback",
             "rollbackFiles": "File nello snapshot",
             "compression": "Compressione",
-            "compressionHint": "Comprime i dati durante il trasferimento per renderlo più veloce; non salva file compressi a destinazione. La modalità Auto salta i formati già compressi (zip, jpg, mp4 e simili).",
             "multiPath": "Sincronizzazione multi-percorso",
             "templates": "Template",
             "templateExportDesc": "Salva la configurazione di sincronizzazione corrente come template .aerosync riutilizzabile",
             "templateImportDesc": "Carica un template .aerosync per applicare la sua configurazione di sincronizzazione",
             "maniacActive": "Attivo",
-            "speedStreams": "{count} flussi",
             "actionUploaded": "Caricato",
             "actionDownloaded": "Scaricato",
             "actionDeleted": "Eliminato",
@@ -2442,7 +2455,7 @@
             "aerosyncScriptUnmappedFields": "Campi metadata non riconosciuti",
             "aerosyncScriptApplyButton": "Salva come preset",
             "aerosyncScriptAppliedToast": "Preset importato salvato. Apri AeroSync per usarlo.",
-            "templateImportPathPairs": "Questo template definisce {count} coppie di percorsi utilizzabili. AeroFTP ne applica esattamente una, quindi non è stato importato nulla. Modifica il template lasciando una sola coppia, poi importalo di nuovo.",
+            "templateImportPathPairs": "Coppie di percorsi locale/remoto utilizzabili in questo template: {count}. Una finestra AeroSync lavora su una sola coppia, quindi non è stato importato nulla. Modifica il template lasciando una sola coppia, poi importalo di nuovo.",
             "templateNamePlaceholder": "es. Backup notturno su S3",
             "templateDescPlaceholder": "A cosa serve questo modello (facoltativo)"
         },
@@ -2623,7 +2636,8 @@
                 "pendingApproval": "in attesa di approvazione",
                 "allowAllCalls": "Consenti tutte le chiamate",
                 "rejectAllCalls": "Rifiuta tutte le chiamate",
-                "allowSession": "Consenti per questa sessione"
+                "allowSession": "Consenti per questa sessione",
+                "nonAtomicReplace": "Sostituzione non atomica: il file manca per un istante"
             },
             "settings": {
                 "title": "Impostazioni AI",
@@ -5285,7 +5299,7 @@
             "toolbarButton": "AeroSync",
             "tabCompare": "Confronta",
             "tabPlan": "Pianifica",
-            "tabSync": "Sincronizza",
+            "tabSync": "Mirror locale",
             "compareWontFitTitle": "Oltre i limiti di {name}: {count}",
             "compareWontFitHint": "Questi file superano il limite di dimensione documentato dal provider, oppure il loro nome o percorso è più lungo di quanto accetta. La sincronizzazione fallirebbe su di essi: rinominali, spostali o dividili prima.",
             "compareWontFitTooLarge": "{size}, limite {limit}",
@@ -5293,6 +5307,78 @@
             "compareWontFitNameChars": "nome oltre {count} caratteri",
             "compareWontFitPathBytes": "percorso oltre {count} byte",
             "compareWontFitPathChars": "percorso oltre {count} caratteri",
+            "presetDefault": "Predefinito",
+            "actionLabel": {
+                "skip": "Salta",
+                "copy-to-right": "Copia → destra",
+                "copy-to-left": "Copia ← sinistra",
+                "overwrite-right": "Sovrascrivi a destra",
+                "overwrite-left": "Sovrascrivi a sinistra",
+                "delete-right": "Elimina a destra",
+                "delete-left": "Elimina a sinistra",
+                "rename-to-right": "Tieni entrambi → destra",
+                "rename-to-left": "Tieni entrambi ← sinistra",
+                "conflict-skip": "Conflitto (salta)"
+            },
+            "conflictPolicyOption": {
+                "skip": {
+                    "label": "Salta",
+                    "tagline": "Lascia i conflitti intatti su entrambi i lati."
+                },
+                "rename": {
+                    "label": "Tieni entrambi",
+                    "tagline": "Copia la versione di origine con un suffisso con data e ora."
+                },
+                "newer-wins": {
+                    "label": "Vince il più recente",
+                    "tagline": "Il lato con la data di modifica più recente sovrascrive l'altro."
+                },
+                "older-wins": {
+                    "label": "Vince il più vecchio",
+                    "tagline": "Il lato più vecchio sovrascrive il più recente (uso da archivio)."
+                },
+                "larger-wins": {
+                    "label": "Vince il più grande",
+                    "tagline": "Il lato con la dimensione maggiore sovrascrive il più piccolo."
+                },
+                "smaller-wins": {
+                    "label": "Vince il più piccolo",
+                    "tagline": "Il lato più piccolo sovrascrive il più grande."
+                }
+            },
+            "bucketName": {
+                "only-left": "Solo a sinistra",
+                "newer-left": "Più recente a sinistra",
+                "only-right": "Solo a destra",
+                "newer-right": "Più recente a destra",
+                "conflict": "Conflitto",
+                "same": "Uguali"
+            },
+            "bucketDescription": {
+                "only-left": "Presente nel pannello di origine, assente nella destinazione.",
+                "newer-left": "Presente su entrambi i lati, la copia di origine ha la data più recente.",
+                "only-right": "Presente nella destinazione, assente nel pannello di origine.",
+                "newer-right": "Presente su entrambi i lati, la copia di destinazione ha la data più recente.",
+                "conflict": "Entrambi i lati hanno la voce, ma la dimensione è diversa con date comparabili.",
+                "same": "Le voci coincidono secondo il criterio di confronto attivo."
+            },
+            "comparePolicy": {
+                "sizeOnly": "Solo dimensione",
+                "mtimeOnly": "Solo data",
+                "sizeAndMtime": "Dimensione + data"
+            },
+            "compareTable": {
+                "name": "Nome",
+                "leftSize": "Dimensione a sinistra",
+                "rightSize": "Dimensione a destra",
+                "leftModified": "Modificato a sinistra",
+                "rightModified": "Modificato a destra",
+                "folder": "cartella",
+                "noEntries": "Nessuna voce.",
+                "countedNotListed": "Contati ma non elencati: la scansione riporta i file identici come totale invece che una riga ciascuno, così gli alberi grandi restano veloci.",
+                "shown": "Mostrati: {shown} di {total}",
+                "moreNotListed": "Contati ma non elencati: {count}"
+            },
             "compareUnavailable": "Apri un secondo pannello o una connessione remota per confrontare.",
             "planUnavailable": "Serve prima un confronto. Apri la scheda Confronta.",
             "totalEntries": "Voci totali",
@@ -5329,7 +5415,7 @@
             "ignoredForMirror": "IGNORATO PER MIRROR",
             "versionedBackup": "Backup con versioni",
             "enable": "Abilita",
-            "versionedBackupHint": "Cattura la copia di destinazione in questa directory prima di ogni sovrascrittura o eliminazione.",
+            "versionedBackupHint": "Prima che un file venga sovrascritto o eliminato, la sua copia di destinazione viene spostata in {dir}, in una cartella che porta la data e l'ora dell'esecuzione.",
             "actionable": "Da eseguire",
             "reportCopiedRight": "Copiati a destra",
             "reportCopiedLeft": "Copiati a sinistra",
@@ -5351,7 +5437,6 @@
             "executePreset": "Esegui preset",
             "execute": "Esegui",
             "sync": {
-                "title": "AeroFile Sync: locale verso locale",
                 "description": "Replica una cartella sorgente locale in una destinazione locale. I file >= 1 MiB passano per il motore delta AeroRsync; i file più piccoli usano la copia diretta.",
                 "source": "Sorgente",
                 "destination": "Destinazione",
@@ -5407,7 +5492,7 @@
             "speedMode_fast": "Veloce",
             "speedMode_turbo": "Turbo",
             "speedMode_extreme": "Estrema",
-            "speedModeHint": "Stream paralleli + preset di compressione applicato all'esecuzione.",
+            "speedModeHint": "Imposta la policy dei retry. Da Fast in su, i file modificati vengono inviati come delta dove il server lo supporta (SFTP con rsync).",
             "errorCorrection": "Correzione errori",
             "errorCorrectionHint": "Salva un piccolo file di parità .aerocorrect accanto a ogni file di backup, così una copia remota corrotta da bit-rot può essere riparata al prossimo pull, senza l'originale.",
             "verifyPolicy": "Policy di verifica",
@@ -5452,7 +5537,45 @@
             },
             "launcherScheduler": "Pianificatore",
             "outOfSyncItemsPct": "Elementi non sincronizzati",
-            "outOfSyncBytesPct": "Byte non sincronizzati"
+            "outOfSyncBytesPct": "Byte non sincronizzati",
+            "exclude": {
+                "label": "Pattern da escludere",
+                "hint": "Separati da virgola o a capo, per esempio cache, *.tmp o build/output. Esclusi sempre: {list}."
+            },
+            "cli": {
+                "title": "La stessa esecuzione da riga di comando",
+                "copy": "Copia",
+                "copied": "Copiato",
+                "copyFailed": "Copia non riuscita",
+                "none": "Nessun equivalente esatto nella CLI: {reason}",
+                "reason": {
+                    "localPair": "per due cartelle locali la CLI usa un suo mirror, che ignora direzione, eliminazione e gestione dei conflitti.",
+                    "unsavedServer": "questa connessione non è un server salvato, e la CLI ne ha bisogno per indicarlo con --profile.",
+                    "overwritesNewer": "la CLI sovrascrive una copia di destinazione di dimensione diversa anche quando è più recente, cosa che questo preset non fa mai.",
+                    "twoWay": "la CLI tratta come conflitto due copie della stessa dimensione con orari diversi e sovrascrive la più vecchia; questo piano le considera uguali entro 30 secondi.",
+                    "canary": "la CLI non ha la prova Canary.",
+                    "versionedBackup": "la CLI non conserva ancora i backup con la stessa struttura.",
+                    "transferBudget": "quando il budget finisce questo piano si ferma, eliminazioni comprese; la CLI limita solo i trasferimenti e continua a eliminare.",
+                    "remotePath": "la CLI risolve la cartella remota rispetto alla cartella iniziale del server salvato e arriverebbe a un'altra cartella.",
+                    "exclusions": "la CLI applica i pattern di esclusione in modo diverso, quindi non salterebbe tutto ciò che questo piano salta (node_modules, .git e il resto)."
+                }
+            },
+            "rescan": "Riscansiona",
+            "rescanNeeded": "Il confronto è stato fatto con altre esclusioni o con un'altra cartella di backup. Riscansiona prima di eseguire.",
+            "backup": {
+                "checking": "Verifica di come questo server sposta i file...",
+                "serverCopy": "Questo server non ha lo spostamento: ogni copia conservata viene copiata sul server e poi eliminata. Costa una copia intera di ogni file conservato, in due passaggi separati.",
+                "clientCopy": "Questo server non ha lo spostamento: ogni copia conservata viene scaricata, caricata nella cartella di backup e poi eliminata. Ogni file conservato passa due volte da questo computer, in passaggi separati.",
+                "unsupported": "Questo server non può spostare file in un'altra cartella, quindi non può conservare le copie precedenti. Disattiva il backup con versioni per eseguire.",
+                "checkFailed": "Non è stato possibile chiedere al server come sposta i file. Riconnettiti, oppure disattiva il backup con versioni per eseguire.",
+                "nested": "La cartella di backup è dentro {folder}, in cui questa sincronizzazione scrive. Scegli una cartella fuori da lì.",
+                "invalid": {
+                    "empty": "Inserisci un nome per la cartella di backup.",
+                    "absolute": "Usa una cartella dentro la destinazione, non un percorso assoluto.",
+                    "parent": "La cartella di backup non può contenere '..'.",
+                    "name": "Questo nome di cartella di backup non è valido."
+                }
+            }
         },
         "aerocryptProfile": {
             "overlaysSection": "Wrapper / Overlay",
@@ -5491,7 +5614,12 @@
             "defaultSaltNeedsStronger": "Inserisci una password generata robusta per attivare il salt predefinito.",
             "defaultSaltOneSaltNote": "Esiste un solo salt: 32 byte, pubblico, identico per ogni vault in modalità salt predefinito.",
             "defaultSaltValueLabel": "Salt predefinito pubblico (AeroCrypt v3), SHA-256 di",
-            "defaultSaltTierMeaning": "Il sale predefinito significa che la password da sola apre la cassaforte: non c'è altro da portare con sé, e non c'è altro che la protegga."
+            "defaultSaltTierMeaning": "Il sale predefinito significa che la password da sola apre la cassaforte: non c'è altro da portare con sé, e non c'è altro che la protegga.",
+            "pastedObscured": "Incollato da rclone.conf (offuscato)",
+            "pastedObscuredHint": "Scegli \"Incollato da rclone.conf\" solo se hai copiato questo valore da un file rclone.conf, dove rclone lo tiene offuscato.",
+            "formNotRecorded": "Non registrato: questo valore è stato salvato prima che AeroFTP lo chiedesse. Scegli come è stato inserito; un valore che AeroFTP ha importato da rclone.conf è stato salvato come digitato.",
+            "secretFormTyped": "Digitato",
+            "secretFormChangeConfirm": "Questo cambia come viene letto il valore salvato, e quindi la chiave con cui si aprono i file: solo la scelta giusta li apre. Vuoi cambiare questa scelta?"
         },
         "modalGuard": {
             "busyTitle": "Operazione in corso",
@@ -5748,10 +5876,17 @@
             }
         },
         "flatpak": {
-            "importBody": "AeroFTP ha trovato una configurazione esistente nella tua cartella home. Questa installazione Flatpak usa un proprio spazio di archiviazione separato, quindi i server salvati e la cassaforte cifrata non sono ancora visibili qui. Importarli ora? I file vengono solo copiati, nulla viene sovrascritto e la cassaforte si sblocca qui nello stesso modo in cui si sblocca ora.",
+            "importBody": "AeroFTP ha trovato una configurazione esistente nella tua cartella home. Questa installazione Flatpak usa un proprio spazio di archiviazione separato, quindi i server salvati e la cassaforte cifrata non sono ancora visibili qui. Importare ora la tua configurazione? I file vengono solo copiati, e un file che questa installazione Flatpak ha già non viene mai sovrascritto.",
             "importAccept": "Importa",
             "importedBody": "La tua configurazione è stata importata. Riavvia AeroFTP per caricare i tuoi server e la cassaforte.",
-            "restartNow": "Riavvia ora"
+            "restartNow": "Riavvia ora",
+            "importNothingBody": "Nessun file è stato copiato: questa installazione Flatpak ha già un file con lo stesso nome per ogni file che l'importazione copierebbe, e i file esistenti non vengono mai sovrascritti.",
+            "importFailedBody": "L'importazione si è interrotta con un errore: {error}. I file già copiati in questa installazione Flatpak restano lì, e nulla è stato sovrascritto. AeroFTP proporrà di nuovo l'importazione al prossimo avvio.",
+            "importedNoVaultBody": "La tua configurazione è stata importata, ma non conteneva server salvati né una cassaforte che l'importazione potesse copiare. Riavvia AeroFTP per caricare ciò che è stato importato.",
+            "importedVaultSkippedBody": "Una parte della tua configurazione è stata importata, ma non i server salvati e la cassaforte: questa installazione Flatpak ha già una propria cassaforte, e i file esistenti non vengono mai sovrascritti. Riavvia AeroFTP per caricare ciò che è stato importato.",
+            "importNothingVaultSkippedBody": "Nessun file è stato copiato, quindi i server salvati e la cassaforte non sono stati importati: questa installazione Flatpak ha già una propria cassaforte e un file con lo stesso nome per ogni file che l'importazione copierebbe, e i file esistenti non vengono mai sovrascritti.",
+            "importUnreadableResult": "AeroFTP non è riuscito a leggere il risultato dell'importazione",
+            "importNothingToImportBody": "Nessun file è stato copiato: la tua configurazione esistente non contiene alcun file che l'importazione possa copiare (i collegamenti simbolici e i file temporanei di SQLite non vengono mai copiati)."
         },
         "picker": {
             "unavailable": {

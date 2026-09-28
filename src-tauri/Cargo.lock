@@ -96,6 +96,9 @@ dependencies = [
  "hmac 0.12.1",
  "hound",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "image",
  "image_hasher",
  "indicatif",
@@ -120,6 +123,7 @@ dependencies = [
  "rand 0.10.3",
  "rand 0.8.8",
  "ratatui",
+ "rcgen",
  "reed-solomon-erasure",
  "regex",
  "reqwest",
@@ -151,7 +155,6 @@ dependencies = [
  "tauri-plugin-autostart",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
- "tauri-plugin-localhost",
  "tauri-plugin-log",
  "tauri-plugin-notification",
  "tauri-plugin-shell",
@@ -546,12 +549,6 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
-
-[[package]]
-name = "ascii"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
 name = "asn1-rs"
@@ -1478,12 +1475,6 @@ dependencies = [
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]
-
-[[package]]
-name = "chunked_transfer"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
 name = "cipher"
@@ -10376,8 +10367,8 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suppaftp"
-version = "10.0.2"
-source = "git+https://github.com/axpdev-lab/suppaftp?rev=2d39fadca96b4be37998c3097cb97c36b39231e1#2d39fadca96b4be37998c3097cb97c36b39231e1"
+version = "12.1.0"
+source = "git+https://github.com/axpdev-lab/suppaftp?rev=8d7c78f67827a8b980e0eee4d0550615183b862e#8d7c78f67827a8b980e0eee4d0550615183b862e"
 dependencies = [
  "async-trait",
  "chrono",
@@ -10786,21 +10777,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-plugin-localhost"
-version = "2.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c8d72c024121b1a3d9268293d49a56baf01a8c785561c85d17872588b839e55"
-dependencies = [
- "http",
- "log",
- "serde",
- "serde_json",
- "tauri",
- "thiserror 2.0.20",
- "tiny_http",
-]
-
-[[package]]
 name = "tauri-plugin-log"
 version = "2.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11195,18 +11171,6 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
-]
-
-[[package]]
-name = "tiny_http"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
-dependencies = [
- "ascii",
- "chunked_transfer",
- "httpdate",
- "log",
 ]
 
 [[package]]

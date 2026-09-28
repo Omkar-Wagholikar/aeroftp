@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use suppaftp::tokio::AsyncFtpStream;
 use suppaftp::types::FileType;
+use suppaftp::{FtpError, Status};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -342,6 +343,87 @@ impl FtpManager {
         Ok(path)
     }
 
+    /// Whether a file or folder is at `path`.
+    ///
+    /// SIZE answers for a file (it works on dotfiles a LIST may hide). A "not
+    /// there" reply to it (550, or 450 as rclone's server sends) sends the
+    /// question to CWD, which answers for a folder and is then undone. A
+    /// server without SIZE (500, 502) is asked through a name listing of the
+    /// parent. Anything else is returned as an error, never as "no": a caller
+    /// deciding whether a file must be kept before it is overwritten must not
+    /// take a lost connection for "nothing there".
+    pub async fn exists(&mut self, path: &str) -> Result<bool> {
+        let stream = self.stream.as_mut().ok_or(FtpManagerError::NotConnected)?;
+        // SIZE is defined on the binary form of a file: vsftpd refuses it
+        // with 550 in ASCII mode even for a file that is there, and that
+        // refusal followed by CWD's 550 on a file read as "nothing there".
+        // Every transfer here sets binary itself, so this changes nothing
+        // else; a server that refuses binary is an error, not a "no".
+        tokio::time::timeout(
+            self.timeouts.command_timeout,
+            stream.transfer_type(FileType::Binary),
+        )
+        .await
+        .context("TYPE timeout")?
+        .map_err(|e| FtpManagerError::OperationFailed(e.to_string()))?;
+        match tokio::time::timeout(self.timeouts.command_timeout, stream.size(path))
+            .await
+            .context("SIZE timeout")?
+        {
+            Ok(_) => return Ok(true),
+            Err(FtpError::UnexpectedResponse(r))
+                if matches!(
+                    r.status,
+                    Status::FileUnavailable | Status::RequestFileActionIgnored
+                ) => {}
+            Err(FtpError::UnexpectedResponse(r))
+                if matches!(r.status, Status::BadCommand | Status::NotImplemented) =>
+            {
+                return self.exists_in_parent_listing(path).await;
+            }
+            Err(e) => return Err(FtpManagerError::OperationFailed(e.to_string()).into()),
+        }
+        match tokio::time::timeout(self.timeouts.command_timeout, stream.cwd(path))
+            .await
+            .context("CWD timeout")?
+        {
+            Ok(()) => {}
+            Err(FtpError::UnexpectedResponse(r)) if r.status == Status::FileUnavailable => {
+                return Ok(false)
+            }
+            Err(e) => return Err(FtpManagerError::OperationFailed(e.to_string()).into()),
+        }
+        let previous = self.current_path.clone();
+        tokio::time::timeout(self.timeouts.command_timeout, stream.cwd(&previous))
+            .await
+            .context("CWD timeout")?
+            .map_err(|e| FtpManagerError::OperationFailed(e.to_string()))?;
+        Ok(true)
+    }
+
+    /// `exists` for a server without SIZE: is the name in its parent's NLST?
+    async fn exists_in_parent_listing(&mut self, path: &str) -> Result<bool> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent, name) = match trimmed.rfind('/') {
+            Some(0) => ("/", &trimmed[1..]),
+            Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+            None => (".", trimmed),
+        };
+        let stream = self.stream.as_mut().ok_or(FtpManagerError::NotConnected)?;
+        match tokio::time::timeout(self.timeouts.list_timeout, stream.nlst(Some(parent)))
+            .await
+            .context("NLST timeout")?
+        {
+            Ok(names) => Ok(names
+                .iter()
+                .any(|n| n.trim_end_matches('/').rsplit('/').next() == Some(name))),
+            Err(FtpError::UnexpectedResponse(r)) if r.status == Status::FileUnavailable => {
+                Ok(false)
+            }
+            Err(e) => Err(FtpManagerError::OperationFailed(e.to_string()).into()),
+        }
+    }
+
     /// Get file size
     pub async fn get_file_size(&mut self, path: &str) -> Result<u64> {
         let stream = self.stream.as_mut().ok_or(FtpManagerError::NotConnected)?;
@@ -380,8 +462,8 @@ impl FtpManager {
         data_stream.read_to_end(&mut buf).await?;
 
         // Finalize the stream
-        stream
-            .finalize_retr_stream(data_stream)
+        data_stream
+            .finish()
             .await
             .map_err(|e| FtpManagerError::OperationFailed(e.to_string()))?;
 
@@ -446,8 +528,8 @@ impl FtpManager {
         let bytes_read = buf.len();
 
         // Finalize the stream
-        stream
-            .finalize_retr_stream(data_stream)
+        data_stream
+            .finish()
             .await
             .map_err(|e| FtpManagerError::OperationFailed(e.to_string()))?;
 
@@ -525,7 +607,7 @@ impl FtpManager {
 
         // Finalize the stream (must always finalize to keep FTP connection clean)
         // On cancel, FTP server sends 426: ignore that error
-        let finalize_result = stream.finalize_retr_stream(data_stream).await;
+        let finalize_result = data_stream.finish().await;
         if cancelled {
             let _ = finalize_result; // Ignore 426 error on cancel
             let _ = tokio::fs::remove_file(local_path).await;
@@ -636,7 +718,7 @@ impl FtpManager {
         }
 
         // Finalize the stream (must always finalize to keep FTP connection clean)
-        let finalize_result = stream.finalize_put_stream(data_stream).await;
+        let finalize_result = data_stream.finish().await;
         if cancelled {
             let _ = finalize_result; // Ignore error on cancel
                                      // Try to remove the partial remote file
@@ -829,13 +911,24 @@ impl FtpManager {
     /// A row that is not a listing row is now an error, which the caller
     /// already skips, instead of an invention.
     fn parse_ftp_listing(&self, listing: &str) -> Result<RemoteFile> {
+        self.parse_ftp_listing_at(listing, chrono::Utc::now().naive_utc())
+    }
+
+    /// [`Self::parse_ftp_listing`] with the present given, which decides the
+    /// year of a Unix date that omits it.
+    fn parse_ftp_listing_at(
+        &self,
+        listing: &str,
+        now: chrono::NaiveDateTime,
+    ) -> Result<RemoteFile> {
         if listing.trim().is_empty() {
             return Err(FtpManagerError::InvalidPath("Empty listing".to_string()).into());
         }
-        let entry = crate::providers::ftp_listing::parse_listing(listing, &self.current_path)
-            .ok_or_else(|| {
-                FtpManagerError::InvalidPath(format!("Unrecognised listing row: {listing}"))
-            })?;
+        let entry =
+            crate::providers::ftp_listing::parse_listing_at(listing, &self.current_path, now)
+                .ok_or_else(|| {
+                    FtpManagerError::InvalidPath(format!("Unrecognised listing row: {listing}"))
+                })?;
         Ok(RemoteFile {
             name: entry.name,
             path: entry.path,
@@ -894,9 +987,13 @@ mod charac_tests {
 
     fn charac_table() -> String {
         let m = FtpManager::new();
+        // The present a year-less Unix date is read against, fixed so the
+        // baseline does not age (the same one as the provider twin).
+        let charac_now =
+            chrono::NaiveDateTime::parse_from_str("2026-09-25 12:00", "%Y-%m-%d %H:%M").unwrap();
         let mut out = String::new();
         for line in CHARAC_ROWS {
-            let rendered = match m.parse_ftp_listing(line) {
+            let rendered = match m.parse_ftp_listing_at(line, charac_now) {
                 Err(e) => format!("<err: {e}>"),
                 Ok(f) => format!(
                     "name={:?} path={:?} dir={} size={:?} perms={:?} mod={:?}",
@@ -920,23 +1017,23 @@ mod charac_tests {
     }
 
     const CHARAC_BASELINE: &str = r#"LIST "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 projects"
-  name="projects" path="/projects" dir=true size=Some(4096) perms=Some("drwxr-xr-x") mod=Some("Jan 20 10:00")
+  name="projects" path="/projects" dir=true size=Some(4096) perms=Some("drwxr-xr-x") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 notes.txt"
-  name="notes.txt" path="/notes.txt" dir=false size=Some(123) perms=Some("-rw-r--r--") mod=Some("Jan 20 10:00")
+  name="notes.txt" path="/notes.txt" dir=false size=Some(123) perms=Some("-rw-r--r--") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 my report.txt"
-  name="my report.txt" path="/my report.txt" dir=false size=Some(123) perms=Some("-rw-r--r--") mod=Some("Jan 20 10:00")
+  name="my report.txt" path="/my report.txt" dir=false size=Some(123) perms=Some("-rw-r--r--") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group         123 Jan 20 10:00 a  b.txt"
-  name="a  b.txt" path="/a  b.txt" dir=false size=Some(123) perms=Some("-rw-r--r--") mod=Some("Jan 20 10:00")
+  name="a  b.txt" path="/a  b.txt" dir=false size=Some(123) perms=Some("-rw-r--r--") mod=Some("2026-01-20 10:00")
 LIST "01-23-24  10:30AM  12345  my  file.txt"
-  name="my  file.txt" path="/my  file.txt" dir=false size=Some(12345) perms=None mod=Some("01-23-24 10:30AM")
+  name="my  file.txt" path="/my  file.txt" dir=false size=Some(12345) perms=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24  10:30AM  ????  odd.txt"
-  name="odd.txt" path="/odd.txt" dir=false size=Some(0) perms=None mod=Some("01-23-24 10:30AM")
+  name="odd.txt" path="/odd.txt" dir=false size=Some(0) perms=None mod=Some("2024-01-23 10:30")
 LIST "lrwxrwxrwx    1 user     group           7 Jan 20 10:00 link -> target"
-  name="link" path="/link" dir=false size=Some(7) perms=Some("lrwxrwxrwx") mod=Some("Jan 20 10:00")
+  name="link" path="/link" dir=false size=Some(7) perms=Some("lrwxrwxrwx") mod=Some("2026-01-20 10:00")
 LIST "lrwxrwxrwx    1 user     group           7 Jan 20 10:00 dangling"
-  name="dangling" path="/dangling" dir=false size=Some(7) perms=Some("lrwxrwxrwx") mod=Some("Jan 20 10:00")
+  name="dangling" path="/dangling" dir=false size=Some(7) perms=Some("lrwxrwxrwx") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r--    1 user     group        ???? Jan 20 10:00 odd.txt"
-  name="odd.txt" path="/odd.txt" dir=false size=Some(0) perms=Some("-rw-r--r--") mod=Some("Jan 20 10:00")
+  name="odd.txt" path="/odd.txt" dir=false size=Some(0) perms=Some("-rw-r--r--") mod=Some("2026-01-20 10:00")
 LIST "-rw-r--r-- 1 user group 123 Jan 20 10:00"
   <err: Invalid path: Unrecognised listing row: -rw-r--r-- 1 user group 123 Jan 20 10:00>
 LIST "drwxr-xr-x    2 user     group        4096 Jan 20 10:00 ."
@@ -948,17 +1045,81 @@ LIST ""
 LIST "total 12"
   <err: Invalid path: Unrecognised listing row: total 12>
 LIST "01-23-24  10:30AM       <DIR>          folder"
-  name="folder" path="/folder" dir=true size=Some(0) perms=None mod=Some("01-23-24 10:30AM")
+  name="folder" path="/folder" dir=true size=Some(0) perms=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24  10:30AM           12345      file.txt"
-  name="file.txt" path="/file.txt" dir=false size=Some(12345) perms=None mod=Some("01-23-24 10:30AM")
+  name="file.txt" path="/file.txt" dir=false size=Some(12345) perms=None mod=Some("2024-01-23 10:30")
 LIST "01-23-2024  10:30AM         12345      file.txt"
-  name="file.txt" path="/file.txt" dir=false size=Some(12345) perms=None mod=Some("01-23-2024 10:30AM")
+  name="file.txt" path="/file.txt" dir=false size=Some(12345) perms=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24  10:30AM           12345      my file.txt"
-  name="my file.txt" path="/my file.txt" dir=false size=Some(12345) perms=None mod=Some("01-23-24 10:30AM")
+  name="my file.txt" path="/my file.txt" dir=false size=Some(12345) perms=None mod=Some("2024-01-23 10:30")
 LIST "01-23-24 10:30AM 12345 a b c d e f"
-  name="a b c d e f" path="/a b c d e f" dir=false size=Some(12345) perms=None mod=Some("01-23-24 10:30AM")
+  name="a b c d e f" path="/a b c d e f" dir=false size=Some(12345) perms=None mod=Some("2024-01-23 10:30")
 LIST "not-a-date 10:30AM <DIR> folder"
   <err: Invalid path: Unrecognised listing row: not-a-date 10:30AM <DIR> folder>
 LIST "drwxr-xr-x 2 1001 1001 4096 Jul 21 09:41 ."
   <err: Invalid path: Unrecognised listing row: drwxr-xr-x 2 1001 1001 4096 Jul 21 09:41 .>"#;
+}
+
+#[cfg(test)]
+mod exists_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// A control connection that answers like vsftpd: the session starts in
+    /// ASCII, and SIZE is refused with 550 in ASCII mode whether or not the
+    /// file is there. `/a.txt` is a file and `/d` a folder.
+    async fn vsftpd_like() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let mut binary = false;
+            write.write_all(b"220 ready\r\n").await.unwrap();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let (cmd, arg) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+                let reply = match cmd {
+                    "USER" => "331 password\r\n".to_string(),
+                    "PASS" => "230 in\r\n".to_string(),
+                    "PWD" => "257 \"/\"\r\n".to_string(),
+                    "TYPE" => {
+                        binary = arg == "I";
+                        "200 type set\r\n".to_string()
+                    }
+                    "SIZE" if !binary => "550 Could not get file size.\r\n".to_string(),
+                    "SIZE" if arg == "/a.txt" => "213 5\r\n".to_string(),
+                    "SIZE" => "550 Could not get file size.\r\n".to_string(),
+                    "CWD" if arg == "/d" || arg == "/" => "250 ok\r\n".to_string(),
+                    "CWD" => "550 Failed to change directory.\r\n".to_string(),
+                    "QUIT" => {
+                        let _ = write.write_all(b"221 bye\r\n").await;
+                        break;
+                    }
+                    _ => "502 not implemented\r\n".to_string(),
+                };
+                write.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    /// In ASCII mode SIZE refuses an existing file with 550, then CWD on a
+    /// file refuses with 550 too, and the file read as absent: a versioned
+    /// backup skipped a source it should have kept and could take a taken
+    /// destination for free.
+    #[tokio::test]
+    async fn a_file_is_found_on_a_server_that_refuses_size_in_ascii() {
+        let addr = vsftpd_like().await;
+        let mut ftp = FtpManager::new();
+        ftp.connect(&addr).await.unwrap();
+        ftp.login("u", "p").await.unwrap();
+        assert!(
+            ftp.exists("/a.txt").await.unwrap(),
+            "an existing file read as absent"
+        );
+        assert!(ftp.exists("/d").await.unwrap());
+        assert!(!ftp.exists("/missing").await.unwrap());
+        ftp.disconnect().await.unwrap();
+    }
 }

@@ -18,7 +18,9 @@ use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
+use reqwest::header::{
+    HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, RANGE,
+};
 use secrecy::ExposeSecret;
 use sha2::Sha256;
 use tokio::io::AsyncReadExt;
@@ -306,6 +308,59 @@ impl AzureProvider {
         Ok(BASE64.encode(raw.as_bytes()))
     }
 
+    /// DELETE the blob that stands for a directory (`what` names it in the
+    /// error). A 404 is the normal case: most folders are prefixes only.
+    async fn delete_directory_blob(
+        &mut self,
+        blob_path: &str,
+        what: &str,
+        if_match: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let url = self.blob_url(blob_path);
+        let mut headers = HeaderMap::new();
+        let now = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        headers.insert(
+            "x-ms-date",
+            HeaderValue::from_str(&now)
+                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
+        );
+        headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
+        if let Some(etag) = if_match {
+            headers.insert(
+                IF_MATCH,
+                HeaderValue::from_str(etag)
+                    .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
+            );
+        }
+        let resp = self
+            .send_with_auth_and_retry(reqwest::Method::DELETE, &url, headers, 0, None)
+            .await?;
+        let status = resp.status();
+        // 412 under `If-Match` is ConditionNotMet: the blob is no longer the
+        // one the check looked at. A lease answers 412 too, with its own code.
+        let lease = resp
+            .headers()
+            .get("x-ms-error-code")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|code| code.starts_with("Lease"));
+        if if_match.is_some() && status == reqwest::StatusCode::PRECONDITION_FAILED && !lease {
+            return Err(ProviderError::Other(format!(
+                "the {what} {blob_path} changed after it was checked, so it was not deleted"
+            )));
+        }
+        if !status.is_success()
+            && status.as_u16() != 202
+            && status != reqwest::StatusCode::NOT_FOUND
+        {
+            return Err(ProviderError::Other(format!(
+                "Delete of the {what} failed: {status}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Build the full blob URL
     fn blob_url(&self, blob_path: &str) -> String {
         let endpoint = self.config.blob_endpoint();
@@ -336,21 +391,18 @@ impl AzureProvider {
             .collect::<String>()
     }
 
-    /// Add SAS token or Shared Key auth to request
-    fn sign_request(
+    /// The Shared Key string to sign (Authorize with Shared Key, Blob
+    /// service): the verb, then Content-Encoding, Content-Language,
+    /// Content-Length, Content-MD5, Content-Type, Date, If-Modified-Since,
+    /// If-Match, If-None-Match, If-Unmodified-Since and Range, one line each,
+    /// then the canonicalized `x-ms-` headers and resource.
+    fn string_to_sign(
         &self,
         method: &str,
         url: &str,
         headers: &HeaderMap,
         content_length: u64,
     ) -> Result<String, ProviderError> {
-        if let Some(ref sas) = self.config.sas_token {
-            // SAS token appended to URL
-            let separator = if url.contains('?') { "&" } else { "?" };
-            return Ok(format!("{}{}{}", url, separator, sas.expose_secret()));
-        }
-
-        // Shared Key signing
         let content_type = headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -376,8 +428,19 @@ impl AzureProvider {
             .map(|(k, v)| format!("\n{}:{}", k, v))
             .collect::<String>();
 
-        let string_to_sign = format!(
-            "{}\n\n\n{}\n\n{}\n\n\n\n\n\n\n{}{}{}",
+        // Shared Key signs If-Match, If-None-Match and Range in slots of their
+        // own: a request that carries one (the ETag condition of a directory
+        // stub's delete, the destination condition of a rename's Copy Blob,
+        // the Range of a resumed download) and signs its slot empty is
+        // refused with 403.
+        let header = |name: reqwest::header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|v: &HeaderValue| v.to_str().ok())
+                .unwrap_or("")
+        };
+        Ok(format!(
+            "{}\n\n\n{}\n\n{}\n\n\n{}\n{}\n\n{}\n{}{}{}",
             method,
             if content_length > 0 {
                 content_length.to_string()
@@ -385,10 +448,30 @@ impl AzureProvider {
                 String::new()
             },
             content_type,
+            header(IF_MATCH),
+            header(IF_NONE_MATCH),
+            header(RANGE),
             canonical_headers,
             canonicalized_resource,
             query_str,
-        );
+        ))
+    }
+
+    /// Add SAS token or Shared Key auth to request
+    fn sign_request(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &HeaderMap,
+        content_length: u64,
+    ) -> Result<String, ProviderError> {
+        if let Some(ref sas) = self.config.sas_token {
+            // SAS token appended to URL
+            let separator = if url.contains('?') { "&" } else { "?" };
+            return Ok(format!("{}{}{}", url, separator, sas.expose_secret()));
+        }
+
+        let string_to_sign = self.string_to_sign(method, url, headers, content_length)?;
 
         let key_bytes = BASE64
             .decode(self.config.access_key.expose_secret())
@@ -403,6 +486,187 @@ impl AzureProvider {
             "SharedKey {}:{}",
             self.config.account_name, signature
         ))
+    }
+
+    /// Rename or replace by Copy Blob, polled to completion when the copy
+    /// is asynchronous, then a delete of the source (Azure has no rename).
+    /// With `overwrite` false the copy carries `If-None-Match: *`, so the
+    /// server refuses an existing destination (the `rename` contract); with
+    /// it true the copy lands over it (the `replace` contract).
+    async fn copy_then_delete(
+        &mut self,
+        from: &str,
+        to: &str,
+        overwrite: bool,
+    ) -> Result<(), ProviderError> {
+        // Without its trailing slash: `d/` names the blob `d/`, the marker
+        // `mkdir` writes, which no listing shows. A file copied there was
+        // invisible and went with the folder; the prefix check below probed
+        // `d//` and found nothing.
+        let from_blob = self
+            .resolve_blob_path(from)
+            .trim_end_matches('/')
+            .to_string();
+        let to_blob = self.resolve_blob_path(to).trim_end_matches('/').to_string();
+        // Onto itself a copy-then-delete would delete the only copy.
+        if from_blob == to_blob {
+            return Ok(());
+        }
+
+        // A folder is only a prefix: no blob holds its name, so the copy
+        // condition below finds none and the copy would put a blob named
+        // like the folder beside it. A rename may not take a folder's name,
+        // and a replace puts a file only in place of a file.
+        if self.is_a_folder(&to_blob).await? {
+            if !overwrite {
+                return Err(ProviderError::AlreadyExists(to.to_string()));
+            }
+            super::refuse_replace_across_types(to, false, true)?;
+        }
+
+        let source_url = self.blob_url(&from_blob);
+        let dest_url = self.blob_url(&to_blob);
+
+        let mut headers = HeaderMap::new();
+        let now = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        headers.insert(
+            "x-ms-date",
+            HeaderValue::from_str(&now)
+                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
+        );
+        headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
+        headers.insert(
+            "x-ms-copy-source",
+            HeaderValue::from_str(&source_url)
+                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
+        );
+        // Azure requires explicit Content-Length: 0 for PUT Copy Blob
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        // The trait promises no overwrite, and Copy Blob replaces the
+        // destination. The destination condition makes the server refuse an
+        // existing blob in the same request that copies, so there is no
+        // window between a look and the write.
+        if !overwrite {
+            headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        }
+
+        // AZ-005: Use retry for copy request
+        let resp = self
+            .send_with_auth_and_retry(reqwest::Method::PUT, &dest_url, headers, 0, None)
+            .await?;
+
+        if !overwrite
+            && matches!(
+                resp.status(),
+                reqwest::StatusCode::PRECONDITION_FAILED | reqwest::StatusCode::CONFLICT
+            )
+        {
+            return Err(ProviderError::AlreadyExists(to.to_string()));
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // No blob by that name. A folder (only a prefix, with or without
+            // the marker `mkdir` writes) is not something Copy Blob moves:
+            // "Copy failed: 404" hid that.
+            if self.is_a_folder(&from_blob).await? {
+                return Err(ProviderError::NotSupported(format!(
+                    "{from} is a folder, and on Azure a rename moves one blob: renaming a \
+                     folder is not supported"
+                )));
+            }
+            return Err(ProviderError::NotFound(from.to_string()));
+        }
+        if !resp.status().is_success() {
+            return Err(ProviderError::Other(format!(
+                "Copy failed: {}",
+                resp.status()
+            )));
+        }
+
+        // AZ-016: Check copy status: may be async for large blobs
+        let copy_status = resp
+            .headers()
+            .get("x-ms-copy-status")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("success")
+            .to_lowercase();
+
+        if copy_status == "pending" {
+            debug!("Azure copy is async (pending), polling for completion");
+            self.poll_copy_status(&dest_url).await?;
+        } else if copy_status == "failed" {
+            let desc = resp
+                .headers()
+                .get("x-ms-copy-status-description")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown reason");
+            return Err(ProviderError::Other(format!("Copy failed: {}", desc)));
+        }
+
+        // Delete original only after copy is confirmed: the blob copied, by
+        // the same name. With its trailing slash `from` named the folder
+        // marker `a.txt/`: a 404 left two copies, or the marker went while
+        // the source stayed.
+        self.delete(&format!("/{from_blob}")).await?;
+
+        Ok(())
+    }
+
+    /// Whether a folder is at `blob`: Azure has none, only blobs named under
+    /// `blob/` (the marker `mkdir` writes included), so one listing of that
+    /// prefix answers.
+    async fn is_a_folder(&self, blob: &str) -> Result<bool, ProviderError> {
+        // Azure may answer a page with no blob and a continuation marker, so
+        // an empty page is "not yet", and only the last one is "no".
+        let mut marker = String::new();
+        loop {
+            let body = self.list_one_blob_under(blob, &marker).await?;
+            if lists_a_blob(&body) {
+                return Ok(true);
+            }
+            match Self::parse_blob_list(&body, "").1 {
+                Some(next) if !next.is_empty() => marker = next,
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// One `comp=list` page of at most one blob under `blob/`, from `marker`.
+    async fn list_one_blob_under(&self, blob: &str, marker: &str) -> Result<String, ProviderError> {
+        let mut url = format!(
+            "{}/{}?restype=container&comp=list&prefix={}&maxresults=1",
+            self.config.blob_endpoint(),
+            self.config.container,
+            urlencoding::encode(&format!("{blob}/"))
+        );
+        if !marker.is_empty() {
+            url.push_str(&format!("&marker={}", urlencoding::encode(marker)));
+        }
+        let mut headers = HeaderMap::new();
+        let now = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        headers.insert(
+            "x-ms-date",
+            HeaderValue::from_str(&now)
+                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
+        );
+        headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
+        let resp = self
+            .send_with_auth_and_retry(reqwest::Method::GET, &url, headers, 0, None)
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::ServerError(format!(
+                "Listing {blob}/ failed ({status}): {}",
+                parse_azure_xml_error(&body)
+            )));
+        }
+        resp.text()
+            .await
+            .map_err(|e| ProviderError::ParseError(e.to_string()))
     }
 
     /// AZ-005/AZ-006: Send a request with retry logic for transient errors (429/5xx).
@@ -1628,100 +1892,50 @@ impl StorageProvider for AzureProvider {
         // next listing. Delete it explicitly; a folder that only ever held
         // files has no marker, so a 404 here is the normal case and must not
         // fail the operation.
-        let marker = format!("{}/", self.resolve_blob_path(path).trim_end_matches('/'));
-        let url = self.blob_url(&marker);
-        let mut headers = HeaderMap::new();
-        let now = chrono::Utc::now()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
+        let blob_path = self
+            .resolve_blob_path(path)
+            .trim_end_matches('/')
             .to_string();
-        headers.insert(
-            "x-ms-date",
-            HeaderValue::from_str(&now)
-                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
-        );
-        headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
-        let resp = self
-            .send_with_auth_and_retry(reqwest::Method::DELETE, &url, headers, 0, None)
+        self.delete_directory_blob(&format!("{blob_path}/"), "directory marker", None)
             .await?;
-        let status = resp.status();
-        if !status.is_success()
-            && status.as_u16() != 202
-            && status != reqwest::StatusCode::NOT_FOUND
-        {
-            return Err(ProviderError::Other(format!(
-                "Delete of the directory marker failed: {}",
-                status
-            )));
+
+        // The directory can also be a blob named `<path>` that carries
+        // `hdi_isfolder=true`: the directory of a hierarchical-namespace
+        // account, or the stub AzCopy (`--include-directory-stub`) and ADLS
+        // migrations leave on a flat account. `stat` reports it as a
+        // directory, so `rm` comes here, and deleting only the marker
+        // answered Ok while the stub stayed. A blob without the flag is a
+        // file that only shares the folder's name, and it stays. The blob is
+        // asked by its name without the slash: `path` as the caller wrote it
+        // (`d/`) sent the HEAD to the marker just deleted.
+        //
+        // The DELETE carries the ETag of the HEAD that saw the flag, so a
+        // stub another client replaced with an ordinary blob in between is
+        // refused (412) instead of deleted. A HEAD without an ETag leaves the
+        // DELETE unconditional, as it was.
+        match self.stat(&format!("/{blob_path}")).await {
+            Ok(entry) if entry.is_dir => {
+                let etag = entry.metadata.get("etag").map(String::as_str);
+                self.delete_directory_blob(&blob_path, "directory blob", etag)
+                    .await?
+            }
+            Ok(_) | Err(ProviderError::NotFound(_)) => {}
+            Err(e) => return Err(e),
         }
 
         Ok(())
     }
 
-    /// AZ-016: Rename via Copy + Delete with async copy polling.
-    /// Azure Copy Blob can be async for large blobs. After issuing the copy,
-    /// we check `x-ms-copy-status` and poll until completion before deleting the source.
+    /// AZ-016: Rename via Copy + Delete with async copy polling: see
+    /// `copy_then_delete`.
     async fn rename(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
-        // Azure doesn't have native rename - must copy then delete
-        let from_blob = self.resolve_blob_path(from);
-        let to_blob = self.resolve_blob_path(to);
+        self.copy_then_delete(from, to, false).await
+    }
 
-        let source_url = self.blob_url(&from_blob);
-        let dest_url = self.blob_url(&to_blob);
-
-        let mut headers = HeaderMap::new();
-        let now = chrono::Utc::now()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
-        headers.insert(
-            "x-ms-date",
-            HeaderValue::from_str(&now)
-                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
-        );
-        headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
-        headers.insert(
-            "x-ms-copy-source",
-            HeaderValue::from_str(&source_url)
-                .map_err(|e| ProviderError::Other(format!("Invalid header value: {}", e)))?,
-        );
-        // Azure requires explicit Content-Length: 0 for PUT Copy Blob
-        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
-
-        // AZ-005: Use retry for copy request
-        let resp = self
-            .send_with_auth_and_retry(reqwest::Method::PUT, &dest_url, headers, 0, None)
-            .await?;
-
-        if !resp.status().is_success() {
-            return Err(ProviderError::Other(format!(
-                "Copy failed: {}",
-                resp.status()
-            )));
-        }
-
-        // AZ-016: Check copy status: may be async for large blobs
-        let copy_status = resp
-            .headers()
-            .get("x-ms-copy-status")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("success")
-            .to_lowercase();
-
-        if copy_status == "pending" {
-            debug!("Azure copy is async (pending), polling for completion");
-            self.poll_copy_status(&dest_url).await?;
-        } else if copy_status == "failed" {
-            let desc = resp
-                .headers()
-                .get("x-ms-copy-status-description")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown reason");
-            return Err(ProviderError::Other(format!("Copy failed: {}", desc)));
-        }
-
-        // Delete original only after copy is confirmed
-        self.delete(from).await?;
-
-        Ok(())
+    /// Copy Blob puts the new blob over the old one in one step, so a
+    /// replace is the rename without its destination condition.
+    async fn replace(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
+        self.copy_then_delete(from, to, true).await
     }
 
     /// AZ-007: Extracts Content-Type from HEAD response to populate mime_type.
@@ -1785,10 +1999,35 @@ impl StorageProvider for AzureProvider {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string());
 
+        // Hierarchical-namespace accounts answer HEAD 200 for a directory and
+        // name its kind in `x-ms-resource-type`, which is asked first: a
+        // directory the service made itself carries no metadata. Then the
+        // `hdi_isfolder` metadata, which those accounts and the stubs AzCopy
+        // and ADLS migrations leave on a flat account carry. A flat account
+        // sends neither for a blob, so it stays a file.
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+        };
+        let is_dir = match header("x-ms-resource-type") {
+            Some(kind) => kind.eq_ignore_ascii_case("directory"),
+            None => {
+                header("x-ms-meta-hdi_isfolder").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            }
+        };
+        // Kept for a later request that must act on this very blob and no
+        // other: the directory-stub delete sends it back in `If-Match`.
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(etag) = header("etag") {
+            metadata.insert("etag".to_string(), etag.to_string());
+        }
+
         Ok(RemoteEntry {
             name,
             path: format!("/{}", blob_path),
-            is_dir: false,
+            is_dir,
             size,
             modified,
             permissions: None,
@@ -1797,7 +2036,7 @@ impl StorageProvider for AzureProvider {
             is_symlink: false,
             link_target: None,
             mime_type,
-            metadata: Default::default(),
+            metadata,
         })
     }
 
@@ -2504,6 +2743,24 @@ impl AzureProvider {
     }
 }
 
+/// Whether a `comp=list` answer names at least one blob or prefix.
+fn lists_a_blob(xml: &str) -> bool {
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if matches!(e.name().as_ref(), "Blob" | "BlobPrefix") =>
+            {
+                return true
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2517,6 +2774,545 @@ mod tests {
             sas_token: None,
             endpoint: None,
         }
+    }
+
+    /// A blob service double for container `mycontainer` holding `existing`
+    /// (blob names). A listing names the first blob under its prefix; under
+    /// `e/` the first page is empty with a continuation marker. A Copy
+    /// Blob onto an existing blob under `If-None-Match: *` answers 412, as
+    /// Azure does; any other copy lands and completes at once; a delete
+    /// succeeds. Returns a provider pointed at it and every request as
+    /// `METHOD path if-none-match`.
+    async fn provider_on_blob_service(
+        existing: &'static [&'static str],
+    ) -> (AzureProvider, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&log);
+        let app =
+            axum::Router::new().fallback(axum::routing::any(move |req: axum::extract::Request| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let path = req.uri().path().to_string();
+                    let condition = req
+                        .headers()
+                        .get("if-none-match")
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .unwrap_or_default();
+                    seen.lock()
+                        .unwrap()
+                        .push(format!("{} {path} {condition}", req.method()));
+                    let blob = path.trim_start_matches("/mycontainer/");
+                    if req.method() == axum::http::Method::GET && path == "/mycontainer" {
+                        let query = urlencoding::decode(req.uri().query().unwrap_or(""))
+                            .unwrap()
+                            .to_string();
+                        let prefix = query
+                            .split('&')
+                            .find_map(|pair| pair.strip_prefix("prefix="))
+                            .unwrap_or("");
+                        // Under `e/` the first page is empty and says to go on.
+                        if prefix == "e/" && !query.contains("marker=M1") {
+                            return axum::response::Response::builder()
+                                .status(200)
+                                .body(axum::body::Body::from(
+                                    "<EnumerationResults><Blobs /><NextMarker>M1</NextMarker></EnumerationResults>",
+                                ))
+                                .unwrap();
+                        }
+                        let blobs: String = existing
+                            .iter()
+                            .filter(|name| name.starts_with(prefix))
+                            .take(1)
+                            .map(|name| format!("<Blob><Name>{name}</Name></Blob>"))
+                            .collect();
+                        return axum::response::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from(format!(
+                                "<EnumerationResults><Blobs>{blobs}</Blobs></EnumerationResults>"
+                            )))
+                            .unwrap();
+                    }
+                    // A copy from a name that is only a folder prefix finds
+                    // no blob, as on Azure.
+                    let copy_source = req
+                        .headers()
+                        .get("x-ms-copy-source")
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .unwrap_or_default();
+                    let source = copy_source
+                        .rsplit_once("/mycontainer/")
+                        .map(|(_, name)| name.to_string())
+                        .unwrap_or_default();
+                    let source_is_a_folder = !source.is_empty()
+                        && !existing.contains(&source.as_str())
+                        && existing.iter().any(|name| name.starts_with(&format!("{source}/")));
+                    let status = match req.method().as_str() {
+                        "PUT" if source_is_a_folder => 404,
+                        "PUT" if condition == "*" && existing.contains(&blob) => 412,
+                        "PUT" | "DELETE" => 202,
+                        _ => 404,
+                    };
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("x-ms-copy-status", "success")
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let mut config = test_config();
+        config.endpoint = Some(format!("http://{addr}"));
+        let mut provider = AzureProvider::new(config);
+        provider.connected = true;
+        (provider, log)
+    }
+
+    /// On a hierarchical-namespace account a directory's HEAD is 200 and
+    /// carries `x-ms-meta-hdi_isfolder: true`. `stat` used to report every
+    /// blob as a file, so a non-recursive delete of that directory never saw
+    /// a directory.
+    #[tokio::test]
+    async fn stat_reads_the_hierarchical_namespace_directory_flag() {
+        let app = axum::Router::new().fallback(axum::routing::any(
+            |req: axum::extract::Request| async move {
+                let path = req.uri().path().to_string();
+                let mut response = axum::response::Response::builder()
+                    .status(200)
+                    .header("content-length", "0")
+                    .header("content-type", "application/octet-stream");
+                if path.ends_with("/folder") {
+                    response = response.header("x-ms-meta-hdi_isfolder", "true");
+                } else if path.ends_with("/marked-false") {
+                    response = response.header("x-ms-meta-hdi_isfolder", "false");
+                } else if path.ends_with("/hns-dir") {
+                    response = response.header("x-ms-resource-type", "Directory");
+                } else if path.ends_with("/hns-file") {
+                    response = response.header("x-ms-resource-type", "file");
+                }
+                response.body(axum::body::Body::empty()).unwrap()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let mut config = test_config();
+        config.endpoint = Some(format!("http://{addr}"));
+        let mut provider = AzureProvider::new(config);
+        provider.connected = true;
+
+        let dir = provider.stat("/folder").await.expect("stat directory");
+        assert!(dir.is_dir, "hdi_isfolder true is a directory");
+        let file = provider.stat("/notes.txt").await.expect("stat file");
+        assert!(!file.is_dir, "a blob with no flag stays a file");
+        let marked = provider.stat("/marked-false").await.expect("stat");
+        assert!(!marked.is_dir, "hdi_isfolder false stays a file");
+        // A hierarchical-namespace account names the kind of every path in
+        // `x-ms-resource-type`, with no metadata on a directory it made
+        // itself: that directory was reported as a file.
+        let hns_dir = provider.stat("/hns-dir").await.expect("stat");
+        assert!(
+            hns_dir.is_dir,
+            "x-ms-resource-type directory is a directory"
+        );
+        let hns_file = provider.stat("/hns-file").await.expect("stat");
+        assert!(!hns_file.is_dir, "x-ms-resource-type file is a file");
+    }
+
+    /// L3 of the 4.2.1 closeout: on a flat account an `hdi_isfolder` stub
+    /// (AzCopy `--include-directory-stub`, data migrated from ADLS) stats as
+    /// a directory since `stat` reads the flag, so `rm` goes through `rmdir`,
+    /// and `rmdir_recursive` deleted only the `<path>/` marker: it answered
+    /// Ok while the stub stayed. The stub itself is deleted now, and a blob
+    /// without the flag that shares the folder's name is left alone.
+    #[tokio::test]
+    async fn removing_a_directory_deletes_its_hdi_isfolder_stub() {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&log);
+        let app =
+            axum::Router::new().fallback(axum::routing::any(move |req: axum::extract::Request| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let method = req.method().to_string();
+                    let path = req.uri().path().to_string();
+                    seen.lock().unwrap().push(format!("{method} {path}"));
+                    let mut response = axum::response::Response::builder()
+                        .header("content-length", "0")
+                        .header("content-type", "application/octet-stream");
+                    let status = match (method.as_str(), path.as_str()) {
+                        ("GET", "/mycontainer") => {
+                            return axum::response::Response::builder()
+                                .status(200)
+                                .body(axum::body::Body::from(
+                                    "<EnumerationResults><Blobs /></EnumerationResults>",
+                                ))
+                                .unwrap();
+                        }
+                        ("HEAD", "/mycontainer/stub") => {
+                            response = response.header("x-ms-meta-hdi_isfolder", "true");
+                            200
+                        }
+                        ("HEAD", "/mycontainer/plain") => 200,
+                        ("DELETE", _) => 202,
+                        _ => 404,
+                    };
+                    response
+                        .status(status)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let mut config = test_config();
+        config.endpoint = Some(format!("http://{addr}"));
+        let mut provider = AzureProvider::new(config);
+        provider.connected = true;
+
+        crate::providers::delete_non_recursive(&mut provider, "/stub")
+            .await
+            .expect("rm of an empty stub directory");
+        let deletes: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("DELETE "))
+            .cloned()
+            .collect();
+        assert!(
+            deletes
+                .iter()
+                .any(|line| line == "DELETE /mycontainer/stub"),
+            "the stub blob must be deleted, not only its marker: {deletes:?}"
+        );
+
+        log.lock().unwrap().clear();
+        provider
+            .rmdir_recursive("/plain")
+            .await
+            .expect("a folder whose name a flagless blob also holds");
+        let deletes: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.starts_with("DELETE "))
+            .cloned()
+            .collect();
+        assert_eq!(
+            deletes,
+            ["DELETE /mycontainer/plain/"],
+            "a blob without the flag is a file, not this folder"
+        );
+
+        log.lock().unwrap().clear();
+        provider
+            .rmdir_recursive("/gone")
+            .await
+            .expect("a HEAD 404 is the normal case of a prefix-only folder");
+
+        // With a trailing slash the flag check sent its HEAD to `stub/`, the
+        // marker deleted just before, got a 404, and the stub stayed while
+        // the call answered Ok. The check asks the blob without the slash.
+        log.lock().unwrap().clear();
+        provider
+            .rmdir_recursive("/stub/")
+            .await
+            .expect("rm -r of the stub named with a trailing slash");
+        let requests = log.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line == "DELETE /mycontainer/stub"),
+            "the stub blob must be deleted whatever the caller's slash: {requests:?}"
+        );
+    }
+
+    /// The stub is deleted only as it was when its HEAD identified it: the
+    /// DELETE carries that answer's ETag in `If-Match`. A stub another client
+    /// replaced with an ordinary blob between the HEAD and the DELETE was
+    /// deleted; the service now answers 412 and nothing is deleted.
+    #[tokio::test]
+    async fn a_directory_stub_changed_since_it_was_checked_is_not_deleted() {
+        use std::sync::{Arc, Mutex};
+        for (checked, deleted_expected) in [("\"v1\"", false), ("\"v2\"", true)] {
+            let deletes: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+            let seen = Arc::clone(&deletes);
+            let app = axum::Router::new().fallback(axum::routing::any(
+                move |req: axum::extract::Request| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        // The blob now there is `"v2"`; its HEAD answers the
+                        // ETag the flag check saw, `checked`.
+                        let current = "\"v2\"";
+                        let method = req.method().to_string();
+                        let path = req.uri().path().to_string();
+                        let if_match = req
+                            .headers()
+                            .get("if-match")
+                            .map(|v| v.to_str().unwrap().to_string());
+                        let reply = axum::response::Response::builder()
+                            .header("content-length", "0")
+                            .header("content-type", "application/octet-stream");
+                        match (method.as_str(), path.as_str()) {
+                            ("GET", "/mycontainer") => axum::response::Response::builder()
+                                .status(200)
+                                .body(axum::body::Body::from(
+                                    "<EnumerationResults><Blobs /></EnumerationResults>",
+                                ))
+                                .unwrap(),
+                            ("HEAD", "/mycontainer/stub") => reply
+                                .status(200)
+                                .header("etag", checked)
+                                .header("x-ms-meta-hdi_isfolder", "true")
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                            ("DELETE", "/mycontainer/stub") => {
+                                let refused = if_match.as_deref().is_some_and(|tag| tag != current);
+                                if !refused {
+                                    seen.lock().unwrap().push(if_match);
+                                }
+                                let status = if refused { 412 } else { 202 };
+                                let reply = if refused {
+                                    reply.header("x-ms-error-code", "ConditionNotMet")
+                                } else {
+                                    reply
+                                };
+                                reply
+                                    .status(status)
+                                    .body(axum::body::Body::empty())
+                                    .unwrap()
+                            }
+                            ("DELETE", _) => {
+                                reply.status(404).body(axum::body::Body::empty()).unwrap()
+                            }
+                            _ => reply.status(404).body(axum::body::Body::empty()).unwrap(),
+                        }
+                    }
+                },
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+            let mut config = test_config();
+            config.endpoint = Some(format!("http://{addr}"));
+            let mut provider = AzureProvider::new(config);
+            provider.connected = true;
+
+            let outcome = provider.rmdir_recursive("/stub").await;
+            let deleted = deletes.lock().unwrap().clone();
+            if deleted_expected {
+                outcome.expect("an unchanged stub is deleted");
+                assert_eq!(
+                    deleted,
+                    [Some(checked.to_string())],
+                    "the DELETE carries the ETag its check saw"
+                );
+            } else {
+                assert!(
+                    deleted.is_empty(),
+                    "a stub changed since its check must not be deleted: {outcome:?}"
+                );
+                let error = outcome.expect_err("a changed stub is refused");
+                assert!(error.to_string().contains("changed"), "{error}");
+            }
+        }
+    }
+
+    /// Copy Blob overwrote the destination: a rename onto an existing blob
+    /// replaced it and reported success. The copy now carries
+    /// `If-None-Match: *`, so the refusal comes from the same request that
+    /// would write, with no window between a look and the copy.
+    #[tokio::test]
+    async fn rename_refuses_an_existing_destination_in_the_copy_itself() {
+        let (mut provider, log) = provider_on_blob_service(&["b.txt"]).await;
+        let outcome = provider.rename("/a.txt", "/b.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+            "{outcome:?}"
+        );
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            ["GET /mycontainer ", "PUT /mycontainer/b.txt *"],
+            "{log:?}"
+        );
+    }
+
+    /// `replace` is the verb for "put this over that" and copies without
+    /// the condition, then deletes the source.
+    #[tokio::test]
+    async fn replace_copies_over_an_existing_destination() {
+        let (mut provider, log) = provider_on_blob_service(&["b.txt"]).await;
+        provider.replace("/a.txt", "/b.txt").await.expect("replace");
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            [
+                "GET /mycontainer ",
+                "PUT /mycontainer/b.txt ",
+                "DELETE /mycontainer/a.txt "
+            ],
+            "{log:?}"
+        );
+    }
+
+    /// A folder is only the prefix of the blobs under it, so the copy
+    /// condition found no blob `d` and the copy put a blob `d` beside the
+    /// folder `d/`. A rename or a replace of a file onto it is refused
+    /// before any copy.
+    #[tokio::test]
+    async fn a_file_onto_a_prefix_folder_is_refused_before_any_copy() {
+        let (mut provider, log) = provider_on_blob_service(&["d/x.txt"]).await;
+        let renamed = provider.rename("/a.txt", "/d").await;
+        let replaced = provider.replace("/a.txt", "/d").await;
+        // With a trailing slash the copy went into the folder marker blob
+        // `d/`, which no listing shows and `rm -r d` deletes.
+        let slashed = provider.rename("/a.txt", "/d/").await;
+        for outcome in [renamed, replaced, slashed] {
+            assert!(
+                matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+                "{outcome:?}"
+            );
+        }
+        let log = log.lock().unwrap().clone();
+        assert!(!log.iter().any(|r| r.starts_with("PUT")), "{log:?}");
+    }
+
+    /// A folder is no blob Copy Blob can move: renaming one failed with
+    /// "Copy failed: 404". It is NotSupported, saying so.
+    #[tokio::test]
+    async fn a_folder_source_is_not_supported_not_a_failed_copy() {
+        let (mut provider, _) = provider_on_blob_service(&["d/", "d/x.txt"]).await;
+        let outcome = provider.rename("/d/", "/e/").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotSupported(ref m)) if m.contains("folder")),
+            "{outcome:?}"
+        );
+    }
+
+    /// The copy took the source without its trailing slash, the delete took
+    /// it with the slash: it deleted `a.txt/`, not the blob copied.
+    #[tokio::test]
+    async fn a_source_with_a_trailing_slash_deletes_the_blob_it_copied() {
+        let (mut provider, log) = provider_on_blob_service(&[]).await;
+        provider.rename("/a.txt/", "/b.txt").await.expect("rename");
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            [
+                "GET /mycontainer ",
+                "PUT /mycontainer/b.txt *",
+                "DELETE /mycontainer/a.txt "
+            ],
+            "{log:?}"
+        );
+    }
+
+    /// Azure may answer a page with no blob and a continuation marker: read
+    /// as "no folder", the copy put a blob `e` beside the folder `e/`.
+    #[tokio::test]
+    async fn a_folder_found_on_a_later_page_is_still_a_folder() {
+        let (mut provider, log) = provider_on_blob_service(&["e/x.txt"]).await;
+        let outcome = provider.rename("/a.txt", "/e").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+            "{outcome:?}"
+        );
+        let log = log.lock().unwrap().clone();
+        assert!(!log.iter().any(|r| r.starts_with("PUT")), "{log:?}");
+    }
+
+    #[test]
+    fn a_listing_names_a_blob_only_when_it_holds_one() {
+        assert!(lists_a_blob(
+            "<EnumerationResults><Blobs><Blob><Name>d/</Name></Blob></Blobs></EnumerationResults>"
+        ));
+        assert!(!lists_a_blob(
+            "<EnumerationResults><Blobs /><NextMarker /></EnumerationResults>"
+        ));
+    }
+
+    /// Headers with a fixed date and the API version, plus `extra`.
+    fn signed_headers(extra: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ms-date",
+            HeaderValue::from_static("Sat, 26 Sep 2026 12:00:00 GMT"),
+        );
+        headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
+        for (name, value) in extra {
+            headers.insert(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    /// The conditional Copy Blob of a rename carries `If-None-Match: *`,
+    /// which Shared Key signs in the tenth line of the string to sign. A
+    /// request that carries it and signs the line empty is a 403.
+    #[test]
+    fn shared_key_signs_if_none_match_in_its_own_line() {
+        let provider = AzureProvider::new(test_config());
+        let url = "https://myacc.blob.core.windows.net/mycontainer/b.txt";
+        let signed = provider
+            .string_to_sign("PUT", url, &signed_headers(&[("if-none-match", "*")]), 0)
+            .unwrap();
+        assert_eq!(
+            signed,
+            format!(
+                "PUT\n\n\n\n\n\n\n\n\n*\n\n\n\
+                 x-ms-date:Sat, 26 Sep 2026 12:00:00 GMT\nx-ms-version:{API_VERSION}\n\
+                 /myacc/mycontainer/b.txt"
+            )
+        );
+    }
+
+    /// The delete of a directory stub carries the ETag its check saw in
+    /// `If-Match`, which Shared Key signs in the ninth line. Signed empty,
+    /// the delete would be refused with 403 on a shared key.
+    #[test]
+    fn shared_key_signs_if_match_in_its_own_line() {
+        let provider = AzureProvider::new(test_config());
+        let url = "https://myacc.blob.core.windows.net/mycontainer/stub";
+        let signed = provider
+            .string_to_sign(
+                "DELETE",
+                url,
+                &signed_headers(&[("if-match", "\"0x8DC\"")]),
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            signed,
+            format!(
+                "DELETE\n\n\n\n\n\n\n\n\"0x8DC\"\n\n\n\n\
+                 x-ms-date:Sat, 26 Sep 2026 12:00:00 GMT\nx-ms-version:{API_VERSION}\n\
+                 /myacc/mycontainer/stub"
+            )
+        );
+    }
+
+    /// A resumed download sends `Range: bytes=N-`, which Shared Key signs in
+    /// the twelfth line. It was signed empty, so every resume with a shared
+    /// key was refused with 403 (SAS tokens do not sign it).
+    #[test]
+    fn shared_key_signs_range_in_its_own_line() {
+        let provider = AzureProvider::new(test_config());
+        let url = "https://myacc.blob.core.windows.net/mycontainer/b.txt";
+        let signed = provider
+            .string_to_sign("GET", url, &signed_headers(&[("range", "bytes=5-")]), 0)
+            .unwrap();
+        assert_eq!(
+            signed,
+            format!(
+                "GET\n\n\n\n\n\n\n\n\n\n\nbytes=5-\n\
+                 x-ms-date:Sat, 26 Sep 2026 12:00:00 GMT\nx-ms-version:{API_VERSION}\n\
+                 /myacc/mycontainer/b.txt"
+            )
+        );
     }
 
     #[test]

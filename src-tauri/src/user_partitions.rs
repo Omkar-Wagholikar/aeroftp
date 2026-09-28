@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::AppHandle;
 
-const DB_FILENAME: &str = "user_partitions.db";
+pub(crate) const DB_FILENAME: &str = "user_partitions.db";
 const SCHEMA_VERSION: &str = "5";
 const LEGACY_PROFILES_KEY: &str = "__legacy_server_profiles";
 /// Vault account of the single-user profile list that predates partitions.
@@ -474,7 +474,7 @@ fn current_schema_version(conn: &Connection) -> Result<Option<String>, String> {
     .map_err(|e| format!("Read schema version: {e}"))
 }
 
-fn active_user_id(conn: &Connection) -> Result<Option<i64>, String> {
+pub(crate) fn active_user_id(conn: &Connection) -> Result<Option<i64>, String> {
     let value = conn
         .query_row(
             "SELECT value FROM global_state WHERE key = ?1",
@@ -1556,6 +1556,21 @@ fn write_profiles_with_dek(
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| format!("Start replace profiles: {e}"))?;
+    insert_profiles_with_dek(&tx, root_secret, user_id, dek, profiles)?;
+    tx.commit()
+        .map_err(|e| format!("Commit replace profiles: {e}"))?;
+    Ok(())
+}
+
+/// The rows of [`write_profiles_with_dek`], on a transaction the caller holds
+/// and commits.
+fn insert_profiles_with_dek(
+    tx: &Connection,
+    root_secret: &SecretKey,
+    user_id: i64,
+    dek: &SecretKey,
+    profiles: &[Value],
+) -> Result<(), String> {
     tx.execute(
         "DELETE FROM server_profiles WHERE user_id = ?1",
         params![user_id],
@@ -1579,10 +1594,49 @@ fn write_profiles_with_dek(
         )
         .map_err(|e| format!("Insert profile: {e}"))?;
     }
-
-    tx.commit()
-        .map_err(|e| format!("Commit replace profiles: {e}"))?;
     Ok(())
+}
+
+/// Re-read `user_id`'s server profiles, let `apply` change them, and write
+/// them back only when it reports a change, all in one IMMEDIATE transaction:
+/// no other writer (the CLI, another window) can save between the read and the
+/// write and have that save overwritten. Returns the stored list afterwards,
+/// the one written or, when `apply` reports no change, the one read (whatever
+/// `apply` did to its copy), and whether it was written.
+pub fn update_server_profiles_for(
+    conn: &mut Connection,
+    root_key: &[u8; 32],
+    user_id: i64,
+    apply: impl FnOnce(&mut Vec<Value>) -> bool,
+) -> Result<(Vec<Value>, bool), String> {
+    let root_secret = user_crypto::secret_key_from_bytes(root_key);
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("Start update profiles: {e}"))?;
+    let (stored, written) = with_user_dek(&tx, &root_secret, user_id, |user_id, dek| {
+        let read = read_profiles_with_dek(&tx, user_id, dek)?;
+        let mut profiles = read.clone();
+        if !apply(&mut profiles) {
+            return Ok((read, false));
+        }
+        insert_profiles_with_dek(&tx, &root_secret, user_id, dek, &profiles)?;
+        Ok((profiles, true))
+    })?;
+    if written {
+        tx.commit()
+            .map_err(|e| format!("Commit update profiles: {e}"))?;
+    }
+    Ok((stored, written))
+}
+
+/// [`update_server_profiles_for`] for the active user.
+pub fn update_active_server_profiles(
+    conn: &mut Connection,
+    root_key: &[u8; 32],
+    apply: impl FnOnce(&mut Vec<Value>) -> bool,
+) -> Result<(Vec<Value>, bool), String> {
+    let user_id = active_user_id(conn)?.ok_or_else(|| "NO_ACTIVE_USER".to_string())?;
+    update_server_profiles_for(conn, root_key, user_id, apply)
 }
 
 /// Outcome of a cross-user profile relocation (N4). Returned to the GUI/CLI so
@@ -1760,7 +1814,7 @@ pub fn relocate_server_profile(
 /// Partition credential_type for a relocate key (migrate precedent at
 /// `copy_user_secrets_with_dek`: `server` / `oauth` / `jottacloud_refresh`,
 /// plus the crypt/Filen/OneDrive prefixes from [`relocate_all_secret_key_candidates`]).
-fn relocate_secret_kind(credential_key: &str) -> &'static str {
+pub(crate) fn relocate_secret_kind(credential_key: &str) -> &'static str {
     if credential_key.starts_with("server_modes_") {
         "server_modes"
     } else if credential_key.starts_with("server_") {
@@ -3912,6 +3966,16 @@ pub fn refresh_legacy_profiles_blob_from_db(
     if !db_path.is_file() {
         return Ok(false);
     }
+    mirror_active_profiles_to_legacy_blob(store, &read_active_profiles_from_db(store, db_path)?)
+}
+
+/// The active user's profiles in the partition database at `db_path`, opened
+/// read-only (never migrated or created). Used by the keystore import preview
+/// on this machine's database and on a temporary copy of the backup's.
+pub fn read_active_profiles_from_db(
+    store: &CredentialStore,
+    db_path: &std::path::Path,
+) -> Result<Vec<Value>, String> {
     let conn = Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -3920,7 +3984,7 @@ pub fn refresh_legacy_profiles_blob_from_db(
     let mut root_key = store.derive_user_partition_wrapping_key();
     let result = list_active_server_profiles(&conn, &root_key);
     root_key.zeroize();
-    mirror_active_profiles_to_legacy_blob(store, &result?)
+    result
 }
 
 /// Read server profiles for a specific user id without touching
@@ -3949,6 +4013,20 @@ pub fn cli_replace_server_profiles_for_user(
     let mut conn = open_or_init_cli()?;
     let mut root_key = store.derive_user_partition_wrapping_key();
     let result = replace_server_profiles_for(&mut conn, &root_key, user_id, profiles);
+    root_key.zeroize();
+    result
+}
+
+/// CLI counterpart of [`update_server_profiles_for`] for the target user.
+pub fn cli_update_server_profiles_for_user(
+    store: &CredentialStore,
+    user_id: i64,
+    apply: impl FnOnce(&mut Vec<Value>) -> bool,
+) -> Result<(Vec<Value>, bool), String> {
+    init_or_migrate_cli(store)?;
+    let mut conn = open_or_init_cli()?;
+    let mut root_key = store.derive_user_partition_wrapping_key();
+    let result = update_server_profiles_for(&mut conn, &root_key, user_id, apply);
     root_key.zeroize();
     result
 }
@@ -4836,10 +4914,33 @@ pub async fn user_partitions_load_active_server_profiles(
     init_or_migrate(&app)?;
     let store = CredentialStore::from_cache().ok_or_else(|| "STORE_NOT_READY".to_string())?;
     let mut root_key = store.derive_user_partition_wrapping_key();
-    let conn = open_or_init(&app)?;
+    let mut conn = open_or_init(&app)?;
     let result = list_active_server_profiles(&conn, &root_key);
+    let mut profiles = match result {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            root_key.zeroize();
+            return Err(e);
+        }
+    };
+    // rclone-crypt secrets an older import left in a profile's options move to
+    // the vault and a binding, once; the list is re-read, merged and written
+    // in one transaction, and only when a move applied.
+    let notes = crate::bridge_commands::migrate_legacy_rclone_crypt_on_load(
+        &mut profiles,
+        |key, secret| store_active_credential_dual(&store, key, secret),
+        |key| {
+            resolve_active_credential(&store, key)
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+        },
+        |apply| update_active_server_profiles(&mut conn, &root_key, apply),
+    );
+    for note in &notes {
+        tracing::warn!("{note}");
+    }
     root_key.zeroize();
-    let mut profiles = result?;
     // #736: heal a legacy blob that an older build left frozen, so AeroAgent
     // and MCP see the same list as My Servers without waiting for a save.
     // Best-effort: the list is what the caller asked for.
@@ -5774,6 +5875,41 @@ mod tests {
             .expect("profile count");
         assert_eq!(user_count, 1);
         assert_eq!(profile_count, 3);
+    }
+
+    /// The load-time crypt migration writes through this: the list is re-read
+    /// and written in one transaction, and a change that `apply` does not
+    /// report is not written at all.
+    #[test]
+    fn update_server_profiles_writes_only_a_reported_change() {
+        let _guard = test_lock();
+        let mut conn = migrated_conn(2);
+        let root = test_root();
+        let before = list_active_server_profiles(&conn, &root).expect("load");
+
+        let untouched = update_active_server_profiles(&mut conn, &root, |p| {
+            p[0]["name"] = json!("changed but not reported");
+            false
+        })
+        .expect("update");
+        // Not written, and what comes back is the list as stored, not the
+        // copy `apply` changed.
+        assert_eq!(untouched, (before.clone(), false));
+        assert_eq!(
+            list_active_server_profiles(&conn, &root).expect("reload"),
+            before
+        );
+
+        let (written, was_written) = update_active_server_profiles(&mut conn, &root, |p| {
+            p[1]["name"] = json!("renamed");
+            true
+        })
+        .expect("update");
+        assert!(was_written);
+        assert_eq!(written[1]["name"], "renamed");
+        let after = list_active_server_profiles(&conn, &root).expect("reload");
+        assert_eq!(after, written);
+        assert_eq!(after[0], before[0]);
     }
 
     #[test]

@@ -14,7 +14,6 @@
 // loop can be exercised under Vitest's `node` environment.
 
 import type {
-    CompressionMode,
     RetryPolicy,
     VerifyPolicy,
     SyncDirection,
@@ -108,10 +107,13 @@ export interface RemoteSyncConfig {
     verifyPolicy: VerifyPolicy;
     deltaSyncEnabled: boolean;
     /**
-     * Versioning strategy for archive-before-delete / archive-before-overwrite.
-     * `undefined`, `null` or `"disabled"` turns archiving off.
+     * Versioned backup: before a destination file is overwritten or deleted,
+     * its copy is moved to `<destination root>/<dir>/<stamp>/<path>`
+     * (`sync_backup_archive_*`, one stamp per run). A failed backup fails
+     * that file and leaves the destination copy where it was. Unset or null
+     * turns it off. `dir` must already be validated (`sync_backup_validate`).
      */
-    versioningStrategy?: string | null;
+    versionedBackup?: { dir: string } | null;
     /** Stop transferring once this many bytes have moved. 0 = unlimited. */
     transferBudget: number;
     /** Stored on the journal for resume bookkeeping. */
@@ -133,19 +135,6 @@ export interface RemoteSyncConfig {
      * mandatory pass catches any corruption.
      */
     postSyncVerification?: boolean;
-    /**
-     * GAP-9b — parallel-streams + compression preset carried from the speed
-     * mode (and the explicit Plan-tab selector). These are first-class config
-     * fields preserved from the legacy SyncPanel, but the concurrent
-     * execution that consumes them is owned by `APPENDIX-DAG-ENGINE` Fase 2.
-     * Until that lands the per-file loop stays sequential and compression is
-     * left to the per-protocol transport — exactly as the legacy SyncPanel
-     * behaved, whose `handleSync` never invoked `parallel_sync_execute`. The
-     * runner threads them so the future DAG builder can read them off one
-     * config object.
-     */
-    parallelStreams?: number;
-    compressionMode?: CompressionMode;
     /**
      * GAP-10 — when `true`, both endpoints are local directories (the Plan
      * tab / Compare-tab mirror on a dual-local AeroFile pair). The runner
@@ -374,8 +363,6 @@ export const runRemoteSync = async (
 
     const localBase = stripTrailingSlash(config.localRoot);
     const remoteBase = stripTrailingSlash(config.remoteRoot);
-    const archivingActive =
-        !!config.versioningStrategy && config.versioningStrategy !== 'disabled';
     const errorCorrectionEnabled =
         config.errorCorrection?.enabled === true
         && config.isLocalLocal !== true;
@@ -461,21 +448,88 @@ export const runRemoteSync = async (
         }).catch(() => null);
     };
 
-    // ── Archive a local file before it is overwritten or deleted ───────────
-    const archiveLocalBeforeMutation = async (
-        localFilePath: string,
+    // ── Versioned backup: move the destination copy aside first ────────────
+    // One stamp for the whole run, asked once, so every copy this run keeps
+    // lands in the same `<dir>/<stamp>/` folder.
+    let backupStamp: string | null = null;
+    /** Move one path into this run's backup folder; null when it is not there. */
+    const archiveOne = async (
+        side: 'local' | 'remote',
+        dir: string,
+        relativePath: string,
+    ): Promise<string | null | undefined> => {
+        backupStamp ??= await invoke<string>('sync_backup_run_stamp');
+        if (side === 'local' || config.isLocalLocal) {
+            return invoke<string | null>('sync_backup_archive_local', {
+                root: side === 'local' ? localBase : remoteBase,
+                dir,
+                stamp: backupStamp,
+                rel: relativePath,
+            });
+        }
+        return invoke<string | null>('sync_backup_archive_remote', {
+            useProvider: config.isProvider,
+            root: remoteBase,
+            dir,
+            stamp: backupStamp,
+            rel: relativePath,
+        });
+    };
+    const archiveBeforeMutation = async (
+        side: 'local' | 'remote',
         relativePath: string,
     ): Promise<void> => {
-        if (!archivingActive) return;
+        const backup = config.versionedBackup;
+        if (!backup) return;
+        let kept: string | null | undefined;
         try {
-            await invoke('archive_before_sync_delete', {
-                syncRoot: localBase,
-                filePath: localFilePath,
-                versioningStrategy: config.versioningStrategy,
-            });
+            kept = await archiveOne(side, backup.dir, relativePath);
         } catch (e) {
-            throw new Error(`Archive failed for ${relativePath}: ${String(e)}`);
+            throw new Error(`Backup failed for ${relativePath}: ${String(e)}`);
         }
+        // Only files the compare saw on the destination reach this point, so
+        // "nothing to keep" means the backend could not find it: a server
+        // that answers "not there" for a file it holds. Writing anyway would
+        // lose the one copy the user asked to keep.
+        if (kept == null) {
+            throw new Error(`Backup failed for ${relativePath}: the destination copy was not found, so it was left as it is`);
+        }
+        // The `.aerocorrect` parity sidecar belongs to the copy just kept, so
+        // it goes into the backup folder with it; most files have none. The
+        // compare never lists sidecars, so one left behind would stay beside a
+        // file that is gone or replaced for good: if it cannot be moved it is
+        // deleted, and the kept copy goes without its parity.
+        if (side === 'remote') {
+            const sidecarRel = `${relativePath}.aerocorrect`;
+            await archiveOne(side, backup.dir, sidecarRel).catch(() =>
+                deleteRemoteSidecar(`${remoteBase}/${relativePath}`),
+            );
+        }
+    };
+    /** Best-effort removal of the `.aerocorrect` sidecar of a destination file. */
+    const deleteRemoteSidecar = async (remoteFilePath: string): Promise<void> => {
+        const sidecarPath = `${remoteFilePath}.aerocorrect`;
+        const sidecarInvoke = config.isLocalLocal
+            ? invoke('delete_local_file', { path: sidecarPath })
+            : config.isProvider
+                ? invoke('provider_delete_file', { path: sidecarPath })
+                : invoke('delete_remote_file', { path: sidecarPath, isDir: false });
+        await sidecarInvoke.catch(() => undefined);
+    };
+    /** Record a file the backup step failed: its destination copy is untouched. */
+    const failBackup = (item: SyncRunFile, journalEntry: SyncJournalEntry | undefined, e: unknown): void => {
+        const errInfo: SyncErrorInfo = {
+            kind: 'disk_error',
+            message: (e as Error)?.message || String(e),
+            retryable: false,
+            file_path: item.relativePath,
+        };
+        if (journalEntry) {
+            journalEntry.status = 'failed';
+            journalEntry.last_error = errInfo;
+        }
+        errors.push(errInfo);
+        setStatus(item.relativePath, 'error');
     };
 
     // ── Re-key delta stats captured under a basename onto the full path ────
@@ -559,6 +613,30 @@ export const runRemoteSync = async (
         completed: false,
     };
     const journalEntryMap = new Map<string, number>();
+    // The local file of each transfer as the index records it, for the files
+    // this run knows no time of (a remote that lists none, a run resumed from
+    // its journal): read when a download completed, and before an upload.
+    const landedStates = new Map<string, { size: number | null; modified: string | null }>();
+    const readLocalState = async (path: string) => {
+        const props = await invoke<{ size?: number; modified: string | null } | undefined>(
+            'get_file_properties',
+            { path },
+        ).catch(() => undefined);
+        // get_file_properties formats UTC without the zone.
+        return {
+            size: typeof props?.size === 'number' ? props.size : null,
+            modified: props?.modified ? `${props.modified}Z` : null,
+        };
+    };
+    // What the index records for a completed transfer, kept in its journal
+    // entry too: a run resumed from the journal reads nothing of the
+    // transfers it skips, and takes this for them.
+    const recordLanded = (item: SyncRunFile, entry: SyncJournalEntry | undefined) => {
+        if (!entry) return;
+        const landed = landedStates.get(item.relativePath);
+        entry.local_size = landed?.size ?? item.size;
+        entry.local_modified = landed ? landed.modified : item.mtime;
+    };
     journal.entries.forEach((entry, idx) => journalEntryMap.set(entry.relative_path, idx));
 
     // GAP-9a — Maniac mode disables journal persistence. The in-memory
@@ -692,6 +770,16 @@ export const runRemoteSync = async (
         let didTransfer = false;
 
         if (item.action === 'upload') {
+            if (config.versionedBackup && item.overwritesExisting) {
+                try {
+                    await archiveBeforeMutation('remote', item.relativePath);
+                } catch (e) {
+                    failBackup(item, journalEntry, e);
+                    completed++;
+                    callbacks.onProgress?.(completed, files.length);
+                    continue;
+                }
+            }
             // GAP-10: a local-local upload is a filesystem copy left → right.
             let cmd: string;
             let args: Record<string, unknown>;
@@ -704,6 +792,11 @@ export const runRemoteSync = async (
             } else {
                 cmd = 'upload_file';
                 args = { params: { local_path: localFilePath, remote_path: remoteFilePath, use_delta: config.deltaSyncEnabled } };
+            }
+            // A run resumed from its journal knows no time of the file it
+            // uploads: read it before the upload, the copy that goes up.
+            if (deps.writeIndex && item.mtime == null) {
+                landedStates.set(item.relativePath, await readLocalState(localFilePath));
             }
             const result = await executeTransferWithRetry(cmd, args, item.relativePath);
             if (journalEntry) {
@@ -719,6 +812,7 @@ export const runRemoteSync = async (
                     journalEntry.bytes_transferred = item.size;
                     journalEntry.verified = true;
                 }
+                recordLanded(item, journalEntry);
                 if (errorCorrectionEnabled) {
                     try {
                         const ecResult = await invoke<SyncEcCommandResult>('sync_ec_generate', {
@@ -751,23 +845,11 @@ export const runRemoteSync = async (
                 setStatus(item.relativePath, 'error');
             }
         } else if (item.action === 'download') {
-            if (archivingActive && item.overwritesExisting) {
+            if (config.versionedBackup && item.overwritesExisting) {
                 try {
-                    await archiveLocalBeforeMutation(localFilePath, item.relativePath);
+                    await archiveBeforeMutation('local', item.relativePath);
                 } catch (e) {
-                    const archiveMessage = (e as Error)?.message || String(e);
-                    const errInfo: SyncErrorInfo = {
-                        kind: 'disk_error',
-                        message: archiveMessage,
-                        retryable: false,
-                        file_path: item.relativePath,
-                    };
-                    if (journalEntry) {
-                        journalEntry.status = 'failed';
-                        journalEntry.last_error = errInfo;
-                    }
-                    errors.push(errInfo);
-                    setStatus(item.relativePath, 'error');
+                    failBackup(item, journalEntry, e);
                     completed++;
                     callbacks.onProgress?.(completed, files.length);
                     continue;
@@ -828,6 +910,12 @@ export const runRemoteSync = async (
                     errors.push(errInfo);
                     setStatus(item.relativePath, 'verify_failed');
                 } else {
+                    // Read now, not when the index is saved after the run: a
+                    // same-size edit made in between is a change the next run
+                    // must see, not the synced state.
+                    if (deps.writeIndex && item.mtime == null) {
+                        landedStates.set(item.relativePath, await readLocalState(localFilePath));
+                    }
                     downloaded++;
                     totalBytes += item.size;
                     if (journalEntry) {
@@ -835,6 +923,7 @@ export const runRemoteSync = async (
                         journalEntry.bytes_transferred = item.size;
                         journalEntry.verified = true;
                     }
+                    recordLanded(item, journalEntry);
                     captureDeltaForPath(item.relativePath);
                     setStatus(item.relativePath, 'success');
                 }
@@ -853,7 +942,23 @@ export const runRemoteSync = async (
                 setStatus(item.relativePath, 'error');
             }
         } else if (item.action === 'delete-remote' || item.action === 'delete-local') {
-            try {
+            // Versioned backup: for a file the move into the backup folder IS
+            // the delete. It fails the file on its own, without the delete
+            // running, so the destination copy stays where it was.
+            if (config.versionedBackup && !item.isDir) {
+                try {
+                    await archiveBeforeMutation(item.action === 'delete-remote' ? 'remote' : 'local', item.relativePath);
+                } catch (e) {
+                    failBackup(item, journalEntry, e);
+                    completed++;
+                    callbacks.onProgress?.(completed, files.length);
+                    continue;
+                }
+                deleted++;
+                didTransfer = true;
+                if (journalEntry) journalEntry.status = 'completed';
+                setStatus(item.relativePath, 'success');
+            } else try {
                 if (item.action === 'delete-remote') {
                     if (config.isLocalLocal) {
                         // GAP-10: the "remote" side is a local directory;
@@ -869,20 +974,8 @@ export const runRemoteSync = async (
                     // Best-effort: remove the `.aerocorrect` EC parity sidecar alongside the
                     // deleted file so a removed backup never orphans its sidecar. The
                     // sidecar is excluded from comparison, so it is never its own action.
-                    if (!item.isDir) {
-                        const sidecarPath = `${remoteFilePath}.aerocorrect`;
-                        const sidecarInvoke = config.isLocalLocal
-                            ? invoke('delete_local_file', { path: sidecarPath })
-                            : config.isProvider
-                                ? invoke('provider_delete_file', { path: sidecarPath })
-                                : invoke('delete_remote_file', { path: sidecarPath, isDir: false });
-                        await sidecarInvoke.catch(() => undefined);
-                    }
+                    if (!item.isDir) await deleteRemoteSidecar(remoteFilePath);
                 } else {
-                    // Archive only real files; directories are not versioned.
-                    if (!item.isDir) {
-                        await archiveLocalBeforeMutation(localFilePath, item.relativePath);
-                    }
                     await invoke('delete_local_file', { path: localFilePath });
                 }
                 deleted++;
@@ -995,9 +1088,33 @@ export const runRemoteSync = async (
                 const entry = idx !== undefined ? journal.entries[idx] : undefined;
                 if (entry?.status !== 'completed') continue;
                 if (f.action === 'upload' || f.action === 'download') {
+                    // The next compare reads the local side against this time
+                    // with the local clock. A download keeps the remote time,
+                    // which it stamped on the local copy, and an upload the
+                    // time the scan read. With neither (a backend that lists no
+                    // time, such as FTP LIST dates, or a run resumed from its
+                    // journal) the file's own is recorded, read when the
+                    // download completed or before the upload, or the local side
+                    // would be compared by size alone and a same-size edit would
+                    // go unseen. A transfer the resumed journal had finished was
+                    // not read in this run: its journal entry says what the run
+                    // that made it recorded. An entry written before these
+                    // fields existed gives no time.
+                    let size = f.size;
+                    let modified = f.mtime;
+                    if (f.mtime == null) {
+                        const landed = landedStates.get(f.relativePath);
+                        if (landed) {
+                            modified = landed.modified;
+                            size = landed.size ?? f.size;
+                        } else {
+                            modified = entry.local_modified ?? null;
+                            size = entry.local_size ?? f.size;
+                        }
+                    }
                     mergedFiles[f.relativePath] = {
-                        size: f.size,
-                        modified: f.mtime,
+                        size,
+                        modified,
                         is_dir: false,
                     };
                 } else {

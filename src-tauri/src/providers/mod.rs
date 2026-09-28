@@ -56,6 +56,8 @@ pub mod oauth1;
 pub mod oauth2;
 pub mod onedrive;
 pub mod opendrive;
+#[cfg(test)]
+mod path_resolution_guard;
 pub mod pcloud;
 pub mod peer;
 pub mod proton;
@@ -486,7 +488,45 @@ pub fn documented_file_limits(provider: ProviderType) -> DocumentedFileLimits {
             max_name_chars: Some(255),
             ..Default::default()
         },
-        _ => DocumentedFileLimits::default(),
+        // No limit to warn about, each for a stated reason. The match has no
+        // wildcard on purpose: a new provider type does not compile until
+        // someone answers for it.
+        //
+        // Set by the provider itself, on AWS endpoints only (AWS_S3_FILE_LIMITS).
+        ProviderType::S3 => DocumentedFileLimits::default(),
+        // Decided by each server or by the operator, not by a service.
+        ProviderType::Ftp
+        | ProviderType::Ftps
+        | ProviderType::Sftp
+        | ProviderType::WebDav
+        | ProviderType::Swift
+        | ProviderType::GitLab
+        | ProviderType::Immich => DocumentedFileLimits::default(),
+        // Documented as unlimited, or unlimited on the highest plan.
+        ProviderType::Mega | ProviderType::Filen | ProviderType::FileLu => {
+            DocumentedFileLimits::default()
+        }
+        // No official number found (marketing page only, site not readable,
+        // or custom plans without a stated ceiling).
+        ProviderType::PCloud
+        | ProviderType::Jottacloud
+        | ProviderType::DrimeCloud
+        | ProviderType::OpenDrive
+        | ProviderType::ImageKit
+        | ProviderType::Uploadcare
+        | ProviderType::Twake => DocumentedFileLimits::default(),
+        // Two write paths with two limits: a repository file goes through the
+        // Contents API (100 MB, refused by the provider itself before the
+        // upload, github/mod.rs MAX_CONTENT_SIZE), a release asset has 2 GiB.
+        // One number per provider type would warn wrongly on one of them.
+        // https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents
+        // https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases
+        ProviderType::GitHub => DocumentedFileLimits::default(),
+        // Not a remote a sync uploads to through this path.
+        ProviderType::AeroCloud
+        | ProviderType::AeroVaultMount
+        | ProviderType::Peer
+        | ProviderType::Mtp => DocumentedFileLimits::default(),
     }
 }
 
@@ -643,6 +683,105 @@ pub struct UploadedPart {
     pub part_number: u32,
     /// Provider-issued verification tag for the uploaded part.
     pub etag: String,
+}
+
+/// The granularity at which each backend's listed modification times can be
+/// compared, `None` when they cannot be. The match is exhaustive on purpose: a
+/// new backend does not compile until somebody states what its dates are.
+///
+/// Measured from what each `list` puts in `RemoteEntry.modified` (audit of
+/// 2026-09-25). A value is the granularity of a time with a known zone; it
+/// says nothing about whether the time is the file's own mtime or its upload
+/// time, which the one-way rule (`destination_is_current`) already absorbs.
+/// `None` is declared for a date with no zone, a localized display string, a
+/// shape nothing reads, or no date at all.
+pub fn declared_mtime_precision(provider: ProviderType) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    const SECOND: Option<Duration> = Some(Duration::from_secs(1));
+    const MILLI: Option<Duration> = Some(Duration::from_millis(1));
+    const MICRO: Option<Duration> = Some(Duration::from_micros(1));
+    const NANO: Option<Duration> = Some(Duration::from_nanos(1));
+    match provider {
+        // Without a session nothing says whether MLSD (UTC, seconds) or LIST
+        // (server-local, no zone) will be read; `FtpProvider` answers per
+        // session and the legacy `FtpManager` only reads LIST.
+        ProviderType::Ftp | ProviderType::Ftps => None,
+        // `attrs.mtime`, Unix seconds.
+        ProviderType::Sftp => SECOND,
+        // `getlastmodified`, RFC 1123.
+        ProviderType::WebDav => SECOND,
+        // `LastModified` carries milliseconds, but the ListObjects value is
+        // the upload time and whole seconds are what the sync compares.
+        ProviderType::S3 => SECOND,
+        // A sync configuration, never a storage backend of its own.
+        ProviderType::AeroCloud => None,
+        // `modifiedTime`, RFC 3339 with milliseconds.
+        ProviderType::GoogleDrive => MILLI,
+        // `server_modified`, whole seconds.
+        ProviderType::Dropbox => SECOND,
+        // `lastModifiedDateTime`, RFC 3339.
+        ProviderType::OneDrive => SECOND,
+        // Native: node `ts`, Unix seconds. `MegaCmdProvider` overrides this:
+        // `mega-ls -l` prints a date with no zone.
+        ProviderType::Mega => SECOND,
+        // `claimedModificationTime`, milliseconds.
+        ProviderType::Proton => MILLI,
+        // `modified_at`, RFC 3339 with an offset.
+        ProviderType::Box => SECOND,
+        // `modified`, RFC 2822.
+        ProviderType::PCloud => SECOND,
+        // `Last-Modified`, RFC 1123.
+        ProviderType::Azure => SECOND,
+        // `lastModified` in milliseconds, cut to seconds.
+        ProviderType::Filen => SECOND,
+        // `modified` passed through with a shape nothing in the code pins.
+        ProviderType::FourShared => None,
+        // `modified_time_i18` is a localized display string.
+        ProviderType::ZohoWorkdrive => None,
+        // `modificationTime`, ISO 8601 with milliseconds.
+        ProviderType::Internxt => MILLI,
+        // `last_modified_at`, Unix seconds.
+        ProviderType::KDrive => SECOND,
+        // `<modified>`, parsed to seconds.
+        ProviderType::Jottacloud => SECOND,
+        // `updated_at`, parsed to seconds.
+        ProviderType::DrimeCloud => SECOND,
+        // `uploaded` is `YYYY-MM-DD HH:MM:SS` with no zone.
+        ProviderType::FileLu => None,
+        // `modified` in milliseconds, cut to seconds.
+        ProviderType::Koofr => SECOND,
+        // `DateModified`, Unix seconds.
+        ProviderType::OpenDrive => SECOND,
+        // `modified`, RFC 3339 with an offset.
+        ProviderType::YandexDisk => SECOND,
+        // The Contents API lists no date; only `stat` looks one up.
+        ProviderType::GitHub => None,
+        ProviderType::GitLab => None,
+        // `last_modified`, microseconds in UTC.
+        ProviderType::Swift => MICRO,
+        // `creationTime`, RFC 3339.
+        ProviderType::GooglePhotos => SECOND,
+        // `fileModifiedAt`, milliseconds.
+        ProviderType::Immich => MILLI,
+        // `updatedAt`, milliseconds.
+        ProviderType::ImageKit => MILLI,
+        // `datetime_uploaded`, microseconds.
+        ProviderType::Uploadcare => MICRO,
+        // `uploadTimestamp`, milliseconds.
+        ProviderType::Backblaze => MILLI,
+        // `created_at`, whole seconds.
+        ProviderType::Cloudinary => SECOND,
+        // Vault entries carry no date.
+        ProviderType::AeroVaultMount => None,
+        // The peer's own file mtime, RFC 3339 with nanoseconds.
+        ProviderType::Peer => NANO,
+        // libmtp reports bare Unix seconds, WPD nothing, gvfs RFC 3339: the
+        // backend is chosen at run time and two of the three do not read.
+        ProviderType::Mtp => None,
+        // `updated_at`, RFC 3339 (Cozy); uploads write the local mtime to
+        // the second.
+        ProviderType::Twake => SECOND,
+    }
 }
 
 /// Unified storage provider trait
@@ -805,7 +944,21 @@ pub trait StorageProvider: Send + Sync {
     ///
     /// The default forwards to `rename`, which is what every caller did
     /// before this method existed. A backend whose rename refuses an occupied
-    /// destination overrides this; `SftpProvider` and `WebDavProvider` do.
+    /// destination must override this, or every replace onto an existing
+    /// file fails: SFTP, WebDAV, the copy-based backends (S3, B2, Swift,
+    /// Azure, Cloudinary, OpenDrive), FTP, ImageKit, pCloud, Yandex Disk and
+    /// the MTP folder overwrite in one server step, MEGAcmd and Jottacloud
+    /// send their move without the look their rename makes, OneDrive
+    /// replaces in the request that moves, Google Drive uploads the new
+    /// content as a revision of the file there, and MEGA, Filen, FileLu,
+    /// Dropbox, Koofr, Drime and kDrive, which have neither, set the old item
+    /// aside first (see [`set_aside_name`]). A backend with none of these keeps the default,
+    /// whose refusal is the answer, and says so through
+    /// [`StorageProvider::supports_atomic_replace`].
+    ///
+    /// A replace puts a file in place of a file or a folder in place of a
+    /// folder. Across the two (see [`refuse_replace_across_types`]) it is
+    /// refused with AlreadyExists before anything changes.
     async fn replace(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
         self.rename(from, to).await
     }
@@ -820,13 +973,43 @@ pub trait StorageProvider: Send + Sync {
     ///
     /// The default answers `true`, which is the assumption every caller
     /// already made. It means "no known obstacle", not "verified": only a
-    /// backend that has actually measured its own ground says otherwise, and
-    /// today that is `SftpProvider`, which asks the server whether it offers
-    /// `posix-rename@openssh.com`.
+    /// backend that has actually measured its own ground says otherwise:
+    /// `SftpProvider`, which asks the server whether it offers
+    /// `posix-rename@openssh.com`; the backends whose replace sets the old
+    /// item aside (MEGA, Filen, FileLu, Dropbox, Koofr, Drime, kDrive, see
+    /// [`StorageProvider::replace_sets_aside`]); those whose move over a file is not
+    /// documented as one step (MEGAcmd, Jottacloud); those with no replace
+    /// at all, whose rename refuses a taken name or who have no rename (each
+    /// says why on its own answer); and ImageKit and OpenDrive, which
+    /// overwrite only across folders while every caller stages its temporary
+    /// in the target's own folder.
     ///
     /// [`replace`]: StorageProvider::replace
     async fn supports_atomic_replace(&mut self) -> Result<bool, ProviderError> {
         Ok(true)
+    }
+
+    /// Whether [`replace`] puts a file over an existing one by setting the
+    /// previous item aside first: it is renamed to [`set_aside_name`], the
+    /// new one moves into its place, and only then is the old one deleted.
+    /// The name is empty between the first two steps, so these backends
+    /// answer `false` to [`StorageProvider::supports_atomic_replace`], but
+    /// their replace does put a file over another and loses neither.
+    ///
+    /// This is the question behind the edit opt-in (`--allow-non-atomic`,
+    /// `allow_non_atomic`), asked through [`ensure_edit_can_replace`] BEFORE
+    /// anything is staged. A backend whose replace is its rename, which
+    /// refuses a taken name, keeps the default `false`: there the opt-in
+    /// would upload a temporary that the replace then refuses to publish.
+    ///
+    /// `true` on MEGA through the native API, Filen, FileLu, Dropbox, Koofr,
+    /// Drime and kDrive. Not on MEGAcmd or Jottacloud: their replace is a
+    /// server move over the file whose atomicity is not documented, not a
+    /// set-aside. The overlays (crypt, compress) forward the inner answer.
+    ///
+    /// [`replace`]: StorageProvider::replace
+    fn replace_sets_aside(&self) -> bool {
+        false
     }
 
     /// Get file/directory info
@@ -1306,6 +1489,17 @@ pub trait StorageProvider: Send + Sync {
         false
     }
 
+    /// How finely the modification times this backend lists can be compared,
+    /// `None` when they cannot be compared at all. The sync reads it through
+    /// [`crate::sync_core::mtime::ModifyWindow::resolve`]: the window is the
+    /// coarser of this and 2 s, and `None` compares by size only. The default
+    /// is the backend's declared value ([`declared_mtime_precision`]); a
+    /// provider whose answer depends on the session (FTP with or without
+    /// MLSD) overrides it, and an overlay forwards its inner provider's.
+    fn mtime_precision(&self) -> Option<std::time::Duration> {
+        declared_mtime_precision(self.provider_type())
+    }
+
     /// Whether `size`/`stat` report the EXACT logical (plaintext) size. True for
     /// every normal provider. A crypt overlay whose size mapping is deferred
     /// (legacy AeroCrypt v1/v2) returns false so size-based sync comparison is
@@ -1327,6 +1521,23 @@ pub trait StorageProvider: Send + Sync {
     /// instead.
     async fn checksum(&mut self, _path: &str) -> Result<HashMap<String, String>, ProviderError> {
         Err(ProviderError::NotSupported("checksum".to_string()))
+    }
+
+    /// [`checksum`](Self::checksum) for a caller that wants one algorithm,
+    /// named by its canonical key (`md5`, `sha1`, `sha256`, ...).
+    ///
+    /// A backend that answers from digests it already stores returns what it
+    /// has, so the default ignores the hint and the caller looks its key up in
+    /// the map. A backend that computes the digest on request and lets the
+    /// client choose the algorithm overrides it: FTP selects it with
+    /// `OPTS HASH` before `HASH`, and would otherwise hash with whatever the
+    /// server has selected.
+    async fn checksum_for(
+        &mut self,
+        path: &str,
+        _algorithm: &str,
+    ) -> Result<HashMap<String, String>, ProviderError> {
+        self.checksum(path).await
     }
 
     /// Which digests this backend can produce without downloading the file.
@@ -1366,6 +1577,17 @@ pub trait StorageProvider: Send + Sync {
         path: &str,
     ) -> Result<HashMap<String, String>, ProviderError> {
         self.checksum(path).await
+    }
+
+    /// [`stored_checksum`](Self::stored_checksum) with the algorithm hint of
+    /// [`checksum_for`](Self::checksum_for). A wrapper that overrides
+    /// `stored_checksum` overrides this too, or the hint stops at the wrapper.
+    async fn stored_checksum_for(
+        &mut self,
+        path: &str,
+        algorithm: &str,
+    ) -> Result<HashMap<String, String>, ProviderError> {
+        self.checksum_for(path, algorithm).await
     }
 
     /// Whether this provider supports remote/URL upload (server fetches a URL)
@@ -1587,6 +1809,126 @@ pub trait StorageProvider: Send + Sync {
     }
 }
 
+/// A `stat` answer that says the provider cannot describe the path, as
+/// opposed to one that failed. S3, Azure, Swift and B2 see no directory
+/// behind a path without its trailing slash (NotFound); Box and GitHub fail
+/// to parse the answer for a folder (ParseError). A transient failure
+/// (network, server, timeout) says nothing about the path, and acting on it
+/// as if the path were a directory reached the directory of the same name.
+pub fn stat_cannot_describe(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::NotFound(_) | ProviderError::NotSupported(_) | ProviderError::ParseError(_)
+    )
+}
+
+fn directory_not_empty(path: &str, entries: usize) -> ProviderError {
+    ProviderError::DirectoryNotEmpty(format!(
+        "{path} holds {entries} entr{}; delete it recursively to remove it with its content",
+        if entries == 1 { "y" } else { "ies" }
+    ))
+}
+
+/// Remove `path` only if it is an empty directory.
+///
+/// `rmdir` removes a directory with everything in it on several backends
+/// (S3 and Azure delete every key under the prefix, Google Drive, OneDrive,
+/// Dropbox, pCloud, Box, MEGA, Filen, kDrive, Koofr, Jottacloud and WebDAV
+/// remove the folder whole), so every caller that means "an empty directory"
+/// (`rm` without `-r`, the served FTP RMD and SFTP RMDIR, the mount's
+/// rmdir, MCP and AeroAgent deletes without `recursive`) lists it first and
+/// refuses one that still holds anything, dotfiles included.
+pub async fn remove_empty_directory(
+    provider: &mut dyn StorageProvider,
+    path: &str,
+) -> Result<(), ProviderError> {
+    let children = provider.list(path).await?;
+    if !children.is_empty() {
+        return Err(directory_not_empty(path, children.len()));
+    }
+    provider.rmdir(path).await
+}
+
+/// Whether a failed listing of `path` says there is no folder there, so a
+/// `delete` of it cannot take a folder's content along: only NotFound. Any
+/// other failure (a timeout, a 503, a lost connection, a permission or parse
+/// error) says nothing about the path, and acting on it as if the path were
+/// a file could remove a folder nobody had looked at.
+fn listing_says_no_folder(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::NotFound(_))
+}
+
+/// Delete `path` without recursing: a file, a link, or an empty directory.
+///
+/// `delete` of a folder removes it with its content on the backends listed
+/// at [`remove_empty_directory`], so a non-recursive delete asks `stat`
+/// first and sends a directory through that check. A directory `stat` cannot
+/// describe (see [`stat_cannot_describe`]) is found by listing it: a listing
+/// with entries is refused the same way, an empty one is removed with
+/// `rmdir` (an object-store directory marker) and, when that fails, `delete`
+/// (a file `stat` could not see). A listing that failed goes on to `delete`
+/// only when it says there is no folder there ([`listing_says_no_folder`]);
+/// any other listing failure, and any other `stat` failure, is returned as
+/// it is, with nothing removed.
+pub async fn delete_non_recursive(
+    provider: &mut dyn StorageProvider,
+    path: &str,
+) -> Result<(), ProviderError> {
+    match provider.stat(path).await {
+        Ok(entry) if entry.is_dir && !entry.is_symlink => {
+            remove_empty_directory(provider, path).await
+        }
+        Ok(_) => provider.delete(path).await,
+        Err(e) if stat_cannot_describe(&e) => match provider.list(path).await {
+            Ok(children) if !children.is_empty() => Err(directory_not_empty(path, children.len())),
+            Ok(_) => match provider.rmdir(path).await {
+                Ok(()) => Ok(()),
+                Err(_) => provider.delete(path).await,
+            },
+            Err(list_error) if listing_says_no_folder(&list_error) => provider.delete(path).await,
+            Err(list_error) => Err(list_error),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn is_a_directory(path: &str) -> ProviderError {
+    ProviderError::InvalidPath(format!(
+        "{path} is a directory: this deletes files only; remove a directory with RMD or RMDIR"
+    ))
+}
+
+/// Delete `path` only if it is not a directory: the served FTP DELE (RFC
+/// 959) and SFTP REMOVE, which are file operations. Their directory verbs,
+/// RMD and RMDIR, go through [`remove_empty_directory`]. Unlike
+/// [`delete_non_recursive`], which `rm` uses, an empty directory is refused
+/// too, with InvalidPath, and nothing is removed.
+///
+/// A `stat` that cannot describe the path is judged by listing it. A
+/// listing with entries is a directory. An empty listing is one as well when
+/// `stat` failed to parse the path (Box and GitHub fail that way on a
+/// folder); after a NotFound it is an object-store name with nothing under
+/// it, and the `delete` of the name without its slash leaves a folder's
+/// marker alone. A listing that failed goes on to `delete` only when it says
+/// there is no folder there ([`listing_says_no_folder`]).
+pub async fn delete_file_only(
+    provider: &mut dyn StorageProvider,
+    path: &str,
+) -> Result<(), ProviderError> {
+    match provider.stat(path).await {
+        Ok(entry) if entry.is_dir && !entry.is_symlink => Err(is_a_directory(path)),
+        Ok(_) => provider.delete(path).await,
+        Err(e) if stat_cannot_describe(&e) => match provider.list(path).await {
+            Ok(children) if !children.is_empty() => Err(is_a_directory(path)),
+            Ok(_) if !matches!(e, ProviderError::NotFound(_)) => Err(is_a_directory(path)),
+            Ok(_) => provider.delete(path).await,
+            Err(list_error) if listing_says_no_folder(&list_error) => provider.delete(path).await,
+            Err(list_error) => Err(list_error),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 /// Refuse to stage a temporary that could not then be published.
 ///
 /// Every "write a remote file in place" path in this tree has the same shape:
@@ -1614,6 +1956,551 @@ pub async fn ensure_atomic_replace(
          anyway, upload over it with `put`, which truncates and rewrites in place: that \
          is not atomic either, but it is your choice and its bad moment is a partial \
          file rather than no file."
+    )))
+}
+
+/// The preflight of an edit that publishes a staged temporary with
+/// [`StorageProvider::replace`] (CLI `edit`, AeroAgent `remote_edit`). Call it
+/// BEFORE the upload, so a refusal can say that nothing was written (G119).
+///
+/// A backend that replaces atomically passes. Without the opt-in any other
+/// one refuses as [`ensure_atomic_replace`] does, and the refusal names the
+/// opt-in (`opt_in`, the caller's spelling of it) only where it can work: a
+/// backend whose replace sets the previous file aside
+/// ([`StorageProvider::replace_sets_aside`]). With the opt-in that backend
+/// passes, and every other one is refused here: its replace would refuse
+/// the taken name after the temporary had been uploaded.
+///
+/// The crypt and AeroCrypt marker paths call [`ensure_atomic_replace`]
+/// directly: they have no opt-in, so their refusal names none.
+pub async fn ensure_edit_can_replace(
+    provider: &mut dyn StorageProvider,
+    target: &str,
+    allow_non_atomic: bool,
+    opt_in: &str,
+) -> Result<(), ProviderError> {
+    if allow_non_atomic {
+        if provider.supports_atomic_replace().await? || provider.replace_sets_aside() {
+            return Ok(());
+        }
+        return Err(ProviderError::NotSupported(opt_in_cannot_set_aside(
+            target, opt_in,
+        )));
+    }
+    match ensure_atomic_replace(provider, target).await {
+        Err(ProviderError::NotSupported(refusal)) if provider.replace_sets_aside() => Err(
+            ProviderError::NotSupported(format!("{refusal} {}", set_aside_opt_in_hint(opt_in))),
+        ),
+        other => other,
+    }
+}
+
+/// The sentence an edit refusal adds on a backend whose replace sets the
+/// previous file aside: the opt-in `opt_in` and what it does.
+pub fn set_aside_opt_in_hint(opt_in: &str) -> String {
+    format!(
+        "To edit it anyway, pass {opt_in}: the previous file is renamed aside, the new one \
+         moves into its place, and the old one is then deleted. There is a short moment \
+         with no file, and the old one is not lost."
+    )
+}
+
+/// The refusal of an edit's non-atomic opt-in on a backend whose replace
+/// neither works in one step nor sets the previous file aside.
+pub fn opt_in_cannot_set_aside(target: &str, opt_in: &str) -> String {
+    format!(
+        "cannot edit `{target}` with {opt_in}: this server can neither put one file over \
+         another in a single step nor set the previous file aside first, so the new file \
+         could not be put in its place. Nothing was written and `{target}` is unchanged."
+    )
+}
+
+/// The Unix mode in a permission string as providers report it: nine
+/// `rwx` letters (`rw-r--r--`), the same after a type letter as `ls` and
+/// SFTP write it (`-rw-r--r--`), or octal (`644`, `0644`, the MLSD
+/// `unix.mode` fact). `s`, `S`, `t` and `T` carry the setuid, setgid and
+/// sticky bits. `None` for anything else, such as the MLSD `perm` fact
+/// (`adfrw`), which lists the operations allowed and is not a mode.
+pub fn permission_mode(permissions: &str) -> Option<u32> {
+    let text = permissions.trim();
+    if !text.is_ascii() || text.is_empty() {
+        return None;
+    }
+    if text.len() <= 6 && text.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return u32::from_str_radix(text, 8).ok().map(|mode| mode & 0o7777);
+    }
+    // `ls -l` marks an ACL or extended attributes after the nine letters.
+    let letters = text.trim_end_matches(['+', '@', '.']);
+    let letters = match letters.len() {
+        10 => &letters[1..],
+        9 => letters,
+        _ => return None,
+    };
+    let mut mode = 0;
+    // Owner, group, others; the third letter of each also carries setuid,
+    // setgid and sticky: lower case with `x`, upper case without.
+    for (class, triplet) in letters.as_bytes().chunks(3).enumerate() {
+        let shift = 6 - 3 * class as u32;
+        let (special, with_x, without_x) = match class {
+            0 => (0o4000, b's', b'S'),
+            1 => (0o2000, b's', b'S'),
+            _ => (0o1000, b't', b'T'),
+        };
+        match triplet[0] {
+            b'r' => mode |= 4 << shift,
+            b'-' => {}
+            _ => return None,
+        }
+        match triplet[1] {
+            b'w' => mode |= 2 << shift,
+            b'-' => {}
+            _ => return None,
+        }
+        match triplet[2] {
+            b'x' => mode |= 1 << shift,
+            b'-' => {}
+            letter if letter == with_x => mode |= (1 << shift) | special,
+            letter if letter == without_x => mode |= special,
+            _ => return None,
+        }
+    }
+    Some(mode)
+}
+
+/// What an edit that publishes a staged temporary with
+/// [`StorageProvider::replace`] carries over from the file it replaces
+/// (CLI `edit`, MCP and CLI-agent `aeroftp_edit`, AeroAgent `remote_edit`).
+///
+/// The replace puts a NEW file in the target's place, so nothing the server
+/// kept on the old one survives unless the edit copies it: on SFTP the mode
+/// came back as the server default (a 0600 `.env` became 0644, a 0755
+/// script lost its `x`). An upload over the file in place, which the GUI
+/// edit made until 4.2.0, truncated the same file and kept it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditOriginal {
+    /// Nothing to carry over: the provider reports no permissions, or has no
+    /// `chmod` to set them with.
+    Nothing,
+    /// The Unix mode to set on the temporary before the replace.
+    Mode(u32),
+    /// Permissions the provider reports that are not a Unix mode (an MLSD
+    /// `perm` fact), so the new file gets the server's default ones.
+    Unreadable(String),
+}
+
+impl EditOriginal {
+    /// What an edit of `entry` carries over; `can_chmod` is
+    /// [`StorageProvider::supports_chmod`].
+    pub fn of(entry: &RemoteEntry, can_chmod: bool) -> Self {
+        match entry.permissions.as_deref() {
+            Some(permissions) if can_chmod => match permission_mode(permissions) {
+                Some(mode) => Self::Mode(mode),
+                None => Self::Unreadable(permissions.to_string()),
+            },
+            _ => Self::Nothing,
+        }
+    }
+}
+
+/// Refuse an edit of a symbolic link, BEFORE anything is staged. The
+/// replace would put a regular file in the link's place, and the file the
+/// link points to, the one the caller meant, would stay as it was. The
+/// refusal names that file, resolved against the link's folder when the
+/// link is relative, so the caller can edit it instead.
+pub fn refuse_edit_of_symlink(entry: &RemoteEntry, target: &str) -> Result<(), String> {
+    if !entry.is_symlink {
+        return Ok(());
+    }
+    let instead = match entry.link_target.as_deref() {
+        Some(link) if !link.is_empty() => {
+            let resolved = match (link.starts_with('/'), target.rsplit_once('/')) {
+                (false, Some((parent, _))) => format!("{parent}/{link}"),
+                _ => link.to_string(),
+            };
+            format!("edit the file it points to, `{resolved}`, instead")
+        }
+        _ => "edit the file it points to instead".to_string(),
+    };
+    Err(format!(
+        "cannot edit `{target}`: it is a symbolic link, and publishing the edit would put a \
+         regular file in the link's place while the file it points to stays unchanged; \
+         {instead}. Nothing was written and `{target}` is unchanged."
+    ))
+}
+
+/// The warning of an edit of `target` whose new file could not be given the
+/// mode `mode` of the old one because `chmod` failed with `error`.
+pub fn edit_mode_not_kept(target: &str, mode: u32, error: &str) -> String {
+    format!(
+        "edited `{target}`, but its permissions ({mode:04o}) could not be set on the new \
+         file ({error}): it has the server's default permissions now; set them again with \
+         chmod"
+    )
+}
+
+/// The warning of an edit of `target` whose permissions, as the provider
+/// reports them (`permissions`), are not a mode that can be set again.
+pub fn edit_permissions_not_readable(target: &str, permissions: &str) -> String {
+    format!(
+        "edited `{target}`, but its permissions (`{permissions}`) are not a Unix mode that \
+         can be set again: the new file has the server's default permissions"
+    )
+}
+
+/// Look at the target of an edit BEFORE anything is staged: a symbolic
+/// link is refused ([`refuse_edit_of_symlink`]), and the answer is what the
+/// temporary must carry ([`EditOriginal`]). A `stat` that cannot describe
+/// the path ([`stat_cannot_describe`]) leaves nothing to carry over, as
+/// before this look existed; any other `stat` failure is returned, with
+/// nothing written.
+pub async fn inspect_edit_target(
+    provider: &mut dyn StorageProvider,
+    target: &str,
+) -> Result<EditOriginal, ProviderError> {
+    let entry = match provider.stat(target).await {
+        Ok(entry) => entry,
+        Err(e) if stat_cannot_describe(&e) => return Ok(EditOriginal::Nothing),
+        Err(e) => return Err(e),
+    };
+    refuse_edit_of_symlink(&entry, target).map_err(ProviderError::InvalidPath)?;
+    Ok(EditOriginal::of(&entry, provider.supports_chmod()))
+}
+
+/// Carry `original` over to the staged temporary `temp` of an edit of
+/// `target`: after its upload, before the replace. Best effort: a `chmod`
+/// the server refuses does not fail an edit that is otherwise done, and the
+/// answer is the warning that says what was not kept, for the caller to
+/// show once the replace has succeeded.
+pub async fn keep_edit_original(
+    provider: &mut dyn StorageProvider,
+    temp: &str,
+    target: &str,
+    original: &EditOriginal,
+) -> Option<String> {
+    match original {
+        EditOriginal::Nothing => None,
+        EditOriginal::Unreadable(permissions) => {
+            Some(edit_permissions_not_readable(target, permissions))
+        }
+        EditOriginal::Mode(mode) => match provider.chmod(temp, *mode).await {
+            Ok(()) => None,
+            Err(e) => Some(edit_mode_not_kept(target, *mode, &e.to_string())),
+        },
+    }
+}
+
+/// The name an item displaced by a replace takes until it is deleted, on a
+/// backend that can neither overwrite on a move nor swap two items in one
+/// call (MEGA, Filen, FileLu, Google Drive for folders, and through
+/// [`replace_by_setting_aside`] Dropbox, Koofr, Drime and kDrive). Their `replace` renames the item
+/// at the destination to this, moves the new one in, and only then deletes
+/// it: no step can lose either item, and the name is hidden and unique so it
+/// never meets another. The destination is empty between the first two
+/// steps, which is why those backends answer `false` to
+/// [`StorageProvider::supports_atomic_replace`].
+pub(crate) fn set_aside_name(name: &str) -> String {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    format!(".{name}.aeroftp-replaced-{}", &unique[..8])
+}
+
+/// The error of a set-aside replace whose move of the new item into `to`
+/// failed: `error` alone when the item set aside as `aside` got its name
+/// back, and both failures with where that item is when it did not.
+pub(crate) fn set_aside_move_failed(
+    to: &str,
+    aside: &str,
+    error: ProviderError,
+    restored: Result<(), ProviderError>,
+) -> ProviderError {
+    match restored {
+        Ok(()) => error,
+        Err(restore) => ProviderError::Other(format!(
+            "replace could not move the new item to {to} ({error}), and giving the previous one \
+             its name back failed too ({restore}): it is kept as {aside}"
+        )),
+    }
+}
+
+/// Report the leftover of a set-aside replace that put the new item in
+/// place but could not delete the one set aside as `aside`. The replace is
+/// done, so it is a success: an error made callers undo or retry a replace
+/// that had happened (a WebDAV client retrying the MOVE, an edit deleting
+/// its temporary). What is left over goes to the log, and to the pending
+/// warnings a front end renders its own way ([`take_warnings`]): the log
+/// reaches no one where no subscriber is installed (the CLI without `-v` or
+/// `RUST_LOG`, `serve webdav`), and the leftover is a hidden name holding
+/// the old content, which no one would otherwise find.
+pub(crate) fn report_set_aside_leftover(to: &str, aside: &str, error: &ProviderError) {
+    let message = format!(
+        "replaced {to}, but deleting the previous version, set aside as {aside}, failed: \
+         {error}; delete it by hand"
+    );
+    tracing::warn!("{message}");
+    report_warning(message);
+}
+
+/// Keep `message` for the front end to show ([`take_warnings`]): a warning
+/// the user should see that a successful call cannot return. Inside
+/// [`CallWarnings::scope`] it is kept for that call; elsewhere it goes to
+/// the process queue. When the front end never asks (the GUI, which has the
+/// log), the oldest go first and are counted, so the queue stays bounded and
+/// the newest survive.
+pub fn report_warning(message: String) {
+    let mut message = Some(message);
+    let _ = CALL_WARNINGS.try_with(|call| {
+        if let Some(message) = message.take() {
+            call.lock().push(message);
+        }
+    });
+    if let Some(message) = message {
+        with_pending_warnings(|pending| pending.push(message));
+    }
+}
+
+/// Take the warnings reported since the last call, oldest first, for the
+/// front end to show in its own format (the CLI: a line on stderr, or a JSON
+/// object there with `--json`; MCP: a text block of the tool result): inside
+/// [`CallWarnings::scope`] the call's own, then the process queue's. When
+/// some were dropped to keep a queue bounded, the first says how many.
+pub fn take_warnings() -> Vec<String> {
+    let mut taken = CALL_WARNINGS
+        .try_with(CallWarnings::take)
+        .unwrap_or_default();
+    taken.extend(with_pending_warnings(PendingWarnings::take));
+    taken
+}
+
+/// The warnings one call reports, kept apart from the process queue so they
+/// reach that call's answer and no other: a server answering several calls
+/// at once (MCP, `serve webdav`) gave one call's warning to whichever call
+/// took the queue next. They stay readable after the call is dropped (a
+/// timeout, a cancellation).
+#[derive(Clone, Default)]
+pub struct CallWarnings(std::sync::Arc<std::sync::Mutex<PendingWarnings>>);
+
+tokio::task_local! {
+    static CALL_WARNINGS: CallWarnings;
+}
+
+impl CallWarnings {
+    /// Run `call`, keeping here what it reports through [`report_warning`].
+    pub async fn scope<F: std::future::Future>(&self, call: F) -> F::Output {
+        CALL_WARNINGS.scope(self.clone(), call).await
+    }
+
+    /// Take what the call reported so far, oldest first.
+    pub fn take(&self) -> Vec<String> {
+        self.lock().take()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingWarnings> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Default)]
+struct PendingWarnings {
+    messages: std::collections::VecDeque<String>,
+    dropped: usize,
+}
+
+impl PendingWarnings {
+    fn push(&mut self, message: String) {
+        if self.messages.len() == MAX_PENDING_WARNINGS {
+            self.messages.pop_front();
+            self.dropped += 1;
+        }
+        self.messages.push_back(message);
+    }
+
+    fn take(&mut self) -> Vec<String> {
+        let mut taken = Vec::with_capacity(self.messages.len() + 1);
+        if self.dropped > 0 {
+            taken.push(format!(
+                "{} earlier warnings were dropped before anyone read them",
+                self.dropped
+            ));
+            self.dropped = 0;
+        }
+        taken.extend(self.messages.drain(..));
+        taken
+    }
+}
+
+const MAX_PENDING_WARNINGS: usize = 64;
+
+/// The queue of [`report_warning`]: one for the process, and one per thread
+/// in this crate's tests, so a test reads only the warnings it caused.
+#[cfg(not(test))]
+fn with_pending_warnings<R>(f: impl FnOnce(&mut PendingWarnings) -> R) -> R {
+    static PENDING: std::sync::Mutex<PendingWarnings> = std::sync::Mutex::new(PendingWarnings {
+        messages: std::collections::VecDeque::new(),
+        dropped: 0,
+    });
+    let mut pending = PENDING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut pending)
+}
+
+#[cfg(test)]
+fn with_pending_warnings<R>(f: impl FnOnce(&mut PendingWarnings) -> R) -> R {
+    thread_local! {
+        static PENDING: std::cell::RefCell<PendingWarnings> =
+            std::cell::RefCell::new(PendingWarnings::default());
+    }
+    PENDING.with(|pending| f(&mut pending.borrow_mut()))
+}
+
+/// Refuse `rename(from, to)` when `to` is taken, on a backend whose own move
+/// would overwrite the item there, move the source inside it, or put a
+/// second item beside it under the same name. The trait promises none of
+/// that happens, and these backends have no call that refuses on their own.
+///
+/// `stat` of `to` decides: found is AlreadyExists, not found is free, and any
+/// other answer is passed on (the rename does not go out on a guess). The one
+/// exception is a rename that only changes the letter case: a
+/// case-insensitive backend finds the source itself under the new spelling
+/// and reports the name it has stored, so an entry named exactly like the
+/// source is the source. A backend that echoes the spelling it was asked for
+/// makes such a rename refused, which is the safe way to be wrong.
+///
+/// The look and the move are separate requests, so an item created at `to`
+/// between them is still overwritten or doubled: the window is declared, not
+/// closed, on every backend that uses this.
+pub(crate) async fn refuse_occupied_destination(
+    provider: &mut dyn StorageProvider,
+    from: &str,
+    to: &str,
+) -> Result<(), ProviderError> {
+    match provider.stat(to).await {
+        Ok(found) if is_the_source_under_another_case(from, to, &found.name) => Ok(()),
+        Ok(_) => Err(ProviderError::AlreadyExists(to.to_string())),
+        Err(ProviderError::NotFound(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Put `from` in place of `to` on a backend whose rename refuses a taken
+/// name and which has no call that overwrites: the item at `to` is renamed
+/// aside under [`set_aside_name`], `from` is renamed in, and only then is
+/// the one set aside deleted. If the rename in fails, the item set aside
+/// gets its name back (see [`set_aside_move_failed`]); if the final delete
+/// fails, the replace is done and the leftover is reported (see
+/// [`report_set_aside_leftover`]). Onto a free name, or onto the source
+/// itself under another letter case, it is the rename; across file and
+/// folder it is refused before anything changes. `to` is empty between the
+/// first two steps, so a backend that uses this answers `false` to
+/// [`StorageProvider::supports_atomic_replace`].
+///
+/// `from` and `to` are the backend's resolved absolute paths.
+pub(crate) async fn replace_by_setting_aside(
+    provider: &mut dyn StorageProvider,
+    from: &str,
+    to: &str,
+) -> Result<(), ProviderError> {
+    let (from, to) = (from.trim_end_matches('/'), to.trim_end_matches('/'));
+    if from == to {
+        return Ok(());
+    }
+    let occupant = match provider.stat(to).await {
+        Ok(found) if !is_the_source_under_another_case(from, to, &found.name) => found,
+        Ok(_) | Err(ProviderError::NotFound(_)) => return provider.rename(from, to).await,
+        Err(e) => return Err(e),
+    };
+    let source = provider.stat(from).await?;
+    refuse_replace_across_types(to, source.is_dir, occupant.is_dir)?;
+    let (parent, name) = to.rsplit_once('/').unwrap_or(("", to));
+    let aside = format!("{parent}/{}", set_aside_name(name));
+
+    provider.rename(to, &aside).await?;
+    if let Err(e) = provider.rename(from, to).await {
+        let restored = provider.rename(&aside, to).await;
+        return Err(set_aside_move_failed(to, &aside, e, restored));
+    }
+    let removed = if occupant.is_dir {
+        provider.rmdir_recursive(&aside).await
+    } else {
+        provider.delete(&aside).await
+    };
+    if let Err(e) = removed {
+        report_set_aside_leftover(to, &aside, &e);
+    }
+    Ok(())
+}
+
+/// The error of a rename done in two steps (a move that keeps the name and
+/// a rename in place, in either order) whose second step failed with
+/// `error` after the first had succeeded. When the first step was undone
+/// nothing changed, and `error` is the answer as it came. When the undo
+/// failed too, the item is at `now_at`: the error names both failures and
+/// that path, and is never AlreadyExists, which would say nothing changed.
+///
+/// Declared, not closed: a second step whose answer was lost after the
+/// server applied it (a timeout) reads as failed, so the undo moves back an
+/// item that had arrived, or the error names a place it has left. No
+/// backend that renames in two steps offers a way to ask which it was.
+pub(crate) fn second_step_failed(
+    from: &str,
+    to: &str,
+    now_at: &str,
+    error: ProviderError,
+    undone: Result<(), ProviderError>,
+) -> ProviderError {
+    match undone {
+        Ok(()) => error,
+        Err(undo) => ProviderError::Other(format!(
+            "renaming {from} to {to} stopped halfway: the second step failed ({error}) and \
+             undoing the first failed too ({undo}): the item is now at {now_at}"
+        )),
+    }
+}
+
+/// Drop from a path-keyed id cache the entry for `path` and every entry
+/// under it. After a rename or a replace the ids cached for the old path,
+/// the new one and everything below them point at items that moved or went
+/// to the trash: a later lookup would act on the wrong item.
+pub(crate) fn forget_cached_subtree<V>(cache: &mut HashMap<String, V>, path: &str) {
+    let path = path.trim_end_matches('/');
+    let below = format!("{path}/");
+    cache.retain(|cached, _| cached != path && !cached.starts_with(&below));
+}
+
+/// Whether the item `stat(to)` found, named `found_name`, is the source of a
+/// rename that only changes the letter case, found again by a
+/// case-insensitive backend under the name it has stored.
+pub(crate) fn is_the_source_under_another_case(from: &str, to: &str, found_name: &str) -> bool {
+    let (from, to) = (from.trim_end_matches('/'), to.trim_end_matches('/'));
+    from != to
+        && from.to_lowercase() == to.to_lowercase()
+        && found_name == from.rsplit('/').next().unwrap_or(from)
+}
+
+/// Refuse a replace that would put a file in place of a folder or a folder
+/// in place of a file. On a backend that sets the old item aside and then
+/// deletes it, a file replacing a folder deleted the whole folder, contents
+/// and all (for good on FileLu, which has no trash), to leave a file under
+/// its name. Nothing a caller means by "replace" asks for that, so it is
+/// refused before anything changes. AlreadyExists, because the destination
+/// is taken by an item this call will not displace.
+pub(crate) fn refuse_replace_across_types(
+    to: &str,
+    source_is_dir: bool,
+    occupant_is_dir: bool,
+) -> Result<(), ProviderError> {
+    if source_is_dir == occupant_is_dir {
+        return Ok(());
+    }
+    let (occupant, source) = if occupant_is_dir {
+        ("folder", "file")
+    } else {
+        ("file", "folder")
+    };
+    Err(ProviderError::AlreadyExists(format!(
+        "{to} is a {occupant}, and a replace puts a {source} only in place of a {source}: \
+         nothing was changed"
     )))
 }
 
@@ -2033,6 +2920,104 @@ mod tests {
         assert!(!out.contains("stack trace"), "only the first line is kept");
     }
 
+    /// A queue no front end reads keeps the newest warnings and counts the
+    /// ones it dropped: it kept the oldest and dropped the newest silently.
+    #[test]
+    fn the_warning_queue_keeps_the_newest_and_counts_the_dropped() {
+        for i in 0..MAX_PENDING_WARNINGS + 3 {
+            report_warning(format!("w{i}"));
+        }
+        let taken = take_warnings();
+        assert_eq!(taken.len(), MAX_PENDING_WARNINGS + 1, "{taken:?}");
+        assert!(
+            taken[0].starts_with("3 earlier warnings were dropped"),
+            "{taken:?}"
+        );
+        assert_eq!(taken[1], "w3");
+        assert_eq!(
+            taken.last().unwrap(),
+            &format!("w{}", MAX_PENDING_WARNINGS + 2)
+        );
+        assert!(take_warnings().is_empty());
+    }
+
+    /// The shared look before a rename, on a local folder: a file or a folder
+    /// at the destination is AlreadyExists, a free name passes, and the
+    /// source found under another letter case (as a case-insensitive backend
+    /// reports it) is not another item.
+    #[tokio::test]
+    async fn the_shared_look_refuses_a_taken_destination_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), b"A").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"B").unwrap();
+        std::fs::create_dir(dir.path().join("d")).unwrap();
+        let mut provider = mtp::MtpFsProvider::new(
+            dir.path().to_path_buf(),
+            "dev".to_string(),
+            "Device".to_string(),
+        );
+        provider.connect().await.expect("connect");
+        for to in ["/b.txt", "/d", "/d/"] {
+            let outcome = refuse_occupied_destination(&mut provider, "/a.txt", to).await;
+            assert!(
+                matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+                "{to}: {outcome:?}"
+            );
+        }
+        refuse_occupied_destination(&mut provider, "/a.txt", "/c.txt")
+            .await
+            .expect("a free name");
+    }
+
+    /// A case-insensitive backend answers `stat("/Readme.TXT")` with the
+    /// source it stored as `readme.txt`: that is no other item. The other
+    /// spelling stored as such, or a different name, is.
+    #[test]
+    fn only_the_source_found_under_another_case_is_not_another_item() {
+        assert!(is_the_source_under_another_case(
+            "/d/readme.txt",
+            "/d/Readme.TXT",
+            "readme.txt"
+        ));
+        assert!(!is_the_source_under_another_case(
+            "/d/readme.txt",
+            "/d/Readme.TXT",
+            "Readme.TXT"
+        ));
+        assert!(!is_the_source_under_another_case(
+            "/d/a.txt", "/d/b.txt", "a.txt"
+        ));
+        assert!(!is_the_source_under_another_case(
+            "/d/a.txt",
+            "/d/a.txt/",
+            "a.txt"
+        ));
+    }
+
+    #[test]
+    fn a_replace_across_types_is_refused_as_already_exists() {
+        assert!(refuse_replace_across_types("/x", false, false).is_ok());
+        assert!(refuse_replace_across_types("/x", true, true).is_ok());
+        for (source_is_dir, occupant_is_dir) in [(false, true), (true, false)] {
+            let refused = refuse_replace_across_types("/x", source_is_dir, occupant_is_dir);
+            assert!(
+                matches!(refused, Err(ProviderError::AlreadyExists(_))),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// Hidden, unique, and naming what it stands in for.
+    #[test]
+    fn a_set_aside_name_is_hidden_unique_and_readable() {
+        let first = set_aside_name("report.pdf");
+        assert!(
+            first.starts_with(".report.pdf.aeroftp-replaced-"),
+            "{first}"
+        );
+        assert_ne!(first, set_aside_name("report.pdf"));
+    }
+
     /// Row 4: an empty body degrades to a stable placeholder, never panics.
     #[test]
     fn sanitize_api_error_empty_body_falls_back() {
@@ -2097,5 +3082,646 @@ mod documented_file_limits_tests {
         .with_documented_limits(documented_file_limits(ProviderType::Box));
         assert_eq!(hints.max_file_size, Some(7));
         assert_eq!(hints.max_name_chars, Some(255));
+    }
+}
+
+#[cfg(test)]
+mod non_recursive_delete_tests {
+    use super::*;
+
+    type Answer<T> = fn() -> Result<T, ProviderError>;
+
+    /// Scripted `stat`, `list`, `delete` and `rmdir`; every call is recorded.
+    struct Scripted {
+        stat: Answer<RemoteEntry>,
+        list: Answer<Vec<RemoteEntry>>,
+        delete: Answer<()>,
+        rmdir: Answer<()>,
+        calls: Vec<&'static str>,
+    }
+
+    impl Scripted {
+        fn new(stat: Answer<RemoteEntry>, list: Answer<Vec<RemoteEntry>>) -> Self {
+            Self {
+                stat,
+                list,
+                delete: || Ok(()),
+                rmdir: || Ok(()),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    fn file() -> Result<RemoteEntry, ProviderError> {
+        Ok(RemoteEntry::file("f".to_string(), "/f".to_string(), 1))
+    }
+
+    fn dir() -> Result<RemoteEntry, ProviderError> {
+        Ok(RemoteEntry::directory("d".to_string(), "/d".to_string()))
+    }
+
+    fn one_child() -> Result<Vec<RemoteEntry>, ProviderError> {
+        Ok(vec![RemoteEntry::file(
+            ".keep".to_string(),
+            "/d/.keep".to_string(),
+            0,
+        )])
+    }
+
+    fn no_child() -> Result<Vec<RemoteEntry>, ProviderError> {
+        Ok(Vec::new())
+    }
+
+    fn not_found<T>() -> Result<T, ProviderError> {
+        Err(ProviderError::NotFound("/d".to_string()))
+    }
+
+    #[async_trait]
+    impl StorageProvider for Scripted {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::S3
+        }
+        fn display_name(&self) -> String {
+            "scripted".to_string()
+        }
+        async fn connect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn list(&mut self, _path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+            self.calls.push("list");
+            (self.list)()
+        }
+        async fn pwd(&mut self) -> Result<String, ProviderError> {
+            Ok("/".to_string())
+        }
+        async fn cd(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn cd_up(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn download(
+            &mut self,
+            _remote_path: &str,
+            _local_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("download".to_string()))
+        }
+        async fn download_to_bytes(
+            &mut self,
+            _remote_path: &str,
+        ) -> Result<Vec<u8>, ProviderError> {
+            Err(ProviderError::NotSupported("download_to_bytes".to_string()))
+        }
+        async fn upload(
+            &mut self,
+            _local_path: &str,
+            _remote_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("upload".to_string()))
+        }
+        async fn mkdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("mkdir".to_string()))
+        }
+        async fn delete(&mut self, _path: &str) -> Result<(), ProviderError> {
+            self.calls.push("delete");
+            (self.delete)()
+        }
+        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            self.calls.push("rmdir");
+            (self.rmdir)()
+        }
+        async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
+            self.calls.push("rmdir_recursive");
+            Ok(())
+        }
+        async fn rename(&mut self, _from: &str, _to: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("rename".to_string()))
+        }
+        async fn stat(&mut self, _path: &str) -> Result<RemoteEntry, ProviderError> {
+            self.calls.push("stat");
+            (self.stat)()
+        }
+        async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
+            Err(ProviderError::NotFound(path.to_string()))
+        }
+        async fn exists(&mut self, _path: &str) -> Result<bool, ProviderError> {
+            Ok(true)
+        }
+        async fn keep_alive(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn server_info(&mut self) -> Result<String, ProviderError> {
+            Ok("scripted".to_string())
+        }
+    }
+
+    /// `rm` without `-r` of a folder that still held files deleted them on
+    /// every backend whose delete or rmdir of a folder takes its content
+    /// along (S3, Azure, Drive, OneDrive, Dropbox, pCloud, Box, MEGA, ...).
+    #[tokio::test]
+    async fn a_directory_with_content_is_refused() {
+        let mut p = Scripted::new(dir, one_child);
+        let result = delete_non_recursive(&mut p, "/d").await;
+        assert!(
+            matches!(result, Err(ProviderError::DirectoryNotEmpty(ref m)) if m.contains("1 entry")),
+            "{result:?}"
+        );
+        assert_eq!(p.calls, ["stat", "list"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_directory_is_removed_with_rmdir() {
+        let mut p = Scripted::new(dir, no_child);
+        delete_non_recursive(&mut p, "/d").await.expect("rm");
+        assert_eq!(p.calls, ["stat", "list", "rmdir"]);
+    }
+
+    #[tokio::test]
+    async fn a_file_and_a_link_to_a_directory_go_through_delete() {
+        let mut f = Scripted::new(file, one_child);
+        delete_non_recursive(&mut f, "/f").await.expect("rm");
+        assert_eq!(f.calls, ["stat", "delete"]);
+
+        let link = || {
+            let mut entry = RemoteEntry::directory("l".to_string(), "/l".to_string());
+            entry.is_symlink = true;
+            Ok(entry)
+        };
+        let mut l = Scripted::new(link, one_child);
+        delete_non_recursive(&mut l, "/l").await.expect("rm");
+        assert_eq!(l.calls, ["stat", "delete"]);
+    }
+
+    /// An object store sees no directory behind `d` (NotFound), Box and
+    /// GitHub fail to parse a folder (ParseError): the listing decides.
+    #[tokio::test]
+    async fn a_directory_stat_cannot_describe_is_judged_by_its_listing() {
+        let mut full = Scripted::new(not_found, one_child);
+        let result = delete_non_recursive(&mut full, "/d").await;
+        assert!(
+            matches!(result, Err(ProviderError::DirectoryNotEmpty(_))),
+            "{result:?}"
+        );
+        assert_eq!(full.calls, ["stat", "list"]);
+
+        let mut parse = Scripted::new(
+            || Err(ProviderError::ParseError("an array".to_string())),
+            one_child,
+        );
+        let result = delete_non_recursive(&mut parse, "/d").await;
+        assert!(
+            matches!(result, Err(ProviderError::DirectoryNotEmpty(_))),
+            "{result:?}"
+        );
+
+        // The directory marker of an empty S3 folder goes with rmdir; a
+        // delete of `d` would answer 204 and leave `d/` in place.
+        let mut empty = Scripted::new(not_found, no_child);
+        delete_non_recursive(&mut empty, "/d").await.expect("rm");
+        assert_eq!(empty.calls, ["stat", "list", "rmdir"]);
+
+        let mut unseen_file = Scripted::new(not_found, no_child);
+        unseen_file.rmdir = || Err(ProviderError::ServerError("not a folder".to_string()));
+        delete_non_recursive(&mut unseen_file, "/f")
+            .await
+            .expect("rm");
+        assert_eq!(unseen_file.calls, ["stat", "list", "rmdir", "delete"]);
+
+        let mut missing = Scripted::new(not_found, not_found);
+        missing.delete = not_found;
+        let result = delete_non_recursive(&mut missing, "/x").await;
+        assert!(
+            matches!(result, Err(ProviderError::NotFound(_))),
+            "{result:?}"
+        );
+        assert_eq!(missing.calls, ["stat", "list", "delete"]);
+    }
+
+    /// A listing that failed says nothing about the path. A timeout, a 503
+    /// or a lost connection sent a path nobody had looked at to `delete`,
+    /// which takes a folder's content along on several backends: the very
+    /// thing a non-recursive delete refuses. Only a listing that says there
+    /// is no folder there (NotFound) lets the delete go.
+    #[tokio::test]
+    async fn a_listing_that_failed_removes_nothing() {
+        for list in [
+            (|| Err(ProviderError::Timeout)) as Answer<Vec<RemoteEntry>>,
+            || Err(ProviderError::ServerError("503".to_string())),
+            || Err(ProviderError::ConnectionLost("reset".to_string())),
+            || Err(ProviderError::NetworkError("reset".to_string())),
+            || Err(ProviderError::PermissionDenied("/d".to_string())),
+            || Err(ProviderError::ParseError("an html page".to_string())),
+        ] {
+            let mut p = Scripted::new(not_found, list);
+            let result = delete_non_recursive(&mut p, "/d").await;
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(p.calls, ["stat", "list"], "{result:?}");
+        }
+    }
+
+    /// The served DELE and REMOVE delete files only: a directory, empty or
+    /// not, is refused with nothing removed, and so is a path whose listing
+    /// failed for a reason that says nothing about it.
+    #[tokio::test]
+    async fn a_file_only_delete_refuses_every_directory() {
+        let mut empty = Scripted::new(dir, no_child);
+        let result = delete_file_only(&mut empty, "/d").await;
+        assert!(
+            matches!(result, Err(ProviderError::InvalidPath(ref m)) if m.contains("is a directory")),
+            "{result:?}"
+        );
+        assert_eq!(empty.calls, ["stat"]);
+
+        let mut f = Scripted::new(file, one_child);
+        delete_file_only(&mut f, "/f")
+            .await
+            .expect("DELE of a file");
+        assert_eq!(f.calls, ["stat", "delete"]);
+
+        let mut listed = Scripted::new(not_found, one_child);
+        assert!(delete_file_only(&mut listed, "/d").await.is_err());
+        assert_eq!(listed.calls, ["stat", "list"]);
+
+        let mut unparsed_folder = Scripted::new(
+            || Err(ProviderError::ParseError("an array".to_string())),
+            no_child,
+        );
+        assert!(delete_file_only(&mut unparsed_folder, "/d").await.is_err());
+        assert_eq!(unparsed_folder.calls, ["stat", "list"]);
+
+        let mut unlisted = Scripted::new(not_found, || Err(ProviderError::Timeout));
+        assert!(delete_file_only(&mut unlisted, "/d").await.is_err());
+        assert_eq!(unlisted.calls, ["stat", "list"]);
+
+        let mut object_name = Scripted::new(not_found, no_child);
+        delete_file_only(&mut object_name, "/f")
+            .await
+            .expect("DELE");
+        assert_eq!(object_name.calls, ["stat", "list", "delete"]);
+    }
+
+    /// An ambiguous path (Cloudinary) and a failed `stat` remove nothing.
+    #[tokio::test]
+    async fn a_stat_that_failed_removes_nothing() {
+        for stat in [
+            (|| Err(ProviderError::InvalidPath("two items".to_string()))) as Answer<RemoteEntry>,
+            || Err(ProviderError::ServerError("503".to_string())),
+            || Err(ProviderError::NetworkError("reset".to_string())),
+            || Err(ProviderError::Timeout),
+            || Err(ProviderError::Cancelled),
+        ] {
+            let mut p = Scripted::new(stat, no_child);
+            assert!(delete_non_recursive(&mut p, "/d").await.is_err());
+            assert_eq!(p.calls, ["stat"]);
+        }
+    }
+
+    /// RMD, SFTP RMDIR, the mount's rmdir and the GUI's non-recursive
+    /// folder delete: `rmdir` recurses on several backends.
+    #[tokio::test]
+    async fn remove_empty_directory_lists_before_rmdir() {
+        let mut full = Scripted::new(dir, one_child);
+        let result = remove_empty_directory(&mut full, "/d").await;
+        assert!(
+            matches!(result, Err(ProviderError::DirectoryNotEmpty(_))),
+            "{result:?}"
+        );
+        assert_eq!(full.calls, ["list"]);
+
+        let mut empty = Scripted::new(dir, no_child);
+        remove_empty_directory(&mut empty, "/d")
+            .await
+            .expect("rmdir");
+        assert_eq!(empty.calls, ["list", "rmdir"]);
+
+        let mut unreadable = Scripted::new(dir, || Err(ProviderError::Timeout));
+        assert!(remove_empty_directory(&mut unreadable, "/d").await.is_err());
+        assert_eq!(unreadable.calls, ["list"]);
+    }
+}
+
+/// The edit preflight and its refusal texts, and the fake the GUI edit's
+/// tests share (`ai_core::gui_tools`).
+#[cfg(test)]
+pub(crate) mod edit_replace_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A backend that answers the two replace questions as told and whose
+    /// `replace` behaves accordingly: atomic or set-aside, it puts the file
+    /// in place; otherwise it is the rename, which refuses a taken name.
+    /// Every upload, replace and delete is recorded.
+    ///
+    /// `stat` finds nothing unless `modes` or `links` name the path, so the
+    /// tests that do not stand on either see the answer of a backend that
+    /// cannot describe a file.
+    pub(crate) struct EditFake {
+        pub(crate) files: HashMap<String, Vec<u8>>,
+        pub(crate) uploads: Vec<String>,
+        pub(crate) replaces: Vec<(String, String)>,
+        pub(crate) deleted: Vec<String>,
+        pub(crate) atomic: bool,
+        pub(crate) sets_aside: bool,
+        /// Unix mode per path, reported by `stat` as `-rw-r--r--`, the way
+        /// SFTP reports it. A new path gets 0644, the server default, and a
+        /// replace moves the mode of the file it moves, as posix-rename does.
+        pub(crate) modes: HashMap<String, u32>,
+        /// Symbolic links: path to the target `stat` reports.
+        pub(crate) links: HashMap<String, String>,
+        /// What `supports_chmod` answers.
+        pub(crate) chmod: bool,
+        /// When set, `chmod` fails with this.
+        pub(crate) chmod_fails_with: Option<String>,
+    }
+
+    impl EditFake {
+        /// `/t.txt` holds `old`.
+        pub(crate) fn new(atomic: bool, sets_aside: bool) -> Self {
+            Self {
+                files: HashMap::from([("/t.txt".to_string(), b"old".to_vec())]),
+                uploads: Vec::new(),
+                replaces: Vec::new(),
+                deleted: Vec::new(),
+                atomic,
+                sets_aside,
+                modes: HashMap::new(),
+                links: HashMap::new(),
+                chmod: false,
+                chmod_fails_with: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for EditFake {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Sftp
+        }
+        fn display_name(&self) -> String {
+            "edit-fake".to_string()
+        }
+        async fn connect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn list(&mut self, _path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn pwd(&mut self) -> Result<String, ProviderError> {
+            Ok("/".to_string())
+        }
+        async fn cd(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn cd_up(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn download(
+            &mut self,
+            _remote_path: &str,
+            _local_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("download".to_string()))
+        }
+        async fn download_to_bytes(&mut self, path: &str) -> Result<Vec<u8>, ProviderError> {
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+        }
+        async fn upload(
+            &mut self,
+            local_path: &str,
+            remote_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            let data = std::fs::read(local_path).map_err(ProviderError::IoError)?;
+            self.uploads.push(remote_path.to_string());
+            self.modes.entry(remote_path.to_string()).or_insert(0o644);
+            self.files.insert(remote_path.to_string(), data);
+            Ok(())
+        }
+        async fn mkdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn delete(&mut self, path: &str) -> Result<(), ProviderError> {
+            self.deleted.push(path.to_string());
+            self.files.remove(path);
+            Ok(())
+        }
+        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rename(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
+            if self.files.contains_key(to) {
+                return Err(ProviderError::AlreadyExists(to.to_string()));
+            }
+            let data = self
+                .files
+                .remove(from)
+                .ok_or_else(|| ProviderError::NotFound(from.to_string()))?;
+            self.files.insert(to.to_string(), data);
+            Ok(())
+        }
+        async fn replace(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
+            if !self.atomic && !self.sets_aside {
+                return self.rename(from, to).await;
+            }
+            let data = self
+                .files
+                .remove(from)
+                .ok_or_else(|| ProviderError::NotFound(from.to_string()))?;
+            self.files.insert(to.to_string(), data);
+            if let Some(mode) = self.modes.remove(from) {
+                self.modes.insert(to.to_string(), mode);
+            }
+            self.links.remove(to);
+            self.replaces.push((from.to_string(), to.to_string()));
+            Ok(())
+        }
+        async fn supports_atomic_replace(&mut self) -> Result<bool, ProviderError> {
+            Ok(self.atomic)
+        }
+        fn replace_sets_aside(&self) -> bool {
+            self.sets_aside
+        }
+        fn supports_chmod(&self) -> bool {
+            self.chmod
+        }
+        async fn chmod(&mut self, path: &str, mode: u32) -> Result<(), ProviderError> {
+            if let Some(message) = &self.chmod_fails_with {
+                return Err(ProviderError::ServerError(message.clone()));
+            }
+            self.modes.insert(path.to_string(), mode);
+            Ok(())
+        }
+        async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
+            let link = self.links.get(path).cloned();
+            let mode = self.modes.get(path).copied();
+            if link.is_none() && mode.is_none() {
+                return Err(ProviderError::NotFound(path.to_string()));
+            }
+            let size = self.files.get(path).map_or(0, |data| data.len() as u64);
+            let mut entry = RemoteEntry::file(path.to_string(), path.to_string(), size);
+            entry.is_symlink = link.is_some();
+            entry.link_target = link;
+            entry.permissions = mode.map(|mode| {
+                let bit = |mask: u32, letter: char| if mode & mask != 0 { letter } else { '-' };
+                [
+                    '-',
+                    bit(0o400, 'r'),
+                    bit(0o200, 'w'),
+                    bit(0o100, 'x'),
+                    bit(0o040, 'r'),
+                    bit(0o020, 'w'),
+                    bit(0o010, 'x'),
+                    bit(0o004, 'r'),
+                    bit(0o002, 'w'),
+                    bit(0o001, 'x'),
+                ]
+                .iter()
+                .collect()
+            });
+            Ok(entry)
+        }
+        async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
+            Err(ProviderError::NotFound(path.to_string()))
+        }
+        async fn exists(&mut self, path: &str) -> Result<bool, ProviderError> {
+            Ok(self.files.contains_key(path))
+        }
+        async fn keep_alive(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn server_info(&mut self) -> Result<String, ProviderError> {
+            Ok("edit-fake".to_string())
+        }
+    }
+
+    /// The four answers of the edit preflight: atomic passes either way; a
+    /// set-aside backend passes only with the opt-in and is offered it
+    /// without; a backend with neither refuses both, and never offers it.
+    #[tokio::test]
+    async fn the_edit_preflight_offers_the_opt_in_only_where_it_works() {
+        for (atomic, sets_aside, allow, passes, names_opt_in) in [
+            (true, false, false, true, false),
+            (true, false, true, true, false),
+            (false, true, false, false, true),
+            (false, true, true, true, false),
+            (false, false, false, false, false),
+            (false, false, true, false, true),
+        ] {
+            let mut p = EditFake::new(atomic, sets_aside);
+            let outcome = ensure_edit_can_replace(&mut p, "/t.txt", allow, "`--opt`").await;
+            let case = format!("atomic {atomic}, sets aside {sets_aside}, opt-in {allow}");
+            assert_eq!(outcome.is_ok(), passes, "{case}: {outcome:?}");
+            if let Err(e) = outcome {
+                let text = e.to_string();
+                assert!(text.contains("Nothing was written"), "{case}: {text}");
+                assert_eq!(text.contains("`--opt`"), names_opt_in, "{case}: {text}");
+            }
+            assert!(p.uploads.is_empty() && p.replaces.is_empty(), "{case}");
+        }
+    }
+
+    #[test]
+    fn permission_mode_reads_the_forms_providers_report() {
+        for (text, mode) in [
+            ("rw-------", Some(0o600)),
+            ("-rw-------", Some(0o600)),
+            ("-rwxr-xr-x", Some(0o755)),
+            ("-rw-r--r--+", Some(0o644)),
+            ("-rwsr-xr-x", Some(0o4755)),
+            ("-rwxr-sr-T", Some(0o3754)),
+            ("drwxrwxrwt", Some(0o1777)),
+            ("0644", Some(0o644)),
+            ("644", Some(0o644)),
+            ("100600", Some(0o600)),
+            ("adfrw", None),
+            ("public", None),
+            ("-rw-r--r", None),
+            ("-rw-r--r-q", None),
+            ("", None),
+        ] {
+            assert_eq!(permission_mode(text), mode, "{text:?}");
+        }
+    }
+
+    /// A link's target is named so the caller can edit it instead: as it
+    /// is when absolute, resolved against the link's folder when relative.
+    #[test]
+    fn an_edit_of_a_link_names_the_file_it_points_to() {
+        let mut entry = RemoteEntry::file(".env".into(), "/srv/app/.env".into(), 0);
+        assert!(refuse_edit_of_symlink(&entry, "/srv/app/.env").is_ok());
+        entry.is_symlink = true;
+        entry.link_target = Some("../shared/.env".into());
+        let text = refuse_edit_of_symlink(&entry, "/srv/app/.env").unwrap_err();
+        assert!(text.contains("`/srv/app/../shared/.env`"), "{text}");
+        assert!(text.contains("Nothing was written"), "{text}");
+        entry.link_target = Some("/etc/app.env".into());
+        let text = refuse_edit_of_symlink(&entry, "/srv/app/.env").unwrap_err();
+        assert!(text.contains("`/etc/app.env`"), "{text}");
+        entry.link_target = None;
+        let text = refuse_edit_of_symlink(&entry, "/srv/app/.env").unwrap_err();
+        assert!(text.contains("symbolic link"), "{text}");
+    }
+
+    /// Only a provider with `chmod` has a mode to carry over, and a
+    /// permission string that is not a mode is reported, not guessed.
+    #[test]
+    fn an_edit_carries_the_mode_only_where_chmod_can_set_it() {
+        let mut entry = RemoteEntry::file("f".into(), "/f".into(), 0);
+        assert_eq!(EditOriginal::of(&entry, true), EditOriginal::Nothing);
+        entry.permissions = Some("-rw-------".into());
+        assert_eq!(EditOriginal::of(&entry, false), EditOriginal::Nothing);
+        assert_eq!(EditOriginal::of(&entry, true), EditOriginal::Mode(0o600));
+        entry.permissions = Some("adfrw".into());
+        assert_eq!(
+            EditOriginal::of(&entry, true),
+            EditOriginal::Unreadable("adfrw".into())
+        );
+    }
+
+    /// The crypt and AeroCrypt marker paths publish through
+    /// `ensure_atomic_replace` too, and they have no edit flag: the shared
+    /// refusal named `--allow-non-atomic` and `allow_non_atomic` there.
+    #[tokio::test]
+    async fn the_shared_refusal_names_no_edit_opt_in() {
+        for sets_aside in [false, true] {
+            let mut p = EditFake::new(false, sets_aside);
+            let text = ensure_atomic_replace(&mut p, "/.aerocrypt.tsv")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(text.contains("Nothing was written"), "{text}");
+            assert!(
+                !text.contains("allow-non-atomic") && !text.contains("allow_non_atomic"),
+                "a marker refusal must not suggest an edit flag: {text}"
+            );
+        }
     }
 }

@@ -10,7 +10,7 @@
 //!   aeroftp mv <url> <from> <to>              Rename/move
 //!   aeroftp cp <url> <from> <to>              Server-side copy when supported
 //!   aeroftp link <url> <path>                 Create a share link when supported
-//!   aeroftp edit <url> <path> <find> <replace> Replace text in a remote UTF-8 file
+//!   aeroftp edit <url> <path> <find> <replace> [--allow-non-atomic] Replace text in a remote UTF-8 file
 //!   aeroftp cat <url> <path>                  Print to stdout
 //!   aeroftp head <url> <path> [-n 20]         Print first N lines
 //!   aeroftp tail <url> <path> [-n 20]         Print last N lines
@@ -85,6 +85,8 @@ use ftp_client_gui_lib::providers::{
     ShareLinkOptions, StorageProvider, TrashEntry, MAX_DOWNLOAD_TO_BYTES,
 };
 use ftp_client_gui_lib::sftp_download_tuning::SftpDownloadPreset;
+use ftp_client_gui_lib::shell_quote::shell_arg;
+use ftp_client_gui_lib::sync_core::mtime::ModifyWindow;
 use ftp_client_gui_lib::user_partitions;
 use ftp_client_gui_lib::util::shutdown_signal;
 use futures_util::StreamExt;
@@ -135,7 +137,7 @@ const SUPPORTED_URL_SCHEMES: &[&str] = &[
     "gitlab",
 ];
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "aeroftp",
     about = "AeroFTP CLI - Multi-protocol file transfer client",
@@ -1444,6 +1446,51 @@ enum RcloneFilenameEncryption {
     Off,
 }
 
+/// How an rclone crypt password and salt given on the command line are
+/// written. `auto` reads an rclone-obscured value as such and refuses one that
+/// reads two ways (a 22+ character value that would reveal to 2 characters or
+/// fewer); `clear` takes them as typed; `obscured` as rclone.conf keeps them.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Default)]
+enum SecretFormArg {
+    #[default]
+    Auto,
+    Clear,
+    Obscured,
+}
+
+/// The form `crypt set-form` records: never a guess.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum RecordedFormArg {
+    Clear,
+    Obscured,
+}
+
+impl RecordedFormArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Obscured => "obscured",
+        }
+    }
+}
+
+/// The forms of a password and a salt given on the command line.
+type CryptSecretForms = (
+    Option<ftp_client_gui_lib::rclone_crypt::CryptSecretForm>,
+    Option<ftp_client_gui_lib::rclone_crypt::CryptSecretForm>,
+);
+
+impl SecretFormArg {
+    fn form(self) -> Option<ftp_client_gui_lib::rclone_crypt::CryptSecretForm> {
+        use ftp_client_gui_lib::rclone_crypt::CryptSecretForm;
+        match self {
+            Self::Auto => None,
+            Self::Clear => Some(CryptSecretForm::Clear),
+            Self::Obscured => Some(CryptSecretForm::Obscured),
+        }
+    }
+}
+
 /// Issue #252: per-create privacy level for providers that expose a
 /// three-level access model (OpenDrive today). Mirrors rclone's
 /// `--opendrive-access`. Defaults to `private` (max-privacy, opt-out)
@@ -1616,7 +1663,7 @@ impl CacheMode {
     }
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum CheckpointCommands {
     /// List the endpoints that currently hold resume records.
     List,
@@ -1640,7 +1687,7 @@ enum CheckpointCommands {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum TrashCommands {
     /// List the items currently in the server-side trash.
     List {
@@ -1675,7 +1722,7 @@ enum TrashCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Commands {
     /// Test connection to a remote server
     Connect {
@@ -1690,6 +1737,15 @@ enum Commands {
     /// Run inside a Flatpak with a native `~/.config/aeroftp` present, this
     /// copies it into the sandbox (copy-only, never overwriting). Outside a
     /// Flatpak it is a no-op. Restart AeroFTP afterwards to load the import.
+    /// The host vault and saved servers come in only when the sandbox has no
+    /// vault of its own, and the output says whether they did.
+    ///
+    /// Exit codes: 0 when files were imported, when no file was copied (each
+    /// file the import would copy already has a file with the same name in the
+    /// sandbox, or the host config holds nothing the import copies), with
+    /// --status, and outside a Flatpak;
+    /// 1 when there is no host config, or when the copy failed (files copied
+    /// before the error stay in the sandbox).
     FlatpakImport {
         /// Only report whether an import is available; do not apply it.
         #[arg(long)]
@@ -1925,6 +1981,14 @@ enum Commands {
         /// Replace only the first occurrence
         #[arg(long)]
         first: bool,
+        /// On a server whose replace sets the previous file aside (MEGA
+        /// native API, Filen, FileLu, Dropbox, Koofr, Drime, kDrive): set it aside, move
+        /// the new one into its place, then delete the old one. There is a
+        /// short moment with no file. Without this flag such a server refuses
+        /// the edit and nothing is written; any other server that cannot
+        /// replace in one step refuses it with the flag too.
+        #[arg(long)]
+        allow_non_atomic: bool,
     },
     /// Print remote file to stdout (for piping)
     Cat {
@@ -2056,10 +2120,10 @@ enum Commands {
         #[arg(default_value = "/")]
         remote: String,
         /// Password for rclone crypt (can also be passed via AEROFTP_RCLONE_CRYPT_PASSWORD)
-        #[arg(long, env = "AEROFTP_RCLONE_CRYPT_PASSWORD")]
+        #[arg(long, env = "AEROFTP_RCLONE_CRYPT_PASSWORD", hide_env_values = true)]
         password: Option<String>,
         /// Salt for rclone crypt (can also be passed via AEROFTP_RCLONE_CRYPT_PASSWORD2)
-        #[arg(long, env = "AEROFTP_RCLONE_CRYPT_PASSWORD2")]
+        #[arg(long, env = "AEROFTP_RCLONE_CRYPT_PASSWORD2", hide_env_values = true)]
         password2: Option<String>,
         /// Filename encryption mode
         #[arg(long, default_value = "standard")]
@@ -2077,6 +2141,13 @@ enum Commands {
         /// Hash algorithm to use (sha256 or md5)
         #[arg(long, short = 'a', default_value = "sha256")]
         algorithm: String,
+        /// How --password is written: auto, clear (as typed) or obscured (as
+        /// in rclone.conf)
+        #[arg(long, value_enum, default_value_t = SecretFormArg::Auto)]
+        password_form: SecretFormArg,
+        /// How --password2 is written: auto, clear or obscured
+        #[arg(long, value_enum, default_value_t = SecretFormArg::Auto)]
+        salt_form: SecretFormArg,
     },
     /// Reconcile local and remote trees with categorized diff output
     Reconcile {
@@ -2564,10 +2635,14 @@ enum Commands {
         /// Detect renamed files by hash to avoid re-upload
         #[arg(long)]
         track_renames: bool,
-        /// Safety limit: abort if more than N files (or N%) would be deleted
+        /// Safety limit: abort if more than N files would be deleted, or more than N% of
+        /// the files on the side they are deleted from
         #[arg(long)]
         max_delete: Option<String>,
-        /// Move overwritten/deleted files to backup directory
+        /// Copy each local file into this directory before sync deletes it; a file
+        /// whose copy fails is not deleted and is reported. Local deletes only:
+        /// files overwritten by a transfer and files deleted on the remote are not
+        /// backed up
         #[arg(long)]
         backup_dir: Option<String>,
         /// Suffix for backup files (e.g., ".bak")
@@ -2585,12 +2660,31 @@ enum Commands {
         /// Consume a reconcile JSON file instead of re-scanning local and remote trees
         #[arg(long)]
         from_reconcile: Option<String>,
-        /// Conflict resolution for --direction both: newer, older, larger, smaller, rename, skip (default: newer)
-        #[arg(long, default_value = "newer")]
-        conflict_mode: String,
-        /// Trust size-only matches and skip transfers even when mtimes differ
+        /// What to do with a file that differs on both sides and neither copy is clearly newer.
+        /// --direction both: newer (default), older, larger, smaller, rename, skip.
+        /// --direction upload|download: source (default, the source copy wins) or skip (leave the destination alone).
         #[arg(long)]
+        conflict_mode: Option<String>,
+        /// Trust size-only matches and skip transfers even when mtimes differ
+        #[arg(long, alias = "size-only")]
         skip_matching: bool,
+        /// One-way sync: never overwrite a destination copy that is newer than the source
+        /// (beyond --modify-window), like rsync --update. The GUI Backup and Update presets
+        /// sync this way.
+        #[arg(long)]
+        update: bool,
+        /// Seconds within which two modification times are the same instant (default 2).
+        /// Raised to the backend's own precision; a backend that keeps no comparable time
+        /// (FTP without MLSD included) is compared by size only, and the run says so. The
+        /// same rule as the GUI compare.
+        #[arg(long, value_name = "SECS")]
+        modify_window: Option<u64>,
+        /// Compare files of the same size by checksum instead of modification time: a file
+        /// whose checksum matches is left alone whatever its date, one that differs is
+        /// synced. Uses the backend's server-side checksums; a file without one is compared
+        /// by size and time, and the run counts it.
+        #[arg(long, conflicts_with = "skip_matching")]
+        checksum: bool,
         /// Discard previous bisync snapshot and rebuild from scratch
         #[arg(long)]
         resync: bool,
@@ -3800,6 +3894,22 @@ enum Commands {
 mod cli_dispatch;
 
 #[cfg(test)]
+mod warning_line_tests {
+    use super::{warning_line, OutputFormat};
+
+    /// With `--json` stderr carries JSON objects: a warning is one of them,
+    /// not a free-text line a consumer cannot parse.
+    #[test]
+    fn a_warning_is_json_on_json_stderr_and_a_line_otherwise() {
+        let json: serde_json::Value =
+            serde_json::from_str(&warning_line(OutputFormat::Json, "left \"x\"")).unwrap();
+        assert_eq!(json["status"], "warning");
+        assert_eq!(json["warning"], "left \"x\"");
+        assert_eq!(warning_line(OutputFormat::Text, "left"), "warning: left");
+    }
+}
+
+#[cfg(test)]
 mod cli_dispatch_tests {
     use super::{cli_dispatch, Cli};
     use clap::CommandFactory;
@@ -3883,7 +3993,7 @@ mod cli_dispatch_tests {
 }
 
 /// `aeroftp aerocloud <sub>`: configure and run the AeroCloud folder sync.
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum AeroCloudCommands {
     /// Print the current AeroCloud configuration (folders, profile, direction,
     /// interval, enabled, versioning, last sync).
@@ -3949,7 +4059,7 @@ enum AeroCloudCommands {
 }
 
 /// Subcommands under `aeroftp aerocloud pair`
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PairCommands {
     /// List configured AeroCloud pairs (from cloud_pairs.json).
     List,
@@ -4001,7 +4111,7 @@ enum PairCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum UsersCommands {
     /// List local AeroFTP users
     List,
@@ -4059,7 +4169,7 @@ enum UsersCommands {
     Lock,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum VaultCommands {
     /// Create a new empty AeroVault container (v3 default; v1/v2 selectable).
     /// Use --error-correction for Reed-Solomon Error Correction (error-correction wrapper, last in 4-wrappers
@@ -4387,7 +4497,7 @@ enum VaultCommands {
 /// (par2-style). The same format protects vault containers and synced files; binding is
 /// by content SHA-256, so it works on arbitrary files. Generation/verify/repair stream
 /// the file in 64 MiB windows, so memory is bounded regardless of file size.
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum CorrectCommands {
     /// Generate a `.aerocorrect` recovery sidecar for a file. Default output is
     /// `<file>.aerocorrect`. The level sets the storage overhead (low ~7%, medium ~15%,
@@ -4433,13 +4543,19 @@ enum CorrectCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ExportCommands {
-    /// Export profiles to rclone.conf format (S3, SFTP, FTP, WebDAV, Mega).
-    /// OAuth-based providers (pCloud, Dropbox, Google Drive, Box, OneDrive,
-    /// Yandex, Zoho, Koofr, Internxt, kDrive) cannot be exported because
-    /// rclone uses its own OAuth flow with provider-issued client IDs:
-    /// they are listed as `# manual setup required` comments instead.
+    /// Export profiles to rclone.conf format: FTP/FTPS, SFTP, WebDAV, S3,
+    /// MEGA, Filen, Internxt, Azure, Swift, Koofr, OpenDrive, Backblaze B2,
+    /// Drime, Cloudinary, ImageKit, Jottacloud, and the OAuth providers
+    /// (Google Drive, Dropbox, OneDrive, Box, pCloud, Yandex Disk, Zoho
+    /// WorkDrive) with their token and the client ID that minted it. An
+    /// Internxt remote needs one `rclone config reconnect "<remote>:"` before
+    /// use, as the file says. ImageKit needs the account public key, which only
+    /// a profile imported from rclone holds. FileLu is skipped: rclone signs in
+    /// with the FileLu Rclone key, not the API key AeroFTP holds. Any profile
+    /// that cannot be written is skipped and listed with the reason in the
+    /// command output; nothing is written for it.
     Rclone {
         /// Output file path (default writes to a temp file)
         #[arg(long, short = 'o')]
@@ -4693,7 +4809,7 @@ impl KeystoreMergeArg {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum KeystoreCommands {
     /// Export an encrypted `.aeroftp-keystore` backup file.
     ///
@@ -4813,7 +4929,7 @@ enum KeystoreCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum AerorsyncCommands {
     /// Get or set the AeroRsync mode (auto / classic / native)
     ///
@@ -4890,7 +5006,7 @@ enum AerorsyncCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum AerorsyncModeCommands {
     /// Print the current mode (auto / classic / native)
     Get,
@@ -4901,7 +5017,7 @@ enum AerorsyncModeCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum AuditCommands {
     /// Cloud storage quota: alert when used/total ratio exceeds threshold
     #[command(name = "storage-quota")]
@@ -4980,7 +5096,7 @@ enum AuditCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ImportCommands {
     /// Import remotes from rclone configuration file
     Rclone {
@@ -5147,7 +5263,7 @@ enum ImportCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum DaemonCommands {
     /// Start the background daemon
     Start {
@@ -5167,7 +5283,7 @@ enum DaemonCommands {
     Status,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum JobCommands {
     /// Add a new background job
     Add {
@@ -5189,7 +5305,7 @@ enum JobCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum VersionCommands {
     /// List previous versions of a file (newest first)
     List {
@@ -5274,7 +5390,7 @@ enum VersionCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum CryptCommands {
     /// Initialize an encrypted overlay on a remote directory
     Init {
@@ -5367,6 +5483,17 @@ enum CryptCommands {
         /// Keyfile, required if the overlay was created with one
         #[arg(long)]
         keyfile: Option<String>,
+    },
+    /// Record how an rclone-crypt profile's stored password and salt are
+    /// written, as typed (clear) or as rclone.conf keeps them (obscured), so
+    /// they are read that way instead of guessed. Needs --profile.
+    SetForm {
+        /// How the stored password is written
+        #[arg(long, value_enum)]
+        password_form: Option<RecordedFormArg>,
+        /// How the stored salt (password2) is written
+        #[arg(long, value_enum)]
+        salt_form: Option<RecordedFormArg>,
     },
     /// Convert a headerless vault to a portable remote marker
     ToHeaded {
@@ -5588,7 +5715,7 @@ enum CryptCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum RcloneCryptCommands {
     /// Encrypt and upload a file using the rclone crypt format
     Put {
@@ -5606,6 +5733,13 @@ enum RcloneCryptCommands {
         /// Optional rclone password2/salt (empty by default)
         #[arg(long, env = "AEROFTP_RCLONE_CRYPT_SALT", hide_env_values = true)]
         salt: Option<String>,
+        /// How --password is written: auto, clear (as typed) or obscured (as
+        /// in rclone.conf)
+        #[arg(long, value_enum, default_value_t = SecretFormArg::Auto)]
+        password_form: SecretFormArg,
+        /// How --salt is written: auto, clear or obscured
+        #[arg(long, value_enum, default_value_t = SecretFormArg::Auto)]
+        salt_form: SecretFormArg,
         /// Filename encryption mode
         #[arg(long, value_enum, default_value_t = RcloneFilenameEncryption::Standard)]
         filename_encryption: RcloneFilenameEncryption,
@@ -5622,7 +5756,7 @@ enum RcloneCryptCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum AliasCommands {
     /// Set or update an alias
     Set {
@@ -5646,7 +5780,7 @@ enum AliasCommands {
     List,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ServeCommands {
     /// Serve a remote over local HTTP (read-only)
     Http {
@@ -5984,6 +6118,41 @@ struct CliSyncResult {
     /// Requested stream policy passed to the shared executor, with origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download_segments: Option<ftp_client_gui_lib::transfer_settings::ResolvedDownloadSegments>,
+    /// `sync`: how modification times were compared (within a window, or
+    /// size only with the reason), the field the GUI compare and MCP
+    /// `sync_tree` report too. Absent on the get/put commands, which compare
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modify_window: Option<ModifyWindow>,
+    /// `sync --delete`: directories the deletes left empty and removed.
+    #[serde(default, skip_serializing_if = "sync_over_budget_is_zero")]
+    dirs_deleted: u32,
+    /// `sync --delete`: directories the deletes left empty whose removal
+    /// failed, kept, with the reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dirs_kept: Vec<CliSyncKeptDir>,
+    /// `sync`: changed pairs left as they are because nothing said which copy
+    /// is newer (dates that do not order them, no snapshot to decide by, or
+    /// `--conflict-mode skip`); neither side is current.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicts_open: Vec<String>,
+    /// `sync --checksum`: the same-size pairs compared by checksum, and those
+    /// that had no checksum both sides could compute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checksum: Option<CliSyncChecksumSummary>,
+}
+
+/// A directory `sync --delete` emptied and could not remove.
+#[derive(Serialize, Clone)]
+struct CliSyncKeptDir {
+    path: String,
+    reason: String,
+}
+
+#[derive(Serialize)]
+struct CliSyncChecksumSummary {
+    compared: u32,
+    unverifiable: u32,
 }
 
 /// Single plan entry surfaced in `sync --dry-run --json`.
@@ -6026,6 +6195,11 @@ struct SyncCycleStats {
     ec_sidecar_deleted: u32,
     ec_sidecar_delete_failed: u32,
     error_count: u32,
+    /// Changed pairs left as they are (the JSON `conflicts_open`).
+    conflicts_open: Vec<String>,
+    /// Emptied directories kept after a failed removal, with the reason: the
+    /// JSON `dirs_kept`, the same list in the `sync` result and the watch cycle.
+    dirs_kept: Vec<CliSyncKeptDir>,
 }
 
 impl From<i32> for SyncCycleStats {
@@ -7231,6 +7405,28 @@ fn print_json<T: Serialize>(value: &T) {
     }
 }
 
+/// A warning the library reported during a command (a set-aside leftover
+/// of a replace), as the line `format` shows on stderr: plain text, or with
+/// `--json` a JSON object, since stderr carries JSON there.
+fn warning_line(format: OutputFormat, warning: &str) -> String {
+    match format {
+        OutputFormat::Text => format!("warning: {warning}"),
+        OutputFormat::Json => {
+            serde_json::json!({ "status": "warning", "warning": warning }).to_string()
+        }
+    }
+}
+
+/// Show on stderr the warnings the library reported since the last call.
+/// A closed stderr is no reason to panic: the line is dropped.
+fn render_pending_warnings(format: OutputFormat) {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    for warning in ftp_client_gui_lib::providers::take_warnings() {
+        let _ = writeln!(stderr, "{}", warning_line(format, &warning));
+    }
+}
+
 fn print_error(format: OutputFormat, msg: &str, code: i32) {
     match format {
         OutputFormat::Text => eprintln!("Error: {}", msg),
@@ -7381,6 +7577,74 @@ async fn reject_restricted_target(
     None
 }
 
+/// How a refused upload reports itself: a refusal another attempt would meet
+/// again, which the retries tell from other failures by this prefix.
+const UPLOAD_REFUSED_PREFIX: &str = "refused: ";
+
+/// The refusal of a remote file that an earlier attempt of this command
+/// reached and then failed on: it may be that attempt's partial, and a skip
+/// would report it as uploaded.
+fn left_incomplete_refusal(target: &str) -> String {
+    format!(
+        "{UPLOAD_REFUSED_PREFIX}{} is what a failed upload of this command left behind: not skipped as already there",
+        target
+    )
+}
+
+/// How an upload that `--immutable` or `--no-clobber` leaves alone reports
+/// itself. The batches count a result as skipped by this prefix, which only
+/// the skip writes, and not by a flag name a path can also contain.
+const UPLOAD_SKIP_PREFIX: &str = "skipped (already exists, ";
+
+/// Under `--immutable`, a remote file whose size differs from the source is
+/// not the file being uploaded: most often the partial a lost connection left
+/// (SFTP opens the file at its final path, then writes). Skipping it would
+/// report a truncated file as uploaded, on this run and on every later one, so
+/// it is an error. `--no-clobber` keeps skipping whatever is there.
+///
+/// It leans toward skipping when the size cannot be trusted
+/// ([`remote_size_is_exact`]), so that a sound file is never refused, and a
+/// source of unknown size (a remote one, for `mv` and `cp`) is not compared.
+/// A partial there goes undetected, as before, unless this very command left
+/// it (`put_run_left_incomplete`).
+fn immutable_size_mismatch(
+    cli: &Cli,
+    target: &str,
+    existing: &RemoteEntry,
+    source_size: Option<u64>,
+    exact: bool,
+) -> Option<String> {
+    let source_size = source_size?;
+    (cli.immutable && exact && !existing.is_dir && existing.size != source_size).then(|| {
+        format!(
+            "{UPLOAD_REFUSED_PREFIX}{} exists with {} bytes and the source has {}: --immutable neither overwrites it nor counts it as done",
+            target, existing.size, source_size
+        )
+    })
+}
+
+/// Whether the size `provider` reports for `entry` is the file's exact size.
+/// Not when the provider says its sizes are not (`reports_exact_size`: the
+/// AeroCrypt v1/v2 and compress overlays), not on Proton Drive (a file
+/// without a `claimedSize` reports its encrypted size), not a size FTP could
+/// not read (an MLST without a size fact and a SIZE the server refuses, a
+/// LIST row without a readable one: it reads 0), and not a 0 on WebDAV or
+/// Google Drive, which is what they report when the server sends no length
+/// or the object has none (a native Google Doc). Elsewhere a 0 is exact, and
+/// it is what an upload cut between its create and its first write leaves.
+fn remote_size_is_exact(provider: &dyn StorageProvider, entry: &RemoteEntry) -> bool {
+    if !provider.reports_exact_size()
+        || ftp_client_gui_lib::providers::ftp_listing::size_is_unreadable(entry)
+    {
+        return false;
+    }
+    match provider.provider_type() {
+        ProviderType::Proton => false,
+        ProviderType::WebDav | ProviderType::GoogleDrive => entry.size != 0,
+        _ => true,
+    }
+}
+
 /// `--immutable` / `--no-clobber`: refuse to write over an existing
 /// destination. Prints the skip and returns `Some(9)`, the exit code `put`
 /// has always used for "already exists"; returns `None` when the write may
@@ -7404,19 +7668,37 @@ async fn reject_restricted_target(
 /// permission error or an unsupported `stat` would otherwise turn that
 /// promise into an overwrite, silently, exactly on the unattended runs the
 /// flag exists for. The error is reported and the provider's own exit code
-/// returned. `--no-clobber` keeps its historical fail-open reading, since it
-/// was documented as a convenience and scripts rely on it proceeding.
+/// returned. `--no-clobber` keeps its historical fail-open reading for those
+/// (a timeout on a live connection, a permission error, an unsupported
+/// `stat`), since it was documented as a convenience and scripts rely on it
+/// proceeding, but not for a `stat` that lost the connection
+/// ([`connection_lost_reading`]): the write that would follow dials again by
+/// itself (SFTP's `ensure_connected`) and overwrites the file the flag
+/// protects, so it fails closed as `--immutable` does.
 async fn skip_if_destination_exists(
     provider: &mut dyn StorageProvider,
     target: &str,
     flag_name: &str,
+    source_size: Option<u64>,
     cli: &Cli,
     format: OutputFormat,
 ) -> Option<i32> {
     match provider.stat(target).await {
-        Ok(_) => {}
+        Ok(entry) => {
+            let refusal = if put_run_left_incomplete(target) {
+                Some(left_incomplete_refusal(target))
+            } else {
+                let exact = remote_size_is_exact(&*provider, &entry);
+                immutable_size_mismatch(cli, target, &entry, source_size, exact)
+            };
+            if let Some(message) = refusal {
+                put_run_note_refused();
+                print_error(format, &message, 4);
+                return Some(4);
+            }
+        }
         Err(ProviderError::NotFound(_)) => return None,
-        Err(e) if cli.immutable => {
+        Err(e) if cli.immutable || connection_lost_reading(&*provider, &e, &[target]) => {
             let code = provider_error_to_exit_code(&e);
             print_error(
                 format,
@@ -7685,13 +7967,24 @@ where
 fn sync_doctor_planned_upload_sizes(
     direction: &str,
     conflict_mode: &str,
+    window: ModifyWindow,
     local_entries: &HashMap<String, (u64, Option<String>)>,
     remote_entries: &HashMap<String, (u64, Option<String>)>,
     default_time: Option<&str>,
+    snapshot: Option<&BisyncSnapshot>,
 ) -> Vec<u64> {
     if !matches!(direction, "upload" | "both") {
         return Vec::new();
     }
+    // The rule `sync` runs with the doctor's flags: no --update, no
+    // --skip-matching, no --checksum.
+    let rule = SyncPairRule {
+        conflict_mode,
+        skip_matching: false,
+        update: false,
+        modify_window: None,
+        checksum: false,
+    };
     local_entries
         .iter()
         .filter_map(
@@ -7700,18 +7993,40 @@ fn sync_doctor_planned_upload_sizes(
                 Some((remote_size, remote_mtime)) => {
                     let lm = apply_default_time(local_mtime.as_deref(), default_time);
                     let rm = apply_default_time(remote_mtime.as_deref(), default_time);
-                    if local_size == remote_size
-                        && compare_mtime(lm, rm) == std::cmp::Ordering::Equal
-                    {
+                    if direction == "upload" {
+                        return match plan_one_way_pair(
+                            &rule,
+                            window,
+                            *local_size,
+                            lm,
+                            *remote_size,
+                            rm,
+                            None,
+                        ) {
+                            OneWayPair::Transfer => Some(*local_size),
+                            OneWayPair::Skip | OneWayPair::LeftOpen => None,
+                        };
+                    }
+                    // The decisions `sync` takes, snapshot included.
+                    if bisync_pair_is_current(
+                        snapshot,
+                        path,
+                        (*local_size, lm),
+                        (*remote_size, rm),
+                        window,
+                    ) {
                         return None;
                     }
-                    if direction == "both" {
-                        match resolve_conflict(conflict_mode, *local_size, lm, *remote_size, rm) {
-                            "upload" | "rename" => Some(*local_size),
-                            _ => None,
-                        }
-                    } else {
-                        Some(*local_size)
+                    match bisync_conflict_action(
+                        conflict_mode,
+                        snapshot,
+                        path,
+                        (*local_size, lm),
+                        (*remote_size, rm),
+                        window,
+                    ) {
+                        "upload" | "rename" => Some(*local_size),
+                        _ => None,
                     }
                 }
             },
@@ -8289,6 +8604,70 @@ const FIND_DEFAULT_PATTERN: &str = "*";
 /// given (DEL-02): an interactive run will abort rather than delete more than
 /// this many files unattended. Override with `--max-delete N` (or a percentage).
 const DEFAULT_SYNC_MAX_DELETE: usize = 100;
+
+/// A `--max-delete` cap: a whole number of files, or a percentage of the
+/// files the plan counts. Anything else is refused: an unreadable value used
+/// to mean no cap at all (`0.5`, `50pct`, `half`), or 100 percent for a bad
+/// percentage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MaxDeleteCap {
+    Count(usize),
+    Percent(f64),
+}
+
+impl MaxDeleteCap {
+    fn parse(value: &str) -> Result<Self, String> {
+        let bad = || {
+            format!("invalid --max-delete '{value}': expected a whole number N or a percentage N% from 0% to 100%")
+        };
+        let value = value.trim();
+        match value.strip_suffix('%') {
+            Some(pct) => {
+                let pct: f64 = pct.trim().parse().map_err(|_| bad())?;
+                if pct.is_finite() && (0.0..=100.0).contains(&pct) {
+                    Ok(Self::Percent(pct))
+                } else {
+                    Err(bad())
+                }
+            }
+            None => value.parse::<usize>().map(Self::Count).map_err(|_| bad()),
+        }
+    }
+
+    /// The number of deletions the cap allows over `total` counted files.
+    fn limit(self, total: usize) -> usize {
+        match self {
+            Self::Count(n) => n,
+            Self::Percent(pct) => ((pct / 100.0) * total as f64).ceil() as usize,
+        }
+    }
+}
+
+/// Every spelling `--conflict-mode` understands. Anything else used to fall
+/// back to "skip" without a word.
+const SYNC_CONFLICT_MODES: &[&str] = &[
+    "newer", "newest", "older", "oldest", "larger", "largest", "smaller", "smallest", "rename",
+    "skip",
+];
+
+/// The `sync` values given as free text, checked before anything connects.
+/// Returns the conflict policy the run uses ([`resolve_sync_conflict_mode`]).
+fn check_sync_values(
+    direction: &str,
+    conflict_mode: Option<&str>,
+    max_delete: Option<&str>,
+) -> Result<String, String> {
+    if !is_valid_sync_direction(direction) {
+        return Err(format!(
+            "invalid --direction '{direction}': expected upload, download or both"
+        ));
+    }
+    let conflict_mode = resolve_sync_conflict_mode(conflict_mode, direction)?;
+    if let Some(value) = max_delete {
+        MaxDeleteCap::parse(value)?;
+    }
+    Ok(conflict_mode)
+}
 
 /// Validate a relative path component is safe (no path traversal).
 /// Returns the sanitized path or None if it contains traversal attempts.
@@ -10028,19 +10407,52 @@ fn create_overall_progress_bar(total_files: usize, total_bytes: u64) -> Progress
 fn make_aggregate_progress_cb(
     aggregate: Arc<AtomicU64>,
     overall_pb: Option<ProgressBar>,
-) -> Box<dyn Fn(u64, u64) + Send> {
+) -> (Box<dyn Fn(u64, u64) + Send>, AttemptProgress) {
     let last_seen = Arc::new(AtomicU64::new(0));
-    Box::new(move |transferred, _total| {
+    let attempt = AttemptProgress {
+        added: Arc::new(AtomicU64::new(0)),
+        aggregate: aggregate.clone(),
+        overall_pb: overall_pb.clone(),
+    };
+    let added = attempt.added.clone();
+    let callback = Box::new(move |transferred, _total| {
         let previous = last_seen.swap(transferred, Ordering::Relaxed);
         let delta = transferred.saturating_sub(previous);
         if delta == 0 {
             return;
         }
+        added.fetch_add(delta, Ordering::Relaxed);
         let current = aggregate.fetch_add(delta, Ordering::Relaxed) + delta;
         if let Some(ref pb) = overall_pb {
             pb.set_position(current);
         }
-    })
+    });
+    (callback, attempt)
+}
+
+/// What one transfer attempt added to the batch's progress, so that a failed
+/// attempt takes it back: a job that goes back to the queue starts again from
+/// zero, and its first attempt's bytes were counted twice.
+struct AttemptProgress {
+    added: Arc<AtomicU64>,
+    aggregate: Arc<AtomicU64>,
+    overall_pb: Option<ProgressBar>,
+}
+
+impl AttemptProgress {
+    fn take_back(&self) {
+        let added = self.added.swap(0, Ordering::Relaxed);
+        if added == 0 {
+            return;
+        }
+        let current = self
+            .aggregate
+            .fetch_sub(added, Ordering::Relaxed)
+            .saturating_sub(added);
+        if let Some(ref pb) = self.overall_pb {
+            pb.set_position(current);
+        }
+    }
 }
 
 /// What `--partial` should do with `local_bytes` already on disk.
@@ -10290,38 +10702,125 @@ async fn cli_run_single_file_dag(
     (provider, result)
 }
 
+/// Why a single-file transfer on a held connection did not complete.
+struct TransferOnError {
+    message: String,
+    /// The session is gone or cannot be trusted: the provider says the peer
+    /// tore it down or the network failed ([`ProviderError::is_recoverable`]),
+    /// the message is one of `SESSION_CLOSED_NEEDLES`, or the provider no
+    /// longer reports itself connected. Anything else (a missing file, a
+    /// permission, a quota, a local I/O error, an API refusal) is about the
+    /// file, and the connection stays usable. A skip decided before the
+    /// transfer (`--max-transfer` spent, an existing file under `--immutable`)
+    /// says nothing about the session either.
+    session_lost: bool,
+    /// See [`WorkerJobDone::retry_safe`].
+    retry_safe: bool,
+    /// See [`WorkerJobDone::untouched`].
+    untouched: bool,
+}
+
+impl TransferOnError {
+    fn skipped(message: String) -> Self {
+        Self {
+            message,
+            session_lost: false,
+            retry_safe: true,
+            untouched: false,
+        }
+    }
+
+    /// Classify a transfer failure. No probe goes on the wire: FTP already
+    /// redials a session with a reply pending at the next command
+    /// (`redial_if_a_reply_is_pending`), and a probe would cost a token refresh
+    /// per failed file on Internxt.
+    ///
+    /// The message is read without the job's own `paths`, so that a missing
+    /// file called `connection reset.txt` stays a file error. A timeout counts
+    /// as a lost session: the session stopped answering, and neither
+    /// russh-sftp's request timeout ("Timeout") nor a TCP one ("Connection
+    /// timed out") is in `SESSION_CLOSED_NEEDLES`, whose other callers this
+    /// leaves alone.
+    fn from_provider(provider: &dyn StorageProvider, err: ProviderError, paths: &[&str]) -> Self {
+        let message = err.to_string();
+        let words = message_without_paths(&message, paths);
+        let session_lost = connection_lost_reading(provider, &err, paths)
+            || matches!(err, ProviderError::Timeout)
+            || words.contains("timeout")
+            || words.contains("timed out");
+        Self {
+            message,
+            session_lost,
+            retry_safe: true,
+            untouched: false,
+        }
+    }
+}
+
+/// `message` in lower case without `paths`, so that a file called
+/// `connection reset.txt` is not read as a sign of anything.
+fn message_without_paths(message: &str, paths: &[&str]) -> String {
+    let mut words = message.to_lowercase();
+    for path in paths.iter().filter(|path| !path.is_empty()) {
+        words = words.replace(&path.to_lowercase(), "");
+    }
+    words
+}
+
+/// Whether `err` ended the connection it came from: the error is a lost or
+/// absent connection or a network failure, its message (without `paths`) is
+/// one of `SESSION_CLOSED_NEEDLES`, or the provider no longer reports itself
+/// connected. A timeout on a connection still up is not one: the server was
+/// slow, and the session is still there. [`TransferOnError::from_provider`]
+/// adds the timeouts, since a batch job that timed out is not retried on the
+/// same session.
+fn connection_lost_reading(
+    provider: &dyn StorageProvider,
+    err: &ProviderError,
+    paths: &[&str],
+) -> bool {
+    matches!(
+        err,
+        ProviderError::ConnectionLost(_)
+            | ProviderError::NotConnected
+            | ProviderError::NetworkError(_)
+    ) || ftp_client_gui_lib::providers::types::is_session_closed_error_message(
+        &message_without_paths(&err.to_string(), paths),
+    ) || !provider.is_connected()
+}
+
+/// One download on a connection the caller holds: it neither opens nor
+/// closes it (see [`run_on_worker_connections`]).
 #[allow(clippy::too_many_arguments)]
-async fn download_transfer_task(
-    url: &str,
+async fn download_transfer_on(
+    provider: &mut dyn StorageProvider,
     remote_path: String,
     local_path: String,
     remote_modified: Option<String>,
     cli: &Cli,
-    format: OutputFormat,
     aggregate: Option<Arc<AtomicU64>>,
     overall_pb: Option<ProgressBar>,
     max_transfer_limit: Option<u64>,
-) -> Result<(), String> {
+) -> Result<Option<(u64, String)>, TransferOnError> {
     // --max-transfer: skip if session limit already exceeded
     if session_transfer_exceeded(max_transfer_limit) {
-        return Err("max-transfer limit reached".to_string());
+        return Err(TransferOnError::skipped(
+            "max-transfer limit reached".to_string(),
+        ));
     }
 
-    let (mut provider, _) = create_and_connect(url, cli, format)
-        .await
-        .map_err(|code| format!("connection failed with exit code {}", code))?;
-
-    let progress_cb = aggregate.map(|aggregate| make_aggregate_progress_cb(aggregate, overall_pb));
-    let result = download_with_resume(
-        &mut *provider,
-        &remote_path,
-        &local_path,
-        None,
-        cli,
-        progress_cb,
-    )
-    .await
-    .map_err(|e| e.to_string());
+    let (progress_cb, attempt) = match aggregate {
+        Some(aggregate) => {
+            let (callback, attempt) = make_aggregate_progress_cb(aggregate, overall_pb);
+            (Some(callback), Some(attempt))
+        }
+        None => (None, None),
+    };
+    let result =
+        download_with_resume(provider, &remote_path, &local_path, None, cli, progress_cb).await;
+    if let (Err(_), Some(attempt)) = (&result, &attempt) {
+        attempt.take_back();
+    }
 
     // In --inplace mode the download writes directly to the final path, so a failed
     // transfer can leave a truncated file behind. When --partial is disabled, match
@@ -10332,62 +10831,562 @@ async fn download_transfer_task(
 
     // Account transferred bytes, and keep the remote mtime on the local copy
     // (same as the shared executor and the GUI).
+    let mut landed = None;
     if result.is_ok() {
         ftp_client_gui_lib::preserve_remote_mtime(&local_path, remote_modified.as_deref());
         let bytes = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
         session_transfer_add(bytes);
+        // What the download left, read as it ends: an edit made later is a
+        // change, not the downloaded state.
+        landed = sync_local_state(&local_path);
     }
 
-    let _ = provider.disconnect().await;
     result
+        .map(|()| landed)
+        .map_err(|err| TransferOnError::from_provider(provider, err, &[&remote_path, &local_path]))
 }
 
+/// One upload on a connection the caller holds: it neither opens nor closes
+/// it (see [`run_on_worker_connections`]). With `create_parent` it creates the
+/// remote parent first; a caller that created every parent before its
+/// workers started passes false, since workers creating the same folder at
+/// once make two of it on Google Drive, which allows two folders of one name.
 #[allow(clippy::too_many_arguments)]
-async fn upload_transfer_task(
-    url: &str,
+async fn upload_transfer_on(
+    provider: &mut dyn StorageProvider,
     local_path: String,
     remote_path: String,
     cli: &Cli,
-    format: OutputFormat,
+    no_clobber: bool,
+    create_parent: bool,
     aggregate: Option<Arc<AtomicU64>>,
     overall_pb: Option<ProgressBar>,
     max_transfer_limit: Option<u64>,
-) -> Result<(), String> {
+) -> Result<(), TransferOnError> {
     // --max-transfer: skip if session limit already exceeded
     if session_transfer_exceeded(max_transfer_limit) {
-        return Err("max-transfer limit reached".to_string());
-    }
-
-    let (mut provider, _) = create_and_connect(url, cli, format)
-        .await
-        .map_err(|code| format!("connection failed with exit code {}", code))?;
-
-    // --immutable: skip if remote file already exists (never overwrite)
-    if cli.immutable && provider.stat(&remote_path).await.is_ok() {
-        let _ = provider.disconnect().await;
-        return Err(format!(
-            "skipped (already exists, --immutable): {}",
-            remote_path
+        return Err(TransferOnError::skipped(
+            "max-transfer limit reached".to_string(),
         ));
     }
 
-    if let Some(parent) = Path::new(&remote_path).parent() {
-        let _ = provider.mkdir(&parent.to_string_lossy()).await;
+    // --immutable / --no-clobber: never overwrite a remote file.
+    if cli.immutable || no_clobber {
+        match provider.stat(&remote_path).await {
+            Ok(entry) => {
+                let local_size = std::fs::metadata(&local_path).map(|m| m.len()).ok();
+                let refusal = if put_run_left_incomplete(&remote_path) {
+                    Some(left_incomplete_refusal(&remote_path))
+                } else {
+                    let exact = remote_size_is_exact(&*provider, &entry);
+                    immutable_size_mismatch(cli, &remote_path, &entry, local_size, exact)
+                };
+                if let Some(message) = refusal {
+                    put_run_note_refused();
+                    return Err(TransferOnError {
+                        message,
+                        session_lost: false,
+                        retry_safe: true,
+                        untouched: false,
+                    });
+                }
+                let flag = if cli.immutable {
+                    "--immutable"
+                } else {
+                    "--no-clobber"
+                };
+                return Err(TransferOnError::skipped(format!(
+                    "{UPLOAD_SKIP_PREFIX}{flag}): {remote_path}"
+                )));
+            }
+            Err(ProviderError::NotFound(_)) => {}
+            // As a single `put` does: under `--immutable` a `stat` that fails
+            // for another reason fails closed, and `--no-clobber` proceeds,
+            // unless the check lost the session. A worker's connection can end
+            // between two jobs, and its `stat` then fails at once (SFTP's does
+            // not dial again) while the upload dials again by itself and would
+            // truncate the very file `--no-clobber` protects. Nothing is
+            // written yet, so the job runs again on a new connection instead
+            // (`untouched`), which sees the file.
+            Err(e) => {
+                let mut err =
+                    TransferOnError::from_provider(provider, e, &[&local_path, &remote_path]);
+                err.untouched = err.session_lost;
+                if cli.immutable {
+                    err.message = format!(
+                        "--immutable: cannot verify that {} does not exist ({}); refusing to write rather than risk an overwrite",
+                        remote_path, err.message
+                    );
+                    return Err(err);
+                }
+                if err.session_lost {
+                    err.message = format!(
+                        "--no-clobber: cannot verify that {} does not exist ({}); not written",
+                        remote_path, err.message
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    if create_parent {
+        if let Some(parent) = Path::new(&remote_path).parent() {
+            let _ = provider.mkdir(&parent.to_string_lossy()).await;
+        }
     }
 
     let file_size = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
-    let progress_cb = aggregate.map(|aggregate| make_aggregate_progress_cb(aggregate, overall_pb));
-    let result = upload_with_resume(&mut *provider, &local_path, &remote_path, cli, progress_cb)
-        .await
-        .map_err(|e| e.to_string());
+    let (progress_cb, attempt) = match aggregate {
+        Some(aggregate) => {
+            let (callback, attempt) = make_aggregate_progress_cb(aggregate, overall_pb);
+            (Some(callback), Some(attempt))
+        }
+        None => (None, None),
+    };
+    let result = upload_with_resume(provider, &local_path, &remote_path, cli, progress_cb).await;
+    if let (Err(_), Some(attempt)) = (&result, &attempt) {
+        attempt.take_back();
+    }
 
     // Account transferred bytes
     if result.is_ok() {
         session_transfer_add(file_size);
     }
 
-    let _ = provider.disconnect().await;
-    result
+    result.map_err(|err| {
+        put_run_note_incomplete(&remote_path);
+        let mut err = TransferOnError::from_provider(provider, err, &[&local_path, &remote_path]);
+        // Past the existence check the upload may have created the remote
+        // file (SFTP opens it at its final path, then writes). Under
+        // `--immutable` or `--no-clobber` a second attempt would find that
+        // partial and skip it as already there, reporting a truncated file as
+        // success.
+        err.retry_safe = !(cli.immutable || no_clobber);
+        err
+    })
+}
+
+/// The byte figure of a batch summary: what arrived, with the total only
+/// when not all of it did. It printed the planned total alone, so a run that
+/// moved 4 files of 40 read "Downloaded 4/40 files (320.0 MB)".
+fn batch_bytes_summary(done: u64, total: u64) -> String {
+    if done >= total {
+        format_size(total)
+    } else {
+        format!("{} of {}", format_size(done), format_size(total))
+    }
+}
+
+/// What a batch on the shared executor moved: the planned total when every
+/// file arrived, else the engine's count of the bytes it transferred.
+fn shared_batch_bytes(
+    all_arrived: bool,
+    total: u64,
+    stats: Option<&ftp_client_gui_lib::transfer_dag::EngineTransferStats>,
+) -> u64 {
+    if all_arrived {
+        total
+    } else {
+        stats.map_or(0, |stats| stats.metrics.bytes_transferred)
+    }
+}
+
+/// What a job hands back to the worker that ran it.
+struct WorkerJobDone<R> {
+    /// The connection the job was given, or `None` if it had none.
+    conn: Option<Box<dyn StorageProvider>>,
+    result: Result<R, String>,
+    /// See [`TransferOnError::session_lost`].
+    session_lost: bool,
+    /// The job may run again after losing a fresh connection without hiding
+    /// that loss (see [`run_on_worker_connections`]).
+    retry_safe: bool,
+    /// The job lost its session before it wrote anything (the existence
+    /// check of `--immutable` or `--no-clobber`): on a connection of its own
+    /// it would have run on a fresh dial, so it goes back to the queue once
+    /// whatever the connection had completed before.
+    untouched: bool,
+}
+
+impl<R> WorkerJobDone<R> {
+    /// The outcome of a `*_transfer_on` call, mapped to the caller's result
+    /// (from what the transfer returned: the landed state of a download) and
+    /// error message.
+    fn from_transfer<T>(
+        conn: Box<dyn StorageProvider>,
+        outcome: Result<T, TransferOnError>,
+        ok: impl FnOnce(T) -> R,
+        describe: impl FnOnce(String) -> String,
+    ) -> Self {
+        match outcome {
+            Ok(value) => Self {
+                conn: Some(conn),
+                result: Ok(ok(value)),
+                session_lost: false,
+                retry_safe: true,
+                untouched: false,
+            },
+            Err(err) => Self {
+                conn: Some(conn),
+                result: Err(describe(err.message)),
+                session_lost: err.session_lost,
+                retry_safe: err.retry_safe,
+                untouched: err.untouched,
+            },
+        }
+    }
+
+    /// A job that ends without using a connection (no connection, or
+    /// cancelled): it gives back what it was given.
+    fn without_transfer(conn: Option<Box<dyn StorageProvider>>, message: String) -> Self {
+        Self {
+            conn,
+            result: Err(message),
+            session_lost: false,
+            retry_safe: true,
+            untouched: false,
+        }
+    }
+}
+
+/// Opens one connection for a worker of [`run_on_worker_connections`], with
+/// the error text the per-file paths have always reported.
+async fn connect_transfer_worker(
+    url: &str,
+    cli: &Cli,
+    format: OutputFormat,
+) -> Result<Box<dyn StorageProvider>, String> {
+    create_and_connect(url, cli, format)
+        .await
+        .map(|(provider, _)| provider)
+        .map_err(|code| format!("connection failed with exit code {}", code))
+}
+
+/// Jobs one worker connection carries before it is closed and the next job
+/// dials afresh: the pooled executor's `WARM_WORKER_MAX_FILES`, for the reason
+/// given there (an SFTP session reused across 5000 files ran out of handles on
+/// 4 of them).
+const WORKER_CONNECTION_MAX_JOBS: u32 = 128;
+
+/// Failed dials, or jobs lost on connections that had not completed one, that
+/// a worker accepts since its last job that kept its session; at this count
+/// it stops.
+const WORKER_MAX_STRIKES: u32 = 2;
+
+/// Pause before a worker dials again after a failed dial, so that a short
+/// outage (a server restart, a network blip) is ridden out rather than burning
+/// both of a worker's attempts in the same instant. It also spaces the login
+/// attempts a rate limiter sees.
+const WORKER_REDIAL_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bound on closing a worker connection: a peer that stopped answering must
+/// not hold the batch at its end.
+const WORKER_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn close_worker_connection(mut conn: Box<dyn StorageProvider>) {
+    let _ = tokio::time::timeout(WORKER_CLOSE_TIMEOUT, conn.disconnect()).await;
+}
+
+/// A connection a worker holds.
+struct HeldConnection {
+    conn: Box<dyn StorageProvider>,
+    /// It has completed a job.
+    proven: bool,
+    /// Jobs it has carried, toward [`WORKER_CONNECTION_MAX_JOBS`].
+    jobs: u32,
+}
+
+/// The jobs of [`run_on_worker_connections`] that have not finished.
+struct WorkerQueue<J> {
+    /// Waiting for a worker; each carries whether it has already lost a
+    /// fresh connection.
+    waiting: std::collections::VecDeque<(J, bool)>,
+    /// Taken by a worker and not finished: each may still come back.
+    in_hand: usize,
+}
+
+/// Single-file transfer jobs on one connection per worker, not one per file.
+///
+/// The paths that cannot use the pooled executor (providers without a
+/// transfer pool, `--immutable` uploads, sync with error correction) used to
+/// dial, and on the cloud APIs sign in, once per file: a 60-file `put -r` to
+/// Internxt made 60 logins, and the gateway answered 429 from about the
+/// twelfth on (live, 2026-09-27). Here `workers` workers take jobs from one
+/// queue, each with a connection of its own that it opens when it takes its
+/// first job and keeps for the next ones. The number of workers is the
+/// caller's, unchanged.
+///
+/// The rules, each pinned by a test:
+/// - A job that fails because of its file (see [`TransferOnError::session_lost`])
+///   keeps the connection; so does a skip decided before the transfer.
+/// - A job that loses a session which had already completed a job fails, as it
+///   would have on a connection of its own, and the next job dials afresh.
+/// - A job that loses a fresh connection, one that has completed nothing yet,
+///   goes back to the queue once, unless running it again could hide the loss
+///   ([`WorkerJobDone::retry_safe`]). If it loses a second fresh connection, or
+///   may not run again, it fails on its own: one bad file does not stop the
+///   batch.
+/// - A job that loses its session before it wrote anything
+///   ([`WorkerJobDone::untouched`]) goes back to the queue once whatever the
+///   connection had completed: a connection can end between two jobs, and on
+///   a connection of its own the job would have dialled afresh.
+/// - A failed dial puts its job back in the queue, and the worker waits
+///   [`WORKER_REDIAL_PAUSE`] before its next dial. Its exit code is not read:
+///   every command has connected once before its batch (its scan, its
+///   probe), so a refusal now is more often a passing one than wrong
+///   credentials (Internxt reports a 429 or a 5xx at login as a failed
+///   authentication, Jottacloud a network error in its OIDC discovery, FTP
+///   any login reply, 421 and 530 "too many connections" included).
+/// - A worker stops at its second failed dial, or its second job failed by
+///   losing fresh connections, since its last job that kept its session (an
+///   upload, a skip, an error of the file's own): past that the endpoint, not
+///   a file, is the problem, and dialling on would be the login storm this
+///   replaces. So a failure streak costs a worker at most five dials: four
+///   accepted and one refused, or three and two.
+/// - A worker that finds the queue empty while other workers still hold jobs
+///   waits for them: a job that comes back runs on its connection instead of
+///   failing for want of one. A connection that waited no longer counts as
+///   proven, since the server may have dropped it in the meantime.
+/// - A connection is closed after [`WORKER_CONNECTION_MAX_JOBS`] jobs.
+/// - `seed` is a connection the caller already holds (the scan connection it
+///   used to close before the batch); it serves the first worker that needs
+///   one, counts as proven, and is closed here if no job takes it.
+/// - Nothing is dialled once `cancelled` is set or the `max_transfer` budget is
+///   spent; those jobs get the reason instead.
+/// - When every worker has stopped, each job still queued reports that it was
+///   not transferred for want of a connection, with the last dial error if
+///   there was one: no job is dropped, and none carries another file's error.
+///
+/// `run` receives the connection, or why there is none, and hands it back in
+/// its [`WorkerJobDone`]. Results come back grouped by worker, in no set order,
+/// like the `buffer_unordered` batches this replaces.
+#[allow(clippy::too_many_arguments)]
+async fn run_on_worker_connections<J, R, C, CFut, F, Fut>(
+    seed: Option<Box<dyn StorageProvider>>,
+    workers: usize,
+    jobs: Vec<J>,
+    cancelled: &AtomicBool,
+    max_transfer: Option<u64>,
+    connect: C,
+    run: F,
+) -> Vec<Result<R, String>>
+where
+    J: Clone,
+    C: Fn() -> CFut,
+    CFut: std::future::Future<Output = Result<Box<dyn StorageProvider>, String>>,
+    F: Fn(Result<Box<dyn StorageProvider>, String>, J) -> Fut,
+    Fut: std::future::Future<Output = WorkerJobDone<R>>,
+{
+    use std::sync::Mutex as StdMutex;
+
+    fn lock<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // Every worker runs on the caller's task, so no guard of these mutexes may
+    // live across an `.await`: take what is needed in a statement of its own.
+    let queue = StdMutex::new(WorkerQueue {
+        waiting: jobs.into_iter().map(|job| (job, false)).collect(),
+        in_hand: 0,
+    });
+    // Woken whenever a job finishes or comes back.
+    let changed = tokio::sync::Notify::new();
+    let seed = StdMutex::new(seed);
+    let last_dial_error: StdMutex<Option<String>> = StdMutex::new(None);
+
+    // The next job and whether the worker had to wait for it, or `None` once
+    // the queue is empty and no job is in hand.
+    let take_job = || async {
+        let mut waited = false;
+        loop {
+            // Registered before the queue is read, so a change made between
+            // the read and the wait still wakes this worker.
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut queue = lock(&queue);
+                if let Some((job, lost_once)) = queue.waiting.pop_front() {
+                    queue.in_hand += 1;
+                    return Some((job, lost_once, waited));
+                }
+                if queue.in_hand == 0 {
+                    return None;
+                }
+            }
+            notified.await;
+            waited = true;
+        }
+    };
+    let finish = || {
+        lock(&queue).in_hand -= 1;
+        changed.notify_waiters();
+    };
+    let put_back = |job: J, lost_once: bool| {
+        {
+            let mut queue = lock(&queue);
+            queue.waiting.push_front((job, lost_once));
+            queue.in_hand -= 1;
+        }
+        changed.notify_waiters();
+    };
+
+    let worker = || async {
+        let mut results = Vec::new();
+        let mut held: Option<HeldConnection> = None;
+        let mut failed_dials = 0u32;
+        let mut lost_jobs = 0u32;
+        while let Some((job, lost_once, waited)) = take_job().await {
+            if waited {
+                if let Some(current) = held.as_mut() {
+                    current.proven = false;
+                }
+            }
+            // Decided before any dial.
+            let skip = if cancelled.load(Ordering::Relaxed) {
+                Some("cancelled")
+            } else if held.is_none() && session_transfer_exceeded(max_transfer) {
+                Some("max-transfer limit reached")
+            } else {
+                None
+            };
+            if let Some(reason) = skip {
+                let done = run(Err(reason.to_string()), job).await;
+                if let Some(conn) = done.conn {
+                    close_worker_connection(conn).await;
+                }
+                results.push(done.result);
+                finish();
+                continue;
+            }
+
+            let current = match held.take() {
+                Some(current) => current,
+                None => {
+                    // Its own statement: the guard of a `match lock(..)`
+                    // scrutinee lives to the end of the match, across the dial
+                    // below, and a second worker locking the same mutex then
+                    // blocks the one thread every worker runs on (a live
+                    // `put -r --immutable` over SFTP hung this way).
+                    let seeded = lock(&seed).take();
+                    match seeded {
+                        Some(conn) => HeldConnection {
+                            conn,
+                            proven: true,
+                            jobs: 0,
+                        },
+                        None => match connect().await {
+                            Ok(conn) => HeldConnection {
+                                conn,
+                                proven: false,
+                                jobs: 0,
+                            },
+                            Err(message) => {
+                                *lock(&last_dial_error) = Some(message);
+                                put_back(job, lost_once);
+                                failed_dials += 1;
+                                if failed_dials >= WORKER_MAX_STRIKES {
+                                    break;
+                                }
+                                tokio::time::sleep(WORKER_REDIAL_PAUSE).await;
+                                continue;
+                            }
+                        },
+                    }
+                }
+            };
+
+            let HeldConnection { conn, proven, jobs } = current;
+            let retry = job.clone();
+            let done = run(Ok(conn), job).await;
+            let Some(conn) = done.conn else {
+                results.push(done.result);
+                finish();
+                continue;
+            };
+            let jobs = jobs + 1;
+            if !done.session_lost {
+                // The session answered, whatever the file's outcome (an
+                // upload, a skip, an error of the file's own): the endpoint
+                // works, and the strikes start over. Reset on uploads alone, a
+                // rerun that skips every file never reset them, and two
+                // refused logins across a whole batch stopped the worker.
+                failed_dials = 0;
+                lost_jobs = 0;
+            }
+            if done.result.is_ok() {
+                held = Some(HeldConnection {
+                    conn,
+                    proven: true,
+                    jobs,
+                });
+                results.push(done.result);
+                finish();
+            } else if !done.session_lost {
+                held = Some(HeldConnection { conn, proven, jobs });
+                results.push(done.result);
+                finish();
+            } else {
+                close_worker_connection(conn).await;
+                if !lost_once && done.retry_safe && (!proven || done.untouched) {
+                    put_back(retry, true);
+                } else {
+                    results.push(done.result);
+                    finish();
+                    if !proven {
+                        lost_jobs += 1;
+                        if lost_jobs >= WORKER_MAX_STRIKES {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(current) = held.take() {
+                if current.jobs >= WORKER_CONNECTION_MAX_JOBS {
+                    close_worker_connection(current.conn).await;
+                } else {
+                    held = Some(current);
+                }
+            }
+        }
+        if let Some(current) = held {
+            close_worker_connection(current.conn).await;
+        }
+        results
+    };
+
+    let mut results: Vec<Result<R, String>> =
+        futures_util::future::join_all((0..workers.max(1)).map(|_| worker()))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+    // Every worker has stopped: the jobs nobody could run still report.
+    let error = match lock(&last_dial_error).clone() {
+        Some(dial) => format!("not transferred: no connection left ({dial})"),
+        None => "not transferred: no connection left".to_string(),
+    };
+    let left: Vec<J> = std::mem::take(&mut lock(&queue).waiting)
+        .into_iter()
+        .map(|(job, _)| job)
+        .collect();
+    for job in left {
+        let done = run(Err(error.clone()), job).await;
+        if let Some(conn) = done.conn {
+            close_worker_connection(conn).await;
+        }
+        results.push(done.result);
+    }
+    let unused_seed = lock(&seed).take();
+    if let Some(conn) = unused_seed {
+        close_worker_connection(conn).await;
+    }
+    results
 }
 
 // ── PD-CLI-CONV-B: shared provider executor convergence ────────────
@@ -10411,6 +11410,8 @@ fn absorb_engine_stats(
 /// Outcome of the converged shared-executor download batch.
 struct SharedDownloadOutcome {
     downloaded: u32,
+    /// Local path to the state each download left when it completed.
+    landed: HashMap<String, (u64, String)>,
     errors: Vec<String>,
     download_segments: ftp_client_gui_lib::transfer_settings::ResolvedDownloadSegments,
     /// G102: files this batch did NOT transfer because `--max-transfer` was
@@ -10439,13 +11440,39 @@ struct SharedDownloadOutcome {
 /// batch-lifecycle events inherit the trait's no-op defaults.
 struct CliBatchSink {
     errors: Mutex<Vec<String>>,
+    /// Download targets, remote path to local path: each completed download
+    /// is read back from disk the moment its `file_complete` arrives.
+    targets: HashMap<String, String>,
+    /// Local path to the state each download left, read when it completed.
+    landed: Mutex<HashMap<String, (u64, String)>>,
 }
 
 impl CliBatchSink {
     fn new() -> Self {
         Self {
             errors: Mutex::new(Vec::new()),
+            targets: HashMap::new(),
+            landed: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// A sink that also notes what each of these downloads, `(remote, local,
+    /// size)`, left on disk when it completed.
+    fn for_downloads(files: &[(String, String, u64)]) -> Self {
+        Self {
+            targets: files
+                .iter()
+                .map(|(remote, local, _)| (remote.clone(), local.clone()))
+                .collect(),
+            ..Self::new()
+        }
+    }
+
+    fn take_landed(&self) -> HashMap<String, (u64, String)> {
+        self.landed
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 
     fn take_errors(&self) -> Vec<String> {
@@ -10458,6 +11485,21 @@ impl CliBatchSink {
 
 impl ftp_client_gui_lib::transfer_event_sink::TransferEventSink for CliBatchSink {
     fn emit_transfer_event(&self, event: ftp_client_gui_lib::TransferEvent) {
+        if event.event_type == "file_complete" {
+            // Emitted after the file is committed and its time stamped, so
+            // this is the state the download left.
+            let local = event
+                .path
+                .as_ref()
+                .and_then(|remote| self.targets.get(remote));
+            if let Some(local) = local {
+                if let Some(state) = sync_local_state(local) {
+                    if let Ok(mut g) = self.landed.lock() {
+                        g.insert(local.clone(), state);
+                    }
+                }
+            }
+        }
         if event.event_type == "file_error" {
             let msg = event
                 .message
@@ -10478,8 +11520,9 @@ impl ftp_client_gui_lib::transfer_event_sink::TransferEventSink for CliBatchSink
 /// back un-consumed via `Err(base)` so the caller keeps the legacy
 /// independent-connection path: honest fallback, no overclaim.
 ///
-/// Non-regression: the legacy CLI path opens N independent connections via
-/// `buffer_unordered(workers)`. The shared SFTP/FTP path opens N independent
+/// Non-regression: the legacy CLI path runs `workers` independent connections,
+/// one per worker, each reused for the files its worker takes
+/// (`run_on_worker_connections`). The shared SFTP/FTP path opens N independent
 /// SSH/FTP connections too (`clone_for_transfer` re-dial, PD-SFTP-1 /
 /// PD-FTP-1), bounded by `min(workers, provider session cap)`. Parallelism
 /// is preserved up to the provider's advertised safe cap; beyond it the
@@ -10546,7 +11589,6 @@ async fn run_shared_provider_download_batch(
             | ProviderExecutorSessionModel::SftpConnectionPool { .. }
             | ProviderExecutorSessionModel::FtpConnectionPool { .. }
     );
-    note_parallel_ceiling(cli, &runtime_settings);
     if !is_pool_backed {
         // Not pool-backed: return the still-connected provider so the
         // caller runs the legacy independent-connection batch.
@@ -10557,6 +11599,9 @@ async fn run_shared_provider_download_batch(
             .expect("base provider must still be present");
         return Err(base);
     }
+    // The ceiling is the shared executor's: the legacy fallback above opens
+    // its own connections, `--parallel` of them, and does not reach it.
+    note_parallel_ceiling(cli, &runtime_settings);
 
     if !cli.quiet && !cli.json && !cli.machine {
         use ftp_client_gui_lib::transfer_dag::Capability;
@@ -10667,7 +11712,7 @@ async fn run_shared_provider_download_batch(
         })
     };
 
-    let sink = Arc::new(CliBatchSink::new());
+    let sink = Arc::new(CliBatchSink::for_downloads(files));
     let dyn_sink: Arc<dyn TransferEventSink> = sink.clone();
 
     let resolved_download_segments = runtime_settings.download_segments.clone();
@@ -10720,6 +11765,7 @@ async fn run_shared_provider_download_batch(
 
     Ok(SharedDownloadOutcome {
         downloaded: batch_result.completed,
+        landed: sink.take_landed(),
         errors: sink.take_errors(),
         download_segments: resolved_download_segments,
         over_budget: max_transfer_skipped as u32,
@@ -10751,7 +11797,7 @@ struct SharedUploadOutcome {
 /// `commit_message` is `None`: the only provider that consumes it is
 /// GitHub, which is single-connection (never pool-backed) and therefore
 /// never reaches this shared path; it always takes the `Err(base)`
-/// legacy fallback where `upload_transfer_task` handles it.
+/// legacy fallback where `upload_transfer_on` handles it.
 ///
 /// `--immutable` is NOT honoured here (the shared upload executor has no
 /// remote-stat skip, and unlike `get -r` the put scan does not
@@ -10764,8 +11810,9 @@ struct SharedUploadOutcome {
 /// Remote parent directories must be pre-created by the caller while the
 /// scan provider is connected (the shared executor does not mkdir).
 ///
-/// Non-regression: the legacy CLI path opens N independent connections
-/// via `buffer_unordered(workers)`. The shared SFTP/FTP path opens N
+/// Non-regression: the legacy CLI path runs `workers` independent
+/// connections, one per worker, each reused for the files its worker takes
+/// (`run_on_worker_connections`). The shared SFTP/FTP path opens N
 /// independent SSH/FTP connections too (`clone_for_transfer` re-dial,
 /// PD-SFTP-1 / PD-FTP-1), bounded by `min(workers, provider session cap)`.
 /// Parallelism is preserved up to the provider's advertised safe cap;
@@ -10815,7 +11862,6 @@ async fn run_shared_provider_upload_batch(
             | ProviderExecutorSessionModel::SftpConnectionPool { .. }
             | ProviderExecutorSessionModel::FtpConnectionPool { .. }
     );
-    note_parallel_ceiling(cli, &runtime_settings);
     if !is_pool_backed {
         // Not pool-backed: return the still-connected provider so the
         // caller runs the legacy independent-connection batch.
@@ -10826,6 +11872,9 @@ async fn run_shared_provider_upload_batch(
             .expect("base provider must still be present");
         return Err(base);
     }
+    // The ceiling is the shared executor's: the legacy fallback above opens
+    // its own connections, `--parallel` of them, and does not reach it.
+    note_parallel_ceiling(cli, &runtime_settings);
 
     // --max-transfer: pre-flight truncate to the remaining session budget
     // (file-granular, the legacy `session_transfer_exceeded` semantics) so
@@ -11695,7 +12744,41 @@ fn load_active_user_profiles(
         None => return Err("NO_ACTIVE_USER".to_string()),
     };
     match user_partitions::cli_list_server_profiles_for_user(store, target.id) {
-        Ok(profiles) => Ok(profiles),
+        Ok(mut profiles) => {
+            // rclone-crypt secrets that `import rclone --apply` used to leave in
+            // a profile's options move to the vault and a binding, once; the list
+            // is re-read, merged and written in one transaction, and only when a
+            // move applied.
+            let uid = scoped_credential_user_id(cli, store);
+            let notes = ftp_client_gui_lib::bridge_commands::migrate_legacy_rclone_crypt_on_load(
+                &mut profiles,
+                |key, secret| dual_store_server_cred_checked(store, uid, key, secret),
+                |key| read_server_cred(store, uid, key),
+                |apply| {
+                    let (stored, written) = user_partitions::cli_update_server_profiles_for_user(
+                        store, target.id, apply,
+                    )?;
+                    if written {
+                        mirror_profiles_to_legacy_blob_if_active(store, target.id, &stored);
+                    }
+                    Ok((stored, written))
+                },
+            );
+            // A profile left unmoved keeps its secrets in its options and opens
+            // without its overlay: say so on every run until it is fixed, once
+            // per run (a command can load the list more than once).
+            static NOTES_SHOWN: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !cli.quiet
+                && !notes.is_empty()
+                && !NOTES_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                for note in &notes {
+                    eprintln!("Warning: {note}");
+                }
+            }
+            Ok(profiles)
+        }
         Err(e) if e == "USER_LOCKED" => Err(e),
         Err(e) if e == "NO_ACTIVE_USER" => Err(e),
         Err(_) => {
@@ -11721,6 +12804,34 @@ fn load_active_user_profiles(
 /// the persistent active user). The legacy `config_server_profiles` blob is
 /// mirrored ONLY when writing to the persistent active user, so downgrade
 /// to a single-user CLI does not silently surface someone else's profiles.
+/// Whether `user_id` is the persistent active user (not a `--user` override).
+fn is_active_user(
+    store: &ftp_client_gui_lib::credential_store::CredentialStore,
+    user_id: i64,
+) -> bool {
+    ftp_client_gui_lib::user_partitions::cli_get_active_user(store)
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+        == Some(user_id)
+}
+
+/// Mirror a written profile list to the legacy blob, only when the write
+/// targets the persistent active user. Mirroring a `--user other` write would
+/// leak `other`'s profile names into the legacy blob, which is exactly the
+/// cross-partition leak R3 forbids.
+fn mirror_profiles_to_legacy_blob_if_active(
+    store: &ftp_client_gui_lib::credential_store::CredentialStore,
+    user_id: i64,
+    profiles: &[serde_json::Value],
+) {
+    if is_active_user(store, user_id) {
+        if let Ok(serialized) = serde_json::to_string(profiles) {
+            let _ = store.store("config_server_profiles", &serialized);
+        }
+    }
+}
+
 fn save_active_user_profiles(
     cli: &Cli,
     store: &ftp_client_gui_lib::credential_store::CredentialStore,
@@ -11731,23 +12842,11 @@ fn save_active_user_profiles(
         Some(t) => t,
         None => return Err("NO_ACTIVE_USER".to_string()),
     };
-    let active_id = user_partitions::cli_get_active_user(store)
-        .ok()
-        .flatten()
-        .map(|u| u.id);
-    let writing_to_active = active_id == Some(target.id);
+    let writing_to_active = is_active_user(store, target.id);
 
     match user_partitions::cli_replace_server_profiles_for_user(store, target.id, profiles) {
         Ok(()) => {
-            // Only mirror to the legacy blob when the write targets the
-            // persistent active user. Mirroring a `--user other` write would
-            // leak `other`'s profile names into the legacy blob, which is
-            // exactly the cross-partition leak R3 forbids.
-            if writing_to_active {
-                if let Ok(serialized) = serde_json::to_string(profiles) {
-                    let _ = store.store("config_server_profiles", &serialized);
-                }
-            }
+            mirror_profiles_to_legacy_blob_if_active(store, target.id, profiles);
             Ok(())
         }
         Err(e) if e == "USER_LOCKED" || e == "NO_ACTIVE_USER" => Err(e),
@@ -12454,7 +13553,7 @@ enum Tone {
 // `ftp_client_gui_lib::peer` (the iroh-isolated peer-l0 crate behind it).
 // ============================================================================
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PeerCommands {
     /// Manage this user-partition's P2P identity (its AeroFTP-ID)
     Identity {
@@ -12623,7 +13722,7 @@ enum PeerCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PeerAgentCommands {
     /// Provision an agent: create the user-partition <name> if absent, initialise
     /// its P2P identity if absent, and print the AeroFTP-ID. Collapses the
@@ -12638,7 +13737,7 @@ enum PeerAgentCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PeerIdentityCommands {
     /// Create this partition's identity if absent and print its AeroFTP-ID
     Init {
@@ -12650,7 +13749,7 @@ enum PeerIdentityCommands {
     Show,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PeerContactCommands {
     /// Add (or rename) a contact by AeroFTP-ID
     Add {
@@ -12669,7 +13768,7 @@ enum PeerContactCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum PeerDriveCommands {
     /// List drives this partition holds keys for (namespace + role)
     List,
@@ -16571,11 +17670,7 @@ async fn remove_tui_session_via_cli_handler(
     let result = if recursive {
         provider.rmdir_recursive(&resolved).await
     } else {
-        // Try file delete first, fall back to empty-directory removal.
-        match provider.delete(&resolved).await {
-            Ok(()) => Ok(()),
-            Err(_) => provider.rmdir(&resolved).await,
-        }
+        ftp_client_gui_lib::providers::delete_non_recursive(provider, &resolved).await
     };
     result
         .map(|_| resolved)
@@ -26319,7 +27414,7 @@ fn cmd_agent_info(cli: &Cli, redact_identifiers: bool) -> i32 {
                 {"name": "mv", "syntax": "aeroftp-cli mv --profile NAME /old /new", "description": "Move/rename"},
                 {"name": "cp", "syntax": "aeroftp-cli cp --profile NAME /old /new", "description": "Server-side copy when supported"},
                 {"name": "link", "syntax": "aeroftp-cli link --profile NAME /path/file", "description": "Create share link when supported"},
-                {"name": "edit", "syntax": "aeroftp-cli edit --profile NAME /path/file \"find\" \"replace\" [--first]", "description": "Replace text in a remote UTF-8 file"},
+                {"name": "edit", "syntax": "aeroftp-cli edit --profile NAME /path/file \"find\" \"replace\" [--first] [--allow-non-atomic]", "description": "Replace text in a remote UTF-8 file"},
                 {"name": "sync", "syntax": "aeroftp-cli sync --profile NAME ./local/ /remote/ [--dry-run]", "description": "Sync directories"},
                 {"name": "transfer", "syntax": "aeroftp-cli transfer \"SRC_PROFILE\" \"DST_PROFILE\" /src/path /dst/path [-r] [--dry-run] [--skip-existing]", "description": "Copy files between two saved profiles (cross-profile, no local hop on disk)"},
             ],
@@ -26540,14 +27635,10 @@ async fn cmd_agent_connect(cli: &Cli, query: &str) -> i32 {
     }
 }
 
-fn shell_double_quote(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 fn profile_or_placeholder(cli: &Cli) -> String {
     cli.profile
         .as_deref()
-        .map(shell_double_quote)
+        .map(shell_arg)
         .unwrap_or_else(|| "NAME".to_string())
 }
 
@@ -26557,25 +27648,25 @@ fn suggest_ls_followup(cli: &Cli, path: &str) -> String {
     // it literally and get zero results. `*` matches anything on every
     // backend and is the honest default.
     format!(
-        "aeroftp-cli find --profile \"{}\" \"{}\" \"*\" --json",
+        "aeroftp-cli find --profile {} {} \"*\" --json",
         profile_or_placeholder(cli),
-        shell_double_quote(path)
+        shell_arg(path)
     )
 }
 
 fn suggest_find_followup(cli: &Cli, path: &str) -> String {
     format!(
-        "aeroftp-cli ls --profile \"{}\" \"{}\" --json",
+        "aeroftp-cli ls --profile {} {} --json",
         profile_or_placeholder(cli),
-        shell_double_quote(path)
+        shell_arg(path)
     )
 }
 
 fn suggest_stat_followup(cli: &Cli, path: &str) -> String {
     format!(
-        "aeroftp-cli stat --profile \"{}\" \"{}\" --json",
+        "aeroftp-cli stat --profile {} {} --json",
         profile_or_placeholder(cli),
-        shell_double_quote(path)
+        shell_arg(path)
     )
 }
 
@@ -26586,20 +27677,20 @@ fn suggest_transfer_apply(
     dest_path: &str,
 ) -> String {
     format!(
-        "aeroftp-cli transfer \"{}\" \"{}\" \"{}\" \"{}\" --format json",
-        shell_double_quote(source_profile),
-        shell_double_quote(dest_profile),
-        shell_double_quote(source_path),
-        shell_double_quote(dest_path)
+        "aeroftp-cli transfer {} {} {} {} --format json",
+        shell_arg(source_profile),
+        shell_arg(dest_profile),
+        shell_arg(source_path),
+        shell_arg(dest_path)
     )
 }
 
 fn suggest_transfer_verify(dest_profile: &str, dest_path: &str, planned_files: u64) -> String {
     if planned_files <= 1 {
         format!(
-            "aeroftp-cli stat --profile \"{}\" \"{}\" --json",
-            shell_double_quote(dest_profile),
-            shell_double_quote(dest_path)
+            "aeroftp-cli stat --profile {} {} --json",
+            shell_arg(dest_profile),
+            shell_arg(dest_path)
         )
     } else {
         let parent = Path::new(dest_path)
@@ -26608,9 +27699,9 @@ fn suggest_transfer_verify(dest_profile: &str, dest_path: &str, planned_files: u
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| "/".to_string());
         format!(
-            "aeroftp-cli ls --profile \"{}\" \"{}\" --json",
-            shell_double_quote(dest_profile),
-            shell_double_quote(&parent)
+            "aeroftp-cli ls --profile {} {} --json",
+            shell_arg(dest_profile),
+            shell_arg(&parent)
         )
     }
 }
@@ -26661,9 +27752,9 @@ fn build_agent_task_router(
             "goal": "Understand a remote quickly and safely",
             "commands": [
                 "aeroftp-cli profiles --json",
-                format!("aeroftp-cli ls --profile \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(path)),
-                format!("aeroftp-cli tree --profile \"{}\" \"{}\" -d 2 --json", shell_double_quote(source_profile), shell_double_quote(path)),
-                format!("aeroftp-cli find --profile \"{}\" \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(path), shell_double_quote(pattern)),
+                format!("aeroftp-cli ls --profile {} {} --json", shell_arg(source_profile), shell_arg(path)),
+                format!("aeroftp-cli tree --profile {} {} -d 2 --json", shell_arg(source_profile), shell_arg(path)),
+                format!("aeroftp-cli find --profile {} {} {} --json", shell_arg(source_profile), shell_arg(path), shell_arg(pattern)),
             ],
             "rule": "Use ls for totals and find for subsets"
         }),
@@ -26671,8 +27762,8 @@ fn build_agent_task_router(
             "task": bootstrap_task_name(task),
             "goal": "Confirm exact existence and metadata for one remote path",
             "commands": [
-                format!("aeroftp-cli stat --profile \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(source_path)),
-                format!("aeroftp-cli ls --profile \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(&source_parent)),
+                format!("aeroftp-cli stat --profile {} {} --json", shell_arg(source_profile), shell_arg(source_path)),
+                format!("aeroftp-cli ls --profile {} {} --json", shell_arg(source_profile), shell_arg(&source_parent)),
             ],
             "rule": "Use stat for exact existence; do not infer from filtered listings"
         }),
@@ -26680,8 +27771,8 @@ fn build_agent_task_router(
             "task": bootstrap_task_name(task),
             "goal": "Copy one file or tree between saved profiles with verification",
             "commands": [
-                format!("aeroftp-cli stat --profile \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(source_path)),
-                format!("aeroftp-cli transfer \"{}\" \"{}\" \"{}\" \"{}\" --dry-run --format json", shell_double_quote(source_profile), shell_double_quote(dest_profile), shell_double_quote(source_path), shell_double_quote(dest_path)),
+                format!("aeroftp-cli stat --profile {} {} --json", shell_arg(source_profile), shell_arg(source_path)),
+                format!("aeroftp-cli transfer {} {} {} {} --dry-run --format json", shell_arg(source_profile), shell_arg(dest_profile), shell_arg(source_path), shell_arg(dest_path)),
                 suggest_transfer_apply(source_profile, dest_profile, source_path, dest_path),
                 suggest_transfer_verify(dest_profile, dest_path, 1),
             ],
@@ -26691,9 +27782,9 @@ fn build_agent_task_router(
             "task": bootstrap_task_name(task),
             "goal": "Plan and verify a backup-style copy with counts and exact destinations",
             "commands": [
-                format!("aeroftp-cli ls --profile \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(source_path)),
-                format!("aeroftp-cli find --profile \"{}\" \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(source_path), shell_double_quote(pattern)),
-                format!("aeroftp-cli transfer \"{}\" \"{}\" \"{}\" \"{}\" --dry-run --format json", shell_double_quote(source_profile), shell_double_quote(dest_profile), shell_double_quote(source_path), shell_double_quote(dest_path)),
+                format!("aeroftp-cli ls --profile {} {} --json", shell_arg(source_profile), shell_arg(source_path)),
+                format!("aeroftp-cli find --profile {} {} {} --json", shell_arg(source_profile), shell_arg(source_path), shell_arg(pattern)),
+                format!("aeroftp-cli transfer {} {} {} {} --dry-run --format json", shell_arg(source_profile), shell_arg(dest_profile), shell_arg(source_path), shell_arg(dest_path)),
                 suggest_transfer_apply(source_profile, dest_profile, source_path, dest_path),
                 suggest_transfer_verify(dest_profile, dest_path, 2),
             ],
@@ -26703,9 +27794,9 @@ fn build_agent_task_router(
             "task": bootstrap_task_name(task),
             "goal": "Compare local and remote state and prepare the next safe action",
             "commands": [
-                format!("aeroftp-cli check --profile \"{}\" \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(local_path), shell_double_quote(remote_path)),
-                format!("aeroftp-cli ls --profile \"{}\" \"{}\" --json", shell_double_quote(source_profile), shell_double_quote(remote_path)),
-                format!("aeroftp-cli sync --profile \"{}\" \"{}\" \"{}\" --dry-run --json", shell_double_quote(source_profile), shell_double_quote(local_path), shell_double_quote(remote_path)),
+                format!("aeroftp-cli check --profile {} {} {} --json", shell_arg(source_profile), shell_arg(local_path), shell_arg(remote_path)),
+                format!("aeroftp-cli ls --profile {} {} --json", shell_arg(source_profile), shell_arg(remote_path)),
+                format!("aeroftp-cli sync --profile {} {} {} --dry-run --json", shell_arg(source_profile), shell_arg(local_path), shell_arg(remote_path)),
             ],
             "rule": "Use check to classify differences before sync"
         }),
@@ -28362,7 +29453,10 @@ async fn cli_apply_crypt_overlay(
             }
         },
     };
-    let password = read_server_cred(&store, uid, &format!("aerocrypt_overlay_pw_{}", id))
+    let stored_password = read_server_cred(&store, uid, &format!("aerocrypt_overlay_pw_{}", id));
+    // A secret from the environment carries no recorded form.
+    let password_from_env = stored_password.is_none();
+    let password = stored_password
         .or_else(|| std::env::var("AEROFTP_CRYPT_OVERLAY_PASSWORD").ok())
         .unwrap_or_default();
     // Keyfiles do not apply to rclone-crypt, which keeps requiring a password.
@@ -28374,9 +29468,12 @@ async fn cli_apply_crypt_overlay(
         );
         return Err(5);
     }
-    let salt = read_server_cred(&store, uid, &format!("aerocrypt_overlay_salt_{}", id))
+    let stored_salt = read_server_cred(&store, uid, &format!("aerocrypt_overlay_salt_{}", id));
+    let salt_from_env = stored_salt.is_none();
+    let salt = stored_salt
         .or_else(|| std::env::var("AEROFTP_CRYPT_OVERLAY_SALT").ok())
         .unwrap_or_default();
+    let (password_form, salt_form) = ftp_client_gui_lib::rclone_crypt::crypt_secret_forms(profile);
     let local_config_json =
         read_server_cred(&store, uid, &format!("aerocrypt_overlay_config_{}", id))
             .filter(|s| !s.is_empty());
@@ -28399,6 +29496,16 @@ async fn cli_apply_crypt_overlay(
             Some(salt.clone())
         },
         with_header,
+        password_form: ftp_client_gui_lib::rclone_crypt::secret_form_for_source(
+            password_form,
+            password_from_env,
+            "AEROFTP_CRYPT_OVERLAY_PASSWORD_FORM",
+        ),
+        salt_form: ftp_client_gui_lib::rclone_crypt::secret_form_for_source(
+            salt_form,
+            salt_from_env,
+            "AEROFTP_CRYPT_OVERLAY_SALT_FORM",
+        ),
     };
     match ftp_client_gui_lib::crypt_overlay_provider::wrap_provider_with_overlay_if_bound(
         provider,
@@ -28485,6 +29592,13 @@ thread_local! {
     /// only: a release binary has no way to reach it.
     static TEST_CONNECTED_PROVIDER: std::cell::RefCell<Option<Box<dyn StorageProvider>>> =
         const { std::cell::RefCell::new(None) };
+    /// Makes a connected provider for every `create_and_connect` on this
+    /// thread once the one-shot slot above is empty, so a command that opens
+    /// more connections than one (a sync's transfers) reaches the same tree.
+    #[allow(clippy::type_complexity)]
+    static TEST_PROVIDER_FACTORY: std::cell::RefCell<
+        Option<std::rc::Rc<dyn Fn() -> Box<dyn StorageProvider>>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 async fn create_and_connect(
@@ -28495,6 +29609,10 @@ async fn create_and_connect(
     #[cfg(test)]
     if let Some(provider) = TEST_CONNECTED_PROVIDER.with(|slot| slot.borrow_mut().take()) {
         return Ok((provider, "/".to_string()));
+    }
+    #[cfg(test)]
+    if let Some(make) = TEST_PROVIDER_FACTORY.with(|slot| slot.borrow().clone()) {
+        return Ok((make(), "/".to_string()));
     }
     create_and_connect_detailed(url, cli, format)
         .await
@@ -28849,6 +29967,38 @@ struct ServeHttpState {
     provider_label: String,
     base_path: String,
     auth_token: Option<String>,
+    warnings: ServedWarnings,
+}
+
+/// Where a served request shows the warnings its provider call left (a
+/// replace that could not delete the copy it set aside): stderr, in the
+/// format the server was started with. The server runs until stopped, and
+/// the log is off by default.
+#[derive(Clone)]
+struct ServedWarnings {
+    format: OutputFormat,
+    out: Arc<std::sync::Mutex<dyn std::io::Write + Send>>,
+}
+
+impl ServedWarnings {
+    fn stderr(format: OutputFormat) -> Self {
+        Self {
+            format,
+            out: Arc::new(std::sync::Mutex::new(std::io::stderr())),
+        }
+    }
+
+    /// Show `warnings`, one line each. A closed stderr is no reason to
+    /// panic: the line is dropped.
+    fn show(&self, warnings: Vec<String>) {
+        let mut out = self
+            .out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for warning in warnings {
+            let _ = writeln!(out, "{}", warning_line(self.format, &warning));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -28946,7 +30096,15 @@ fn sanitize_served_relative_path(path: &str) -> Result<String, StatusCode> {
     let decoded = urlencoding::decode(path)
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .into_owned();
+    sanitize_decoded_served_path(&decoded)
+}
 
+/// [`sanitize_served_relative_path`] for a path already percent-decoded, as
+/// axum's `Path` extractor hands a request path over. Decoding it a second
+/// time turned a name holding a literal `%41` into another name (`aA.txt`)
+/// while the `Destination` header was decoded once: a MOVE onto itself
+/// missed its 403 and moved another file over it.
+fn sanitize_decoded_served_path(decoded: &str) -> Result<String, StatusCode> {
     if decoded.contains('\0') {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -29118,8 +30276,11 @@ fn resolve_served_backend_path(
     base_path: &str,
     requested_path: &str,
 ) -> Result<String, &'static str> {
+    // An FTP or SFTP path is not percent-encoded: decoding it made the name
+    // `a%41.txt` the file `aA.txt`, so DELE, RNFR and STOR acted on another
+    // file. `..` is still refused as a segment.
     let relative =
-        sanitize_served_relative_path(requested_path).map_err(|_| "path traversal denied")?;
+        sanitize_decoded_served_path(requested_path).map_err(|_| "path traversal denied")?;
     Ok(build_served_remote_path(base_path, &relative))
 }
 
@@ -29580,7 +30741,7 @@ async fn serve_http_response(
     head_only: bool,
     range: Option<&HeaderValue>,
 ) -> Response {
-    let relative_path = match sanitize_served_relative_path(&relative_path) {
+    let relative_path = match sanitize_decoded_served_path(&relative_path) {
         Ok(path) => path,
         Err(status) => return serve_error_response(status, "Invalid request path"),
     };
@@ -29771,6 +30932,7 @@ async fn cmd_serve_http(
         provider_label,
         base_path: base_path.clone(),
         auth_token: auth_token.clone(),
+        warnings: ServedWarnings::stderr(format),
     };
 
     let app = Router::new()
@@ -29936,6 +31098,54 @@ fn extract_destination_relative(headers: &HeaderMap) -> Result<String, StatusCod
     sanitize_served_relative_path(path_part).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
+/// Whether a MOVE may replace an existing destination. RFC 4918 section
+/// 10.6: `Overwrite: F` forbids it, and a request without the header is
+/// treated as `Overwrite: T`.
+fn webdav_move_may_overwrite(headers: &HeaderMap) -> bool {
+    !headers
+        .get("Overwrite")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("F"))
+}
+
+/// A served WebDAV DELETE: a file, or a collection with everything under it
+/// (RFC 4918 section 9.6.1).
+///
+/// It used to escalate after ANY `delete` failure: `rmdir`, then
+/// `rmdir_recursive`. A file `delete` refused for a transient reason then
+/// erased the directory of the same name (an S3 key `x` beside the prefix
+/// `x/`), and an ambiguous path (Cloudinary: an asset and a folder sharing a
+/// name) emptied the folder. The escalation now happens only for a path `stat`
+/// calls a directory (not a link to one), or one it cannot describe (see
+/// `providers::stat_cannot_describe`) that the provider can list: on S3 the
+/// served collection `x` is the prefix `x/`, which no key names.
+async fn served_webdav_delete(
+    provider: &mut dyn StorageProvider,
+    path: &str,
+) -> Result<(), ProviderError> {
+    let refused = match provider.delete(path).await {
+        Ok(()) => return Ok(()),
+        Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
+        Err(e) => e,
+    };
+    match provider.stat(path).await {
+        Ok(entry) if entry.is_dir && !entry.is_symlink => {}
+        // An object store sees no key `x` behind the collection `x/`: only a
+        // path the provider can list is a collection. A key that is simply
+        // gone keeps the delete error.
+        Err(e) if ftp_client_gui_lib::providers::stat_cannot_describe(&e) => {
+            if provider.list(path).await.is_err() {
+                return Err(refused);
+            }
+        }
+        _ => return Err(refused),
+    }
+    match provider.rmdir(path).await {
+        Ok(()) => Ok(()),
+        Err(_) => provider.rmdir_recursive(path).await,
+    }
+}
+
 async fn webdav_dispatch(
     state: ServeHttpState,
     method: Method,
@@ -29952,11 +31162,21 @@ async fn webdav_dispatch(
         return response;
     }
 
-    let relative_path = match sanitize_served_relative_path(&path) {
+    let relative_path = match sanitize_decoded_served_path(&path) {
         Ok(p) => p,
         Err(status) => return serve_error_response(status, "Invalid path"),
     };
     let remote_path = build_served_remote_path(&state.base_path, &relative_path);
+
+    // The served root is the share itself: a DELETE of it recursed into the
+    // whole base path, and a MOVE of it took the share away from under the
+    // server. A client removes or moves what is inside it.
+    if relative_path.is_empty() && matches!(method.as_str(), "DELETE" | "MOVE") {
+        return serve_error_response(
+            StatusCode::FORBIDDEN,
+            "The served root cannot be deleted or moved",
+        );
+    }
 
     match method.as_str() {
         "OPTIONS" => {
@@ -30093,30 +31313,13 @@ async fn webdav_dispatch(
 
         "DELETE" => {
             let mut provider = state.provider.lock().await;
-            // Try file delete first; on any failure try rmdir (target may be a directory)
-            match provider.delete(&remote_path).await {
+            match served_webdav_delete(provider.as_mut(), &remote_path).await {
                 Ok(()) => {
                     let mut response = Response::new(Body::empty());
                     *response.status_mut() = StatusCode::NO_CONTENT;
                     response
                 }
-                Err(_file_err) => match provider.rmdir(&remote_path).await {
-                    Ok(()) => {
-                        let mut response = Response::new(Body::empty());
-                        *response.status_mut() = StatusCode::NO_CONTENT;
-                        response
-                    }
-                    Err(_) => match provider.rmdir_recursive(&remote_path).await {
-                        Ok(()) => {
-                            let mut response = Response::new(Body::empty());
-                            *response.status_mut() = StatusCode::NO_CONTENT;
-                            response
-                        }
-                        Err(e) => {
-                            serve_error_response(provider_error_to_status_code(&e), &e.to_string())
-                        }
-                    },
-                },
+                Err(e) => serve_error_response(provider_error_to_status_code(&e), &e.to_string()),
             }
         }
 
@@ -30128,12 +31331,55 @@ async fn webdav_dispatch(
                 }
             };
             let dest_remote = build_served_remote_path(&state.base_path, &dest_relative);
+            // RFC 4918 section 9.9.4: a MOVE whose source and destination are
+            // the same resource is 403. The backends answer a rename onto
+            // itself with a no-op, which read as 204, a move that happened.
+            if remote_path.trim_end_matches('/') == dest_remote.trim_end_matches('/') {
+                return serve_error_response(
+                    StatusCode::FORBIDDEN,
+                    "The source and the destination are the same resource",
+                );
+            }
+            let overwrite = webdav_move_may_overwrite(&headers);
             let mut provider = state.provider.lock().await;
-            match provider.rename(&remote_path, &dest_remote).await {
+            // `rename` first: it refuses an occupied destination, which is
+            // what `Overwrite: F` asks for, and a plain move onto a free name
+            // stays one call on every backend. Only a refusal with
+            // `Overwrite: T` goes on to `replace`, the verb that is allowed to
+            // put one item over another.
+            // What this MOVE reports is kept for it: a request served at the
+            // same time does not show it, nor it theirs.
+            let call_warnings = ftp_client_gui_lib::providers::CallWarnings::default();
+            let outcome = call_warnings
+                .scope(async {
+                    match provider.rename(&remote_path, &dest_remote).await {
+                        Err(ProviderError::AlreadyExists(_)) if overwrite => {
+                            provider.replace(&remote_path, &dest_remote).await
+                        }
+                        other => other,
+                    }
+                })
+                .await;
+            // A replace that left its set-aside copy behind says so here.
+            state.warnings.show(call_warnings.take());
+            match outcome {
                 Ok(()) => {
                     let mut response = Response::new(Body::empty());
                     *response.status_mut() = StatusCode::NO_CONTENT;
                     response
+                }
+                // RFC 4918 section 9.9.4: a destination that exists under
+                // `Overwrite: F` is 412, not a server failure. Under
+                // `Overwrite: T` the client allowed the overwrite, so a
+                // refusal there (a file onto a folder, a backend that cannot
+                // replace in one folder) is a conflict, 409.
+                Err(ProviderError::AlreadyExists(message)) => {
+                    let status = if overwrite {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::PRECONDITION_FAILED
+                    };
+                    serve_error_response(status, &message)
                 }
                 Err(e) => serve_error_response(provider_error_to_status_code(&e), &e.to_string()),
             }
@@ -30147,6 +31393,14 @@ async fn webdav_dispatch(
                 }
             };
             let dest_remote = build_served_remote_path(&state.base_path, &dest_relative);
+            // RFC 4918 section 9.8.5: a COPY whose source and destination are
+            // the same resource is 403.
+            if remote_path.trim_end_matches('/') == dest_remote.trim_end_matches('/') {
+                return serve_error_response(
+                    StatusCode::FORBIDDEN,
+                    "The source and the destination are the same resource",
+                );
+            }
             // The bridge shares the production copy DAG and its one
             // authoritative fallback classifier with GUI and `cp`.
             match ftp_client_gui_lib::transfer_dag_single_file::execute_copy_dag(
@@ -30234,6 +31488,7 @@ async fn cmd_serve_webdav(
         provider_label,
         base_path: base_path.clone(),
         auth_token: auth_token.clone(),
+        warnings: ServedWarnings::stderr(format),
     };
 
     let app = Router::new()
@@ -30401,7 +31656,9 @@ mod serve_ftp_backend {
 
         fn provider_err_to_ftp(e: ProviderError) -> FtpError {
             let kind = match &e {
-                ProviderError::NotFound(_) => FtpErrorKind::PermanentFileNotAvailable,
+                ProviderError::NotFound(_) | ProviderError::DirectoryNotEmpty(_) => {
+                    FtpErrorKind::PermanentFileNotAvailable
+                }
                 ProviderError::PermissionDenied(_) => FtpErrorKind::PermissionDenied,
                 _ => FtpErrorKind::LocalError,
             };
@@ -30424,16 +31681,13 @@ mod serve_ftp_backend {
             Ok(AeroFtpMeta {
                 size: entry.size,
                 is_dir: entry.is_dir,
-                modified: entry.modified.as_deref().and_then(|s| {
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                        .ok()
-                        .map(|dt| {
-                            std::time::UNIX_EPOCH
-                                + std::time::Duration::from_secs(
-                                    dt.and_utc().timestamp().max(0) as u64
-                                )
-                        })
-                }),
+                modified: entry
+                    .modified
+                    .as_deref()
+                    .and_then(ftp_client_gui_lib::parse_remote_mtime)
+                    .map(|secs| {
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64)
+                    }),
             })
         }
 
@@ -30452,16 +31706,14 @@ mod serve_ftp_backend {
                     metadata: AeroFtpMeta {
                         size: e.size,
                         is_dir: e.is_dir,
-                        modified: e.modified.as_deref().and_then(|s| {
-                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                                .ok()
-                                .map(|dt| {
-                                    std::time::UNIX_EPOCH
-                                        + std::time::Duration::from_secs(
-                                            dt.and_utc().timestamp().max(0) as u64,
-                                        )
-                                })
-                        }),
+                        modified: e
+                            .modified
+                            .as_deref()
+                            .and_then(ftp_client_gui_lib::parse_remote_mtime)
+                            .map(|secs| {
+                                std::time::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(secs.max(0) as u64)
+                            }),
                     },
                 })
                 .collect())
@@ -30538,7 +31790,16 @@ mod serve_ftp_backend {
         ) -> FtpResult<()> {
             let remote = self.resolve_path(path.as_ref())?;
             let mut p = self.provider.lock().await;
-            p.delete(&remote).await.map_err(Self::provider_err_to_ftp)
+            // DELE removes a file; RMD is the directory verb. A directory is
+            // refused with 550, as a server with a file system answers.
+            ftp_client_gui_lib::providers::delete_file_only(p.as_mut(), &remote)
+                .await
+                .map_err(|e| match e {
+                    ProviderError::InvalidPath(_) => {
+                        FtpError::new(FtpErrorKind::PermanentFileNotAvailable, e)
+                    }
+                    e => Self::provider_err_to_ftp(e),
+                })
         }
 
         async fn mkd<P: AsRef<Path> + Send + Debug>(
@@ -30572,7 +31833,9 @@ mod serve_ftp_backend {
         ) -> FtpResult<()> {
             let remote = self.resolve_path(path.as_ref())?;
             let mut p = self.provider.lock().await;
-            p.rmdir(&remote).await.map_err(Self::provider_err_to_ftp)
+            ftp_client_gui_lib::providers::remove_empty_directory(p.as_mut(), &remote)
+                .await
+                .map_err(Self::provider_err_to_ftp)
         }
 
         async fn cwd<P: AsRef<Path> + Send + Debug>(
@@ -30874,6 +32137,31 @@ mod serve_sftp {
         rt: Arc<tokio::runtime::Runtime>,
     }
 
+    #[cfg(test)]
+    impl AeroSftpHandler {
+        /// A handler on `provider` serving `/`, without authentication.
+        pub(crate) fn for_tests(
+            provider: Arc<AsyncMutex<Box<dyn StorageProvider>>>,
+            rt: Arc<tokio::runtime::Runtime>,
+        ) -> Self {
+            Self {
+                provider,
+                base_path: "/".to_string(),
+                auth_credentials: None,
+                handles: HashMap::new(),
+                next_handle: 0,
+                dir_read: std::collections::HashSet::new(),
+                sftp_buf: Vec::new(),
+                rt,
+            }
+        }
+
+        /// The reply to one SFTP packet (type byte first, no length).
+        pub(crate) fn answer(&mut self, packet: &[u8]) -> Vec<u8> {
+            self.process_sftp(packet)
+        }
+    }
+
     impl AeroSftpHandler {
         fn resolve_path(&self, path: &str) -> Result<String, &'static str> {
             resolve_served_backend_path(&self.base_path, path)
@@ -31147,8 +32435,17 @@ mod serve_sftp {
                         }
                     };
                     let r = remote.clone();
-                    match prov!(provider, rt, async |p| p.delete(&r).await) {
+                    // REMOVE removes a file; RMDIR is the directory verb.
+                    // Protocol 3 has no "is a directory" status: it is
+                    // SSH_FX_FAILURE, as OpenSSH's sftp-server answers for
+                    // EISDIR, with a message that says why.
+                    match prov!(provider, rt, async |p| {
+                        ftp_client_gui_lib::providers::delete_file_only(p, &r).await
+                    }) {
                         Ok(()) => make_status(id, SSH_FX_OK, ""),
+                        Err(ProviderError::InvalidPath(_)) => {
+                            make_status(id, SSH_FX_FAILURE, "is a directory")
+                        }
                         Err(_) => make_status(id, SSH_FX_FAILURE, "delete failed"),
                     }
                 }
@@ -31185,7 +32482,9 @@ mod serve_sftp {
                         }
                     };
                     let r = remote.clone();
-                    match prov!(provider, rt, async |p| p.rmdir(&r).await) {
+                    match prov!(provider, rt, async |p| {
+                        ftp_client_gui_lib::providers::remove_empty_directory(p, &r).await
+                    }) {
                         Ok(()) => make_status(id, SSH_FX_OK, ""),
                         Err(_) => make_status(id, SSH_FX_FAILURE, "rmdir failed"),
                     }
@@ -32922,6 +34221,8 @@ async fn cmd_get_recursive(
     };
 
     let mut downloaded: u32 = 0;
+    // What arrived, for the summary (see `batch_bytes_summary`).
+    let mut done_bytes: u64 = 0;
     // G102: files the --max-transfer budget left behind on this run.
     let mut over_budget: u32 = 0;
     let mut errors: Vec<String> = listing_errors;
@@ -32949,6 +34250,11 @@ async fn cmd_get_recursive(
     {
         Ok(outcome) => {
             downloaded = outcome.downloaded;
+            done_bytes = shared_batch_bytes(
+                downloaded as usize == total_files,
+                total_bytes,
+                outcome.engine_stats.as_ref(),
+            );
             over_budget = outcome.over_budget;
             // G108, and the reason this is `extend` and not `=`: `errors`
             // starts as `listing_errors`, the directories the scan could not
@@ -32960,44 +34266,58 @@ async fn cmd_get_recursive(
             engine_stats = outcome.engine_stats;
             download_segments = Some(outcome.download_segments);
         }
-        Err(mut base) => {
-            let _ = base.disconnect().await;
-            let results = futures_util::stream::iter(files.into_iter().map(
-                |(remote_path, local_path, _size)| {
+        Err(base) => {
+            // One connection per worker, starting with the scan connection,
+            // instead of one per file (see `run_on_worker_connections`).
+            let results = run_on_worker_connections(
+                Some(base),
+                effective_parallel_workers(cli),
+                files,
+                &cancelled,
+                resolve_max_transfer(cli),
+                || connect_transfer_worker(url, cli, format),
+                |conn, (remote_path, local_path, size)| {
                     let cancelled = cancelled.clone();
                     let aggregate = aggregate.clone();
                     let overall_pb = overall_pb.clone();
                     let remote_modified = remote_mtimes.get(&remote_path).cloned();
                     async move {
                         if cancelled.load(Ordering::Relaxed) {
-                            return Err("Cancelled by user".to_string());
+                            return WorkerJobDone::without_transfer(
+                                conn.ok(),
+                                "Cancelled by user".to_string(),
+                            );
                         }
+                        let mut conn = match conn {
+                            Ok(conn) => conn,
+                            Err(err) => return WorkerJobDone::without_transfer(None, err),
+                        };
                         if let Some(parent) = Path::new(&local_path).parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        let result = download_transfer_task(
-                            url,
+                        let outcome = download_transfer_on(
+                            &mut *conn,
                             remote_path.clone(),
                             local_path,
                             remote_modified,
                             cli,
-                            format,
                             Some(aggregate),
                             overall_pb,
                             resolve_max_transfer(cli),
                         )
                         .await;
-                        result.map(|_| remote_path)
+                        WorkerJobDone::from_transfer(conn, outcome, |_| size, |err| err)
                     }
                 },
-            ))
-            .buffer_unordered(effective_parallel_workers(cli))
-            .collect::<Vec<_>>()
+            )
             .await;
 
             for result in results {
                 match result {
-                    Ok(_) => downloaded += 1,
+                    Ok(bytes) => {
+                        downloaded += 1;
+                        done_bytes += bytes;
+                    }
                     Err(err) => errors.push(err),
                 }
             }
@@ -33016,7 +34336,7 @@ async fn cmd_get_recursive(
                     "Downloaded {}/{} files ({}) in {:.1}s",
                     downloaded,
                     total_files,
-                    format_size(total_bytes),
+                    batch_bytes_summary(done_bytes, total_bytes),
                     elapsed.as_secs_f64()
                 );
                 for err in &errors {
@@ -33047,6 +34367,11 @@ async fn cmd_get_recursive(
                 unseen_paths: Vec::new(),
                 stats: engine_stats,
                 download_segments,
+                modify_window: None,
+                dirs_deleted: 0,
+                dirs_kept: Vec::new(),
+                conflicts_open: Vec::new(),
+                checksum: None,
             });
         }
     }
@@ -33172,7 +34497,7 @@ async fn cmd_get_glob(
     // by construction. Coherent with `get -r` (scan pre-filter) and `sync`
     // (plan strip); without this `get --glob` would silently ignore
     // --immutable on both paths (neither the shared executor nor
-    // `download_transfer_task` has a skip-if-exists check). The skipped
+    // `download_transfer_on` has a skip-if-exists check). The skipped
     // count is intentional (not a failure): it is added back to the exit
     // accounting below so an immutable run is exit 0, like `get -r`.
     let mut immutable_skipped: u32 = 0;
@@ -33218,39 +34543,50 @@ async fn cmd_get_glob(
             engine_stats = outcome.engine_stats;
             download_segments = Some(outcome.download_segments);
         }
-        Err(mut base) => {
-            let _ = base.disconnect().await;
-            let results = futures_util::stream::iter(files.into_iter().map(
-                |(remote_path, local_path, _size)| {
+        Err(base) => {
+            // One connection per worker, starting with the scan connection,
+            // instead of one per file (see `run_on_worker_connections`).
+            let results = run_on_worker_connections(
+                Some(base),
+                effective_parallel_workers(cli),
+                files,
+                &cancelled,
+                resolve_max_transfer(cli),
+                || connect_transfer_worker(url, cli, format),
+                |conn, (remote_path, local_path, _size)| {
                     let cancelled = cancelled.clone();
                     let aggregate = aggregate.clone();
                     let overall_pb = overall_pb.clone();
                     let remote_modified = remote_mtimes.get(&remote_path).cloned();
                     async move {
                         if cancelled.load(Ordering::Relaxed) {
-                            return Err("Cancelled by user".to_string());
+                            return WorkerJobDone::without_transfer(
+                                conn.ok(),
+                                "Cancelled by user".to_string(),
+                            );
                         }
+                        let mut conn = match conn {
+                            Ok(conn) => conn,
+                            Err(err) => return WorkerJobDone::without_transfer(None, err),
+                        };
                         if let Some(parent) = Path::new(&local_path).parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        download_transfer_task(
-                            url,
+                        let outcome = download_transfer_on(
+                            &mut *conn,
                             remote_path.clone(),
                             local_path,
                             remote_modified,
                             cli,
-                            format,
                             Some(aggregate),
                             overall_pb,
                             resolve_max_transfer(cli),
                         )
-                        .await
-                        .map(|_| remote_path)
+                        .await;
+                        WorkerJobDone::from_transfer(conn, outcome, |_| remote_path, |err| err)
                     }
                 },
-            ))
-            .buffer_unordered(effective_parallel_workers(cli))
-            .collect::<Vec<_>>()
+            )
             .await;
 
             for result in results {
@@ -33300,6 +34636,11 @@ async fn cmd_get_glob(
                 unseen_paths: Vec::new(),
                 stats: engine_stats,
                 download_segments,
+                modify_window: None,
+                dirs_deleted: 0,
+                dirs_kept: Vec::new(),
+                conflicts_open: Vec::new(),
+                checksum: None,
             });
         }
     }
@@ -33316,6 +34657,130 @@ async fn cmd_get_glob(
     } else {
         4
     }
+}
+
+/// What one `put` command learns across its attempts (the text mode's
+/// `--retries` reruns it): the remote paths an upload reached and then failed
+/// on, which may hold its partial, and whether an upload was refused for a
+/// reason another attempt cannot change. `put_with_retries` scopes it to the
+/// command; outside that scope (`sync`, the tests of the pieces) nothing is
+/// kept.
+#[derive(Default)]
+struct PutRun {
+    left_incomplete: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// This attempt refused an upload for a reason the next would meet again.
+    refused: AtomicBool,
+    /// This attempt failed some other way, which the next may not meet.
+    other_failure: AtomicBool,
+}
+
+tokio::task_local! {
+    static PUT_RUN: Arc<PutRun>;
+}
+
+/// An upload to `remote` failed after its existence check: it may have left
+/// a partial there.
+fn put_run_note_incomplete(remote: &str) {
+    let _ = PUT_RUN.try_with(|run| {
+        run.left_incomplete
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(remote.to_string());
+    });
+}
+
+/// An earlier attempt of this command left `remote` incomplete.
+fn put_run_left_incomplete(remote: &str) -> bool {
+    PUT_RUN
+        .try_with(|run| {
+            run.left_incomplete
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(remote)
+        })
+        .unwrap_or(false)
+}
+
+/// An upload was refused for a reason another attempt cannot change.
+fn put_run_note_refused() {
+    let _ = PUT_RUN.try_with(|run| run.refused.store(true, Ordering::Relaxed));
+}
+
+/// A batch ends: any failure among `errors` that is not a refusal (see
+/// `UPLOAD_REFUSED_PREFIX`) may pass on another attempt.
+fn put_run_note_failures(errors: &[String]) {
+    if errors
+        .iter()
+        .any(|error| !error.starts_with(UPLOAD_REFUSED_PREFIX))
+    {
+        let _ = PUT_RUN.try_with(|run| run.other_failure.store(true, Ordering::Relaxed));
+    }
+}
+
+/// `put` with the text mode's retries. An attempt that exits with a
+/// retryable code runs again, unless every failure in it was a refusal the
+/// next attempt would meet again (a remote file of another size under
+/// `--immutable`, a partial an earlier attempt left): repeating those would
+/// only print them again. An attempt that also failed some other way (a
+/// 503, a lost connection) runs again, and its refusals are reported again.
+#[allow(clippy::too_many_arguments)]
+async fn put_with_retries(
+    url: &str,
+    local: &str,
+    remote: Option<&str>,
+    recursive: bool,
+    no_clobber: bool,
+    delta: bool,
+    access: Option<CliAccessLevel>,
+    cli: &Cli,
+    format: OutputFormat,
+    cancelled: Arc<AtomicBool>,
+) -> i32 {
+    let run = Arc::new(PutRun::default());
+    PUT_RUN
+        .scope(run.clone(), async {
+            let max_attempts = effective_max_attempts(cli, format);
+            let sleep_dur = parse_retry_sleep(&cli.retries_sleep);
+            let max_transfer_limit = resolve_max_transfer(cli);
+            let mut last_code = 0i32;
+            for attempt in 1..=max_attempts {
+                run.refused.store(false, Ordering::Relaxed);
+                run.other_failure.store(false, Ordering::Relaxed);
+                last_code = cmd_put(
+                    url,
+                    local,
+                    remote,
+                    recursive,
+                    no_clobber,
+                    delta,
+                    access,
+                    cli,
+                    format,
+                    cancelled.clone(),
+                )
+                .await;
+                let only_refusals = run.refused.load(Ordering::Relaxed)
+                    && !run.other_failure.load(Ordering::Relaxed);
+                if !is_retryable_exit(last_code)
+                    || only_refusals
+                    || session_transfer_exceeded(max_transfer_limit)
+                    || attempt == max_attempts
+                {
+                    break;
+                }
+                if !cli.quiet {
+                    eprintln!(
+                        "Attempt {}/{} failed (exit {}), retrying in {:?}...",
+                        attempt, max_attempts, last_code, sleep_dur
+                    );
+                }
+                if !sleep_dur.is_zero() {
+                    tokio::time::sleep(sleep_dur).await;
+                }
+            }
+            last_code
+        })
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33347,7 +34812,7 @@ async fn cmd_put(
                 "Note: --access is not applied per-file on recursive uploads in this release; set the destination folder privacy with `aeroftp mkdir --access` (it cascades to children)"
             );
         }
-        return cmd_put_recursive(url, local, remote, cli, format, cancelled).await;
+        return cmd_put_recursive(url, local, remote, no_clobber, cli, format, cancelled).await;
     }
 
     // Check for glob patterns in local path
@@ -33362,7 +34827,7 @@ async fn cmd_put(
                 "Note: --access is not applied per-file on glob uploads in this release; set the destination folder privacy with `aeroftp mkdir --access` (it cascades to children)"
             );
         }
-        return cmd_put_glob(url, local, remote, cli, format, cancelled).await;
+        return cmd_put_glob(url, local, remote, no_clobber, cli, format, cancelled).await;
     }
 
     let (mut provider, initial_path) = match create_and_connect(url, cli, format).await {
@@ -33437,8 +34902,15 @@ async fn cmd_put(
         } else {
             "--no-clobber"
         };
-        if let Some(code) =
-            skip_if_destination_exists(provider.as_mut(), remote_path, flag_name, cli, format).await
+        if let Some(code) = skip_if_destination_exists(
+            provider.as_mut(),
+            remote_path,
+            flag_name,
+            std::fs::metadata(local).map(|m| m.len()).ok(),
+            cli,
+            format,
+        )
+        .await
         {
             let _ = provider.disconnect().await;
             return code;
@@ -33636,6 +35108,9 @@ async fn cmd_put(
             0
         }
         Err(e) => {
+            // It may have left a partial at the target: a later attempt of
+            // this command must not skip it as already there.
+            put_run_note_incomplete(remote_path);
             if let Some(pb) = pb {
                 pb.finish_and_clear();
             }
@@ -33654,6 +35129,7 @@ async fn cmd_put_recursive(
     url: &str,
     local_dir: &str,
     remote_base: Option<&str>,
+    no_clobber: bool,
     cli: &Cli,
     format: OutputFormat,
     cancelled: Arc<AtomicBool>,
@@ -33836,6 +35312,8 @@ async fn cmd_put_recursive(
     };
 
     let mut uploaded: u32 = 0;
+    // What arrived, for the summary (see `batch_bytes_summary`).
+    let mut done_bytes: u64 = 0;
     let mut skipped: u32 = 0;
     // G102: files the --max-transfer budget left behind on this run.
     let mut over_budget: u32 = 0;
@@ -33858,14 +35336,21 @@ async fn cmd_put_recursive(
     // pre-filter existing remote files. Non-pool-backed providers
     // (single-conn APIs) fall back to the legacy independent-connection
     // batch below: honest fallback, no overclaim.
-    let use_legacy = if cli.immutable {
+    // The connection the legacy batch starts from, instead of closing it.
+    let mut legacy_seed: Option<Box<dyn StorageProvider>> = None;
+    let use_legacy = if cli.immutable || no_clobber {
         if !cli.quiet {
             eprintln!(
-                "Note: --immutable uses the single-stream upload path \
-                 (the pooled uploader has no remote-existence check)"
+                "Note: {} uses the single-stream upload path \
+                 (the pooled uploader has no remote-existence check)",
+                if cli.immutable {
+                    "--immutable"
+                } else {
+                    "--no-clobber"
+                }
             );
         }
-        let _ = provider.disconnect().await;
+        legacy_seed = Some(provider);
         true
     } else {
         match run_shared_provider_upload_batch(
@@ -33879,6 +35364,11 @@ async fn cmd_put_recursive(
         {
             Ok(outcome) => {
                 uploaded = outcome.uploaded;
+                done_bytes = shared_batch_bytes(
+                    uploaded as usize == total_files,
+                    total_bytes,
+                    outcome.engine_stats.as_ref(),
+                );
                 over_budget = outcome.over_budget;
                 // Same shape as the one CodeRabbit raised on the download
                 // twin, and found by asking whether that one was alone: here
@@ -33890,46 +35380,64 @@ async fn cmd_put_recursive(
                 engine_stats = outcome.engine_stats;
                 false
             }
-            Err(mut base) => {
-                let _ = base.disconnect().await;
+            Err(base) => {
+                legacy_seed = Some(base);
                 true
             }
         }
     };
 
     if use_legacy {
-        let results = futures_util::stream::iter(files.into_iter().map(
-            |(local_path, remote_path, _size)| {
+        // One connection per worker, starting with the scan connection,
+        // instead of one per file (see `run_on_worker_connections`).
+        let results = run_on_worker_connections(
+            legacy_seed.take(),
+            effective_parallel_workers(cli),
+            files,
+            &cancelled,
+            resolve_max_transfer(cli),
+            || connect_transfer_worker(url, cli, format),
+            |conn, (local_path, remote_path, size)| {
                 let cancelled = cancelled.clone();
                 let aggregate = aggregate.clone();
                 let overall_pb = overall_pb.clone();
                 async move {
                     if cancelled.load(Ordering::Relaxed) {
-                        return Err("Cancelled by user".to_string());
+                        return WorkerJobDone::without_transfer(
+                            conn.ok(),
+                            "Cancelled by user".to_string(),
+                        );
                     }
-                    upload_transfer_task(
-                        url,
+                    let mut conn = match conn {
+                        Ok(conn) => conn,
+                        Err(err) => return WorkerJobDone::without_transfer(None, err),
+                    };
+                    let outcome = upload_transfer_on(
+                        &mut *conn,
                         local_path.clone(),
-                        remote_path.clone(),
+                        remote_path,
                         cli,
-                        format,
+                        no_clobber,
+                        // Every folder was created before the workers started.
+                        false,
                         Some(aggregate),
                         overall_pb,
                         resolve_max_transfer(cli),
                     )
-                    .await
-                    .map(|_| local_path)
+                    .await;
+                    WorkerJobDone::from_transfer(conn, outcome, |_| size, |err| err)
                 }
             },
-        ))
-        .buffer_unordered(effective_parallel_workers(cli))
-        .collect::<Vec<_>>()
+        )
         .await;
 
         for result in results {
             match result {
-                Ok(_) => uploaded += 1,
-                Err(ref err) if err.contains("--immutable") => {
+                Ok(bytes) => {
+                    uploaded += 1;
+                    done_bytes += bytes;
+                }
+                Err(ref err) if err.starts_with(UPLOAD_SKIP_PREFIX) => {
                     skipped += 1;
                 }
                 Err(err) => errors.push(err),
@@ -33941,6 +35449,8 @@ async fn cmd_put_recursive(
         pb.finish_and_clear();
     }
 
+    put_run_note_failures(&errors);
+
     let elapsed = start.elapsed();
 
     match format {
@@ -33950,10 +35460,18 @@ async fn cmd_put_recursive(
                     "\nUploaded {}/{} files ({}) in {:.1}s{}",
                     uploaded,
                     total_files,
-                    format_size(total_bytes),
+                    batch_bytes_summary(done_bytes, total_bytes),
                     elapsed.as_secs_f64(),
                     if skipped > 0 {
-                        format!(" ({} skipped, --immutable)", skipped)
+                        format!(
+                            " ({} skipped, {})",
+                            skipped,
+                            if cli.immutable {
+                                "--immutable"
+                            } else {
+                                "--no-clobber"
+                            }
+                        )
                     } else {
                         String::new()
                     }
@@ -33984,6 +35502,11 @@ async fn cmd_put_recursive(
                 unseen_paths: Vec::new(),
                 stats: engine_stats,
                 download_segments: None,
+                modify_window: None,
+                dirs_deleted: 0,
+                dirs_kept: Vec::new(),
+                conflicts_open: Vec::new(),
+                checksum: None,
             });
         }
     }
@@ -34332,7 +35855,7 @@ impl RmFilter {
     fn matches_file(&self, name: &str, path: &str, size: u64, modified: Option<&str>) -> bool {
         if let Some(ref predicate) = self.predicate {
             let mtime = modified
-                .and_then(parse_iso8601_to_unix)
+                .and_then(ftp_client_gui_lib::parse_remote_mtime)
                 .and_then(|ts| u64::try_from(ts).ok());
             if !predicate(name, size, mtime) {
                 return false;
@@ -34901,11 +36424,7 @@ async fn cmd_rm(
     let result = if recursive {
         provider.rmdir_recursive(path).await
     } else {
-        // Try file delete first, then directory
-        match provider.delete(path).await {
-            Ok(()) => Ok(()),
-            Err(_) => provider.rmdir(path).await,
-        }
+        ftp_client_gui_lib::providers::delete_non_recursive(provider.as_mut(), path).await
     };
 
     match result {
@@ -34968,7 +36487,8 @@ async fn cmd_mv(url: &str, from: &str, to: &str, cli: &Cli, format: OutputFormat
     // provider that allows it, which is exactly the overwrite the flag forbids.
     if cli.immutable {
         if let Some(code) =
-            skip_if_destination_exists(provider.as_mut(), to, "--immutable", cli, format).await
+            skip_if_destination_exists(provider.as_mut(), to, "--immutable", None, cli, format)
+                .await
         {
             let _ = provider.disconnect().await;
             return code;
@@ -35022,7 +36542,7 @@ async fn cmd_cp(url: &str, from: &str, to: &str, cli: &Cli, format: OutputFormat
     if cli.immutable {
         let mut guard = provider.lock().await;
         if let Some(code) =
-            skip_if_destination_exists(guard.as_mut(), to, "--immutable", cli, format).await
+            skip_if_destination_exists(guard.as_mut(), to, "--immutable", None, cli, format).await
         {
             let _ = guard.disconnect().await;
             return code;
@@ -35278,12 +36798,26 @@ async fn publish_cli_edit_via_temp_rename(
     provider: &mut dyn StorageProvider,
     local_temp_path: &str,
     remote_path: &str,
+    allow_non_atomic: bool,
 ) -> Result<(), ProviderError> {
     // Asked before the temporary exists, not after. A backend that cannot put
     // one file over another refuses here, while the server is still untouched,
     // so the refusal can say that nothing was written and be telling the truth
-    // (G119).
-    ftp_client_gui_lib::providers::ensure_atomic_replace(provider, remote_path).await?;
+    // (G119). `--allow-non-atomic` is the explicit opt-in to the set-aside
+    // replace some of those backends implement (a short moment with no file,
+    // and the previous one is not lost); on the others it is refused here too.
+    ftp_client_gui_lib::providers::ensure_edit_can_replace(
+        provider,
+        remote_path,
+        allow_non_atomic,
+        "`--allow-non-atomic`",
+    )
+    .await?;
+    // The replace puts a new file in the target's place: a link is refused
+    // here, while nothing is written, and the mode of the file is read to
+    // be set on the temporary (M-A of the 4.2.1 closeout).
+    let original =
+        ftp_client_gui_lib::providers::inspect_edit_target(provider, remote_path).await?;
 
     let remote_temp_path = cli_edit_temp_path(remote_path);
     if let Err(e) = provider
@@ -35293,6 +36827,13 @@ async fn publish_cli_edit_via_temp_rename(
         let _ = provider.delete(&remote_temp_path).await;
         return Err(e);
     }
+    let not_kept = ftp_client_gui_lib::providers::keep_edit_original(
+        provider,
+        &remote_temp_path,
+        remote_path,
+        &original,
+    )
+    .await;
     // `replace` and not `rename`: the destination exists by definition here,
     // and `rename` deliberately keeps refusing that case so an ordinary `mv`
     // cannot destroy a file the user did not mean to lose.
@@ -35300,7 +36841,16 @@ async fn publish_cli_edit_via_temp_rename(
         let _ = provider.delete(&remote_temp_path).await;
         return Err(e);
     }
+    if let Some(warning) = not_kept {
+        tracing::warn!("{warning}");
+        ftp_client_gui_lib::providers::report_warning(warning);
+    }
     Ok(())
+}
+
+struct CliEditOptions {
+    replace_all: bool,
+    allow_non_atomic: bool,
 }
 
 async fn cmd_edit(
@@ -35308,7 +36858,7 @@ async fn cmd_edit(
     path: &str,
     find: &str,
     replace: &str,
-    replace_all: bool,
+    options: CliEditOptions,
     cli: &Cli,
     format: OutputFormat,
 ) -> i32 {
@@ -35406,12 +36956,12 @@ async fn cmd_edit(
         return 0;
     }
 
-    let new_content = if replace_all {
+    let new_content = if options.replace_all {
         content.replace(find, replace)
     } else {
         content.replacen(find, replace, 1)
     };
-    let replaced = if replace_all { occurrences } else { 1 };
+    let replaced = if options.replace_all { occurrences } else { 1 };
 
     let mut temp_file = match NamedTempFile::new() {
         Ok(file) => file,
@@ -35437,7 +36987,14 @@ async fn cmd_edit(
     }
 
     let temp_path = temp_file.path().to_string_lossy().to_string();
-    match publish_cli_edit_via_temp_rename(provider.as_mut(), &temp_path, path).await {
+    match publish_cli_edit_via_temp_rename(
+        provider.as_mut(),
+        &temp_path,
+        path,
+        options.allow_non_atomic,
+    )
+    .await
+    {
         Ok(()) => {
             match format {
                 OutputFormat::Text => {
@@ -36173,6 +37730,115 @@ async fn cmd_rcat(url: &str, remote: &str, cli: &Cli, format: OutputFormat) -> i
     }
 }
 
+/// The `import rclone` text report, up to the apply line. Everything in it
+/// that comes from the file (section names, types, users, hosts, and the
+/// reasons that quote them) goes through `sanitize_filename`: a section named
+/// with escape sequences must not drive the terminal it is printed on.
+fn rclone_import_listing(result: &ftp_client_gui_lib::rclone_import::RcloneImportResult) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Scanned {} remotes from {}\n",
+        result.total_remotes,
+        sanitize_filename(&result.source_path)
+    );
+
+    if !result.servers.is_empty() {
+        let _ = writeln!(out, "Importable ({}):", result.servers.len());
+        for s in &result.servers {
+            let proto = s.protocol.as_deref().unwrap_or("?");
+            let cred = if s.credential.is_some() {
+                " [credentials]"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "  {} - {}://{}@{}:{}{}{}",
+                sanitize_filename(&s.name),
+                sanitize_filename(proto),
+                sanitize_filename(&s.username),
+                sanitize_filename(&s.host),
+                s.port,
+                cred,
+                sanitize_filename(s.cleartext_endpoint_note())
+            );
+        }
+        out.push('\n');
+    }
+
+    if !result.skipped.is_empty() {
+        let _ = writeln!(out, "Skipped ({}):", result.skipped.len());
+        for s in &result.skipped {
+            let _ = writeln!(
+                out,
+                "  {} - {} ({})",
+                sanitize_filename(&s.name),
+                sanitize_filename(&s.rclone_type),
+                sanitize_filename(&s.reason)
+            );
+        }
+        out.push('\n');
+    }
+
+    // Imported, but not whole: e.g. a password that does not reveal left the
+    // profile without a credential.
+    if !result.warnings.is_empty() {
+        let _ = writeln!(out, "Warnings ({}):", result.warnings.len());
+        for w in &result.warnings {
+            let _ = writeln!(
+                out,
+                "  {} - {}",
+                sanitize_filename(&w.name),
+                sanitize_filename(&w.reason)
+            );
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The `import rclone --json` document. It carries no credential: servers say
+/// `hasCredential` instead of the password, and the options the importer fills
+/// with a revealed secret (the crypt password and salt, the Filen API key) are
+/// left out, as the GUI preview leaves them out.
+fn rclone_import_json(
+    result: &ftp_client_gui_lib::rclone_import::RcloneImportResult,
+    apply: bool,
+    applied_summary: Option<&RcloneApplySummary>,
+) -> serde_json::Value {
+    let mut redacted = serde_json::json!({
+        "servers": result.servers.iter().map(|s| serde_json::json!({
+            "id": s.id,
+            "name": s.name,
+            "host": s.host,
+            "port": s.port,
+            "username": s.username,
+            "protocol": s.protocol,
+            "initialPath": s.initial_path,
+            "options": ftp_client_gui_lib::rclone_import::options_without_secrets(
+                s.options.as_ref()
+            ),
+            "hasCredential": s.credential.is_some(),
+        })).collect::<Vec<_>>(),
+        "skipped": serde_json::to_value(&result.skipped).unwrap_or_default(),
+        "warnings": serde_json::to_value(&result.warnings).unwrap_or_default(),
+        "sourcePath": result.source_path,
+        "totalRemotes": result.total_remotes,
+        "applied": apply,
+    });
+    if let Some(summary) = applied_summary {
+        redacted["appliedSummary"] = serde_json::json!({
+            "passwordsStored": summary.passwords_stored,
+            "oauthTokensStored": summary.oauth_tokens_stored,
+            "jottaRefreshStored": summary.jotta_refresh_stored,
+            "profilesAppended": summary.profiles_appended,
+        });
+    }
+    redacted
+}
+
 async fn cmd_import_rclone(path: Option<String>, json: bool, apply: bool, cli: &Cli) -> i32 {
     use ftp_client_gui_lib::rclone_import;
 
@@ -36248,73 +37914,17 @@ async fn cmd_import_rclone(path: Option<String>, json: bool, apply: bool, cli: &
             }
 
             if json {
-                // Redact credentials: never output plaintext passwords to stdout
-                let mut redacted = serde_json::json!({
-                    "servers": result.servers.iter().map(|s| serde_json::json!({
-                        "id": s.id,
-                        "name": s.name,
-                        "host": s.host,
-                        "port": s.port,
-                        "username": s.username,
-                        "protocol": s.protocol,
-                        "initialPath": s.initial_path,
-                        "options": s.options,
-                        "hasCredential": s.credential.is_some(),
-                    })).collect::<Vec<_>>(),
-                    "skipped": serde_json::to_value(&result.skipped).unwrap_or_default(),
-                    "sourcePath": result.source_path,
-                    "totalRemotes": result.total_remotes,
-                    "applied": apply,
-                });
-                if let Some(summary) = &applied_summary {
-                    redacted["appliedSummary"] = serde_json::json!({
-                        "passwordsStored": summary.passwords_stored,
-                        "oauthTokensStored": summary.oauth_tokens_stored,
-                        "jottaRefreshStored": summary.jotta_refresh_stored,
-                        "profilesAppended": summary.profiles_appended,
-                    });
-                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&redacted).unwrap_or_default()
+                    serde_json::to_string_pretty(&rclone_import_json(
+                        &result,
+                        apply,
+                        applied_summary.as_ref()
+                    ))
+                    .unwrap_or_default()
                 );
             } else {
-                println!(
-                    "Scanned {} remotes from {}",
-                    result.total_remotes, result.source_path
-                );
-                println!();
-
-                if !result.servers.is_empty() {
-                    println!("Importable ({}):", result.servers.len());
-                    for s in &result.servers {
-                        let proto = s.protocol.as_deref().unwrap_or("?");
-                        let cred = if s.credential.is_some() {
-                            " [credentials]"
-                        } else {
-                            ""
-                        };
-                        println!(
-                            "  {} - {}://{}@{}:{}{}{}",
-                            s.name,
-                            proto,
-                            s.username,
-                            s.host,
-                            s.port,
-                            cred,
-                            s.cleartext_endpoint_note()
-                        );
-                    }
-                    println!();
-                }
-
-                if !result.skipped.is_empty() {
-                    println!("Skipped ({}):", result.skipped.len());
-                    for s in &result.skipped {
-                        println!("  {} - {} ({})", s.name, s.rclone_type, s.reason);
-                    }
-                    println!();
-                }
+                print!("{}", rclone_import_listing(&result));
 
                 if let Some(summary) = &applied_summary {
                     println!(
@@ -36376,6 +37986,34 @@ fn cli_oauth_vault_slug_for_protocol(protocol: &str) -> Option<&'static str> {
 /// blobs into the AeroFTP vault, then append the new profiles to
 /// `config_server_profiles` so the GUI lists them on next launch. Mirrors
 /// the `import_rclone_config` Tauri command in `lib.rs`. Issue #214.
+/// The profile `import rclone --apply` saves for one imported server. An
+/// rclone crypt remote becomes the same overlay binding the GUI import makes,
+/// its password and salt written with `store_secret` and recorded clear. Saved
+/// in the options instead, they sat there in clear and no overlay was bound.
+fn imported_server_profile(
+    server: &ftp_client_gui_lib::rclone_import::ServerProfileExport,
+    store_secret: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Result<serde_json::Value, String> {
+    let mut profile = serde_json::json!({
+        "id": server.id,
+        "name": server.name,
+        "host": server.host,
+        "port": server.port,
+        "username": server.username,
+        "protocol": server.protocol,
+        "initialPath": server.initial_path,
+        "color": server.color,
+        "lastConnected": server.last_connected,
+        "options": server.options,
+        "providerId": server.provider_id,
+    });
+    ftp_client_gui_lib::bridge_commands::materialize_imported_crypt_overlay(
+        &mut profile,
+        store_secret,
+    )?;
+    Ok(profile)
+}
+
 async fn apply_rclone_import_to_vault(
     cli: &Cli,
     result: &ftp_client_gui_lib::rclone_import::RcloneImportResult,
@@ -36461,19 +38099,11 @@ async fn apply_rclone_import_to_vault(
         if existing_ids.contains(&server.id) {
             continue;
         }
-        profiles.push(serde_json::json!({
-            "id": server.id,
-            "name": server.name,
-            "host": server.host,
-            "port": server.port,
-            "username": server.username,
-            "protocol": server.protocol,
-            "initialPath": server.initial_path,
-            "color": server.color,
-            "lastConnected": server.last_connected,
-            "options": server.options,
-            "providerId": server.provider_id,
-        }));
+        let profile = imported_server_profile(server, |key, secret| {
+            dual_store_server_cred_checked(&store, scoped_uid, key, secret)
+        })
+        .map_err(|e| format!("vault write failed for {}: {}", server.id, e))?;
+        profiles.push(profile);
         profiles_appended += 1;
     }
     save_active_user_profiles(cli, &store, &profiles)
@@ -36759,6 +38389,7 @@ fn collect_export_scaffold(
     store: &ftp_client_gui_lib::credential_store::CredentialStore,
     servers_json: &serde_json::Value,
     name_filter: Option<&[String]>,
+    source: &str,
     supported_protocols: &[&str],
     oauth_protocols: &[&str],
 ) -> Result<ExportCollected, String> {
@@ -36856,10 +38487,11 @@ fn collect_export_scaffold(
             continue;
         }
         if !proto_supported {
-            out.skipped.push((
-                name.to_string(),
-                format!("protocol {} not exportable", protocol),
-            ));
+            let reason =
+                ftp_client_gui_lib::bridge_shared::bridge_export_refusal(source, &protocol)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("protocol {} not exportable", protocol));
+            out.skipped.push((name.to_string(), reason));
             continue;
         }
         // SFTP profiles authenticate by SSH key (path in
@@ -36950,8 +38582,8 @@ async fn cmd_export_rclone(
     let filter = parse_profile_name_filter(profiles);
 
     // Single source of truth shared with the GUI bridge: the credential
-    // backends (FTP/SFTP/WebDAV/S3/Filen/Mega/Azure/Swift/Koofr/OpenDrive/
-    // Backblaze) plus the #128-D OAuth-token providers (Drive/Dropbox/
+    // backends (FTP/SFTP/WebDAV/S3/Filen/Mega/Internxt/Azure/Swift/Koofr/
+    // OpenDrive/Backblaze) plus the #128-D OAuth-token providers (Drive/Dropbox/
     // OneDrive/Box/pCloud/Yandex/Zoho), whose token + BYO client_id/secret
     // are injected below. Jottacloud is appended CLI-only: its rclone export
     // rebuilds the persisted OIDC refresh token into a working token (verified
@@ -36963,15 +38595,20 @@ async fn cmd_export_rclone(
     supported.push("jottacloud");
     let oauth: [&str; 0] = [];
 
-    let collected =
-        match collect_export_scaffold(&store, &servers_json, filter.as_deref(), &supported, &oauth)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                print_error(format, &e, 4);
-                return 4;
-            }
-        };
+    let collected = match collect_export_scaffold(
+        &store,
+        &servers_json,
+        filter.as_deref(),
+        "rclone",
+        &supported,
+        &oauth,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            print_error(format, &e, 4);
+            return 4;
+        }
+    };
 
     if collected.profiles.is_empty() {
         emit_empty_export(json, format, &collected.skipped);
@@ -37107,15 +38744,20 @@ async fn cmd_export_winscp(
     let supported = ["ftp", "ftps", "sftp"];
     let oauth: [&str; 0] = [];
 
-    let collected =
-        match collect_export_scaffold(&store, &servers_json, filter.as_deref(), &supported, &oauth)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                print_error(format, &e, 4);
-                return 4;
-            }
-        };
+    let collected = match collect_export_scaffold(
+        &store,
+        &servers_json,
+        filter.as_deref(),
+        "winscp",
+        &supported,
+        &oauth,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            print_error(format, &e, 4);
+            return 4;
+        }
+    };
     if collected.profiles.is_empty() {
         emit_empty_export(json, format, &collected.skipped);
         return 4;
@@ -37182,15 +38824,20 @@ async fn cmd_export_filezilla(
     let supported = ["ftp", "ftps", "sftp"];
     let oauth: [&str; 0] = [];
 
-    let collected =
-        match collect_export_scaffold(&store, &servers_json, filter.as_deref(), &supported, &oauth)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                print_error(format, &e, 4);
-                return 4;
-            }
-        };
+    let collected = match collect_export_scaffold(
+        &store,
+        &servers_json,
+        filter.as_deref(),
+        "filezilla",
+        &supported,
+        &oauth,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            print_error(format, &e, 4);
+            return 4;
+        }
+    };
     if collected.profiles.is_empty() {
         emit_empty_export(json, format, &collected.skipped);
         return 4;
@@ -37291,6 +38938,7 @@ async fn cmd_export_bridge(
         &store,
         &servers_json,
         filter.as_deref(),
+        src,
         supported,
         &oauth,
     ) {
@@ -38153,6 +39801,7 @@ async fn cmd_keystore_import(
             sections,
             cfg_clone.as_deref(),
             Some(&progress_cb),
+            None,
         )
     })
     .await;
@@ -38254,9 +39903,9 @@ fn cmd_flatpak_import(status_only: bool, format: OutputFormat) -> i32 {
             ),
             OutputFormat::Text => match (st.available, st.source) {
                 (true, Some(src)) => println!("Import available from {}", src.display()),
-                _ => {
-                    println!("No host configuration to import (none present, or already decided).")
-                }
+                _ => println!(
+                    "No host configuration to import (none present, nothing in it to import, or already decided)."
+                ),
             },
         }
         return 0;
@@ -38264,25 +39913,15 @@ fn cmd_flatpak_import(status_only: bool, format: OutputFormat) -> i32 {
 
     match portable::flatpak_host_import_apply(true) {
         Ok(report) => {
+            let imported = report.imported();
             match format {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::json!({
-                        "imported": report.imported,
-                        "source": path_str(report.source),
-                        "target": path_str(report.target),
-                        "requires_restart": report.imported,
-                    })
-                ),
-                OutputFormat::Text => {
-                    if report.imported {
-                        println!(
-                            "Imported host configuration into the sandbox. Restart AeroFTP to load it."
-                        );
-                    } else {
-                        println!("Nothing to import.");
-                    }
+                OutputFormat::Json => {
+                    // The GUI command's fields, plus the restart flag of the CLI.
+                    let mut json = report.to_json();
+                    json["requires_restart"] = serde_json::Value::Bool(imported);
+                    println!("{json}");
                 }
+                OutputFormat::Text => println!("{}", flatpak_import_summary(&report)),
             }
             0
         }
@@ -38290,6 +39929,126 @@ fn cmd_flatpak_import(status_only: bool, format: OutputFormat) -> i32 {
             print_error(format, &format!("flatpak-import failed: {e}"), 1);
             1
         }
+    }
+}
+
+/// The text `flatpak-import` prints after an accepted import: how many files it
+/// copied, and what happened to the host vault and saved servers.
+fn flatpak_import_summary(report: &ftp_client_gui_lib::portable::FlatpakImportReport) -> String {
+    use ftp_client_gui_lib::portable::HostVault;
+
+    let source = report
+        .source
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if report.imported() {
+        let files = format!(
+            "Imported {} {} from {} into the sandbox",
+            report.copied,
+            if report.copied == 1 { "file" } else { "files" },
+            source
+        );
+        match report.vault {
+            HostVault::Imported => format!(
+                "{files}, including your saved servers and vault. Restart AeroFTP to load them."
+            ),
+            HostVault::Skipped => format!(
+                "{files}, but not your saved servers and vault: this Flatpak install already has its own vault, and existing files are never overwritten. Restart AeroFTP to load what was imported."
+            ),
+            HostVault::Absent => format!(
+                "{files}, but your existing configuration held no saved servers or vault the import could copy. Restart AeroFTP to load what was imported."
+            ),
+        }
+    } else if report.vault == HostVault::Skipped {
+        format!(
+            "No file was copied from {source}, so your saved servers and vault were not imported: this Flatpak install already has its own vault and a file with the same name for each file the import would copy, and existing files are never overwritten."
+        )
+    } else if report.nothing_importable {
+        format!(
+            "Nothing to import: {source} holds no file the import copies (it copies files only, never SQLite sidecar files or symbolic links)."
+        )
+    } else {
+        // The copy skips a file by name, never by content, so this says what it
+        // saw: a file with the same name, not the same file. And it never copies
+        // symbolic links or SQLite sidecars, so the claim covers only the files
+        // it would copy: a linked file on the host is not "already here".
+        format!(
+            "No file was copied: this Flatpak install already has a file with the same name for each file the import would copy from {source}, and existing files are never overwritten."
+        )
+    }
+}
+
+#[cfg(test)]
+mod flatpak_import_summary_tests {
+    use super::flatpak_import_summary;
+    use ftp_client_gui_lib::portable::{FlatpakImportReport, HostVault};
+    use std::path::PathBuf;
+
+    fn report(copied: usize, vault: HostVault) -> FlatpakImportReport {
+        FlatpakImportReport {
+            copied,
+            vault,
+            nothing_importable: false,
+            source: Some(PathBuf::from("/home/u/.config/aeroftp")),
+            target: Some(PathBuf::from(
+                "/home/u/.var/app/app.aeroftp.AeroFTP/config/aeroftp",
+            )),
+        }
+    }
+
+    #[test]
+    fn flatpak_import_says_the_vault_stayed_behind() {
+        let text = flatpak_import_summary(&report(2, HostVault::Skipped));
+        assert!(
+            text.starts_with("Imported 2 files from /home/u/.config/aeroftp"),
+            "{text}"
+        );
+        assert!(
+            text.contains("but not your saved servers and vault: this Flatpak install already has its own vault"),
+            "{text}"
+        );
+
+        // The claim covers the files the import copies, not every host file:
+        // symbolic links and SQLite sidecars are never copied.
+        assert_eq!(
+            flatpak_import_summary(&report(0, HostVault::Skipped)),
+            "No file was copied from /home/u/.config/aeroftp, so your saved servers and vault were not imported: this Flatpak install already has its own vault and a file with the same name for each file the import would copy, and existing files are never overwritten."
+        );
+    }
+
+    #[test]
+    fn flatpak_import_says_no_file_was_copied_not_that_none_was_needed() {
+        // The copy skips by name, never by content, and never copies symbolic
+        // links or SQLite sidecars: the claim is about the files it would copy.
+        assert_eq!(
+            flatpak_import_summary(&report(0, HostVault::Absent)),
+            "No file was copied: this Flatpak install already has a file with the same name for each file the import would copy from /home/u/.config/aeroftp, and existing files are never overwritten."
+        );
+    }
+
+    #[test]
+    fn flatpak_import_of_a_config_with_nothing_to_copy_says_nothing_to_import() {
+        let mut empty = report(0, HostVault::Absent);
+        empty.nothing_importable = true;
+        assert_eq!(
+            flatpak_import_summary(&empty),
+            "Nothing to import: /home/u/.config/aeroftp holds no file the import copies (it copies files only, never SQLite sidecar files or symbolic links)."
+        );
+    }
+
+    #[test]
+    fn flatpak_import_says_whether_the_servers_and_vault_came() {
+        let text = flatpak_import_summary(&report(3, HostVault::Imported));
+        assert!(
+            text.contains("including your saved servers and vault"),
+            "{text}"
+        );
+        // A user who expects the servers after the restart is told none came.
+        assert_eq!(
+            flatpak_import_summary(&report(1, HostVault::Absent)),
+            "Imported 1 file from /home/u/.config/aeroftp into the sandbox, but your existing configuration held no saved servers or vault the import could copy. Restart AeroFTP to load what was imported."
+        );
     }
 }
 
@@ -39050,11 +40809,12 @@ async fn cmd_aerorsync_probe(
 fn classify_keystore_error(err: &ftp_client_gui_lib::keystore_export::KeystoreExportError) -> i32 {
     use ftp_client_gui_lib::keystore_export::KeystoreExportError as E;
     match err {
-        E::InvalidPassword => 6,       // auth failure
-        E::VaultNotReady => 5,         // configuration / vault-locked
-        E::UnsupportedVersion(_) => 7, // not-supported / unsupported version
-        E::UnsupportedCodec(_) => 7,   // same family: this build cannot read it
-        E::Io(_) => 11,                // I/O
+        E::InvalidPassword => 6,          // auth failure
+        E::VaultNotReady => 5,            // configuration / vault-locked
+        E::UnsupportedVersion(_) => 7,    // not-supported / unsupported version
+        E::UnsupportedCodec(_) => 7,      // same family: this build cannot read it
+        E::StaleProfileDecisions(_) => 5, // usage: the choices do not fit this backup
+        E::Io(_) => 11,                   // I/O
         // Both cover too many distinct causes for one code to say anything
         // useful, so they say nothing rather than something false.
         E::Serialization(_) | E::Encryption(_) => 99,
@@ -40295,15 +42055,15 @@ async fn cmd_stat(url: &str, path: &str, cli: &Cli, format: OutputFormat) -> i32
                             "Next: {}",
                             if entry.is_dir {
                                 format!(
-                                    "aeroftp-cli ls --profile \"{}\" \"{}\" --json",
+                                    "aeroftp-cli ls --profile {} {} --json",
                                     profile_or_placeholder(cli),
-                                    shell_double_quote(&entry.path)
+                                    shell_arg(&entry.path)
                                 )
                             } else {
                                 format!(
-                                    "aeroftp-cli ls --profile \"{}\" \"{}\" --json",
+                                    "aeroftp-cli ls --profile {} {} --json",
                                     profile_or_placeholder(cli),
-                                    shell_double_quote(&parent_remote_path(&entry.path))
+                                    shell_arg(&parent_remote_path(&entry.path))
                                 )
                             }
                         );
@@ -40315,15 +42075,15 @@ async fn cmd_stat(url: &str, path: &str, cli: &Cli, format: OutputFormat) -> i32
                         "entry": remote_entry_to_filtered_json(&entry, cli),
                         "suggested_next_command": if entry.is_dir {
                             format!(
-                                "aeroftp-cli ls --profile \"{}\" \"{}\" --json",
+                                "aeroftp-cli ls --profile {} {} --json",
                                 profile_or_placeholder(cli),
-                                shell_double_quote(&entry.path)
+                                shell_arg(&entry.path)
                             )
                         } else {
                             format!(
-                                "aeroftp-cli ls --profile \"{}\" \"{}\" --json",
+                                "aeroftp-cli ls --profile {} {} --json",
                                 profile_or_placeholder(cli),
-                                shell_double_quote(&parent_remote_path(&entry.path))
+                                shell_arg(&parent_remote_path(&entry.path))
                             )
                         },
                     }));
@@ -41358,7 +43118,7 @@ async fn lsjson_server_hash(
     }
     // 2. Server-side checksum: HEAD / exec / API, never a content download.
     if provider.supports_checksum() {
-        if let Ok(map) = provider.checksum(&entry.path).await {
+        if let Ok(map) = provider.checksum_for(&entry.path, key).await {
             if let Some(v) = map.get(key) {
                 return wrap(v);
             }
@@ -46401,12 +48161,13 @@ async fn cmd_dedupe(
         // Safety cap: bound the number of destructive actions. Percentages are
         // taken against the total scanned files. Default cap when --max-delete is
         // omitted; an explicit value raises (or lowers) it.
-        let limit = match max_delete {
-            Some(v) if v.ends_with('%') => {
-                let pct: f64 = v.trim_end_matches('%').parse().unwrap_or(100.0);
-                ((pct / 100.0) * files.len() as f64).ceil() as usize
+        let limit = match max_delete.map(MaxDeleteCap::parse) {
+            Some(Ok(cap)) => cap.limit(files.len()),
+            Some(Err(err)) => {
+                print_error(format, &err, 5);
+                let _ = provider.disconnect().await;
+                return 5;
             }
-            Some(v) => v.parse::<usize>().unwrap_or(usize::MAX),
             None => DEFAULT_SYNC_MAX_DELETE,
         };
         if planned_actions > limit {
@@ -46645,14 +48406,21 @@ async fn dedupe_hash_remote_sha256(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// The exact order of two mtimes for `dedupe --mode newest|oldest`: a file
+/// with a date that reads orders after one without.
+fn dedupe_mtime_order(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    a.and_then(ftp_client_gui_lib::parse_remote_mtime)
+        .cmp(&b.and_then(ftp_client_gui_lib::parse_remote_mtime))
+}
+
 /// Sort a dedupe group so index 0 is the file to keep, based on mode.
 fn dedupe_sort_group(group: &mut [(String, u64, Option<String>)], mode: &str) {
     match mode {
         "newest" => {
-            group.sort_by(|a, b| compare_mtime(b.2.as_deref(), a.2.as_deref()));
+            group.sort_by(|a, b| dedupe_mtime_order(b.2.as_deref(), a.2.as_deref()));
         }
         "oldest" => {
-            group.sort_by(|a, b| compare_mtime(a.2.as_deref(), b.2.as_deref()));
+            group.sort_by(|a, b| dedupe_mtime_order(a.2.as_deref(), b.2.as_deref()));
         }
         "largest" => {
             group.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -46697,21 +48465,93 @@ fn load_bisync_snapshot(local_dir: &str) -> Option<BisyncSnapshot> {
     serde_json::from_str(&data).ok()
 }
 
+/// What a `--direction both` run established, path by path. The snapshot
+/// records only this: a pair the run left open, or a transfer it did not
+/// finish, is not in sync, and recording it as synced made the next run read
+/// the other side as the one that changed and copy it over the pair.
+#[derive(Debug, Default)]
+struct BisyncOutcome {
+    /// Paths in sync after the run, with the size both sides hold and the
+    /// local file's mtime as it is on disk now.
+    settled: HashMap<String, (u64, String)>,
+    /// Paths the run removed from the side that still had them.
+    removed: std::collections::HashSet<String>,
+    /// The run decided without the previous snapshot (`--resync`): its
+    /// entries for the paths the run saw and did not settle are dropped
+    /// rather than kept.
+    rebuilt: bool,
+}
+
+/// The paths a `--direction both` run acted on, by what it did.
+struct BisyncRunPaths<'a> {
+    /// Pairs found in sync.
+    in_sync: &'a [&'a str],
+    /// Planned uploads.
+    uploaded: &'a [&'a str],
+    /// Completed downloads, with the state each left on disk when it
+    /// completed.
+    downloaded: &'a HashMap<String, (u64, String)>,
+    /// `--track-renames` renames that went through, `(old, new)`.
+    renamed: &'a [(&'a str, &'a str)],
+    /// Deletes that went through, on either side.
+    deleted: &'a [&'a str],
+}
+
+/// What the run settled, from what it did: the pairs in sync and the uploads
+/// as the local scan saw them, the downloads as they were when each completed
+/// (not as the file is when the run ends: an edit made since is a change the
+/// next run must see), the new names of renames; the deletes and the old
+/// names are removed. The uploads count only when `transfers_complete`: they
+/// are known by count, not by path, so a run that left one behind records
+/// none of them.
+fn bisync_outcome(
+    local_map: &HashMap<&str, (u64, Option<&str>)>,
+    paths: BisyncRunPaths<'_>,
+    transfers_complete: bool,
+) -> BisyncOutcome {
+    let mut outcome = BisyncOutcome::default();
+    let as_scanned = |path: &str| {
+        local_map
+            .get(path)
+            .map(|(size, mtime)| (*size, mtime.unwrap_or("").to_string()))
+    };
+    for path in paths.in_sync {
+        if let Some(state) = as_scanned(path) {
+            outcome.settled.insert(path.to_string(), state);
+        }
+    }
+    if transfers_complete {
+        for path in paths.uploaded {
+            if let Some(state) = as_scanned(path) {
+                outcome.settled.insert(path.to_string(), state);
+            }
+        }
+    }
+    // Each of these is known to have completed, whatever else the run left.
+    for (path, state) in paths.downloaded {
+        outcome.settled.insert(path.clone(), state.clone());
+    }
+    for (old, new) in paths.renamed {
+        outcome.removed.insert(old.to_string());
+        if let Some(state) = as_scanned(new) {
+            outcome.settled.insert(new.to_string(), state);
+        }
+    }
+    for path in paths.deleted {
+        outcome.removed.insert(path.to_string());
+    }
+    outcome
+}
+
 fn save_bisync_snapshot(
     local_dir: &str,
     local_entries: &[(String, u64, Option<String>)],
     remote_entries: &[(String, u64, Option<String>)],
+    outcome: &BisyncOutcome,
     listed: Option<&std::collections::HashSet<String>>,
     bound: &ftp_client_gui_lib::sync_core::ScanBound,
     left_alone: &[ftp_client_gui_lib::sync_core::SkippedLink],
 ) {
-    let mut files = HashMap::new();
-    // Merge both sides - after a successful sync they should be equal
-    for (path, size, mtime) in local_entries.iter().chain(remote_entries.iter()) {
-        files
-            .entry(path.clone())
-            .or_insert_with(|| (*size, mtime.as_deref().unwrap_or("").to_string()));
-    }
     // A `--files-from` run saw only the listed paths, and a bounded run left
     // every path its scans could not see alone, so either may rewrite only what
     // it saw. The previous snapshot's entries for the rest are kept: dropped, the
@@ -46732,17 +48572,28 @@ fn save_bisync_snapshot(
                     .is_some_and(|rest| rest.starts_with('/'))
         })
     };
-    if listed.is_some() || !bound.is_empty() || !left_alone.is_empty() {
-        if let Some(previous) = load_bisync_snapshot(local_dir) {
-            for (path, state) in previous.files {
-                let saw = listed.is_none_or(|listed| listed.contains(&path))
-                    && !bound.covers(&path)
-                    && !under_a_reported_link(&path);
-                if !saw {
-                    files.entry(path).or_insert(state);
-                }
-            }
-        }
+    let saw = |path: &str| {
+        listed.is_none_or(|listed| listed.contains(path))
+            && !bound.covers(path)
+            && !under_a_reported_link(path)
+    };
+    let present: std::collections::HashSet<&str> = local_entries
+        .iter()
+        .chain(remote_entries.iter())
+        .map(|(path, _, _)| path.as_str())
+        .collect();
+    let mut files = load_bisync_snapshot(local_dir)
+        .map(|previous| previous.files)
+        .unwrap_or_default();
+    // Of the paths the run saw, one gone from both sides loses its entry; one
+    // still there keeps it unless the run settled it (below) or decided
+    // without the snapshot.
+    files.retain(|path, _| !saw(path) || (!outcome.rebuilt && present.contains(path.as_str())));
+    for path in &outcome.removed {
+        files.remove(path);
+    }
+    for (path, state) in &outcome.settled {
+        files.insert(path.clone(), state.clone());
     }
     let snapshot = BisyncSnapshot {
         synced_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -46814,44 +48665,487 @@ fn apply_default_time<'a>(mtime: Option<&'a str>, default: Option<&'a str>) -> O
     mtime.or(default)
 }
 
-/// Tolerance for "same instant" decisions between two stores: FAT and FTP
-/// `MDTM` keep 2-second granularity, and clocks on two machines are never
-/// exactly aligned.
-const SYNC_MTIME_TOLERANCE_SECS: i64 = 2;
-
 /// One-way sync, sizes already equal: is the destination copy current?
 ///
 /// The destination is current when its mtime is not older than the source's
-/// (within tolerance): a copy written after the source last changed already
-/// holds that content. Backends that do not preserve mtime (S3 reports the
-/// upload time) therefore stop re-uploading every file on every run, and a
-/// source edited after the last sync (newer than the destination) is still
-/// transferred. When either timestamp cannot be parsed the rule falls back to
-/// the exact comparison the planner always used.
-fn destination_is_current(src_mtime: Option<&str>, dst_mtime: Option<&str>) -> bool {
-    match (
-        src_mtime.and_then(ftp_client_gui_lib::parse_remote_mtime),
-        dst_mtime.and_then(ftp_client_gui_lib::parse_remote_mtime),
-    ) {
-        (Some(src), Some(dst)) => dst + SYNC_MTIME_TOLERANCE_SECS >= src,
-        _ => compare_mtime(src_mtime, dst_mtime) == std::cmp::Ordering::Equal,
+/// (within `window`, see [`ModifyWindow`]): a copy written after the source
+/// last changed already holds that content. Backends that do not preserve
+/// mtime (S3 reports the upload time) therefore stop re-uploading every file
+/// on every run, and a source edited after the last sync (newer than the
+/// destination) is still transferred. A size-only window, or a date that is
+/// missing or cannot be read, leaves the equal sizes to decide.
+fn destination_is_current(
+    src_mtime: Option<&str>,
+    dst_mtime: Option<&str>,
+    window: ModifyWindow,
+) -> bool {
+    !matches!(
+        window.order_text(src_mtime, dst_mtime),
+        Some(std::cmp::Ordering::Greater)
+    )
+}
+
+/// The conflict policy `sync` runs with: `newer` by default in `--direction
+/// both`, `source` (the source copy wins, what one-way sync always did) in
+/// `upload` / `download`. A value a direction cannot honour is a usage error,
+/// with one exception: `newer` in a one-way sync has no effect and runs as
+/// `source` (see [`one_way_newer_notice`]), because the GUI script export
+/// writes `--conflict-mode newer` whatever the direction (4.2.0 included), and
+/// refusing it would stop every exported Mirror and Backup script.
+fn resolve_sync_conflict_mode(requested: Option<&str>, direction: &str) -> Result<String, String> {
+    let one_way = direction == "upload" || direction == "download";
+    match (requested, one_way) {
+        (None, false) => Ok("newer".to_string()),
+        (None, true) => Ok("source".to_string()),
+        (Some(mode @ ("source" | "skip")), true) => Ok(mode.to_string()),
+        (Some("newer" | "newest"), true) => Ok("source".to_string()),
+        (Some(mode), true) if SYNC_CONFLICT_MODES.contains(&mode) => Err(format!(
+            "--conflict-mode {mode} needs --direction both; one-way sync accepts source or skip"
+        )),
+        (Some("source"), false) => {
+            Err("--conflict-mode source needs --direction upload or download".to_string())
+        }
+        (Some(mode), false) if SYNC_CONFLICT_MODES.contains(&mode) => Ok(mode.to_string()),
+        (Some(mode), _) => Err(format!(
+            "invalid --conflict-mode '{mode}': expected newer, older, larger, smaller, rename or skip with --direction both, source or skip with --direction upload or download"
+        )),
     }
 }
 
-fn compare_mtime(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            match (
-                ftp_client_gui_lib::parse_remote_mtime(a),
-                ftp_client_gui_lib::parse_remote_mtime(b),
-            ) {
-                (Some(ta), Some(tb)) => ta.cmp(&tb),
-                _ => a.cmp(b), // fallback to lexicographic
+/// The line `sync` prints when a one-way run was given `--conflict-mode
+/// newer`, which it accepts and does not apply.
+fn one_way_newer_notice(requested: Option<&str>, direction: &str) -> Option<&'static str> {
+    let one_way = direction == "upload" || direction == "download";
+    (one_way && matches!(requested, Some("newer" | "newest"))).then_some(
+        "Note: --conflict-mode newer applies to --direction both only; in a one-way sync the source copy wins (--update keeps a destination copy that is newer)",
+    )
+}
+
+/// What a one-way sync does with a file present on both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneWayPair {
+    /// Current, or a destination newer than the source left by `--update`.
+    Skip,
+    Transfer,
+    /// A changed pair the rule leaves alone because nothing says which copy
+    /// is newer: reported, since the destination is not current.
+    LeftOpen,
+}
+
+/// How `sync` decides whether a file present on both sides moves: the flags
+/// `--conflict-mode`, `--skip-matching`, `--update`, `--modify-window` and
+/// `--checksum`, resolved once and carried together.
+#[derive(Debug, Clone, Copy)]
+struct SyncPairRule<'a> {
+    /// Resolved by [`resolve_sync_conflict_mode`]: never absent.
+    conflict_mode: &'a str,
+    skip_matching: bool,
+    update: bool,
+    /// `--modify-window` as given; the run raises it to the backend's
+    /// precision ([`ModifyWindow::against_provider`]).
+    modify_window: Option<u64>,
+    checksum: bool,
+}
+
+impl SyncPairRule<'_> {
+    fn requested_window(&self) -> Option<std::time::Duration> {
+        self.modify_window.map(std::time::Duration::from_secs)
+    }
+}
+
+/// The one-way decision, the CLI form of the GUI Mirror / Backup / Update
+/// buckets. `same_content` is the `--checksum` verdict when there is one: a
+/// match is current whatever the dates, a mismatch is a changed file even at
+/// the same size. Without it, same size and a destination at least as new is
+/// current (skipped). A changed file whose source is newer beyond the window is
+/// transferred; one whose destination is newer beyond the window is skipped
+/// with `--update` and transferred otherwise (Mirror: the source wins).
+/// Anything else (a change inside the window, a date that is unknown, or a
+/// size-only window) is a conflict: `--conflict-mode skip` leaves it open,
+/// `source` transfers it. `--update` leaves open one the dates cannot order,
+/// since the destination may be newer; one whose date is the same within the
+/// window is not newer, and it is transferred, as rsync does.
+fn plan_one_way_pair(
+    rule: &SyncPairRule<'_>,
+    window: ModifyWindow,
+    src_size: u64,
+    src_mtime: Option<&str>,
+    dst_size: u64,
+    dst_mtime: Option<&str>,
+    same_content: Option<bool>,
+) -> OneWayPair {
+    let current = match same_content {
+        Some(same) => same,
+        None => {
+            src_size == dst_size
+                && (rule.skip_matching || destination_is_current(src_mtime, dst_mtime, window))
+        }
+    };
+    if current {
+        return OneWayPair::Skip;
+    }
+    match window.order_text(src_mtime, dst_mtime) {
+        Some(std::cmp::Ordering::Greater) => OneWayPair::Transfer,
+        Some(std::cmp::Ordering::Less) if rule.update => OneWayPair::Skip,
+        Some(std::cmp::Ordering::Less) => OneWayPair::Transfer,
+        _ if rule.conflict_mode == "skip" => OneWayPair::LeftOpen,
+        // `--update` protects a destination that may be newer, and one the
+        // dates cannot order may be.
+        None if rule.update => OneWayPair::LeftOpen,
+        _ => OneWayPair::Transfer,
+    }
+}
+
+/// The `sync --checksum` verdicts: for each file present on both sides with the
+/// same size, whether the two copies hold the same bytes. A pair missing here
+/// had no checksum both sides could produce and is decided by size and time;
+/// `unverifiable` counts those, so the run can say how many.
+#[derive(Debug, Default)]
+struct SyncChecksumVerdicts {
+    same: HashMap<String, bool>,
+    unverifiable: u32,
+}
+
+impl SyncChecksumVerdicts {
+    fn get(&self, path: &str) -> Option<bool> {
+        self.same.get(path).copied()
+    }
+}
+
+/// The digest `sync --checksum` compares for one remote file: the first of the
+/// backend's checksums that a local file can be hashed with, strongest first.
+/// Provider maps spell the keys inconsistently (`sha256`, `SHA-256`, `sha_256`).
+fn sync_checksum_pick(checksums: &HashMap<String, String>) -> Option<(HashAlgorithm, String)> {
+    const ORDER: &[(HashAlgorithm, &[&str])] = &[
+        (HashAlgorithm::Sha256, &["sha256", "sha-256", "sha_256"]),
+        (HashAlgorithm::Sha512, &["sha512", "sha-512", "sha_512"]),
+        (HashAlgorithm::Blake3, &["blake3"]),
+        (HashAlgorithm::Sha1, &["sha1", "sha-1", "sha_1"]),
+        (HashAlgorithm::Md5, &["md5"]),
+    ];
+    let lower: HashMap<String, &String> = checksums
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+        .collect();
+    ORDER.iter().find_map(|(algo, keys)| {
+        keys.iter().find_map(|key| {
+            lower
+                .get(*key)
+                .map(|value| (*algo, value.trim().to_ascii_lowercase()))
+        })
+    })
+}
+
+/// Read the `--checksum` verdict of every same-size pair: the backend's
+/// server-side checksum against a local digest of the same algorithm. A
+/// backend without server-side checksums (or a crypt overlay, whose stored
+/// digests are of the ciphertext) gives no verdict at all.
+async fn sync_checksum_verdicts(
+    provider: &mut dyn StorageProvider,
+    local: &str,
+    remote: &str,
+    local_map: &HashMap<&str, (u64, Option<&str>)>,
+    remote_map: &HashMap<&str, (u64, Option<&str>)>,
+    cancelled: &AtomicBool,
+) -> SyncChecksumVerdicts {
+    let mut verdicts = SyncChecksumVerdicts::default();
+    let mut pairs: Vec<&str> = local_map
+        .iter()
+        .filter(|(path, (size, _))| {
+            remote_map
+                .get(*path)
+                .is_some_and(|(rsize, _)| rsize == size)
+        })
+        .map(|(path, _)| *path)
+        .collect();
+    pairs.sort_unstable();
+    if !provider.supports_checksum() {
+        verdicts.unverifiable = pairs.len() as u32;
+        return verdicts;
+    }
+    for path in pairs {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let remote_path = format!("{}/{}", remote.trim_end_matches('/'), path);
+        let picked = match provider.checksum(&remote_path).await {
+            Ok(map) => sync_checksum_pick(&map),
+            Err(_) => None,
+        };
+        let Some((algo, remote_digest)) = picked else {
+            verdicts.unverifiable += 1;
+            continue;
+        };
+        let local_path = Path::new(local).join(path);
+        let local_digest =
+            tokio::task::spawn_blocking(move || hash_file_streaming_algo(algo, &local_path))
+                .await
+                .ok()
+                .and_then(Result::ok);
+        match local_digest {
+            Some(digest) => {
+                verdicts.same.insert(
+                    path.to_string(),
+                    digest.eq_ignore_ascii_case(&remote_digest),
+                );
+            }
+            None => verdicts.unverifiable += 1,
+        }
+    }
+    verdicts
+}
+
+/// How to settle the pairs a run left open, for the direction it ran in.
+fn sync_open_pairs_hint(direction: &str) -> &'static str {
+    if direction == "both" {
+        "To settle them: make the two copies the same, choose a rule for them \
+         (--conflict-mode rename; larger or smaller only for copies of different \
+         sizes), or sync them one way (--direction upload or download, with \
+         --files-from naming them). --resync does not settle them. Deleting one \
+         copy by hand is not a way out: with --delete the next run deletes the \
+         other copy too."
+    } else {
+        "To transfer them, run again with --conflict-mode source and without \
+         --update (add --files-from naming them to copy only those)."
+    }
+}
+
+/// Up to `limit` paths joined for a message, then how many more there are.
+fn sync_path_list(paths: &[String], limit: usize) -> String {
+    let shown = paths[..paths.len().min(limit)].join(", ");
+    match paths.len().saturating_sub(limit) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// Every parent directory of a relative path, deepest first
+/// (`a/b/c.txt` gives `a/b`, then `a`).
+fn relative_parent_dirs(path: &str) -> impl Iterator<Item = &str> {
+    path.rmatch_indices('/').map(move |(at, _)| &path[..at])
+}
+
+/// The directories a one-way `sync --delete` may remove once its orphan files
+/// are gone, deepest first: each parent directory of a deleted orphan that no
+/// source file lives under, that the exclude list does not name, and that the
+/// scans did not leave out (`unseen`). The run still checks that the source
+/// has no directory of that name, and lists each one again right before it
+/// removes it, keeping it unless that listing is empty: a file the scan did not
+/// see (an excluded one, one written since) keeps its directory.
+fn sync_orphan_dir_candidates<'a>(
+    deleted: &[&'a str],
+    source_paths: impl IntoIterator<Item = &'a str>,
+    excludes: &SyncExcludes,
+    unseen: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let source_dirs: std::collections::HashSet<&str> = source_paths
+        .into_iter()
+        .flat_map(relative_parent_dirs)
+        .collect();
+    let mut dirs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for path in deleted {
+        for dir in relative_parent_dirs(path) {
+            if !source_dirs.contains(dir) && !excludes.is_excluded(dir) && !unseen(dir) {
+                dirs.insert(dir);
             }
         }
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (None, None) => std::cmp::Ordering::Equal,
+    }
+    let mut out: Vec<String> = dirs.into_iter().map(str::to_string).collect();
+    out.sort_by(|a, b| {
+        b.matches('/')
+            .count()
+            .cmp(&a.matches('/').count())
+            .then_with(|| a.cmp(b))
+    });
+    out
+}
+
+/// Whether `rmdir` on this backend refuses a directory that is not empty, by
+/// protocol: FTP `RMD` and SFTP `rmdir` do. Object stores and most cloud APIs
+/// delete a directory with everything in it, and a listing can leave stored
+/// objects out (a crypt overlay's sentinels, a listing that is not
+/// authoritative), so an "emptied" directory there is not removed. The crypt
+/// and compress overlays forward `rmdir` to the backend's own, and report its
+/// type, so they answer as the backend underneath.
+fn sync_rmdir_refuses_non_empty(provider: ProviderType) -> bool {
+    matches!(
+        provider,
+        ProviderType::Ftp | ProviderType::Ftps | ProviderType::Sftp
+    )
+}
+
+/// Whether `dir` is the `--backup-dir` directory or inside it: the empty
+/// directories a `sync --delete` removes never include the backups.
+fn sync_backup_dir_holds(backup_dir: Option<&str>, dir: &Path) -> bool {
+    let Some(backup) = backup_dir else {
+        return false;
+    };
+    let (Ok(backup), Ok(dir)) = (std::fs::canonicalize(backup), std::fs::canonicalize(dir)) else {
+        return false;
+    };
+    dir.starts_with(backup)
+}
+
+/// The local-to-local flags `sync --local` would otherwise ignore.
+struct LocalToLocalFlags<'a> {
+    direction: &'a str,
+    delete: bool,
+    track_renames: bool,
+    max_delete: bool,
+    backup_dir: bool,
+    compare_dest: bool,
+    copy_dest: bool,
+    from_reconcile: bool,
+    conflict_mode: bool,
+    skip_matching: bool,
+    update: bool,
+    modify_window: bool,
+    checksum: bool,
+    resync: bool,
+    watch: bool,
+    files_from: bool,
+    files_from_raw: bool,
+}
+
+fn local_to_local_ignored_flags(f: &LocalToLocalFlags) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    // The copier copies source to destination: `upload` says so, `both` is
+    // the default nobody typed; `download` would be the opposite direction.
+    if f.direction == "download" {
+        out.push("--direction");
+    }
+    for (set, name) in [
+        (f.delete, "--delete"),
+        (f.track_renames, "--track-renames"),
+        (f.max_delete, "--max-delete"),
+        (f.backup_dir, "--backup-dir"),
+        (f.compare_dest, "--compare-dest"),
+        (f.copy_dest, "--copy-dest"),
+        (f.from_reconcile, "--from-reconcile"),
+        (f.conflict_mode, "--conflict-mode"),
+        (f.skip_matching, "--skip-matching"),
+        (f.update, "--update"),
+        (f.modify_window, "--modify-window"),
+        (f.checksum, "--checksum"),
+        (f.resync, "--resync"),
+        (f.watch, "--watch"),
+        (f.files_from, "--files-from"),
+        (f.files_from_raw, "--files-from-raw"),
+    ] {
+        if set {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The side of a pair that changed since the last bisync snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedSide {
+    Local,
+    Remote,
+}
+
+/// Which side changed since the last bisync snapshot, when exactly one did.
+/// The snapshot records the size both sides had and the LOCAL mtime, so the
+/// local side is read by size and time with the local clock
+/// ([`ModifyWindow::LOCAL`], whatever `--modify-window` says: two local
+/// clocks have no skew, and a window sized for a server in another zone
+/// would hide an edit) and the remote side by size alone: the question is
+/// asked only when the remote dates do not order the pair.
+fn bisync_changed_side(
+    snapshot: Option<&BisyncSnapshot>,
+    path: &str,
+    local_size: u64,
+    local_mtime: Option<&str>,
+    remote_size: u64,
+) -> Option<ChangedSide> {
+    let (size, mtime) = snapshot?.files.get(path)?;
+    let local_changed = local_size != *size
+        || matches!(
+            ModifyWindow::LOCAL
+                .order_text(local_mtime, Some(mtime.as_str()).filter(|m| !m.is_empty())),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+        );
+    let remote_changed = remote_size != *size;
+    match (local_changed, remote_changed) {
+        (true, false) => Some(ChangedSide::Local),
+        (false, true) => Some(ChangedSide::Remote),
+        _ => None,
+    }
+}
+
+/// The window two local copies of a file are compared with: `--modify-window`
+/// as given, raised to the local filesystem's precision.
+fn local_pair_window(requested: Option<std::time::Duration>) -> ModifyWindow {
+    use ftp_client_gui_lib::sync_core::mtime::{SizeOnlyReason, LOCAL_MTIME_PRECISION};
+    ModifyWindow::resolve(
+        requested,
+        LOCAL_MTIME_PRECISION,
+        LOCAL_MTIME_PRECISION,
+        SizeOnlyReason::NoComparableTime,
+    )
+}
+
+/// Whether `sync --direction both` leaves a pair as it is: the same size and
+/// the same date within the window. When no date orders the pair (a size-only
+/// window, a date missing), the same size is current unless the snapshot says
+/// the local copy changed since the last run: a same-size local edit is a
+/// change, and read as current it would never be uploaded.
+fn bisync_pair_is_current(
+    snapshot: Option<&BisyncSnapshot>,
+    path: &str,
+    (local_size, local_mtime): (u64, Option<&str>),
+    (remote_size, remote_mtime): (u64, Option<&str>),
+    window: ModifyWindow,
+) -> bool {
+    local_size == remote_size
+        && match window.order_text(local_mtime, remote_mtime) {
+            Some(std::cmp::Ordering::Equal) => true,
+            Some(_) => false,
+            None => {
+                bisync_changed_side(snapshot, path, local_size, local_mtime, remote_size)
+                    != Some(ChangedSide::Local)
+            }
+        }
+}
+
+/// What `sync --direction both` does with a pair whose copies differ:
+/// "upload", "download", "rename", or "skip" (the pair is left open).
+/// `newer` and `older` follow the dates when they order the pair; when they do
+/// not (a size-only window, a date missing, the same date within the window),
+/// the side the bisync snapshot says changed since the last run is the newer
+/// one, and a pair the snapshot cannot decide either is left open.
+fn bisync_conflict_action(
+    conflict_mode: &str,
+    snapshot: Option<&BisyncSnapshot>,
+    path: &str,
+    (local_size, local_mtime): (u64, Option<&str>),
+    (remote_size, remote_mtime): (u64, Option<&str>),
+    window: ModifyWindow,
+) -> &'static str {
+    let dates_order = matches!(
+        window.order_text(local_mtime, remote_mtime),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
+    );
+    let by_snapshot = if dates_order {
+        None
+    } else {
+        bisync_changed_side(snapshot, path, local_size, local_mtime, remote_size)
+    };
+    match (conflict_mode, by_snapshot) {
+        ("newer" | "newest", Some(ChangedSide::Local))
+        | ("older" | "oldest", Some(ChangedSide::Remote)) => "upload",
+        ("newer" | "newest", Some(ChangedSide::Remote))
+        | ("older" | "oldest", Some(ChangedSide::Local)) => "download",
+        _ => resolve_conflict(
+            conflict_mode,
+            local_size,
+            local_mtime,
+            remote_size,
+            remote_mtime,
+            window,
+        ),
     }
 }
 
@@ -46863,34 +49157,22 @@ fn resolve_conflict(
     local_mtime: Option<&str>,
     remote_size: u64,
     remote_mtime: Option<&str>,
+    window: ModifyWindow,
 ) -> &'static str {
     match conflict_mode {
-        "newer" | "newest" => match compare_mtime(local_mtime, remote_mtime) {
-            std::cmp::Ordering::Greater => "upload",
-            std::cmp::Ordering::Less => "download",
-            std::cmp::Ordering::Equal => {
-                // mtime equal but size differs - fallback to larger wins
-                if local_size > remote_size {
-                    "upload"
-                } else if remote_size > local_size {
-                    "download"
-                } else {
-                    "skip"
-                }
-            }
+        // Dates that do not order the pair (a backend with no comparable
+        // time, a date missing or unreadable, the same date within the
+        // window) cannot say which copy is newer: the pair is left alone
+        // rather than handed to the larger copy.
+        "newer" | "newest" => match window.order_text(local_mtime, remote_mtime) {
+            Some(std::cmp::Ordering::Greater) => "upload",
+            Some(std::cmp::Ordering::Less) => "download",
+            Some(std::cmp::Ordering::Equal) | None => "skip",
         },
-        "older" | "oldest" => match compare_mtime(local_mtime, remote_mtime) {
-            std::cmp::Ordering::Less => "upload",
-            std::cmp::Ordering::Greater => "download",
-            std::cmp::Ordering::Equal => {
-                if local_size < remote_size {
-                    "upload"
-                } else if remote_size < local_size {
-                    "download"
-                } else {
-                    "skip"
-                }
-            }
+        "older" | "oldest" => match window.order_text(local_mtime, remote_mtime) {
+            Some(std::cmp::Ordering::Less) => "upload",
+            Some(std::cmp::Ordering::Greater) => "download",
+            Some(std::cmp::Ordering::Equal) | None => "skip",
         },
         "larger" | "largest" => {
             if local_size > remote_size {
@@ -46945,9 +49227,9 @@ fn backup_file(
     backup_suffix: &str,
     relative_path: &str,
     suffix_keep_extension: bool,
-) {
+) -> Result<(), String> {
     if backup_dir.is_empty() {
-        return;
+        return Ok(());
     }
     let backup_name = if suffix_keep_extension && !backup_suffix.is_empty() {
         // Insert suffix before extension: "file.txt" + ".bak" -> "file.bak.txt"
@@ -46971,11 +49253,35 @@ fn backup_file(
     };
     let dest = Path::new(backup_dir).join(backup_name);
     if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("backup folder {}: {}", parent.display(), e))?;
     }
-    if let Err(e) = std::fs::copy(source_path, &dest) {
-        eprintln!("Warning: backup failed for {}: {}", relative_path, e);
+    std::fs::copy(source_path, &dest)
+        .map(|_| ())
+        .map_err(|e| format!("backup of {} failed: {}", relative_path, e))
+}
+
+/// Delete one local file for `sync --delete`, after copying it into
+/// `--backup-dir` when one is set. A backup that fails leaves the file where
+/// it is and is the error: the user asked to keep a copy of what is deleted,
+/// and a warning followed by the delete lost it.
+fn backup_then_delete_local(
+    local_path: &str,
+    backup_dir: Option<&str>,
+    backup_suffix: &str,
+    relative_path: &str,
+    suffix_keep_extension: bool,
+) -> Result<(), String> {
+    if let Some(dir) = backup_dir {
+        backup_file(
+            local_path,
+            dir,
+            backup_suffix,
+            relative_path,
+            suffix_keep_extension,
+        )?;
     }
+    std::fs::remove_file(local_path).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -47418,6 +49724,12 @@ fn sync_relative_path(path: &Path, root: &str) -> String {
         .replace('\\', "/")
 }
 
+/// A local file's size and mtime as the scans record them, read now.
+fn sync_local_state(path: &str) -> Option<(u64, String)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), sync_local_mtime(&meta).unwrap_or_default()))
+}
+
 /// A local file's modification time in the form `sync` compares.
 fn sync_local_mtime(meta: &std::fs::Metadata) -> Option<String> {
     meta.modified().ok().map(|t| {
@@ -47689,6 +50001,15 @@ fn plan_sync_orphan_deletes<'a>(
     Ok(orphans)
 }
 
+/// With `--profile`, `sync LOCAL REMOTE` puts the paths in the first two
+/// positional slots (the URL slot and the local one). They move one slot
+/// along unless the first is a real URL or the `_` placeholder. The AeroSync
+/// Plan tab builds its command line for this rule; see
+/// `aerosync_plan_cli_line_tests`.
+fn profile_shifts_positionals(has_profile: bool, url: &str) -> bool {
+    has_profile && !url.contains("://") && url != "_"
+}
+
 // `use_aerorsync_batch` is only consumed inside an `aerorsync`-gated
 // block below; tolerate the dead argument when the feature is off.
 #[cfg_attr(not(feature = "aerorsync"), allow(unused_variables))]
@@ -47711,8 +50032,7 @@ async fn cmd_sync(
     compare_dest: Option<&str>,
     copy_dest: Option<&str>,
     from_reconcile: Option<&str>,
-    conflict_mode: &str,
-    skip_matching: bool,
+    pair_rule: SyncPairRule<'_>,
     resync: bool,
     cli: &Cli,
     format: OutputFormat,
@@ -47723,6 +50043,11 @@ async fn cmd_sync(
     // when the provider does not expose a delta transport.
     use_aerorsync_batch: bool,
 ) -> SyncCycleStats {
+    let SyncPairRule {
+        conflict_mode,
+        skip_matching,
+        ..
+    } = pair_rule;
     if !is_valid_sync_direction(direction) {
         print_error(
             format,
@@ -48039,6 +50364,46 @@ async fn cmd_sync(
     let local_map = sync_entry_map(local_entries);
     let remote_map = sync_entry_map(&remote_entries);
 
+    // One rule for "the same modification time", the GUI compare's: the
+    // requested window (2 s) raised to the backend's precision, or size only
+    // when the backend keeps no comparable time. Read after the scan: an FTP
+    // session whose MLSD broke lists with LIST from then on.
+    let modify_window = ModifyWindow::against_provider(pair_rule.requested_window(), &*provider);
+    if !modify_window.compares_times() && !quiet {
+        eprintln!("Note: {}", modify_window.describe());
+    }
+    // Two local copies (a file against `--compare-dest`): the local window
+    // on both sides.
+    let local_window = local_pair_window(pair_rule.requested_window());
+    // `--checksum`: the verdict of every same-size pair, read before the plan
+    // so each direction decides on it.
+    let checksum_verdicts = if pair_rule.checksum && reconcile_plan.is_none() {
+        if !quiet {
+            eprintln!("Comparing checksums of the files present on both sides...");
+        }
+        sync_checksum_verdicts(
+            provider.as_mut(),
+            local,
+            remote,
+            &local_map,
+            &remote_map,
+            &cancelled,
+        )
+        .await
+    } else {
+        SyncChecksumVerdicts::default()
+    };
+    let checksum_summary = pair_rule.checksum.then_some(CliSyncChecksumSummary {
+        compared: checksum_verdicts.same.len() as u32,
+        unverifiable: checksum_verdicts.unverifiable,
+    });
+    if checksum_verdicts.unverifiable > 0 && !quiet {
+        eprintln!(
+            "Note: --checksum: {} file(s) of the same size have no checksum both sides can compute; compared by size and time",
+            checksum_verdicts.unverifiable
+        );
+    }
+
     // Load previous snapshot for bisync delta detection (--direction both only)
     let prev_snapshot = if direction == "both" && !resync {
         load_bisync_snapshot(local)
@@ -48119,6 +50484,11 @@ async fn cmd_sync(
     // Conflict renames: (original_relative_path, conflict_suffixed_remote_path)
     let mut to_conflict_upload: Vec<(String, String)> = Vec::new();
     let mut conflicts_resolved: u32 = 0;
+    // Changed pairs the run left alone because nothing said which copy is
+    // newer: reported by path, since neither side is current.
+    let mut conflicts_open: Vec<String> = Vec::new();
+    // `--direction both`: the pairs found in sync, which the snapshot records.
+    let mut in_sync: Vec<&str> = Vec::new();
     let mut skipped: u32 = 0;
     // G102: files the `--max-transfer` budget left behind, kept apart from
     // `skipped` (already current) and from `errors` (something went wrong).
@@ -48135,23 +50505,58 @@ async fn cmd_sync(
             if let Some((rsize, rmtime)) = remote_map.get(path) {
                 let lm = apply_default_time(*mtime, default_time_ref);
                 let rm = apply_default_time(*rmtime, default_time_ref);
-                // One-way upload: the remote copy is current when it is at
-                // least as new as the local file (it was written after the
-                // local file last changed). Exact equality is impossible on
-                // backends that do not preserve mtime (S3 reports the upload
-                // time), and demanding it re-uploaded every file on every run.
-                // Bidirectional sync keeps exact equality: a difference there
-                // is a conflict to resolve, not a copy to skip.
-                let current = if direction == "upload" {
-                    skip_matching || destination_is_current(lm, rm)
-                } else {
-                    skip_matching || compare_mtime(lm, rm) == std::cmp::Ordering::Equal
+                // One-way upload: `plan_one_way_pair` (a remote copy at least as
+                // new as the local file is current, since exact equality is
+                // impossible on backends that do not preserve mtime; --update
+                // and --conflict-mode skip leave the destination alone).
+                if direction == "upload" {
+                    match plan_one_way_pair(
+                        &pair_rule,
+                        modify_window,
+                        *size,
+                        lm,
+                        *rsize,
+                        rm,
+                        checksum_verdicts.get(path),
+                    ) {
+                        OneWayPair::Skip => skipped += 1,
+                        OneWayPair::Transfer => to_upload.push(path),
+                        OneWayPair::LeftOpen => {
+                            skipped += 1;
+                            conflicts_open.push(path.to_string());
+                        }
+                    }
+                    continue;
+                }
+                // Bidirectional sync: the same pair under the same window is
+                // current; a difference is a conflict to resolve, not a copy
+                // to skip.
+                let current = match checksum_verdicts.get(path) {
+                    Some(same) => same,
+                    None => {
+                        (skip_matching && size == rsize)
+                            || bisync_pair_is_current(
+                                prev_snapshot.as_ref(),
+                                path,
+                                (*size, lm),
+                                (*rsize, rm),
+                                modify_window,
+                            )
+                    }
                 };
-                if size == rsize && current {
+                if current {
                     skipped += 1;
-                } else if direction == "both" {
+                    in_sync.push(path);
+                } else {
                     // Conflict: file exists on both sides with different content
-                    let action = resolve_conflict(conflict_mode, *size, lm, *rsize, rm);
+                    let action = bisync_conflict_action(
+                        conflict_mode,
+                        prev_snapshot.as_ref(),
+                        path,
+                        (*size, lm),
+                        (*rsize, rm),
+                        modify_window,
+                    );
                     match action {
                         "upload" => {
                             to_upload.push(path);
@@ -48175,12 +50580,9 @@ async fn cmd_sync(
                         }
                         _ => {
                             skipped += 1;
-                            conflicts_resolved += 1;
+                            conflicts_open.push(path.to_string());
                         }
                     }
-                } else {
-                    // upload-only: local always wins
-                    to_upload.push(path);
                 }
             } else {
                 // File only on local side
@@ -48210,22 +50612,26 @@ async fn cmd_sync(
             if let Some((lsize, lmtime)) = local_map.get(path) {
                 let rm = apply_default_time(*mtime, default_time_ref);
                 let lm = apply_default_time(*lmtime, default_time_ref);
-                // Mirror of the upload rule: in one-way download the local copy
-                // is current when it is at least as new as the remote file.
-                let current = if direction == "download" {
-                    skip_matching || destination_is_current(rm, lm)
-                } else {
-                    skip_matching || compare_mtime(rm, lm) == std::cmp::Ordering::Equal
-                };
-                if size == lsize && current {
-                    if direction == "download" {
-                        skipped += 1;
+                // Mirror of the upload rule, with the remote file as the source.
+                // In "both" mode the pair was already decided in the upload pass.
+                if direction == "download" {
+                    match plan_one_way_pair(
+                        &pair_rule,
+                        modify_window,
+                        *size,
+                        rm,
+                        *lsize,
+                        lm,
+                        checksum_verdicts.get(path),
+                    ) {
+                        OneWayPair::Skip => skipped += 1,
+                        OneWayPair::Transfer => to_download.push(path),
+                        OneWayPair::LeftOpen => {
+                            skipped += 1;
+                            conflicts_open.push(path.to_string());
+                        }
                     }
-                    // In "both" mode, already handled above
-                } else if direction == "download" {
-                    to_download.push(path);
                 }
-                // In "both" mode, conflicts already resolved in upload pass
             } else {
                 // File only on remote side
                 if direction == "both" {
@@ -48423,7 +50829,8 @@ async fn cmd_sync(
                 if let Some((lsize, lmtime)) = local_map.get(path) {
                     let lm = apply_default_time(*lmtime, default_time_ref);
                     if csize == *lsize
-                        && compare_mtime(cmtime.as_deref(), lm) == std::cmp::Ordering::Equal
+                        && local_window.order_text(cmtime.as_deref(), lm)
+                            == Some(std::cmp::Ordering::Equal)
                     {
                         if is_copy {
                             // Copy from compare-dest to local instead of downloading
@@ -48454,8 +50861,9 @@ async fn cmd_sync(
         }
     }
 
+    conflicts_open.sort_unstable();
     if !quiet {
-        let conflict_info = if conflicts_resolved > 0 {
+        let mut conflict_info = if conflicts_resolved > 0 {
             format!(
                 ", {} conflict(s) resolved via --conflict-mode={}",
                 conflicts_resolved, conflict_mode
@@ -48463,6 +50871,9 @@ async fn cmd_sync(
         } else {
             String::new()
         };
+        if !conflicts_open.is_empty() {
+            conflict_info.push_str(&format!(", {} conflict(s) left open", conflicts_open.len()));
+        }
         eprintln!(
             "\nSync plan: {} upload, {} download, {} delete, {} rename, {} conflict-rename, {} skipped{}",
             to_upload.len(),
@@ -48473,6 +50884,13 @@ async fn cmd_sync(
             skipped,
             conflict_info
         );
+        if !conflicts_open.is_empty() {
+            eprintln!(
+                "Left open, both copies stay as they are (changed, and nothing says which copy is newer): {}",
+                sync_path_list(&conflicts_open, 20)
+            );
+            eprintln!("{}", sync_open_pairs_hint(direction));
+        }
     }
 
     // DEL-01 / DEL-02: gate destructive --delete before applying the cap.
@@ -48504,14 +50922,33 @@ async fn cmd_sync(
     // --max-delete safety check
     if let Some(max_del) = effective_max_delete.as_deref() {
         let delete_count = to_delete_remote.len() + to_delete_local.len();
-        let total_files = local_map.len() + remote_map.len();
-        let limit = if max_del.ends_with('%') {
-            let pct: f64 = max_del.trim_end_matches('%').parse().unwrap_or(100.0);
-            ((pct / 100.0) * total_files as f64).ceil() as usize
-        } else {
-            max_del.parse::<usize>().unwrap_or(usize::MAX)
+        let cap = match MaxDeleteCap::parse(max_del) {
+            Ok(cap) => cap,
+            Err(err) => {
+                print_error(format, &err, 5);
+                let _ = provider.disconnect().await;
+                return 5.into();
+            }
         };
-        if delete_count > limit {
+        // A count caps the deletes of the whole run. A percentage applies to
+        // each side on its own: the deletes on the remote against the remote's
+        // file count, and the same locally. Summing both sides let a Mirror
+        // whose 100 files were all replaced delete the 100 old ones (100 of 200).
+        let (exceeded, limit) = match cap {
+            MaxDeleteCap::Count(_) => {
+                let limit = cap.limit(delete_count);
+                (delete_count > limit, limit)
+            }
+            MaxDeleteCap::Percent(_) => {
+                let remote_limit = cap.limit(remote_map.len());
+                let local_limit = cap.limit(local_map.len());
+                (
+                    to_delete_remote.len() > remote_limit || to_delete_local.len() > local_limit,
+                    remote_limit.max(local_limit),
+                )
+            }
+        };
+        if exceeded {
             let defaulted = max_delete.is_none();
             let msg = if defaulted {
                 format!(
@@ -48530,16 +50967,59 @@ async fn cmd_sync(
         }
     }
 
+    // The directories a one-way --delete leaves empty on the destination:
+    // candidates now (for the dry run too), each removed after the file
+    // deletes only when it lists empty then. A remote destination takes part
+    // only where `rmdir` refuses a directory that is not empty
+    // (`sync_rmdir_refuses_non_empty`): elsewhere the removal would take with
+    // it whatever the listing did not show.
+    let removes_dirs = direction == "download"
+        || (direction == "upload" && sync_rmdir_refuses_non_empty(provider.provider_type()));
+    let orphan_dirs: Vec<String> = if delete
+        && removes_dirs
+        && reconcile_plan.is_none()
+        && matches!(direction, "upload" | "download")
+    {
+        let (deleted, source_paths): (&[&str], Vec<&str>) = if direction == "upload" {
+            (&to_delete_remote, local_map.keys().copied().collect())
+        } else {
+            (&to_delete_local, remote_map.keys().copied().collect())
+        };
+        let mut dirs = Vec::new();
+        for dir in sync_orphan_dir_candidates(deleted, source_paths, &exclude_matchers, |d| {
+            bound.covers(d)
+        }) {
+            if validate_relative_path(&dir).is_none() {
+                continue;
+            }
+            // A directory the source has, empty or not, stays. On a remote
+            // source only a NotFound answer counts as absent.
+            let source_has_it = if direction == "upload" {
+                Path::new(local).join(&dir).is_dir()
+            } else {
+                let remote_dir = format!("{}/{}", remote.trim_end_matches('/'), dir);
+                !matches!(
+                    provider.stat(&remote_dir).await,
+                    Err(ProviderError::NotFound(_))
+                )
+            };
+            if !source_has_it {
+                dirs.push(dir);
+            }
+        }
+        dirs
+    } else {
+        Vec::new()
+    };
+
     // KE-A5: Apply --order-by to the transfer queue BEFORE the dry-run
     // gate so the printed/JSON plan reflects the order that the live
     // run would dispatch. The local_map / remote_map carry (size,
     // Option<mtime_string>) for every candidate; ModtimeAsc/Desc parse
     // the mtime as RFC 3339; entries without a parseable timestamp are
     // sorted to the end via OrderBy::sort_in_place.
-    let mtime_to_epoch = |raw: Option<&str>| -> Option<i64> {
-        raw.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|d| d.timestamp())
-    };
+    let mtime_to_epoch =
+        |raw: Option<&str>| -> Option<i64> { raw.and_then(ftp_client_gui_lib::parse_remote_mtime) };
     cli.order_by.sort_in_place(
         &mut to_upload,
         |p| *p,
@@ -48567,6 +51047,14 @@ async fn cmd_sync(
                 }
                 for p in &to_delete_local {
                     println!("  DELETE (local)  {}", p);
+                }
+                let side = if direction == "upload" {
+                    "remote"
+                } else {
+                    "local"
+                };
+                for d in &orphan_dirs {
+                    println!("  RMDIR ({side}, if empty after the deletes)  {d}/");
                 }
                 for (orig, conflict) in &to_conflict_upload {
                     println!("  CONFLICT-RENAME  {} -> {}", orig, conflict);
@@ -48622,6 +51110,17 @@ async fn cmd_sync(
                         conflict_path: None,
                     });
                 }
+                for d in &orphan_dirs {
+                    plan.push(CliSyncPlanEntry {
+                        op: if direction == "upload" {
+                            "rmdir_remote"
+                        } else {
+                            "rmdir_local"
+                        },
+                        path: d.clone(),
+                        ..Default::default()
+                    });
+                }
                 for (orig, conflict) in &to_conflict_upload {
                     plan.push(CliSyncPlanEntry {
                         op: "conflict_rename",
@@ -48656,6 +51155,12 @@ async fn cmd_sync(
                     // Dry run performs no transfer, so there is no engine job.
                     stats: None,
                     download_segments: None,
+                    modify_window: Some(modify_window),
+                    // A dry run removes nothing; the plan lists the candidates.
+                    dirs_deleted: 0,
+                    dirs_kept: Vec::new(),
+                    conflicts_open: conflicts_open.clone(),
+                    checksum: checksum_summary,
                 });
             }
         }
@@ -48676,6 +51181,8 @@ async fn cmd_sync(
             ec_sidecar_deleted: 0,
             ec_sidecar_delete_failed: 0,
             error_count: 0,
+            conflicts_open,
+            dirs_kept: Vec::new(),
         };
     }
 
@@ -48696,6 +51203,10 @@ async fn cmd_sync(
     let mut downloaded: u32 = 0;
     let mut deleted: u32 = 0;
     let mut errors: Vec<String> = Vec::new();
+    // What each download left on disk, read when it completed (relative
+    // path): the bisync snapshot records that, not the file as it is when
+    // the run ends, which a later edit may already have changed.
+    let mut landed: HashMap<String, (u64, String)> = HashMap::new();
     // DAG-P2-07 (block E): a sync cycle runs an upload batch and a download
     // batch on the converged DAG engine; fold their engine stats into one
     // snapshot for the `--json` result via `absorb_engine_stats`. `None` while
@@ -48878,6 +51389,8 @@ async fn cmd_sync(
         // non-pool-backed providers (FTP, single-conn APIs) fall back to
         // the legacy independent-connection batch: honest fallback, no
         // overclaim.
+        // The connection the legacy batch starts from, instead of closing it.
+        let mut legacy_upload_seed: Option<Box<dyn StorageProvider>> = None;
         let use_legacy_upload = if error_correction_enabled {
             // EC sidecars must be generated only for uploads that are known
             // to have succeeded. The shared batch reports aggregate counters,
@@ -48908,48 +51421,70 @@ async fn cmd_sync(
                         absorb_engine_stats(&mut engine_stats, outcome.engine_stats);
                         false
                     }
-                    Err(mut base) => {
-                        let _ = base.disconnect().await;
+                    Err(base) => {
+                        legacy_upload_seed = Some(base);
                         true
                     }
                 },
                 // Could not open the shared base (transient): degrade to the
-                // legacy per-file path rather than dropping the uploads.
+                // legacy batch rather than dropping the uploads.
                 Err(_) => true,
             }
         };
 
         if use_legacy_upload {
-            let upload_results = futures_util::stream::iter(leftover_upload_jobs.into_iter().map(
-                |(path, local_path, remote_path, _size)| {
+            // One connection per worker instead of one per file (see
+            // `run_on_worker_connections`).
+            let upload_results = run_on_worker_connections(
+                legacy_upload_seed.take(),
+                effective_parallel_workers(cli),
+                leftover_upload_jobs,
+                &cancelled,
+                resolve_max_transfer(cli),
+                || connect_transfer_worker(url, cli, format),
+                |conn, (path, local_path, remote_path, _size)| {
                     let cancelled = cancelled.clone();
                     let aggregate = aggregate.clone();
                     let overall_pb = overall_pb.clone();
                     async move {
                         if cancelled.load(Ordering::Relaxed) {
-                            return Err(format!("upload {}: cancelled", path));
+                            return WorkerJobDone::without_transfer(
+                                conn.ok(),
+                                format!("upload {}: cancelled", path),
+                            );
                         }
-                        let display_path = path.clone();
-                        match upload_transfer_task(
-                            url,
+                        let mut conn = match conn {
+                            Ok(conn) => conn,
+                            Err(err) => {
+                                return WorkerJobDone::without_transfer(
+                                    None,
+                                    format!("upload {}: {}", path, err),
+                                )
+                            }
+                        };
+                        let outcome = upload_transfer_on(
+                            &mut *conn,
                             local_path.clone(),
                             remote_path.clone(),
                             cli,
-                            format,
+                            false,
+                            // The folders were created before the workers started.
+                            false,
                             Some(aggregate),
                             overall_pb,
                             resolve_max_transfer(cli),
                         )
-                        .await
-                        {
-                            Ok(()) => Ok((path, local_path, remote_path)),
-                            Err(err) => Err(format!("upload {}: {}", display_path, err)),
-                        }
+                        .await;
+                        let display_path = path.clone();
+                        WorkerJobDone::from_transfer(
+                            conn,
+                            outcome,
+                            |_| (path, local_path, remote_path),
+                            |err| format!("upload {}: {}", display_path, err),
+                        )
                     }
                 },
-            ))
-            .buffer_unordered(effective_parallel_workers(cli))
-            .collect::<Vec<_>>()
+            )
             .await;
 
             for result in upload_results {
@@ -48983,37 +51518,80 @@ async fn cmd_sync(
     let mut conflict_uploaded = 0u32;
     let mut preserved_conflict_downloads: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for (orig_path, conflict_path) in &to_conflict_upload {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-        let local_path = Path::new(local)
-            .join(orig_path)
-            .to_string_lossy()
-            .to_string();
-        let remote_conflict = format!("{}/{}", remote.trim_end_matches('/'), conflict_path);
-        let local_path_for_ec = local_path.clone();
-        let remote_conflict_for_ec = remote_conflict.clone();
-        match upload_transfer_task(
-            url,
-            local_path,
-            remote_conflict,
-            cli,
-            format,
-            None,
-            None,
-            resolve_max_transfer(cli),
-        )
-        .await
-        {
-            Ok(()) => {
+    // One connection for the conflict uploads instead of one each (see
+    // `run_on_worker_connections`). A single worker keeps them in order, and a
+    // cancelled run leaves the remaining ones alone without an error, as the
+    // loop this replaces did.
+    let conflict_jobs: Vec<(String, String)> = to_conflict_upload
+        .iter()
+        .map(|(orig_path, conflict_path)| (orig_path.clone(), conflict_path.clone()))
+        .collect();
+    let conflict_results = run_on_worker_connections(
+        None,
+        1,
+        conflict_jobs,
+        &cancelled,
+        resolve_max_transfer(cli),
+        || connect_transfer_worker(url, cli, format),
+        |conn, (orig_path, conflict_path)| {
+            let cancelled = cancelled.clone();
+            async move {
+                if cancelled.load(Ordering::Relaxed) {
+                    return WorkerJobDone {
+                        conn: conn.ok(),
+                        result: Ok(None),
+                        session_lost: false,
+                        retry_safe: true,
+                        untouched: false,
+                    };
+                }
+                let local_path = Path::new(local)
+                    .join(&orig_path)
+                    .to_string_lossy()
+                    .to_string();
+                let remote_conflict = format!("{}/{}", remote.trim_end_matches('/'), conflict_path);
+                let mut conn = match conn {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        return WorkerJobDone::without_transfer(
+                            None,
+                            format!("conflict-rename {}: {}", orig_path, err),
+                        )
+                    }
+                };
+                let outcome = upload_transfer_on(
+                    &mut *conn,
+                    local_path.clone(),
+                    remote_conflict.clone(),
+                    cli,
+                    false,
+                    true,
+                    None,
+                    None,
+                    resolve_max_transfer(cli),
+                )
+                .await;
+                let display_path = orig_path.clone();
+                WorkerJobDone::from_transfer(
+                    conn,
+                    outcome,
+                    |_| Some((orig_path, conflict_path, local_path, remote_conflict)),
+                    |err| format!("conflict-rename {}: {}", display_path, err),
+                )
+            }
+        },
+    )
+    .await;
+    for result in conflict_results {
+        match result {
+            Ok(Some((orig_path, conflict_path, local_path, remote_conflict))) => {
                 conflict_uploaded += 1;
                 preserved_conflict_downloads.insert(orig_path.clone());
                 record_sync_ec_after_successful_upload(
                     provider.as_mut(),
-                    conflict_path,
-                    &local_path_for_ec,
-                    &remote_conflict_for_ec,
+                    &conflict_path,
+                    &local_path,
+                    &remote_conflict,
                     error_correction_pct,
                     error_correction_max_overhead_pct,
                     &mut ec_counters,
@@ -49024,7 +51602,9 @@ async fn cmd_sync(
                     eprintln!("  CONFLICT-RENAME  {} -> {}", orig_path, conflict_path);
                 }
             }
-            Err(e) => errors.push(format!("conflict-rename {}: {}", orig_path, e)),
+            // Cancelled before it started: not attempted, not an error.
+            Ok(None) => {}
+            Err(e) => errors.push(e),
         }
     }
 
@@ -49137,6 +51717,9 @@ async fn cmd_sync(
                         .await;
                         if res.used_delta {
                             downloaded += 1;
+                            if let Some(state) = sync_local_state(&local_path_s) {
+                                landed.insert(rel.clone(), state);
+                            }
                             // The house convention is the logical size of the
                             // RECONSTRUCTED file, read from local metadata, as
                             // `cmd_get --delta` (:31148) and the classic task
@@ -49195,6 +51778,10 @@ async fn cmd_sync(
         }
     }
     let download_jobs = leftover_download_jobs;
+    let relative_of_local: HashMap<String, String> = download_jobs
+        .iter()
+        .map(|(relative, local_path, _, _)| (local_path.clone(), relative.clone()))
+        .collect();
 
     // PD-CLI-CONV-D: converge the sync download transfer phase on the SAME
     // shared provider executor + orchestrator `aeroftp get -r` uses
@@ -49223,6 +51810,8 @@ async fn cmd_sync(
         })
         .collect();
 
+    // The connection the legacy batch starts from, instead of closing it.
+    let mut legacy_download_seed: Option<Box<dyn StorageProvider>> = None;
     let use_legacy_download = if download_files.is_empty() {
         false
     } else {
@@ -49239,63 +51828,93 @@ async fn cmd_sync(
             {
                 Ok(outcome) => {
                     downloaded += outcome.downloaded;
+                    for (local_path, state) in outcome.landed {
+                        if let Some(relative) = relative_of_local.get(&local_path) {
+                            landed.insert(relative.clone(), state);
+                        }
+                    }
                     over_budget += outcome.over_budget;
                     errors.extend(outcome.errors);
                     absorb_engine_stats(&mut engine_stats, outcome.engine_stats);
                     download_segments = Some(outcome.download_segments);
                     false
                 }
-                Err(mut base) => {
-                    let _ = base.disconnect().await;
+                Err(base) => {
+                    legacy_download_seed = Some(base);
                     true
                 }
             },
             // Could not open the shared base (transient): degrade to the
-            // legacy per-file path rather than dropping the downloads.
+            // legacy batch rather than dropping the downloads.
             Err(_) => true,
         }
     };
 
     if use_legacy_download {
-        let download_results = futures_util::stream::iter(download_jobs.into_iter().map(
-            |(path, local_path, remote_path, _size)| {
+        // One connection per worker instead of one per file (see
+        // `run_on_worker_connections`).
+        let download_results = run_on_worker_connections(
+            legacy_download_seed.take(),
+            effective_parallel_workers(cli),
+            download_jobs,
+            &cancelled,
+            resolve_max_transfer(cli),
+            || connect_transfer_worker(url, cli, format),
+            |conn, (path, local_path, remote_path, _size)| {
                 let cancelled = cancelled.clone();
                 let aggregate = aggregate.clone();
                 let overall_pb = overall_pb.clone();
                 let remote_modified = remote_mtimes.get(&remote_path).cloned();
                 async move {
                     if cancelled.load(Ordering::Relaxed) {
-                        return Err(format!("download {}: cancelled", path));
+                        return WorkerJobDone::without_transfer(
+                            conn.ok(),
+                            format!("download {}: cancelled", path),
+                        );
                     }
+                    let mut conn = match conn {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            return WorkerJobDone::without_transfer(
+                                None,
+                                format!("download {}: {}", path, err),
+                            )
+                        }
+                    };
                     if let Some(parent) = Path::new(&local_path).parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    match download_transfer_task(
-                        url,
+                    let outcome = download_transfer_on(
+                        &mut *conn,
                         remote_path,
                         local_path,
                         remote_modified,
                         cli,
-                        format,
                         Some(aggregate),
                         overall_pb,
                         resolve_max_transfer(cli),
                     )
-                    .await
-                    {
-                        Ok(()) => Ok(path),
-                        Err(err) => Err(format!("download {}: {}", path, err)),
-                    }
+                    .await;
+                    let display_path = path.clone();
+                    WorkerJobDone::from_transfer(
+                        conn,
+                        outcome,
+                        |landed| (path, landed),
+                        |err| format!("download {}: {}", display_path, err),
+                    )
                 }
             },
-        ))
-        .buffer_unordered(effective_parallel_workers(cli))
-        .collect::<Vec<_>>()
+        )
         .await;
 
         for result in download_results {
             match result {
-                Ok(_) => downloaded += 1,
+                Ok((path, state)) => {
+                    downloaded += 1;
+                    if let Some(state) = state {
+                        landed.insert(path, state);
+                    }
+                }
                 Err(err) => errors.push(err),
             }
         }
@@ -49307,6 +51926,10 @@ async fn cmd_sync(
 
     // Execute renames (--track-renames)
     let mut renamed = 0u32;
+    // The renames and deletes that went through, path by path: the bisync
+    // snapshot follows them.
+    let mut renames_done: Vec<(&str, &str)> = Vec::new();
+    let mut deleted_paths: Vec<&str> = Vec::new();
     for (old_remote, new_local) in &renames {
         if cancelled.load(Ordering::Relaxed) {
             break;
@@ -49317,6 +51940,7 @@ async fn cmd_sync(
             match provider.rename(&old_path, &new_path).await {
                 Ok(()) => {
                     renamed += 1;
+                    renames_done.push((old_remote.as_str(), new_local.as_str()));
                     if !quiet {
                         eprintln!("  RENAME {} → {}", old_remote, new_local);
                     }
@@ -49343,6 +51967,7 @@ async fn cmd_sync(
         match provider.delete(&remote_path).await {
             Ok(()) => {
                 deleted += 1;
+                deleted_paths.push(path);
                 if error_correction_enabled {
                     let status =
                         ftp_client_gui_lib::sync::delete_sync_error_correction_sidecar_after_remote_delete(
@@ -49379,28 +52004,107 @@ async fn cmd_sync(
             continue;
         }
         let local_path = format!("{}/{}", local, path);
-        // Backup before delete (if --backup-dir set)
-        if let Some(bdir) = backup_dir {
-            backup_file(
-                &local_path,
-                bdir,
-                backup_suffix,
-                path,
-                suffix_keep_extension,
-            );
-        }
-        match std::fs::remove_file(&local_path) {
-            Ok(()) => deleted += 1,
+        match backup_then_delete_local(
+            &local_path,
+            backup_dir,
+            backup_suffix,
+            path,
+            suffix_keep_extension,
+        ) {
+            Ok(()) => {
+                deleted += 1;
+                deleted_paths.push(path);
+            }
             Err(e) => errors.push(format!("delete local {}: {}", path, e)),
         }
     }
 
+    // Directories the deletes left empty, deepest first. Each is listed again
+    // and removed only when that listing is empty, with a call that refuses a
+    // directory that is not empty (a local `remove_dir`, FTP `RMD`, SFTP
+    // `rmdir`), so an entry the listing did not show makes the removal fail
+    // instead of going with it. A failure is a note, not an error: the files
+    // the run was asked to sync are synced. Each directory kept that way is
+    // listed in the JSON result with the reason, `--quiet` or not.
+    let mut dirs_deleted: u32 = 0;
+    let mut dirs_kept: Vec<CliSyncKeptDir> = Vec::new();
+    for dir in &orphan_dirs {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        if direction == "upload" {
+            let remote_dir = format!("{}/{}", remote.trim_end_matches('/'), dir);
+            if !matches!(provider.list(&remote_dir).await, Ok(entries) if entries.is_empty()) {
+                continue;
+            }
+            match provider.rmdir(&remote_dir).await {
+                Ok(()) => dirs_deleted += 1,
+                Err(ProviderError::NotFound(_)) => {}
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("Note: kept remote directory {dir}: {e}");
+                    }
+                    dirs_kept.push(CliSyncKeptDir {
+                        path: dir.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        } else {
+            let local_dir = Path::new(local).join(dir);
+            if sync_backup_dir_holds(backup_dir, &local_dir) {
+                continue;
+            }
+            let empty = std::fs::read_dir(&local_dir).is_ok_and(|mut it| it.next().is_none());
+            if !empty {
+                continue;
+            }
+            match std::fs::remove_dir(&local_dir) {
+                Ok(()) => dirs_deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("Note: kept local directory {dir}: {e}");
+                    }
+                    dirs_kept.push(CliSyncKeptDir {
+                        path: dir.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    if dirs_deleted > 0 && !quiet {
+        eprintln!(
+            "Removed {} empty director(ies) left by --delete",
+            dirs_deleted
+        );
+    }
+
     // Save bisync snapshot after successful sync (--direction both)
     if direction == "both" && errors.is_empty() && !dry_run {
+        let outcome = BisyncOutcome {
+            rebuilt: resync,
+            ..bisync_outcome(
+                &local_map,
+                BisyncRunPaths {
+                    in_sync: &in_sync,
+                    uploaded: &to_upload,
+                    downloaded: &landed,
+                    renamed: &renames_done,
+                    deleted: &deleted_paths,
+                },
+                // The transfers are counted, not listed, so they are recorded
+                // only when every one of them went through: a file left behind
+                // by `--max-transfer` or a cancel keeps the entry it had.
+                over_budget == 0 && !cancelled.load(Ordering::Relaxed),
+            )
+        };
         save_bisync_snapshot(
             local,
             local_entries,
             &remote_entries,
+            &outcome,
             files_from_set.as_ref(),
             &bound,
             &reported_links,
@@ -49488,6 +52192,11 @@ async fn cmd_sync(
                 unseen_paths: unseen_paths.clone(),
                 stats: engine_stats,
                 download_segments,
+                modify_window: Some(modify_window),
+                dirs_deleted,
+                dirs_kept: dirs_kept.clone(),
+                conflicts_open: conflicts_open.clone(),
+                checksum: checksum_summary,
             });
         }
     }
@@ -49524,6 +52233,8 @@ async fn cmd_sync(
         ec_sidecar_deleted: ec_counters.sidecar_deleted,
         ec_sidecar_delete_failed: ec_counters.sidecar_delete_failed,
         error_count: errors.len() as u32,
+        conflicts_open,
+        dirs_kept,
     }
 }
 
@@ -51176,7 +53887,7 @@ mod fuse_mount {
             let p = child_path.clone();
             let result = self.rt.block_on(async {
                 let mut prov = provider.lock().await;
-                prov.rmdir(&p).await
+                ftp_client_gui_lib::providers::remove_empty_directory(prov.as_mut(), &p).await
             });
 
             match result {
@@ -51188,6 +53899,7 @@ mod fuse_mount {
                     }
                     reply.ok();
                 }
+                Err(ProviderError::DirectoryNotEmpty(_)) => reply.error(Errno::ENOTEMPTY),
                 Err(_) => reply.error(Errno::EIO),
             }
         }
@@ -51776,6 +54488,7 @@ async fn cmd_mount_windows(
         provider_label,
         base_path,
         auth_token: None, // local-only WebDAV bridge for Windows mount - no auth needed
+        warnings: ServedWarnings::stderr(format),
     };
 
     let app = Router::new()
@@ -54192,6 +56905,126 @@ fn bind_after_init(
     }
 }
 
+/// What `crypt set-form` writes: `overlay` with the given forms recorded and
+/// every other field as it was. Refused when it is not an enabled rclone-crypt
+/// binding, and when it would leave one form recorded and the other not: the
+/// unrecorded secret would stay on the reading a refusal was about, which is
+/// why the GUI asks for both before Save.
+fn binding_with_recorded_forms(
+    overlay: &serde_json::Value,
+    password_form: Option<RecordedFormArg>,
+    salt_form: Option<RecordedFormArg>,
+) -> Result<serde_json::Value, String> {
+    let rclone_crypt = overlay.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+        && overlay.get("kind").and_then(|v| v.as_str()) == Some("rclone-crypt");
+    let mut overlay = overlay.clone();
+    let obj = overlay
+        .as_object_mut()
+        .filter(|_| rclone_crypt)
+        .ok_or("This profile has no rclone-crypt overlay.")?;
+    if let Some(form) = password_form {
+        obj.insert("passwordForm".into(), serde_json::json!(form.as_str()));
+    }
+    if let Some(form) = salt_form {
+        obj.insert("saltForm".into(), serde_json::json!(form.as_str()));
+    }
+    match (
+        obj.contains_key("passwordForm"),
+        obj.contains_key("saltForm"),
+    ) {
+        (true, false) => Err("Record the salt's form too: pass --salt-form clear|obscured.".into()),
+        (false, true) => {
+            Err("Record the password's form too: pass --password-form clear|obscured.".into())
+        }
+        _ => Ok(overlay),
+    }
+}
+
+/// `crypt set-form`: record on the `--profile`'s rclone-crypt binding how its
+/// stored password and salt are written, the answer to a "reads two ways"
+/// refusal. Only the binding changes; the secrets stay as they are.
+fn cmd_crypt_set_form(
+    password_form: Option<RecordedFormArg>,
+    salt_form: Option<RecordedFormArg>,
+    cli: &Cli,
+    format: OutputFormat,
+) -> i32 {
+    if password_form.is_none() && salt_form.is_none() {
+        print_error(
+            format,
+            "Pass --password-form and/or --salt-form (clear or obscured).",
+            5,
+        );
+        return 5;
+    }
+    let Some(profile_query) = cli.profile.as_deref() else {
+        print_error(format, "crypt set-form needs --profile <name-or-index>.", 5);
+        return 5;
+    };
+    let store = match open_vault(cli) {
+        Ok(store) => store,
+        Err(e) => {
+            print_error(format, &e, 5);
+            return 5;
+        }
+    };
+    let profile_id = match resolve_profile_id_for_query(cli, &store, profile_query, format) {
+        Ok(id) => id,
+        Err(code) => return code,
+    };
+    let profiles = match load_active_user_profiles(cli, &store) {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            print_error(format, &format!("Could not load the profiles: {e}"), 5);
+            return 5;
+        }
+    };
+    let current = profiles
+        .iter()
+        .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(profile_id.as_str()))
+        .and_then(|p| p.get("aeroCryptOverlay"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let overlay = match binding_with_recorded_forms(&current, password_form, salt_form) {
+        Ok(overlay) => overlay,
+        Err(e) => {
+            print_error(format, &e, 5);
+            return 5;
+        }
+    };
+    let recorded = (
+        overlay
+            .get("passwordForm")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        overlay
+            .get("saltForm")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    );
+    if let Err(e) =
+        update_profile_field_in_vault(cli, &store, &profile_id, "aeroCryptOverlay", overlay)
+    {
+        print_error(format, &format!("Could not save the profile: {e}"), 4);
+        return 4;
+    }
+    if matches!(format, OutputFormat::Json) {
+        print_json(&serde_json::json!({
+            "status": "ok",
+            "profile": profile_query,
+            "passwordForm": recorded.0,
+            "saltForm": recorded.1,
+        }));
+    } else {
+        println!(
+            "Recorded for {profile_query}: password {}, salt {}",
+            recorded.0.as_str().unwrap_or("not recorded"),
+            recorded.1.as_str().unwrap_or("not recorded"),
+        );
+    }
+    0
+}
+
 /// Set or clear `aeroCryptOverlay.withHeader` on a saved profile without
 /// touching secrets. Used by `crypt to-headed` / `to-headerless` so connect-time
 /// heal knows the vault's headed intent (tracker #421 item #7).
@@ -56172,6 +59005,7 @@ async fn cmd_rclone_crypt_put(
     remote_path: &str,
     password: &str,
     salt: &str,
+    secret_forms: CryptSecretForms,
     filename_encryption: RcloneFilenameEncryption,
     dir_iv_base64: Option<&str>,
     remote_name: Option<&str>,
@@ -56187,7 +59021,12 @@ async fn cmd_rclone_crypt_put(
     let base_path = normalize_remote_path(&resolve_cli_remote_path(&initial_path, remote_path));
 
     let (name_key, data_key, name_tweak) =
-        match ftp_client_gui_lib::rclone_crypt::derive_keys_with_tweak(password, salt) {
+        match ftp_client_gui_lib::rclone_crypt::derive_keys_with_forms(
+            password,
+            secret_forms.0,
+            salt,
+            secret_forms.1,
+        ) {
             Ok(keys) => keys,
             Err(e) => {
                 print_error(format, &format!("rclone key derivation failed: {}", e), 5);
@@ -56364,19 +59203,21 @@ async fn cmd_put_glob(
     url: &str,
     local_pattern: &str,
     remote_base: Option<&str>,
+    no_clobber: bool,
     cli: &Cli,
     format: OutputFormat,
     cancelled: Arc<AtomicBool>,
 ) -> i32 {
     let raw_remote_base = remote_base.unwrap_or("/");
 
-    // Resolve remote_base against profile's initial_path
+    // Resolve remote_base against profile's initial_path. The connection
+    // stays open: it creates `remote_base` below, and serves the first
+    // worker of an `--immutable` or `--no-clobber` batch.
     let (mut probe_provider, initial_path) = match create_and_connect(url, cli, format).await {
         Ok(v) => v,
         Err(code) => return code,
     };
     let glob_provider_type = probe_provider.provider_type();
-    let _ = probe_provider.disconnect().await;
     let remote_base = resolve_cli_remote_path(&initial_path, raw_remote_base);
     let remote_base = remote_base.as_str();
 
@@ -56404,6 +59245,7 @@ async fn cmd_put_glob(
         Ok(g) => g.compile_matcher(),
         Err(e) => {
             print_error(format, &format!("Invalid glob pattern: {}", e), 5);
+            let _ = probe_provider.disconnect().await;
             return 5;
         }
     };
@@ -56417,6 +59259,7 @@ async fn cmd_put_glob(
                 &format!("Cannot read directory '{}': {}", dir, e),
                 2,
             );
+            let _ = probe_provider.disconnect().await;
             return 2;
         }
     };
@@ -56445,6 +59288,7 @@ async fn cmd_put_glob(
                 2,
             ),
         }
+        let _ = probe_provider.disconnect().await;
         return 2;
     }
 
@@ -56476,11 +59320,21 @@ async fn cmd_put_glob(
         {
             let code = provider_error_to_exit_code(&e);
             print_error(format, &format!("put failed: {}", e), code);
+            let _ = probe_provider.disconnect().await;
             return code;
         }
     }
 
+    // The one remote parent of every file, created once and before any
+    // upload: the shared executor does not create it, and workers each
+    // creating it at once made two `remote_base` folders on Google Drive,
+    // which allows two folders of one name.
+    let _ = probe_provider.mkdir(remote_base).await;
+
     let mut uploaded: u32 = 0;
+    // Left alone by `--immutable` or `--no-clobber`: done, not failed, as
+    // `put -r` counts them.
+    let mut skipped: u32 = 0;
     // G102: files the --max-transfer budget left behind on this run.
     let mut over_budget: u32 = 0;
     let mut errors: Vec<String> = Vec::new();
@@ -56491,25 +59345,32 @@ async fn cmd_put_glob(
 
     // PD-CLI-CONV-C: converge the glob upload batch on the SAME shared
     // provider executor + orchestrator (PD-CLI-CONV-B), sink-agnostic.
-    // The probe connection was only used to resolve `initial_path`; the
-    // shared engine needs a live base whose connection spec backs the
-    // clone-pool workers, so a base provider is (re)connected here. The
-    // single remote parent (`remote_base`) is pre-created idempotently
-    // because the shared executor does not mkdir. `--immutable` and
-    // non-pool-backed providers (FTP, single-conn APIs) stay on the
-    // legacy independent-connection batch: honest fallback, no overclaim.
-    let use_legacy = if cli.immutable {
+    // The shared engine needs a live base whose connection spec backs the
+    // clone-pool workers, so a base provider is (re)connected here.
+    // `--immutable`, `--no-clobber` and non-pool-backed providers (FTP,
+    // single-conn APIs) stay on the legacy batch: honest fallback, no
+    // overclaim. The connection the legacy batch starts from: the probe
+    // for `--immutable` and `--no-clobber`, the base the shared executor
+    // hands back otherwise.
+    let mut legacy_seed: Option<Box<dyn StorageProvider>> = None;
+    let use_legacy = if cli.immutable || no_clobber {
         if !cli.quiet {
             eprintln!(
-                "Note: --immutable uses the single-stream upload path \
-                 (the pooled uploader has no remote-existence check)"
+                "Note: {} uses the single-stream upload path \
+                 (the pooled uploader has no remote-existence check)",
+                if cli.immutable {
+                    "--immutable"
+                } else {
+                    "--no-clobber"
+                }
             );
         }
+        legacy_seed = Some(probe_provider);
         true
     } else {
+        let _ = probe_provider.disconnect().await;
         match create_and_connect(url, cli, format).await {
-            Ok((mut provider, _)) => {
-                let _ = provider.mkdir(remote_base).await;
+            Ok((provider, _)) => {
                 match run_shared_provider_upload_batch(
                     provider,
                     &files,
@@ -56526,8 +59387,8 @@ async fn cmd_put_glob(
                         engine_stats = outcome.engine_stats;
                         false
                     }
-                    Err(mut base) => {
-                        let _ = base.disconnect().await;
+                    Err(base) => {
+                        legacy_seed = Some(base);
                         true
                     }
                 }
@@ -56537,37 +59398,53 @@ async fn cmd_put_glob(
     };
 
     if use_legacy {
-        let results = futures_util::stream::iter(files.into_iter().map(
-            |(local_path, remote_path, _size)| {
+        // One connection per worker, starting with the scan connection,
+        // instead of one per file (see `run_on_worker_connections`).
+        let results = run_on_worker_connections(
+            legacy_seed.take(),
+            effective_parallel_workers(cli),
+            files,
+            &cancelled,
+            resolve_max_transfer(cli),
+            || connect_transfer_worker(url, cli, format),
+            |conn, (local_path, remote_path, _size)| {
                 let cancelled = cancelled.clone();
                 let aggregate = aggregate.clone();
                 let overall_pb = overall_pb.clone();
                 async move {
                     if cancelled.load(Ordering::Relaxed) {
-                        return Err("Cancelled by user".to_string());
+                        return WorkerJobDone::without_transfer(
+                            conn.ok(),
+                            "Cancelled by user".to_string(),
+                        );
                     }
-                    upload_transfer_task(
-                        url,
+                    let mut conn = match conn {
+                        Ok(conn) => conn,
+                        Err(err) => return WorkerJobDone::without_transfer(None, err),
+                    };
+                    // `remote_base`, the parent of every file, exists already.
+                    let outcome = upload_transfer_on(
+                        &mut *conn,
                         local_path.clone(),
                         remote_path,
                         cli,
-                        format,
+                        no_clobber,
+                        false,
                         Some(aggregate),
                         overall_pb,
                         resolve_max_transfer(cli),
                     )
-                    .await
-                    .map(|_| local_path)
+                    .await;
+                    WorkerJobDone::from_transfer(conn, outcome, |_| local_path, |err| err)
                 }
             },
-        ))
-        .buffer_unordered(effective_parallel_workers(cli))
-        .collect::<Vec<_>>()
+        )
         .await;
 
         for result in results {
             match result {
                 Ok(_) => uploaded += 1,
+                Err(ref err) if err.starts_with(UPLOAD_SKIP_PREFIX) => skipped += 1,
                 Err(err) => errors.push(err),
             }
         }
@@ -56577,17 +59454,37 @@ async fn cmd_put_glob(
         pb.finish_and_clear();
     }
 
+    put_run_note_failures(&errors);
+
     let elapsed = start.elapsed();
 
     match format {
         OutputFormat::Text => {
             if !cli.quiet {
                 println!(
-                    "\n{}/{} files uploaded in {:.1}s",
+                    "\n{}/{} files uploaded in {:.1}s{}",
                     uploaded,
                     total,
-                    elapsed.as_secs_f64()
+                    elapsed.as_secs_f64(),
+                    if skipped > 0 {
+                        format!(
+                            " ({} skipped, {})",
+                            skipped,
+                            if cli.immutable {
+                                "--immutable"
+                            } else {
+                                "--no-clobber"
+                            }
+                        )
+                    } else {
+                        String::new()
+                    }
                 );
+                // As `put -r` does: without them a refusal showed only as
+                // exit 4, and only `--json` said why.
+                for err in &errors {
+                    eprintln!("  Error: {}", err);
+                }
             }
         }
         OutputFormat::Json => {
@@ -56596,7 +59493,7 @@ async fn cmd_put_glob(
                 uploaded,
                 downloaded: 0,
                 deleted: 0,
-                skipped: 0,
+                skipped,
                 over_budget,
                 ec_generated: None,
                 ec_skipped_too_large: None,
@@ -56611,11 +59508,20 @@ async fn cmd_put_glob(
                 unseen_paths: Vec::new(),
                 stats: engine_stats,
                 download_segments: None,
+                modify_window: None,
+                dirs_deleted: 0,
+                dirs_kept: Vec::new(),
+                conflicts_open: Vec::new(),
+                checksum: None,
             });
         }
     }
-    if uploaded == total as u32 {
-        0
+    if uploaded + skipped == total as u32 {
+        if skipped > 0 && uploaded == 0 {
+            9
+        } else {
+            0
+        }
     } else if session_transfer_exceeded(resolve_max_transfer(cli)) {
         // Intentional --max-transfer cap (honest note already emitted),
         // not a transfer failure: the dedicated exit code, consistent
@@ -56726,6 +59632,96 @@ fn note_incomplete_watch_snapshot(snapshot: &WatchLocalSnapshot, quiet: bool) {
     );
 }
 
+/// The JSON line a watch cycle prints.
+fn watch_cycle_payload(
+    cycle: u64,
+    trigger: &str,
+    stats: &SyncCycleStats,
+    elapsed_secs: f64,
+    timestamp: &str,
+    error_correction: bool,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "cycle": cycle,
+        "trigger": trigger,
+        "exit_code": stats.exit_code,
+        "uploaded": stats.uploaded,
+        "downloaded": stats.downloaded,
+        "deleted": stats.deleted,
+        "skipped": stats.skipped,
+        "errors": stats.error_count,
+        "elapsed_secs": elapsed_secs,
+        "timestamp": timestamp,
+    });
+    // G102: a watch cycle that stopped on the budget says so, in the same
+    // place a consumer already reads the counters. Emitted only when it
+    // happened, so the cycle payload of an ordinary run keeps its shape.
+    if stats.over_budget > 0 {
+        payload["over_budget"] = serde_json::json!(stats.over_budget);
+    }
+    // The same for the pairs a cycle left open and the emptied directories it
+    // could not remove, in the shape the `sync` result gives them.
+    if !stats.conflicts_open.is_empty() {
+        payload["conflicts_open"] = serde_json::json!(stats.conflicts_open);
+    }
+    if !stats.dirs_kept.is_empty() {
+        payload["dirs_kept"] = serde_json::json!(stats.dirs_kept);
+    }
+    if error_correction {
+        payload["ec_generated"] = serde_json::json!(stats.ec_generated);
+        payload["ec_skipped_too_large"] = serde_json::json!(stats.ec_skipped_too_large);
+        payload["ec_skipped_low_benefit"] = serde_json::json!(stats.ec_skipped_low_benefit);
+        payload["ec_generate_failed"] = serde_json::json!(stats.ec_generate_failed);
+        payload["ec_sidecar_deleted"] = serde_json::json!(stats.ec_sidecar_deleted);
+        payload["ec_sidecar_delete_failed"] = serde_json::json!(stats.ec_sidecar_delete_failed);
+    }
+    payload
+}
+
+/// Watcher events that did not start a cycle: they came while one ran or in
+/// the cooldown after it. They are kept, not dropped, for the cycle that runs
+/// when the cooldown ends: the snapshot has to learn them (mostly a cycle's
+/// own writes), and a user edit among them has to be synced.
+#[derive(Default)]
+struct WatchDeferred {
+    /// A set: an event storm repeats the same paths, and a list of them grew
+    /// without bound.
+    paths: std::collections::BTreeSet<std::path::PathBuf>,
+    /// When the cycle for them is due; `None` when nothing waits.
+    due: Option<tokio::time::Instant>,
+    /// More than [`WATCH_DEFERRED_LIMIT`] paths waited: they are dropped and
+    /// the cycle for them is a full one.
+    overflowed: bool,
+}
+
+/// How many distinct paths wait for the next cycle before a full cycle is
+/// cheaper than keeping them (a checkout or an unpack touches thousands).
+const WATCH_DEFERRED_LIMIT: usize = 10_000;
+
+impl WatchDeferred {
+    fn defer(&mut self, paths: Vec<std::path::PathBuf>, due: tokio::time::Instant) {
+        if !self.overflowed {
+            self.paths.extend(paths);
+            if self.paths.len() > WATCH_DEFERRED_LIMIT {
+                self.paths.clear();
+                self.overflowed = true;
+            }
+        }
+        self.due.get_or_insert(due);
+    }
+
+    /// The paths waiting, handed to the cycle that runs now: the watched
+    /// `root` alone, which the loop reads as a full cycle, when there were
+    /// too many.
+    fn take(&mut self, root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        self.due = None;
+        if std::mem::take(&mut self.overflowed) {
+            return vec![root.to_path_buf()];
+        }
+        std::mem::take(&mut self.paths).into_iter().collect()
+    }
+}
+
 /// Build the local side of a watch cycle incrementally: refresh metadata only
 /// for watcher-reported paths, and take everything else from the snapshot.
 /// This avoids a full walkdir when only a few files changed.
@@ -56800,6 +59796,34 @@ fn incremental_local_scan(
     }
 }
 
+/// What the watcher forwards for one event: its paths worth a cycle, or the
+/// watched root alone when the event asks for a rescan (the kernel's event
+/// queue overflowed and what was in it is lost; the loop then runs a full
+/// cycle). A read (an open, an access, a close that wrote nothing) changes
+/// nothing and is not forwarded; a close after a write is, since a program
+/// that writes through a memory map produces nothing else. The bisync
+/// snapshot at the root is not forwarded either: every `both` cycle reads and
+/// rewrites it there, and forwarding that started the next cycle, and so on
+/// forever. A sync root's snapshot deeper in the tree is a file like any
+/// other.
+fn watch_event_paths(event: &notify::Event, root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use notify::event::{AccessKind, AccessMode};
+    if event.need_rescan() {
+        return vec![root.to_path_buf()];
+    }
+    if matches!(event.kind, notify::EventKind::Access(access) if access != AccessKind::Close(AccessMode::Write))
+    {
+        return Vec::new();
+    }
+    let snapshot = root.join(BISYNC_SNAPSHOT_FILE);
+    event
+        .paths
+        .iter()
+        .filter(|p| !should_exclude_watch_path(p) && **p != snapshot)
+        .cloned()
+        .collect()
+}
+
 /// Start a filesystem watcher and return a boxed handle (dropped to stop).
 /// Filtered, debounced paths are sent on `tx`.
 fn start_watch_watcher(
@@ -56814,14 +59838,11 @@ fn start_watch_watcher(
             use notify::PollWatcher;
             let config =
                 notify::Config::default().with_poll_interval(std::time::Duration::from_secs(5));
+            let root = watch_path.to_path_buf();
             let watcher = PollWatcher::new(
                 move |res: Result<notify::Event, notify::Error>| {
                     if let Ok(event) = res {
-                        let paths: Vec<_> = event
-                            .paths
-                            .into_iter()
-                            .filter(|p| !should_exclude_watch_path(p))
-                            .collect();
+                        let paths = watch_event_paths(&event, &root);
                         if !paths.is_empty() {
                             let _ = tx.send(paths);
                         }
@@ -56849,18 +59870,17 @@ fn start_watch_watcher(
                 .map_err(|e| format!("Failed to watch path: {}", e))?;
 
             // Spawn thread to drain debouncer events and forward filtered paths
+            let root = watch_path.to_path_buf();
             std::thread::spawn(move || {
                 while let Ok(result) = drx.recv() {
                     if let Ok(events) = result {
-                        let mut all_paths = Vec::new();
-                        for event in &events {
-                            for p in &event.paths {
-                                if !should_exclude_watch_path(p) && !all_paths.contains(p) {
-                                    all_paths.push(p.clone());
-                                }
-                            }
-                        }
-                        if !all_paths.is_empty() && tx.send(all_paths).is_err() {
+                        let all_paths: std::collections::BTreeSet<std::path::PathBuf> = events
+                            .iter()
+                            .flat_map(|event| watch_event_paths(event, &root))
+                            .collect();
+                        if !all_paths.is_empty()
+                            && tx.send(all_paths.into_iter().collect()).is_err()
+                        {
                             break; // receiver dropped
                         }
                     }
@@ -56891,8 +59911,7 @@ async fn cmd_sync_watch(
     compare_dest: Option<&str>,
     copy_dest: Option<&str>,
     from_reconcile: Option<&str>,
-    conflict_mode: &str,
-    skip_matching: bool,
+    pair_rule: SyncPairRule<'_>,
     resync: bool,
     watch_mode: &str,
     watch_debounce_ms: u64,
@@ -56912,7 +59931,18 @@ async fn cmd_sync_watch(
         );
         return 5;
     }
-    let local_path = std::path::Path::new(local);
+    // The watched root, absolute and resolved. Watcher events carry absolute
+    // paths (notify makes a relative watch path absolute; FSEvents reports
+    // /private/var for /var), and the incremental scan strips the root off
+    // each one: a relative root, as every example in the guide uses, failed
+    // that for every event and dropped it, so an edit waited for the periodic
+    // rescan and a remote change meanwhile downloaded over it. A directory
+    // that cannot be resolved (a Windows filesystem in user space, some
+    // network redirectors) is still made absolute.
+    let watch_root = std::fs::canonicalize(local)
+        .or_else(|_| std::path::absolute(local))
+        .unwrap_or_else(|_| PathBuf::from(local));
+    let local_path = watch_root.as_path();
     if !local_path.is_dir() {
         if matches!(format, OutputFormat::Json) {
             print_json(
@@ -56980,6 +60010,9 @@ async fn cmd_sync_watch(
         .checked_sub(std::time::Duration::from_secs(watch_cooldown + 1))
         .unwrap_or_else(std::time::Instant::now);
 
+    // The watcher events that did not start a cycle (see `WatchDeferred`).
+    let mut deferred = WatchDeferred::default();
+
     // Helper macro to run one sync cycle.
     // Usage: run_sync_cycle!("trigger")           : full walkdir scan (None)
     //        run_sync_cycle!("trigger", entries)   : incremental (Some(entries))
@@ -57012,8 +60045,7 @@ async fn cmd_sync_watch(
                 compare_dest,
                 copy_dest,
                 from_reconcile,
-                conflict_mode,
-                skip_matching,
+                pair_rule,
                 resync && cycle == 1, // resync only on first cycle
                 cli,
                 format,
@@ -57031,41 +60063,22 @@ async fn cmd_sync_watch(
             // Emit cycle status with detailed stats
             if matches!(format, OutputFormat::Json) {
                 let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                let mut payload = serde_json::json!({
-                    "cycle": cycle,
-                    "trigger": trigger_label,
-                    "exit_code": stats.exit_code,
-                    "uploaded": stats.uploaded,
-                    "downloaded": stats.downloaded,
-                    "deleted": stats.deleted,
-                    "skipped": stats.skipped,
-                    "errors": stats.error_count,
-                    "elapsed_secs": (elapsed.as_millis() as f64) / 1000.0,
-                    "timestamp": ts,
-                });
-                // G102: a watch cycle that stopped on the budget says so, in the
-                // same place a consumer already reads the counters. Emitted
-                // only when it happened, so the cycle payload of an ordinary
-                // run keeps its shape.
-                if stats.over_budget > 0 {
-                    payload["over_budget"] = serde_json::json!(stats.over_budget);
-                }
-                if error_correction_pct.is_some() {
-                    payload["ec_generated"] = serde_json::json!(stats.ec_generated);
-                    payload["ec_skipped_too_large"] =
-                        serde_json::json!(stats.ec_skipped_too_large);
-                    payload["ec_skipped_low_benefit"] =
-                        serde_json::json!(stats.ec_skipped_low_benefit);
-                    payload["ec_generate_failed"] = serde_json::json!(stats.ec_generate_failed);
-                    payload["ec_sidecar_deleted"] =
-                        serde_json::json!(stats.ec_sidecar_deleted);
-                    payload["ec_sidecar_delete_failed"] =
-                        serde_json::json!(stats.ec_sidecar_delete_failed);
-                }
-                print_json(&payload);
+                print_json(&watch_cycle_payload(
+                    cycle,
+                    trigger_label,
+                    &stats,
+                    (elapsed.as_millis() as f64) / 1000.0,
+                    &ts,
+                    error_correction_pct.is_some(),
+                ));
             } else if !quiet {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                if total_changes == 0 && stats.error_count == 0 {
+                let left_open = if stats.conflicts_open.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} left open", stats.conflicts_open.len())
+                };
+                if total_changes == 0 && stats.error_count == 0 && left_open.is_empty() {
                     eprintln!(
                         "[{}] Sync #{} ({}) -- no changes ({}s)",
                         ts, cycle, trigger_label,
@@ -57073,7 +60086,7 @@ async fn cmd_sync_watch(
                     );
                 } else {
                     eprintln!(
-                        "[{}] Sync #{} ({}) -- {} up, {} down, {} del{} ({}s)",
+                        "[{}] Sync #{} ({}) -- {} up, {} down, {} del{}{} ({}s)",
                         ts, cycle, trigger_label,
                         stats.uploaded, stats.downloaded, stats.deleted,
                         if stats.error_count > 0 {
@@ -57081,13 +60094,18 @@ async fn cmd_sync_watch(
                         } else {
                             String::new()
                         },
+                        left_open,
                         format!("{:.1}", elapsed.as_secs_f64()),
                     );
                 }
             }
 
-            // Drain any watcher events accumulated during the sync
-            while async_rx.try_recv().is_ok() {}
+            // Drain the watcher events accumulated during the sync, mostly its
+            // own writes: they wait for the cycle that runs when the cooldown
+            // ends, which brings them into the incremental snapshot.
+            while let Ok(paths) = async_rx.try_recv() {
+                deferred.defer(paths, tokio::time::Instant::now() + cooldown_dur);
+            }
 
             stats.exit_code
         }};
@@ -57135,7 +60153,8 @@ async fn cmd_sync_watch(
 
     // Watch loop
     loop {
-        tokio::select! {
+        // The paths of the watcher cycle to run now, if one is due.
+        let due: Option<Vec<std::path::PathBuf>> = tokio::select! {
             biased; // prioritize ctrl_c
 
             _ = shutdown_tick.tick() => {
@@ -57148,55 +60167,32 @@ async fn cmd_sync_watch(
                     }
                     return 0;
                 }
+                None
             }
 
             Some(changed_paths) = async_rx.recv() => {
-                // Suppress if sync in progress
-                if syncing.load(Ordering::SeqCst) {
-                    while async_rx.try_recv().is_ok() {}
-                    continue;
-                }
-                // Cooldown check
-                if last_sync_completed.elapsed() < cooldown_dur {
-                    while async_rx.try_recv().is_ok() {}
-                    continue;
-                }
-                let path_count = changed_paths.len();
-                let trigger = format!("watcher: {} paths", path_count);
-
-                if use_incremental && local_snapshot.completeness.is_complete() {
-                    let scan = incremental_local_scan(
-                        local_path,
-                        &changed_paths,
-                        &local_snapshot,
-                        &local_filter,
-                    );
-                    local_snapshot = WatchLocalSnapshot::from_scan(&scan);
-                    run_sync_cycle!(trigger.as_str(), Some(scan));
-                    if cancelled.load(Ordering::SeqCst) {
-                        if !quiet {
-                            eprintln!("\nWatch mode stopped. {} sync cycles completed.", cycle_count);
-                        }
-                        return 0;
+                // During a cycle, or in the cooldown after one, an event does
+                // not start a cycle; it is kept for the cycle that runs when
+                // the cooldown ends. Dropped, the last writes of a cycle and a
+                // user edit made in the cooldown never reached the snapshot,
+                // and the next cycle could download over that edit.
+                if syncing.load(Ordering::SeqCst) || last_sync_completed.elapsed() < cooldown_dur {
+                    let at = tokio::time::Instant::from_std(last_sync_completed + cooldown_dur);
+                    deferred.defer(changed_paths, at);
+                    while let Ok(more) = async_rx.try_recv() {
+                        deferred.defer(more, at);
                     }
+                    None
                 } else {
-                    // A snapshot that could not read the whole tree is no base
-                    // for an incremental cycle: run a full one, whose own walk
-                    // decides whether --delete may proceed (TX-01), and take a
-                    // fresh snapshot for the next event, so a transient error
-                    // heals instead of lasting until the periodic rescan.
-                    run_sync_cycle!(trigger.as_str());
-                    if use_incremental {
-                        local_snapshot = build_watch_local_snapshot(local, &local_filter);
-                        note_incomplete_watch_snapshot(&local_snapshot, quiet);
-                    }
-                    if cancelled.load(Ordering::SeqCst) {
-                        if !quiet {
-                            eprintln!("\nWatch mode stopped. {} sync cycles completed.", cycle_count);
-                        }
-                        return 0;
-                    }
+                    let mut paths = deferred.take(local_path);
+                    paths.extend(changed_paths);
+                    Some(paths)
                 }
+            }
+
+            _ = tokio::time::sleep_until(deferred.due.unwrap_or_else(tokio::time::Instant::now)),
+                if deferred.due.is_some() => {
+                Some(deferred.take(local_path))
             }
 
             _ = rescan_tick.tick() => {
@@ -57215,7 +60211,43 @@ async fn cmd_sync_watch(
                     }
                     return 0;
                 }
+                None
             }
+        };
+        let Some(changed_paths) = due else {
+            continue;
+        };
+        let trigger = format!("watcher: {} paths", changed_paths.len());
+        // The watcher lost events (its queue overflowed) and sent its root:
+        // the snapshot no longer knows what changed, and a full cycle rebuilds
+        // it below.
+        let rescan = changed_paths.iter().any(|p| p.as_path() == local_path);
+
+        if use_incremental && !rescan && local_snapshot.completeness.is_complete() {
+            let scan =
+                incremental_local_scan(local_path, &changed_paths, &local_snapshot, &local_filter);
+            local_snapshot = WatchLocalSnapshot::from_scan(&scan);
+            run_sync_cycle!(trigger.as_str(), Some(scan));
+        } else {
+            // A snapshot that could not read the whole tree is no base for an
+            // incremental cycle: run a full one, whose own walk decides whether
+            // --delete may proceed (TX-01), and take a fresh snapshot for the
+            // next event, so a transient error heals instead of lasting until
+            // the periodic rescan.
+            run_sync_cycle!(trigger.as_str());
+            if use_incremental {
+                local_snapshot = build_watch_local_snapshot(local, &local_filter);
+                note_incomplete_watch_snapshot(&local_snapshot, quiet);
+            }
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            if !quiet {
+                eprintln!(
+                    "\nWatch mode stopped. {} sync cycles completed.",
+                    cycle_count
+                );
+            }
+            return 0;
         }
     }
 }
@@ -57373,6 +60405,14 @@ async fn sync_doctor_report(
         );
         return Err(5);
     }
+    // The conflict policy `sync` would run with (one-way: source or skip).
+    let conflict_mode = match resolve_sync_conflict_mode(Some(conflict_mode), direction) {
+        Ok(mode) => mode,
+        Err(err) => {
+            print_error(format, &err, 5);
+            return Err(5);
+        }
+    };
 
     let doctor_cfg = if let Some(profile_name) = cli.profile.as_deref() {
         match profile_to_provider_config(profile_name, cli, format) {
@@ -57468,13 +60508,20 @@ async fn sync_doctor_report(
     let ec_max_file_size = ftp_client_gui_lib::sync::AEROSYNC_EC_MAX_FILE_SIZE_BYTES;
     let default_time_val = resolve_default_time(cli);
     let default_time_ref = default_time_val.as_deref();
+    // The window `sync` would run with, read after the scan as `sync` does.
+    let window = ModifyWindow::against_provider(None, provider.as_ref());
     let ec_estimate = error_correction_pct.map(|pct| {
         let upload_sizes = sync_doctor_planned_upload_sizes(
             direction,
-            conflict_mode,
+            &conflict_mode,
+            window,
             &local_entries,
             &remote_entries,
             default_time_ref,
+            (direction == "both" && !resync)
+                .then(|| load_bisync_snapshot(local))
+                .flatten()
+                .as_ref(),
         );
         estimate_sync_doctor_ec_for_uploads(
             upload_sizes,
@@ -57516,6 +60563,21 @@ async fn sync_doctor_report(
     }
 
     let mut risks = Vec::new();
+    // What `sync` would compare the files by: stated, like the run does.
+    // A statement, like `exclude_patterns`: a size-only comparison is not a
+    // failed check (the status stays ok), it is the risk named below.
+    checks.push(serde_json::json!({
+        "name": "modify_window",
+        "ok": true,
+        "compares_times": window.compares_times(),
+        "window": window,
+    }));
+    if !window.compares_times() {
+        risks.push(format!(
+            "files compared by size only: {}; a same-size edit is not seen",
+            window.describe()
+        ));
+    }
     if let Some(cfg) = doctor_cfg.as_ref() {
         push_s3_doctor_checks(&mut checks, &mut risks, "remote", cfg);
     }
@@ -57580,21 +60642,24 @@ async fn sync_doctor_report(
         }
     }
 
-    let suggested_next_command =
-        format!(
-        "aeroftp-cli sync --profile \"{}\" \"{}\" \"{}\" --direction {} --dry-run --json{}{}{}{}{}{}",
+    let suggested_next_command = format!(
+        "aeroftp-cli sync --profile {} {} {} --direction {} --dry-run --json{}{}{}{}{}{}",
         profile_or_placeholder(cli),
-        shell_double_quote(local),
-        shell_double_quote(&remote),
-        shell_double_quote(direction),
+        shell_arg(local),
+        shell_arg(&remote),
+        shell_arg(direction),
         if delete { " --delete" } else { "" },
-        if track_renames { " --track-renames" } else { "" },
+        if track_renames {
+            " --track-renames"
+        } else {
+            ""
+        },
         if resync { " --resync" } else { "" },
         error_correction_pct
             .map(|pct| format!(" --error-correction={pct}"))
             .unwrap_or_default(),
         files_from
-            .map(|(flag, path, _)| format!(" {flag} \"{}\"", shell_double_quote(path)))
+            .map(|(flag, path, _)| format!(" {flag} {}", shell_arg(path)))
             .unwrap_or_default(),
         if exclude.is_empty() {
             String::new()
@@ -57603,7 +60668,7 @@ async fn sync_doctor_report(
                 " {}",
                 exclude
                     .iter()
-                    .map(|pattern| format!("--exclude \"{}\"", shell_double_quote(pattern)))
+                    .map(|pattern| format!("--exclude {}", shell_arg(pattern)))
                     .collect::<Vec<_>>()
                     .join(" ")
             )
@@ -58008,8 +61073,9 @@ async fn hashsum_digest(
     // Falls through to download+digest for sha512/blake3 (never
     // server-side) and for multipart/SSE objects with no usable hash.
     if !download && provider.supports_checksum() {
-        if let Ok(map) = provider.checksum(path).await {
-            if let Some(h) = map.get(hash_algo_key(algorithm)) {
+        let key = hash_algo_key(algorithm);
+        if let Ok(map) = provider.checksum_for(path, key).await {
+            if let Some(h) = map.get(key) {
                 let hash = h.trim().to_ascii_lowercase();
                 let size = provider.stat(path).await.map(|e| e.size).unwrap_or(0);
                 return Ok((hash, size));
@@ -58309,6 +61375,174 @@ mod hashsum_digest_tests {
         assert_ne!(CONTENT_MD5, SERVER_MD5);
     }
 
+    /// `import rclone --apply` turns an rclone crypt remote into the overlay
+    /// binding the GUI import makes: secrets in the vault, recorded clear,
+    /// none left in the profile's options. The values are obscured by rclone
+    /// v1.75.1; the salt is one rclone generates, which a second reveal empties.
+    #[test]
+    fn rclone_apply_binds_a_crypt_remote_with_its_secrets_in_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("rclone.conf");
+        std::fs::write(
+            &conf,
+            "[base]\ntype = sftp\nhost = sftp.example.invalid\nuser = smoke\n\n\
+             [vault]\ntype = crypt\nremote = base:\n\
+             password = Z5gL8_HnB9SyJT5RjJtYcEBwiBrSN8h0fHelLigK\n\
+             password2 = V98yILELzRn3G-7rg4ymQ3B0X0zgFAbWo74vIapw-YnWja9Jn3k\n",
+        )
+        .unwrap();
+        let result = ftp_client_gui_lib::rclone_import::import_rclone(&conf).unwrap();
+        let server = result
+            .servers
+            .iter()
+            .find(|s| s.name == "vault")
+            .expect("the crypt remote is imported");
+        let mut vault = std::collections::HashMap::new();
+        let profile = imported_server_profile(server, |k, v| {
+            vault.insert(k.to_string(), v.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(profile["aeroCryptOverlay"]["kind"], "rclone-crypt");
+        assert_eq!(profile["aeroCryptOverlay"]["passwordForm"], "clear");
+        assert_eq!(profile["aeroCryptOverlay"]["saltForm"], "clear");
+        assert!(profile.pointer("/options/rcloneCryptPassword").is_none());
+        assert!(profile.pointer("/options/rcloneCryptPassword2").is_none());
+        assert_eq!(
+            vault[&format!("aerocrypt_overlay_pw_{}", server.id)],
+            "crypt-pass-954"
+        );
+        assert_eq!(
+            vault[&format!("aerocrypt_overlay_salt_{}", server.id)],
+            "hD1lB5uyIChoDFqhaHOsUg"
+        );
+    }
+
+    /// What `crypt set-form` writes: the forms given, recorded on an enabled
+    /// rclone-crypt binding, every other field (and a form not given) kept;
+    /// nothing for an AeroCrypt or disabled binding.
+    #[test]
+    fn crypt_set_form_writes_only_the_forms_given() {
+        let bound = serde_json::json!({
+            "enabled": true, "kind": "rclone-crypt", "remoteScope": "/enc",
+            "filenameEncryption": "standard", "passwordForm": "obscured"
+        });
+        let written =
+            binding_with_recorded_forms(&bound, None, Some(RecordedFormArg::Clear)).unwrap();
+        assert_eq!(written["passwordForm"], "obscured");
+        assert_eq!(written["saltForm"], "clear");
+        assert_eq!(written["remoteScope"], "/enc");
+        assert_eq!(written["filenameEncryption"], "standard");
+        let written = binding_with_recorded_forms(
+            &bound,
+            Some(RecordedFormArg::Clear),
+            Some(RecordedFormArg::Clear),
+        )
+        .unwrap();
+        assert_eq!(written["passwordForm"], "clear");
+        assert_eq!(written["saltForm"], "clear");
+
+        // One form recorded and not the other is what the GUI will not save.
+        let unrecorded = serde_json::json!({"enabled": true, "kind": "rclone-crypt"});
+        let e = binding_with_recorded_forms(&unrecorded, Some(RecordedFormArg::Clear), None)
+            .unwrap_err();
+        assert!(e.contains("--salt-form"), "{e}");
+        let e = binding_with_recorded_forms(&bound, Some(RecordedFormArg::Clear), None);
+        assert!(e.unwrap_err().contains("--salt-form"));
+
+        let aerocrypt = serde_json::json!({"enabled": true, "kind": "aerocrypt"});
+        assert!(
+            binding_with_recorded_forms(&aerocrypt, Some(RecordedFormArg::Clear), None)
+                .unwrap_err()
+                .contains("no rclone-crypt overlay")
+        );
+        let disabled = serde_json::json!({"enabled": false, "kind": "rclone-crypt"});
+        assert!(
+            binding_with_recorded_forms(&disabled, Some(RecordedFormArg::Clear), None).is_err()
+        );
+    }
+
+    /// A password and a salt can be given in different forms, and `crypt
+    /// set-form` records one form per secret; a form is never a guess (`auto`
+    /// is not accepted there).
+    #[test]
+    fn crypt_secret_form_flags_parse() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let put = Cli::try_parse_from([
+                    "aeroftp",
+                    "rclone-crypt",
+                    "put",
+                    "./f.txt",
+                    "sftp://example",
+                    "/r",
+                    "--password",
+                    "p",
+                    "--password-form",
+                    "clear",
+                    "--salt-form",
+                    "obscured",
+                ])
+                .expect("put with forms parses");
+                match put.command {
+                    Commands::RcloneCrypt {
+                        command:
+                            RcloneCryptCommands::Put {
+                                password_form,
+                                salt_form,
+                                ..
+                            },
+                    } => {
+                        assert_eq!(password_form, SecretFormArg::Clear);
+                        assert_eq!(salt_form, SecretFormArg::Obscured);
+                        assert_eq!(
+                            salt_form.form(),
+                            Some(ftp_client_gui_lib::rclone_crypt::CryptSecretForm::Obscured)
+                        );
+                        assert_eq!(SecretFormArg::Auto.form(), None);
+                    }
+                    _ => panic!("expected rclone-crypt put"),
+                }
+                let set = Cli::try_parse_from([
+                    "aeroftp",
+                    "--profile",
+                    "vault",
+                    "crypt",
+                    "set-form",
+                    "--password-form",
+                    "clear",
+                    "--salt-form",
+                    "obscured",
+                ])
+                .expect("crypt set-form parses");
+                match set.command {
+                    Commands::Crypt {
+                        command:
+                            CryptCommands::SetForm {
+                                password_form,
+                                salt_form,
+                            },
+                    } => {
+                        assert_eq!(password_form.map(RecordedFormArg::as_str), Some("clear"));
+                        assert_eq!(salt_form.map(RecordedFormArg::as_str), Some("obscured"));
+                    }
+                    _ => panic!("expected crypt set-form"),
+                }
+                assert!(Cli::try_parse_from([
+                    "aeroftp",
+                    "crypt",
+                    "set-form",
+                    "--password-form",
+                    "auto",
+                ])
+                .is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn hashsum_download_flag_parses() {
         std::thread::Builder::new()
@@ -58520,7 +61754,10 @@ async fn cli_unlock_crypt_compare_keys(
             }
         },
     };
-    let password = read_server_cred(&store, uid, &format!("aerocrypt_overlay_pw_{}", id))
+    let stored_password = read_server_cred(&store, uid, &format!("aerocrypt_overlay_pw_{}", id));
+    // A secret from the environment carries no recorded form.
+    let password_from_env = stored_password.is_none();
+    let password = stored_password
         .or_else(|| std::env::var("AEROFTP_CRYPT_OVERLAY_PASSWORD").ok())
         .unwrap_or_default();
     // Keyfiles do not apply to rclone-crypt, which keeps requiring a password.
@@ -58532,9 +61769,12 @@ async fn cli_unlock_crypt_compare_keys(
         );
         return Err(5);
     }
-    let salt = read_server_cred(&store, uid, &format!("aerocrypt_overlay_salt_{}", id))
+    let stored_salt = read_server_cred(&store, uid, &format!("aerocrypt_overlay_salt_{}", id));
+    let salt_from_env = stored_salt.is_none();
+    let salt = stored_salt
         .or_else(|| std::env::var("AEROFTP_CRYPT_OVERLAY_SALT").ok())
         .unwrap_or_default();
+    let (password_form, salt_form) = ftp_client_gui_lib::rclone_crypt::crypt_secret_forms(profile);
     let local_config_json =
         read_server_cred(&store, uid, &format!("aerocrypt_overlay_config_{}", id))
             .filter(|s| !s.is_empty());
@@ -58553,6 +61793,16 @@ async fn cli_unlock_crypt_compare_keys(
             Some(salt.clone())
         },
         with_header: false,
+        password_form: ftp_client_gui_lib::rclone_crypt::secret_form_for_source(
+            password_form,
+            password_from_env,
+            "AEROFTP_CRYPT_OVERLAY_PASSWORD_FORM",
+        ),
+        salt_form: ftp_client_gui_lib::rclone_crypt::secret_form_for_source(
+            salt_form,
+            salt_from_env,
+            "AEROFTP_CRYPT_OVERLAY_SALT_FORM",
+        ),
     };
     match ftp_client_gui_lib::crypt_compare::unlock_overlay_keys(
         provider,
@@ -58786,10 +62036,10 @@ fn print_check_report(report: &CliCheckReport, local_path: &str, cli: &Cli, form
             "elapsed_secs": report.elapsed_secs,
             "details": report.details,
             "suggested_next_command": format!(
-                "aeroftp-cli sync --profile \"{}\" \"{}\" \"{}\" --dry-run --json",
+                "aeroftp-cli sync --profile {} {} {} --dry-run --json",
                 profile_or_placeholder(cli),
-                shell_double_quote(local_path),
-                shell_double_quote(&report.remote_path)
+                shell_arg(local_path),
+                shell_arg(&report.remote_path)
             ),
         });
         report.add_scan_fields(&mut doc);
@@ -58805,10 +62055,10 @@ fn print_check_report(report: &CliCheckReport, local_path: &str, cli: &Cli, form
         );
         report.warn_incomplete_scans();
         eprintln!(
-            "Next: aeroftp-cli sync --profile \"{}\" \"{}\" \"{}\" --dry-run --json",
+            "Next: aeroftp-cli sync --profile {} {} {} --dry-run --json",
             profile_or_placeholder(cli),
-            shell_double_quote(local_path),
-            shell_double_quote(&report.remote_path)
+            shell_arg(local_path),
+            shell_arg(&report.remote_path)
         );
         for d in &report.details {
             let icon = match d.status.as_str() {
@@ -58870,6 +62120,7 @@ async fn cmd_cryptcheck(
     remote_path: &str,
     password: Option<String>,
     password2: Option<String>,
+    secret_forms: CryptSecretForms,
     filename_encryption: &str,
     suffix: Option<&str>,
     one_way: bool,
@@ -58884,6 +62135,7 @@ async fn cmd_cryptcheck(
         remote_path,
         password,
         password2,
+        secret_forms,
         filename_encryption,
         suffix,
         one_way,
@@ -58942,6 +62194,7 @@ async fn cryptcheck_report(
     remote_path: &str,
     password: Option<String>,
     password2: Option<String>,
+    secret_forms: CryptSecretForms,
     filename_encryption: &str,
     suffix: Option<&str>,
     one_way: bool,
@@ -58978,7 +62231,12 @@ async fn cryptcheck_report(
         .unwrap_or_else(|| std::env::var("AEROFTP_RCLONE_CRYPT_PASSWORD2").unwrap_or_default());
 
     let (name_key, data_key, name_tweak) =
-        match ftp_client_gui_lib::rclone_crypt::derive_keys_with_tweak(&pwd, &salt) {
+        match ftp_client_gui_lib::rclone_crypt::derive_keys_with_forms(
+            &pwd,
+            secret_forms.0,
+            &salt,
+            secret_forms.1,
+        ) {
             Ok(keys) => keys,
             Err(e) => {
                 print_error(format, &format!("Key derivation failed: {}", e), 5);
@@ -59523,10 +62781,10 @@ async fn cmd_reconcile(
 
     let elapsed = start.elapsed().as_secs_f64();
     let suggested_next_command = format!(
-        "aeroftp-cli sync --profile \"{}\" \"{}\" \"{}\" --dry-run --json",
+        "aeroftp-cli sync --profile {} {} {} --dry-run --json",
         profile_or_placeholder(cli),
-        shell_double_quote(local_path),
-        shell_double_quote(remote_path)
+        shell_arg(local_path),
+        shell_arg(remote_path)
     );
 
     let result = CliReconcileResult {
@@ -60572,20 +63830,6 @@ fn quota_pct(used: u64, total: u64) -> Option<f64> {
     }
 }
 
-/// Parse an ISO 8601 / RFC 3339 timestamp into UNIX seconds. Falls back to
-/// `None` for unparseable input.
-fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.timestamp())
-        .or_else(|| {
-            // Tolerate trailing space or Z-less variants used by some providers.
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                .ok()
-                .map(|ndt| ndt.and_utc().timestamp())
-        })
-}
-
 /// Convert UNIX seconds to RFC 3339 string for inclusion in audit details.
 fn unix_to_rfc3339(ts: i64) -> Option<String> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339())
@@ -60854,7 +64098,11 @@ async fn run_audit_backup_freshness(
                         let mut newest_unix: Option<i64> = None;
                         let mut newest_name: Option<String> = None;
                         for e in &filtered {
-                            if let Some(m) = e.modified.as_deref().and_then(parse_iso8601_to_unix) {
+                            if let Some(m) = e
+                                .modified
+                                .as_deref()
+                                .and_then(ftp_client_gui_lib::parse_remote_mtime)
+                            {
                                 if newest_unix.is_none_or(|cur| m > cur) {
                                     newest_unix = Some(m);
                                     newest_name = Some(e.name.clone());
@@ -61047,6 +64295,788 @@ async fn run_audit_file_exists(
     emit_audit_report(&report, markdown, exit_code_flag)
 }
 
+/// Run a parsed `sync` command. The command line and the batch `SYNC` line
+/// both come here, so a script runs the same code with the same flags as
+/// `aeroftp-cli sync` (the batch used to call `cmd_sync` with fixed defaults
+/// and ignore every flag on the line).
+async fn dispatch_sync(
+    command: &Commands,
+    cli: &Cli,
+    format: OutputFormat,
+    cancelled: Arc<AtomicBool>,
+) -> i32 {
+    let Commands::Sync {
+        url,
+        local,
+        remote,
+        direction,
+        dry_run,
+        delete,
+        exclude,
+        error_correction,
+        ec_max_overhead,
+        track_renames,
+        max_delete,
+        backup_dir,
+        backup_suffix,
+        suffix_keep_extension,
+        compare_dest,
+        copy_dest,
+        from_reconcile,
+        conflict_mode,
+        skip_matching,
+        update,
+        modify_window,
+        checksum,
+        resync,
+        watch,
+        watch_mode,
+        watch_debounce_ms,
+        watch_cooldown,
+        watch_rescan,
+        watch_no_initial,
+        local_only,
+        no_local_delta,
+        delta,
+    } = command
+    else {
+        unreachable!("dispatch_sync takes a Commands::Sync");
+    };
+    // Z.2.2: local-to-local fast path. With `--local` the positional
+    // args become `<SRC> <DST>` (url=SRC, local=DST). Without
+    // `--local` the legacy 3-arg shape `<URL> <LOCAL> <REMOTE>`
+    // applies. Auto-detection also kicks in if both positional
+    // candidates look like real local fs paths (no scheme, exists or
+    // absolute) and no profile/URL was given.
+    let local_to_local_src;
+    let local_to_local_dst;
+    let local_to_local_match;
+    if *local_only {
+        local_to_local_src = url.as_str();
+        local_to_local_dst = local.as_str();
+        local_to_local_match = true;
+    } else if cli.profile.is_none()
+        && is_local_to_local_sync(false, url, cli.profile.as_deref(), local)
+    {
+        // Shape `<URL> <LOCAL> <REMOTE>` where URL is actually a path.
+        local_to_local_src = url.as_str();
+        local_to_local_dst = local.as_str();
+        local_to_local_match = true;
+    } else {
+        local_to_local_src = "";
+        local_to_local_dst = "";
+        local_to_local_match = false;
+    }
+
+    if local_to_local_match {
+        // The local-to-local copier does not plan: it copies every file.
+        // A flag it cannot honour is refused instead of ignored, so a
+        // `--delete` or a conflict policy never reads as applied.
+        let ignored = local_to_local_ignored_flags(&LocalToLocalFlags {
+            direction,
+            delete: *delete,
+            track_renames: *track_renames,
+            max_delete: max_delete.is_some(),
+            backup_dir: backup_dir.is_some(),
+            compare_dest: compare_dest.is_some(),
+            copy_dest: copy_dest.is_some(),
+            from_reconcile: from_reconcile.is_some(),
+            conflict_mode: conflict_mode.is_some(),
+            skip_matching: *skip_matching,
+            update: *update,
+            modify_window: modify_window.is_some(),
+            checksum: *checksum,
+            resync: *resync,
+            watch: *watch,
+            files_from: cli.files_from.is_some(),
+            files_from_raw: cli.files_from_raw.is_some(),
+        });
+        if !ignored.is_empty() {
+            print_error(
+                format,
+                &format!(
+                    "local-to-local sync copies every file and does not support: {}",
+                    ignored.join(", ")
+                ),
+                5,
+            );
+            return 5;
+        }
+        if error_correction.is_some() && !cli.quiet {
+            eprintln!("Warning: --error-correction is ignored for local-to-local sync");
+        }
+        let stats = cmd_sync_local_to_local(
+            local_to_local_src,
+            local_to_local_dst,
+            *dry_run,
+            exclude,
+            *no_local_delta,
+            cli,
+            format,
+            cancelled.clone(),
+        )
+        .await;
+        stats.exit_code
+    } else {
+        let notice = one_way_newer_notice(conflict_mode.as_deref(), direction);
+        let conflict_mode =
+            match check_sync_values(direction, conflict_mode.as_deref(), max_delete.as_deref()) {
+                Ok(mode) => mode,
+                Err(err) => {
+                    print_error(format, &err, 5);
+                    return 5;
+                }
+            };
+        if let (Some(notice), false) = (notice, cli.quiet) {
+            eprintln!("{notice}");
+        }
+        if *update && direction == "both" {
+            print_error(
+                format,
+                "--update applies to --direction upload or download: a two-way sync decides by its conflict mode",
+                5,
+            );
+            return 5;
+        }
+        let pair_rule = SyncPairRule {
+            conflict_mode: &conflict_mode,
+            skip_matching: *skip_matching,
+            update: *update,
+            modify_window: *modify_window,
+            checksum: *checksum,
+        };
+        match parse_sync_error_correction_level_pct(error_correction.as_deref()) {
+            Err(err) => {
+                print_error(format, &err, 5);
+                5
+            }
+            Ok(error_correction_pct) => {
+                let (u, l, r) = if profile_shifts_positionals(cli.profile.is_some(), url) {
+                    ("_", url.as_str(), local.as_str())
+                } else {
+                    (url.as_str(), local.as_str(), remote.as_str())
+                };
+
+                if *watch {
+                    cmd_sync_watch(
+                        u,
+                        l,
+                        r,
+                        direction,
+                        *dry_run,
+                        *delete,
+                        exclude,
+                        error_correction_pct,
+                        *ec_max_overhead,
+                        *track_renames,
+                        max_delete.as_deref(),
+                        backup_dir.as_deref(),
+                        backup_suffix,
+                        *suffix_keep_extension,
+                        compare_dest.as_deref(),
+                        copy_dest.as_deref(),
+                        from_reconcile.as_deref(),
+                        pair_rule,
+                        *resync,
+                        watch_mode,
+                        *watch_debounce_ms,
+                        *watch_cooldown,
+                        *watch_rescan,
+                        *watch_no_initial,
+                        cli,
+                        format,
+                        cancelled.clone(),
+                    )
+                    .await
+                } else {
+                    let max_attempts = effective_max_attempts(cli, format);
+                    let sleep_dur = parse_retry_sleep(&cli.retries_sleep);
+                    let max_transfer_limit = resolve_max_transfer(cli);
+                    let mut last_code = 0i32;
+                    for attempt in 1..=max_attempts {
+                        last_code = cmd_sync(
+                            u,
+                            l,
+                            r,
+                            direction,
+                            *dry_run,
+                            *delete,
+                            exclude,
+                            error_correction_pct,
+                            *ec_max_overhead,
+                            *track_renames,
+                            max_delete.as_deref(),
+                            backup_dir.as_deref(),
+                            backup_suffix,
+                            *suffix_keep_extension,
+                            compare_dest.as_deref(),
+                            copy_dest.as_deref(),
+                            from_reconcile.as_deref(),
+                            pair_rule,
+                            *resync,
+                            cli,
+                            format,
+                            cancelled.clone(),
+                            None,
+                            *delta,
+                        )
+                        .await
+                        .exit_code;
+                        if !is_retryable_exit(last_code)
+                            || session_transfer_exceeded(max_transfer_limit)
+                            || attempt == max_attempts
+                        {
+                            break;
+                        }
+                        if !cli.quiet {
+                            eprintln!(
+                                "Attempt {}/{} failed (exit {}), retrying in {:?}...",
+                                attempt, max_attempts, last_code, sleep_dur
+                            );
+                        }
+                        if !sleep_dur.is_zero() {
+                            tokio::time::sleep(sleep_dur).await;
+                        }
+                    }
+                    last_code
+                }
+            }
+        }
+    }
+}
+
+/// Where a batch script is connected: a URL, or a saved profile resolved the
+/// way `--profile` resolves it on the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchTarget {
+    Url(String),
+    Profile(String),
+}
+
+/// Positional arguments and flags a batch command accepts. Every line is
+/// checked against this before the script runs, so a mistyped flag or a stray
+/// token stops the script instead of being ignored.
+struct BatchCommandSpec {
+    name: &'static str,
+    min_args: usize,
+    max_args: usize,
+    flags: &'static [&'static str],
+    usage: &'static str,
+}
+
+const BATCH_COMMAND_SPECS: &[BatchCommandSpec] = &[
+    BatchCommandSpec {
+        name: "ON_ERROR",
+        min_args: 1,
+        max_args: 1,
+        flags: &[],
+        usage: "ON_ERROR CONTINUE|FAIL",
+    },
+    BatchCommandSpec {
+        name: "DISCONNECT",
+        min_args: 0,
+        max_args: 0,
+        flags: &[],
+        usage: "DISCONNECT",
+    },
+    BatchCommandSpec {
+        name: "GET",
+        min_args: 1,
+        max_args: 2,
+        flags: &[],
+        usage: "GET <remote> [local]",
+    },
+    BatchCommandSpec {
+        name: "PUT",
+        min_args: 1,
+        max_args: 2,
+        flags: &[],
+        usage: "PUT <local> [remote]",
+    },
+    BatchCommandSpec {
+        name: "RM",
+        min_args: 1,
+        max_args: 1,
+        flags: &["-r", "-rf"],
+        usage: "RM [-r] <remote>",
+    },
+    BatchCommandSpec {
+        name: "MV",
+        min_args: 2,
+        max_args: 2,
+        flags: &[],
+        usage: "MV <from> <to>",
+    },
+    BatchCommandSpec {
+        name: "LS",
+        min_args: 0,
+        max_args: 1,
+        flags: &["-l"],
+        usage: "LS [-l] [path]",
+    },
+    BatchCommandSpec {
+        name: "CAT",
+        min_args: 1,
+        max_args: 1,
+        flags: &[],
+        usage: "CAT <remote>",
+    },
+    BatchCommandSpec {
+        name: "STAT",
+        min_args: 1,
+        max_args: 1,
+        flags: &[],
+        usage: "STAT <remote>",
+    },
+    BatchCommandSpec {
+        name: "FIND",
+        min_args: 2,
+        max_args: 2,
+        flags: &[],
+        usage: "FIND <path> <pattern>",
+    },
+    BatchCommandSpec {
+        name: "DF",
+        min_args: 0,
+        max_args: 0,
+        flags: &[],
+        usage: "DF",
+    },
+    BatchCommandSpec {
+        name: "MKDIR",
+        min_args: 1,
+        max_args: 1,
+        flags: &[],
+        usage: "MKDIR <remote>",
+    },
+    BatchCommandSpec {
+        name: "TREE",
+        min_args: 0,
+        max_args: 1,
+        flags: &[],
+        usage: "TREE [path]",
+    },
+    BatchCommandSpec {
+        name: "TRANSFER",
+        min_args: 2,
+        max_args: 2,
+        flags: &["-r", "--recursive", "--skip-existing", "--dry-run"],
+        usage: "TRANSFER <source_path> <dest_path> [-r] [--skip-existing] [--dry-run]",
+    },
+];
+
+const BATCH_SUPPORTED_COMMANDS: &str = "SET, ECHO, ON_ERROR, CONNECT, DISCONNECT, GET, PUT, RM, MV, LS, CAT, STAT, FIND, DF, MKDIR, TREE, SYNC, CONNECT_SOURCE_PROFILE, CONNECT_DEST_PROFILE, TRANSFER";
+
+/// The CLI a batch uses for a `CONNECT <url>` target: the same flags without
+/// an outer `--profile`, which the connection would otherwise resolve instead
+/// of the URL (an OAuth or MTP profile then took every command of the script).
+fn cli_for_url_targets(cli: &Cli) -> Cli {
+    let mut url_cli = cli.clone();
+    url_cli.profile = None;
+    url_cli
+}
+
+/// One logical line of a batch script, read and checked before anything runs.
+#[derive(Debug)]
+struct BatchLine {
+    /// 0-based index of the line's first physical line (messages print +1).
+    line_num: usize,
+    /// The command word, upper-cased.
+    cmd: String,
+    /// The line after variable expansion (ECHO prints from it).
+    expanded: String,
+    /// Positional arguments after the command word, flags removed.
+    args: Vec<String>,
+    /// Flags present on the line, each one known to the command.
+    flags: Vec<String>,
+    /// CONNECT: what it connects to.
+    target: Option<BatchTarget>,
+    /// SYNC: the tokens after the command word, parsed as `aeroftp-cli sync`.
+    sync_args: Vec<String>,
+}
+
+impl BatchLine {
+    fn has_flag(&self, flag: &str) -> bool {
+        self.flags.iter().any(|f| f == flag)
+    }
+}
+
+/// The `sync` subcommand of the CLI, without the global flags: a batch `SYNC`
+/// line takes exactly what `aeroftp-cli sync` takes, through the same clap
+/// definition, and a global flag on the line is an error instead of being
+/// silently dropped.
+#[derive(Parser)]
+#[command(no_binary_name = true, disable_help_subcommand = true)]
+struct BatchSyncLine {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Parse the tokens of a `SYNC` line into the `sync` command. `url` is the
+/// connection the line runs against, `"_"` for a saved profile, exactly as the
+/// command line passes it with `--profile`.
+fn parse_batch_sync(url: &str, tokens: &[String]) -> Result<Commands, String> {
+    use clap::parser::ValueSource;
+    use clap::FromArgMatches;
+
+    let argv: Vec<&str> = ["sync", url]
+        .into_iter()
+        .chain(tokens.iter().map(String::as_str))
+        .collect();
+    let matches = BatchSyncLine::command()
+        .try_get_matches_from(argv)
+        .map_err(|e| {
+            e.render()
+                .to_string()
+                .lines()
+                .find(|l| l.starts_with("error:"))
+                .unwrap_or("invalid SYNC arguments")
+                .trim_start_matches("error: ")
+                .to_string()
+        })?;
+    let sub = matches
+        .subcommand_matches("sync")
+        .ok_or_else(|| "not a sync command".to_string())?;
+    // The CLI defaults `local` to "." and `remote` to "/"; a script must say
+    // both, or a missing path would sync the working directory to the root.
+    for field in ["local", "remote"] {
+        if sub.value_source(field) != Some(ValueSource::CommandLine) {
+            return Err("SYNC requires <local> <remote>".to_string());
+        }
+    }
+    if sub.get_flag("local_only_flag") {
+        return Err(
+            "--local is not available in a batch SYNC, which runs against the active CONNECT"
+                .to_string(),
+        );
+    }
+    // A script says which way it syncs: the CLI default (both) is what turned
+    // the 4.2.0 export into a bidirectional run.
+    if sub.value_source("direction") != Some(ValueSource::CommandLine) {
+        return Err(
+            "SYNC needs --direction upload, download or both: a script states which way it syncs"
+                .to_string(),
+        );
+    }
+    let command = BatchSyncLine::from_arg_matches(&matches)
+        .map(|line| line.command)
+        .map_err(|e| e.to_string())?;
+    let Commands::Sync {
+        direction,
+        conflict_mode,
+        max_delete,
+        delete,
+        dry_run,
+        ..
+    } = &command
+    else {
+        return Err("not a sync command".to_string());
+    };
+    check_sync_values(direction, conflict_mode.as_deref(), max_delete.as_deref())?;
+    // A batch run is never interactive, and `sync` refuses an unattended
+    // --delete without a cap: refuse it now, before line 1 runs.
+    if *delete && !*dry_run && max_delete.is_none() {
+        return Err(
+            "--delete in a script needs --max-delete N or N%: a batch run is never interactive"
+                .to_string(),
+        );
+    }
+    Ok(command)
+}
+
+/// Join a physical line ending in `\` with the next one. Returns the logical
+/// lines with the index of their first physical line.
+fn batch_logical_lines(content: &str) -> Result<Vec<(usize, String)>, (usize, String)> {
+    let mut out = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (idx, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if let Some((start, mut acc)) = pending.take() {
+            if line.is_empty() || line.starts_with('#') {
+                return Err((
+                    start,
+                    "a line ending in '\\' must be followed by its continuation, not by a blank or comment line".to_string(),
+                ));
+            }
+            match ftp_client_gui_lib::sync_script::continuation_head(line) {
+                Some(head) => {
+                    acc.push(' ');
+                    acc.push_str(head);
+                    pending = Some((start, acc));
+                }
+                None => {
+                    acc.push(' ');
+                    acc.push_str(line);
+                    out.push((start, acc));
+                }
+            }
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match ftp_client_gui_lib::sync_script::continuation_head(line) {
+            Some(head) => pending = Some((idx, head.to_string())),
+            None => out.push((idx, line.to_string())),
+        }
+    }
+    if let Some((start, _)) = pending {
+        return Err((
+            start,
+            "the script ends inside a '\\' continuation".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Check the arguments of a command against its spec: `--` ends the flags, a
+/// token starting with `-` must be one of the command's flags, and the number
+/// of positional arguments must fit.
+fn split_batch_args(
+    spec: &BatchCommandSpec,
+    tokens: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut args = Vec::new();
+    let mut flags = Vec::new();
+    let mut only_positional = false;
+    for token in tokens {
+        if !only_positional && token == "--" {
+            only_positional = true;
+        } else if !only_positional && token.len() > 1 && token.starts_with('-') {
+            if !spec.flags.contains(&token.as_str()) {
+                return Err(format!(
+                    "unknown flag '{}' for {} (usage: {})",
+                    token, spec.name, spec.usage
+                ));
+            }
+            flags.push(token.clone());
+        } else {
+            args.push(token.clone());
+        }
+    }
+    if args.len() < spec.min_args || args.len() > spec.max_args {
+        return Err(format!(
+            "{} takes {} (got {} argument{}): usage {}",
+            spec.name,
+            if spec.min_args == spec.max_args {
+                format!(
+                    "{} argument{}",
+                    spec.min_args,
+                    if spec.min_args == 1 { "" } else { "s" }
+                )
+            } else {
+                format!("{} to {} arguments", spec.min_args, spec.max_args)
+            },
+            args.len(),
+            if args.len() == 1 { "" } else { "s" },
+            spec.usage
+        ));
+    }
+    Ok((args, flags))
+}
+
+/// Read a whole batch script into checked lines: continuations joined,
+/// variables expanded in order (SET is applied here, so the values a line
+/// sees are the ones the run will see), every command and flag validated.
+/// Nothing runs until the whole script has passed, so an error on line 20
+/// never leaves lines 1 to 19 executed.
+fn read_batch_script(content: &str) -> Result<Vec<BatchLine>, (usize, String)> {
+    let mut variables: HashMap<String, String> = HashMap::new();
+    let mut lines = Vec::new();
+    // What earlier lines have opened, so a command that can only fail for
+    // want of a connection is reported now, not when it runs.
+    let mut connected = false;
+    let mut source_profile = false;
+    let mut dest_profile = false;
+    for (line_num, logical) in batch_logical_lines(content)? {
+        let expanded =
+            ftp_client_gui_lib::sync_script::expand_script_variables(&logical, &variables)
+                .map_err(|name| {
+                    (
+                        line_num,
+                        format!(
+                            "undefined variable '{name}': SET it on an earlier line, or write $$ for a literal $"
+                        ),
+                    )
+                })?;
+        let Some(word) = expanded.split_whitespace().next() else {
+            continue;
+        };
+        // ECHO and SET take the rest of the line as text, so an apostrophe
+        // in a message or a value is not an opening quote; every other line
+        // is split into arguments.
+        let parts = if matches!(word.to_uppercase().as_str(), "ECHO" | "SET") {
+            vec![word.to_string()]
+        } else {
+            ftp_client_gui_lib::sync_script::tokenize_script_line(&expanded)
+                .map_err(|e| (line_num, e))?
+        };
+        let Some(first) = parts.first() else {
+            continue;
+        };
+        let cmd = first.to_uppercase();
+        let rest = &parts[1..];
+        let mut line = BatchLine {
+            line_num,
+            cmd: cmd.clone(),
+            expanded: expanded.clone(),
+            args: Vec::new(),
+            flags: Vec::new(),
+            target: None,
+            sync_args: Vec::new(),
+        };
+        match cmd.as_str() {
+            "SET" => {
+                let body = expanded.get(3..).unwrap_or("").trim();
+                let Some(eq_pos) = body.find('=') else {
+                    return Err((line_num, "SET requires KEY=VALUE syntax".to_string()));
+                };
+                let key = body[..eq_pos].trim().to_string();
+                let value = body[eq_pos + 1..].trim().to_string();
+                if value.len() > 65_536 {
+                    return Err((line_num, "variable value too large (max 64 KB)".to_string()));
+                }
+                let valid_name = key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if !valid_name {
+                    return Err((
+                        line_num,
+                        format!(
+                            "invalid variable name '{}' (must match [A-Za-z_][A-Za-z0-9_]*)",
+                            key
+                        ),
+                    ));
+                }
+                if variables.len() >= 256 && !variables.contains_key(&key) {
+                    return Err((line_num, "too many variables (max 256)".to_string()));
+                }
+                variables.insert(key, value);
+            }
+            "ECHO" => {}
+            "CONNECT" => {
+                // `--profile=Name` is `--profile Name`.
+                let joined: Vec<String>;
+                let rest = match rest {
+                    [single] if single.starts_with("--profile=") => {
+                        joined = vec![
+                            "--profile".to_string(),
+                            single["--profile=".len()..].to_string(),
+                        ];
+                        joined.as_slice()
+                    }
+                    other => other,
+                };
+                line.target = Some(match rest {
+                    [flag] if flag == "--profile" => {
+                        return Err((
+                            line_num,
+                            "CONNECT --profile needs a saved profile name: CONNECT --profile \"My Server\"".to_string(),
+                        ));
+                    }
+                    [flag, name] if flag == "--profile" => {
+                        if name.trim().is_empty() {
+                            return Err((
+                                line_num,
+                                "CONNECT --profile needs a saved profile name (the script was exported without one: write the name between the quotes)".to_string(),
+                            ));
+                        }
+                        BatchTarget::Profile(name.clone())
+                    }
+                    [flag, ..] if flag == "--profile" => {
+                        return Err((
+                            line_num,
+                            "CONNECT --profile takes one name: quote a name with spaces, CONNECT --profile \"My Server\"".to_string(),
+                        ));
+                    }
+                    [url] if url.contains("://") => BatchTarget::Url(url.clone()),
+                    [name] => {
+                        return Err((
+                            line_num,
+                            format!("'{}' is not a URL. For a saved profile write CONNECT --profile \"{}\"", name, name),
+                        ));
+                    }
+                    _ => {
+                        return Err((
+                            line_num,
+                            "CONNECT takes a URL (protocol://host/path) or --profile <name>"
+                                .to_string(),
+                        ));
+                    }
+                });
+            }
+            "SYNC" => {
+                parse_batch_sync("_", rest).map_err(|e| (line_num, format!("SYNC: {}", e)))?;
+                line.sync_args = rest.to_vec();
+            }
+            "CONNECT_SOURCE_PROFILE" | "CONNECT_DEST_PROFILE" => match rest {
+                [name] if !name.starts_with('-') && !name.trim().is_empty() => {
+                    line.args = vec![name.clone()];
+                }
+                _ => {
+                    return Err((
+                        line_num,
+                        format!(
+                            "{cmd} takes one name: quote a name with spaces, {cmd} \"My Server\""
+                        ),
+                    ));
+                }
+            },
+            _ => {
+                let Some(spec) = BATCH_COMMAND_SPECS.iter().find(|s| s.name == cmd) else {
+                    return Err((
+                        line_num,
+                        format!(
+                            "Unknown command '{}'. Supported: {}",
+                            cmd, BATCH_SUPPORTED_COMMANDS
+                        ),
+                    ));
+                };
+                let (args, flags) = split_batch_args(spec, rest).map_err(|e| (line_num, e))?;
+                if cmd == "ON_ERROR"
+                    && !matches!(args[0].to_uppercase().as_str(), "CONTINUE" | "FAIL")
+                {
+                    return Err((
+                        line_num,
+                        format!("ON_ERROR expects CONTINUE or FAIL, got '{}'", args[0]),
+                    ));
+                }
+                line.args = args;
+                line.flags = flags;
+            }
+        }
+        match cmd.as_str() {
+            "CONNECT" => connected = true,
+            "DISCONNECT" => connected = false,
+            "CONNECT_SOURCE_PROFILE" => source_profile = true,
+            "CONNECT_DEST_PROFILE" => dest_profile = true,
+            "TRANSFER" if !(source_profile && dest_profile) => {
+                return Err((
+                    line_num,
+                    "TRANSFER needs CONNECT_SOURCE_PROFILE and CONNECT_DEST_PROFILE on earlier lines"
+                        .to_string(),
+                ));
+            }
+            "GET" | "PUT" | "RM" | "MV" | "LS" | "CAT" | "STAT" | "FIND" | "DF" | "MKDIR"
+            | "TREE" | "SYNC"
+                if !connected =>
+            {
+                return Err((
+                    line_num,
+                    format!(
+                        "{cmd} needs a connection: CONNECT to a URL or a saved profile on an earlier line"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
 async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<AtomicBool>) -> i32 {
     // The `.aeroftp` extension is the canonical profile-export format
     // and is unrelated to batch scripts (issue #225). Reject it here
@@ -61096,8 +65126,13 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
         return 5;
     }
 
-    let mut variables: HashMap<String, String> = HashMap::new();
-    let mut current_url: Option<String> = None;
+    let mut current: Option<BatchTarget> = None;
+    // CONNECT --profile: a copy of the CLI whose `--profile` is the connected
+    // profile, so every command resolves it as `aeroftp-cli --profile` would.
+    let mut profile_cli: Option<Cli> = None;
+    // CONNECT <url>: the CLI without an outer --profile, which would
+    // otherwise win over the URL on every command of the script.
+    let url_cli = cli_for_url_targets(cli);
     let mut exit_code = 0;
     let mut on_error_continue = false;
     let mut total_commands: u32 = 0;
@@ -61140,11 +65175,18 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
         }
     }
 
-    /// Require an active connection URL, or return error.
-    fn require_url(current_url: &Option<String>, line_num: usize) -> Result<String, i32> {
-        match current_url {
-            Some(u) => Ok(u.clone()),
-            None => {
+    /// The active connection as the command line passes it: the URL with the
+    /// batch CLI, or "_" with the CLI whose `--profile` is the connected one.
+    fn require_target<'a>(
+        current: &Option<BatchTarget>,
+        cli: &'a Cli,
+        profile_cli: &'a Option<Cli>,
+        line_num: usize,
+    ) -> Result<(String, &'a Cli), i32> {
+        match (current, profile_cli) {
+            (Some(BatchTarget::Url(u)), _) => Ok((u.clone(), cli)),
+            (Some(BatchTarget::Profile(_)), Some(pcli)) => Ok(("_".to_string(), pcli)),
+            _ => {
                 eprintln!(
                     "Line {}: No active connection. Use CONNECT first.",
                     line_num + 1
@@ -61154,197 +65196,61 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
         }
     }
 
-    for (line_num, raw_line) in content.lines().enumerate() {
+    // Read and check the whole script before running any of it.
+    let lines = match read_batch_script(&content) {
+        Ok(lines) => lines,
+        Err((line_num, message)) => {
+            print_error(format, &format!("Line {}: {}", line_num + 1, message), 5);
+            return 5;
+        }
+    };
+
+    for line in &lines {
+        let line_num = line.line_num;
         if cancelled.load(Ordering::Relaxed) {
             eprintln!("Batch interrupted at line {}", line_num + 1);
             return 4;
         }
-
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Single-pass variable substitution (prevents recursive expansion)
-        // Uses char indices for proper UTF-8 handling
-        let expanded = {
-            let mut result = String::with_capacity(line.len());
-            let chars: Vec<(usize, char)> = line.char_indices().collect();
-            let mut ci = 0;
-            while ci < chars.len() {
-                let (byte_idx, ch) = chars[ci];
-                if ch == '$' && ci + 1 < chars.len() {
-                    let (_, next_ch) = chars[ci + 1];
-                    if next_ch == '$' {
-                        // $$ escape → literal $
-                        result.push('$');
-                        ci += 2;
-                        continue;
-                    } else if next_ch == '{' {
-                        // ${VAR} syntax
-                        let start_byte = chars[ci + 2..]
-                            .first()
-                            .map(|(b, _)| *b)
-                            .unwrap_or(line.len());
-                        if let Some(close_pos) = line[start_byte..].find('}') {
-                            let key = &line[start_byte..start_byte + close_pos];
-                            if let Some(val) = variables.get(key) {
-                                result.push_str(val);
-                            } else {
-                                let end_byte = start_byte + close_pos + 1;
-                                result.push_str(&line[byte_idx..end_byte]);
-                            }
-                            // Skip past the closing }
-                            let end_byte = start_byte + close_pos + 1;
-                            ci = chars
-                                .iter()
-                                .position(|(b, _)| *b >= end_byte)
-                                .unwrap_or(chars.len());
-                            continue;
-                        }
-                    } else if next_ch.is_ascii_alphabetic() || next_ch == '_' {
-                        // $VAR syntax
-                        let start = ci + 1;
-                        let mut end = start;
-                        while end < chars.len()
-                            && (chars[end].1.is_ascii_alphanumeric() || chars[end].1 == '_')
-                        {
-                            end += 1;
-                        }
-                        let key_start = chars[start].0;
-                        let key_end = if end < chars.len() {
-                            chars[end].0
-                        } else {
-                            line.len()
-                        };
-                        let key = &line[key_start..key_end];
-                        if let Some(val) = variables.get(key) {
-                            result.push_str(val);
-                        } else {
-                            result.push_str(&line[byte_idx..key_end]);
-                        }
-                        ci = end;
-                        continue;
-                    }
-                }
-                result.push(ch);
-                ci += 1;
-            }
-            result
-        };
-
-        // Shell-like splitting that respects double quotes for paths with spaces
-        let parts_owned: Vec<String> = {
-            let mut parts = Vec::new();
-            let mut current = String::new();
-            let mut in_quotes = false;
-            for ch in expanded.chars() {
-                match ch {
-                    '"' => in_quotes = !in_quotes,
-                    ' ' | '\t' if !in_quotes => {
-                        if !current.is_empty() {
-                            parts.push(std::mem::take(&mut current));
-                        }
-                    }
-                    _ => current.push(ch),
-                }
-            }
-            if in_quotes {
-                eprintln!("Warning: line {}: unmatched quote", line_num + 1);
-            }
-            if !current.is_empty() {
-                parts.push(current);
-            }
-            parts
-        };
-        if parts_owned.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = parts_owned.iter().map(|s| s.as_str()).collect();
-
-        let cmd = parts[0].to_uppercase();
+        let args: Vec<&str> = line.args.iter().map(String::as_str).collect();
         total_commands += 1;
 
-        match cmd.as_str() {
-            "SET" => {
-                if expanded.len() > 3 {
-                    let rest = expanded[3..].trim();
-                    if let Some(eq_pos) = rest.find('=') {
-                        let key = rest[..eq_pos].trim().to_string();
-                        let value = rest[eq_pos + 1..].trim().to_string();
-                        // Limit variable value size to 64 KB
-                        if value.len() > 65_536 {
-                            eprintln!(
-                                "Line {}: variable value too large (max 64 KB)",
-                                line_num + 1
-                            );
-                            return 5;
-                        }
-                        // Validate variable name: [A-Za-z_][A-Za-z0-9_]*
-                        if !key.is_empty()
-                            && key
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        {
-                            if variables.len() >= 256 && !variables.contains_key(&key) {
-                                eprintln!("Line {}: too many variables (max 256)", line_num + 1);
-                                return 5;
-                            }
-                            variables.insert(key, value);
-                        } else {
-                            eprintln!("Line {}: invalid variable name '{}' (must match [A-Za-z_][A-Za-z0-9_]*)", line_num + 1, key);
-                            return 5;
-                        }
-                    } else {
-                        eprintln!("Line {}: SET requires KEY=VALUE syntax", line_num + 1);
-                        return 5;
-                    }
-                } else {
-                    eprintln!("Line {}: SET requires KEY=VALUE syntax", line_num + 1);
-                    return 5;
-                }
-            }
+        match line.cmd.as_str() {
+            // Applied while reading, so later lines already see the value.
+            "SET" => {}
             "ECHO" => {
                 // ECHO <message> - print to stderr for logging
-                let msg = if expanded.len() > 4 {
-                    expanded[4..].trim()
-                } else {
-                    ""
-                };
+                let msg = line.expanded.get(4..).unwrap_or("").trim();
                 eprintln!("{}", msg);
             }
             "ON_ERROR" => {
-                // ON_ERROR CONTINUE | ON_ERROR FAIL
-                if parts.len() >= 2 {
-                    match parts[1].to_uppercase().as_str() {
-                        "CONTINUE" => on_error_continue = true,
-                        "FAIL" => on_error_continue = false,
-                        other => {
-                            eprintln!(
-                                "Line {}: ON_ERROR expects CONTINUE or FAIL, got '{}'",
-                                line_num + 1,
-                                other
-                            );
-                            return 5;
-                        }
-                    }
-                }
+                // ON_ERROR CONTINUE | ON_ERROR FAIL (checked while reading)
+                on_error_continue = args[0].eq_ignore_ascii_case("CONTINUE");
             }
             "CONNECT" => {
-                if parts.len() < 2 {
-                    eprintln!("Line {}: CONNECT requires a URL", line_num + 1);
-                    return 5;
-                }
-                // Clear previous URL before attempting new connection
-                // Prevents stale URL reuse if CONNECT fails with ON_ERROR CONTINUE
-                current_url = None;
+                // Clear the previous connection before trying the new one, so a
+                // failed CONNECT under ON_ERROR CONTINUE never leaves the old one live.
+                current = None;
+                profile_cli = None;
                 // Reset profile info flag so each batch CONNECT prints its profile
                 PROFILE_INFO_PRINTED.store(false, Ordering::Relaxed);
-                exit_code = cmd_connect(parts[1], cli, format).await;
+                let target = line
+                    .target
+                    .clone()
+                    .expect("read_batch_script sets the CONNECT target");
+                exit_code = match &target {
+                    BatchTarget::Url(url) => cmd_connect(url, &url_cli, format).await,
+                    BatchTarget::Profile(name) => {
+                        let mut pcli = cli.clone();
+                        pcli.profile = Some(name.clone());
+                        let code = cmd_connect("_", &pcli, format).await;
+                        if code == 0 {
+                            profile_cli = Some(pcli);
+                        }
+                        code
+                    }
+                };
                 if exit_code == 0 {
-                    current_url = Some(parts[1].to_string());
+                    current = Some(target);
                 } else if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61356,25 +65262,18 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "DISCONNECT" => {
-                current_url = None;
+                current = None;
+                profile_cli = None;
             }
             "GET" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 2 {
-                    eprintln!("Line {}: GET requires a remote path", line_num + 1);
-                    return 5;
-                }
-                let local = if parts.len() > 2 {
-                    Some(parts[2])
-                } else {
-                    None
-                };
+                let local = if args.len() > 1 { Some(args[1]) } else { None };
                 exit_code = cmd_get(
                     &url,
-                    parts[1],
+                    args[0],
                     local,
                     false,
                     1,
@@ -61395,22 +65294,14 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "PUT" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 2 {
-                    eprintln!("Line {}: PUT requires a local path", line_num + 1);
-                    return 5;
-                }
-                let remote = if parts.len() > 2 {
-                    Some(parts[2])
-                } else {
-                    None
-                };
+                let remote = if args.len() > 1 { Some(args[1]) } else { None };
                 exit_code = cmd_put(
                     &url,
-                    parts[1],
+                    args[0],
                     remote,
                     false,
                     false,
@@ -61432,16 +65323,12 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "RM" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 2 {
-                    eprintln!("Line {}: RM requires a path", line_num + 1);
-                    return 5;
-                }
-                let recursive = parts.contains(&"-r") || parts.contains(&"-rf");
-                exit_code = cmd_rm(&url, parts[1], recursive, true, false, cli, format).await;
+                let recursive = line.has_flag("-r") || line.has_flag("-rf");
+                exit_code = cmd_rm(&url, args[0], recursive, true, false, cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61453,15 +65340,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "MV" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 3 {
-                    eprintln!("Line {}: MV requires <from> <to>", line_num + 1);
-                    return 5;
-                }
-                exit_code = cmd_mv(&url, parts[1], parts[2], cli, format).await;
+                exit_code = cmd_mv(&url, args[0], args[1], cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61473,12 +65356,12 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "LS" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                let path = if parts.len() > 1 { parts[1] } else { "/" };
-                let long = parts.contains(&"-l");
+                let path = args.first().copied().unwrap_or("/");
+                let long = line.has_flag("-l");
                 exit_code = cmd_ls(
                     &url, path, long, "name", false, true, None, false, false, cli, format,
                 )
@@ -61494,15 +65377,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "CAT" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 2 {
-                    eprintln!("Line {}: CAT requires a path", line_num + 1);
-                    return 5;
-                }
-                exit_code = cmd_cat(&url, parts[1], cli, format).await;
+                exit_code = cmd_cat(&url, args[0], cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61514,15 +65393,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "STAT" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 2 {
-                    eprintln!("Line {}: STAT requires a path", line_num + 1);
-                    return 5;
-                }
-                exit_code = cmd_stat(&url, parts[1], cli, format).await;
+                exit_code = cmd_stat(&url, args[0], cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61534,16 +65409,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "FIND" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 3 {
-                    eprintln!("Line {}: FIND requires <path> <pattern>", line_num + 1);
-                    return 5;
-                }
-                exit_code =
-                    cmd_find(&url, parts[1], parts[2], false, false, None, cli, format).await;
+                exit_code = cmd_find(&url, args[0], args[1], false, false, None, cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61555,8 +65425,8 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "DF" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
                 exit_code = cmd_df(&url, false, false, cli, format).await;
@@ -61571,15 +65441,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "MKDIR" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 2 {
-                    eprintln!("Line {}: MKDIR requires a path", line_num + 1);
-                    return 5;
-                }
-                exit_code = cmd_mkdir(&url, parts[1], false, None, cli, format).await;
+                exit_code = cmd_mkdir(&url, args[0], false, None, cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61591,11 +65457,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "TREE" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                let path = if parts.len() > 1 { parts[1] } else { "/" };
+                let path = args.first().copied().unwrap_or("/");
                 exit_code = cmd_tree(&url, path, 3, cli, format).await;
                 if let Some(code) = check_exit(
                     exit_code,
@@ -61608,43 +65474,18 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "SYNC" => {
-                let url = match require_url(&current_url, line_num) {
-                    Ok(u) => u,
+                let (url, cli) = match require_target(&current, &url_cli, &profile_cli, line_num) {
+                    Ok(t) => t,
                     Err(code) => return code,
                 };
-                if parts.len() < 3 {
-                    eprintln!("Line {}: SYNC requires <local> <remote>", line_num + 1);
-                    return 5;
-                }
-                exit_code = cmd_sync(
-                    &url,
-                    parts[1],
-                    parts[2],
-                    "both",
-                    false,
-                    false,
-                    &[],
-                    None,
-                    0,
-                    false,
-                    None,
-                    None,
-                    "",
-                    false,
-                    None,
-                    None,
-                    None,
-                    "newer",
-                    false,
-                    false,
-                    cli,
-                    format,
-                    cancelled.clone(),
-                    None,
-                    false, // Z.1.2: batch script SYNC keeps classic path; users opt in via dedicated CLI invocation
-                )
-                .await
-                .exit_code;
+                // The same clap definition and the same code as `aeroftp-cli sync`.
+                exit_code = match parse_batch_sync(&url, &line.sync_args) {
+                    Ok(command) => dispatch_sync(&command, cli, format, cancelled.clone()).await,
+                    Err(e) => {
+                        print_error(format, &format!("Line {}: SYNC: {}", line_num + 1, e), 5);
+                        5
+                    }
+                };
                 if let Some(code) = check_exit(
                     exit_code,
                     line_num,
@@ -61656,14 +65497,7 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "CONNECT_SOURCE_PROFILE" => {
-                if parts.len() < 2 {
-                    eprintln!(
-                        "Line {}: CONNECT_SOURCE_PROFILE requires a profile name",
-                        line_num + 1
-                    );
-                    return 5;
-                }
-                let profile_name = parts[1..].join(" ");
+                let profile_name = args[0].to_string();
                 PROFILE_INFO_PRINTED.store(false, Ordering::Relaxed);
                 // Disconnect previous source if any
                 if let Some((mut old, _)) = cross_source.take() {
@@ -61688,14 +65522,7 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                 }
             }
             "CONNECT_DEST_PROFILE" => {
-                if parts.len() < 2 {
-                    eprintln!(
-                        "Line {}: CONNECT_DEST_PROFILE requires a profile name",
-                        line_num + 1
-                    );
-                    return 5;
-                }
-                let profile_name = parts[1..].join(" ");
+                let profile_name = args[0].to_string();
                 PROFILE_INFO_PRINTED.store(false, Ordering::Relaxed);
                 if let Some((mut old, _)) = cross_dest.take() {
                     let _ = old.disconnect().await;
@@ -61752,15 +65579,11 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                     }
                 };
 
-                if parts.len() < 3 {
-                    eprintln!("Line {}: TRANSFER requires <source_path> <dest_path> [-r] [--skip-existing]", line_num + 1);
-                    return 5;
-                }
-                let source_path = parts[1];
-                let dest_path = parts[2];
-                let recursive = parts.contains(&"-r") || parts.contains(&"--recursive");
-                let skip_existing = parts.contains(&"--skip-existing");
-                let dry_run = parts.contains(&"--dry-run");
+                let source_path = args[0];
+                let dest_path = args[1];
+                let recursive = line.has_flag("-r") || line.has_flag("--recursive");
+                let skip_existing = line.has_flag("--skip-existing");
+                let dry_run = line.has_flag("--dry-run");
 
                 let request = CrossProfileTransferRequest {
                     source_profile: src_name.clone(),
@@ -61834,17 +65657,7 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
                     }
                 }
             }
-            _ => {
-                print_error(
-                    format,
-                    &format!("Line {}: Unknown command '{}'. Supported: SET, ECHO, ON_ERROR, CONNECT, DISCONNECT, GET, PUT, RM, MV, LS, CAT, STAT, FIND, DF, MKDIR, TREE, SYNC, CONNECT_SOURCE_PROFILE, CONNECT_DEST_PROFILE, TRANSFER", line_num + 1, cmd),
-                    5,
-                );
-                if !on_error_continue {
-                    return 5;
-                }
-                failed_commands += 1;
-            }
+            other => unreachable!("read_batch_script rejects unknown command {other}"),
         }
     }
 
@@ -61866,6 +65679,707 @@ async fn cmd_batch(file: &str, cli: &Cli, format: OutputFormat, cancelled: Arc<A
         4
     } else {
         exit_code
+    }
+}
+
+/// Building the full `Cli` clap command tree overflows the 2MB default test
+/// stack (the tree is enormous), so run clap-parsing assertions on a 32MB
+/// thread exactly like `dispatcher_allowlist_matches_clap_subcommands`.
+#[cfg(test)]
+fn on_big_stack<F: FnOnce() + Send + 'static>(f: F) {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+        .expect("big-stack test body panicked");
+}
+
+#[cfg(test)]
+mod batch_script_tests {
+    use super::*;
+    use ftp_client_gui_lib::sync::{CompareDirection, SyncProfile};
+    use ftp_client_gui_lib::sync_script::{
+        generate_script, ps1_wrapper, sh_wrapper, AerosyncScriptProfile,
+        SETTINGS_NOT_APPLIED_BY_CLI, UNATTENDED_MAX_DELETE,
+    };
+
+    fn sync_of(line: &BatchLine) -> Commands {
+        parse_batch_sync("_", &line.sync_args).expect("SYNC parses")
+    }
+
+    /// The script L2 ran against Koofr with v4.2.0: a download sync written on
+    /// continuation lines. It ran as a bidirectional sync without delete or
+    /// exclude, then failed on the orphaned "--direction" line. Here with the
+    /// `--max-delete 50%` the export now writes, since a script's --delete
+    /// needs a cap.
+    const EXPORTED_DOWNLOAD: &str = "# @aerosync:1\n\
+SET LOCAL=\"/home/me/Local Copy\"\n\
+SET REMOTE=\"/Backup\"\n\
+\n\
+CONNECT --profile \"Koofr\"\n\
+\n\
+SYNC ${LOCAL} ${REMOTE} \\\n\
+  --direction download \\\n\
+  --delete \\\n\
+  --max-delete 50% \\\n\
+  --exclude \"*.tmp\"\n\
+\n\
+DISCONNECT\n";
+
+    #[test]
+    fn continuation_lines_are_one_sync_with_every_flag() {
+        on_big_stack(|| {
+            let lines = read_batch_script(EXPORTED_DOWNLOAD).expect("script reads");
+            let cmds: Vec<&str> = lines.iter().map(|l| l.cmd.as_str()).collect();
+            assert_eq!(cmds, ["SET", "SET", "CONNECT", "SYNC", "DISCONNECT"]);
+            let sync = lines.iter().find(|l| l.cmd == "SYNC").unwrap();
+            assert_eq!(sync.line_num, 6, "reported on the SYNC line itself");
+            let Commands::Sync {
+                local,
+                remote,
+                direction,
+                delete,
+                exclude,
+                ..
+            } = sync_of(sync)
+            else {
+                panic!("not a sync");
+            };
+            assert_eq!(local, "/home/me/Local Copy");
+            assert_eq!(remote, "/Backup");
+            assert_eq!(direction, "download");
+            assert!(delete);
+            assert_eq!(exclude, vec!["*.tmp".to_string()]);
+
+            // The 4.2.0 export, with no cap, stops before line 1 runs.
+            let uncapped = EXPORTED_DOWNLOAD.replace("--max-delete 50% \\\n", "");
+            assert_ne!(uncapped, EXPORTED_DOWNLOAD);
+            let err = read_batch_script(&uncapped).expect_err("an uncapped --delete");
+            assert!(err.1.contains("needs --max-delete"), "{}", err.1);
+        });
+    }
+
+    /// A backslash that ends a Windows path is not a continuation. Every
+    /// line ending in `\` used to be joined to the next one, so the GET below
+    /// became part of the SET value, never ran, and the script exited 0.
+    /// Only ` \` (a space, then the backslash, as the export and CLI-GUIDE
+    /// write it) continues a line.
+    #[test]
+    fn a_trailing_backslash_in_a_path_does_not_swallow_the_next_line() {
+        let lines =
+            read_batch_script("SET DEST=C:\\Backup\\\nCONNECT sftp://h/\nGET /db.sql ${DEST}\n")
+                .expect("script reads");
+        let cmds: Vec<&str> = lines.iter().map(|l| l.cmd.as_str()).collect();
+        assert_eq!(cmds, ["SET", "CONNECT", "GET"]);
+        assert_eq!(lines[2].args, ["/db.sql", "C:\\Backup\\"]);
+
+        let lines =
+            read_batch_script("CONNECT sftp://h/\nECHO Saved to C:\\Backup\\\nRM -r /staging\n")
+                .expect("script reads");
+        let cmds: Vec<&str> = lines.iter().map(|l| l.cmd.as_str()).collect();
+        assert_eq!(cmds, ["CONNECT", "ECHO", "RM"]);
+        assert_eq!(lines[2].args, ["/staging"]);
+    }
+
+    /// SYNC values are checked while the script is read, not when the line
+    /// runs: a typo in --direction failed only after the lines before it had
+    /// run, an unknown --conflict-mode became "skip" in silence, a
+    /// --max-delete that is neither a count nor a percentage meant no cap at
+    /// all, and an unattended --delete without a cap was refused only at run
+    /// time. A script also says which way it syncs.
+    #[test]
+    fn sync_values_are_checked_before_the_script_runs() {
+        on_big_stack(|| {
+            for (sync, needle) in [
+                ("--direction dowload", "--direction 'dowload'"),
+                (
+                    "--direction upload --conflict-mode renmae",
+                    "--conflict-mode 'renmae'",
+                ),
+                (
+                    "--direction upload --delete --max-delete 0.5",
+                    "--max-delete '0.5'",
+                ),
+                (
+                    "--direction upload --delete --max-delete 50pct",
+                    "--max-delete '50pct'",
+                ),
+                (
+                    "--direction upload --delete --max-delete half",
+                    "--max-delete 'half'",
+                ),
+                (
+                    "--direction upload --delete --max-delete 150%",
+                    "--max-delete '150%'",
+                ),
+                ("--direction upload --delete", "needs --max-delete"),
+                ("--delete --max-delete 10", "needs --direction"),
+            ] {
+                let script = format!("CONNECT sftp://h/\nSYNC /a /b {sync}\n");
+                let err = read_batch_script(&script).expect_err(&script);
+                assert!(err.1.contains(needle), "{script:?}: {}", err.1);
+            }
+            for sync in [
+                "--direction upload --delete --max-delete 10",
+                "--direction download --delete --max-delete 50%",
+                "--direction both --delete --dry-run",
+                "--direction both --conflict-mode rename",
+            ] {
+                read_batch_script(&format!("CONNECT sftp://h/\nSYNC /a /b {sync}\n"))
+                    .unwrap_or_else(|e| panic!("{sync}: {}", e.1));
+            }
+        });
+    }
+
+    /// A variable that was never SET stops the script while it is read: kept
+    /// as text, `${REMOT}` became the name of the folder SYNC wrote into.
+    #[test]
+    fn an_undefined_variable_stops_the_script_before_it_runs() {
+        on_big_stack(|| {
+            for script in [
+                "SET REMOTE=/r\nCONNECT sftp://h/\nSYNC /a ${REMOT} --direction upload\n",
+                "CONNECT sftp://h/\nECHO saved to $DEST\n",
+            ] {
+                let err = read_batch_script(script).expect_err(script);
+                assert!(
+                    err.1.contains("undefined variable"),
+                    "{script:?}: {}",
+                    err.1
+                );
+            }
+            let ok = read_batch_script("SET V=1\nCONNECT sftp://h/\nECHO Price: $$$V, $5\n")
+                .expect("reads");
+            let echo = ok.iter().find(|l| l.cmd == "ECHO").expect("an ECHO line");
+            assert!(
+                echo.expanded.ends_with("Price: $1, $5"),
+                "{}",
+                echo.expanded
+            );
+        });
+    }
+
+    /// Paths and patterns with `$`, a leading dash, an apostrophe or a
+    /// trailing backslash, exported and run as a batch, reach `sync` as they
+    /// were: the export writes `$$` and `--exclude=` for a dash, and `$weird`
+    /// is no longer read as a variable.
+    #[test]
+    fn edge_values_in_an_exported_script_reach_sync_unchanged() {
+        on_big_stack(|| {
+            let mut preset = SyncProfile::mirror();
+            preset.exclude_patterns = vec![
+                "-tmp".to_string(),
+                "it's".to_string(),
+                "dir\\".to_string(),
+                "$HOME".to_string(),
+            ];
+            let profile = AerosyncScriptProfile {
+                profile: preset,
+                local_path: "/data/$weird/a$$b".to_string(),
+                remote_path: "/r/${HOME}".to_string(),
+                connect_profile: Some("P".to_string()),
+                connect_url: None,
+                dry_run: false,
+                conflict_mode: None,
+                track_renames: false,
+                skip_matching: false,
+                resync: false,
+                watch: false,
+            };
+            let script = generate_script(&profile, "test");
+            let lines = read_batch_script(&script).unwrap_or_else(|e| panic!("{}: {script}", e.1));
+            let sync = lines.iter().find(|l| l.cmd == "SYNC").expect("a SYNC line");
+            let Commands::Sync {
+                local,
+                remote,
+                exclude,
+                ..
+            } = sync_of(sync)
+            else {
+                panic!("not a sync");
+            };
+            assert_eq!(local, "/data/$weird/a$$b");
+            assert_eq!(remote, "/r/${HOME}");
+            assert_eq!(exclude, ["-tmp", "it's", "dir\\", "$HOME"]);
+        });
+    }
+
+    /// ECHO and SET take the rest of the line as text: an apostrophe in a
+    /// message or a value stopped the whole script with "unmatched quote".
+    /// A command that takes arguments still reads quotes, so a URL with an
+    /// apostrophe is written between double quotes.
+    #[test]
+    fn an_apostrophe_in_echo_or_set_is_text() {
+        on_big_stack(|| {
+            let lines = read_batch_script(
+                "SET MSG=it's done\nCONNECT \"sftp://u:pa'ss@h/\"\nECHO Don't forget: ${MSG}\n",
+            )
+            .unwrap_or_else(|e| panic!("{}", e.1));
+            let echo = lines
+                .iter()
+                .find(|l| l.cmd == "ECHO")
+                .expect("an ECHO line");
+            assert!(
+                echo.expanded.ends_with("Don't forget: it's done"),
+                "{}",
+                echo.expanded
+            );
+            let connect = lines.iter().find(|l| l.cmd == "CONNECT").unwrap();
+            assert_eq!(
+                connect.target,
+                Some(BatchTarget::Url("sftp://u:pa'ss@h/".into()))
+            );
+        });
+    }
+
+    /// `aeroftp-cli --profile X batch s.aeroftp-script` with `CONNECT <url>`
+    /// in the script: the URL is what the script connects to, not X.
+    #[test]
+    fn a_url_target_does_not_inherit_the_outer_profile() {
+        on_big_stack(a_url_target_does_not_inherit_the_outer_profile_body);
+    }
+
+    fn a_url_target_does_not_inherit_the_outer_profile_body() {
+        let cli = Cli::try_parse_from([
+            "aeroftp-cli",
+            "--profile",
+            "Other",
+            "--quiet",
+            "batch",
+            "s.aeroftp-script",
+        ])
+        .expect("parses");
+        assert_eq!(cli.profile.as_deref(), Some("Other"));
+        let url_cli = cli_for_url_targets(&cli);
+        assert_eq!(url_cli.profile, None);
+        assert!(url_cli.quiet, "the other flags are kept");
+    }
+
+    /// Mistakes a reader can see are reported while the script is read:
+    /// a command before any CONNECT, a TRANSFER without both profiles, and
+    /// the CONNECT forms that used to get the wrong hint.
+    #[test]
+    fn connection_mistakes_are_reported_before_the_script_runs() {
+        on_big_stack(|| {
+            for (script, needle) in [
+                ("LS /\n", "LS needs a connection"),
+                (
+                    "CONNECT sftp://h/\nDISCONNECT\nGET /a\n",
+                    "GET needs a connection",
+                ),
+                ("CONNECT --profile\n", "needs a saved profile name"),
+                (
+                    "CONNECT_SOURCE_PROFILE A\nTRANSFER /a /b\n",
+                    "CONNECT_DEST_PROFILE",
+                ),
+                ("CONNECT_SOURCE_PROFILE My A\n", "takes one name"),
+                ("CONNECT_DEST_PROFILE --x\n", "takes one name"),
+            ] {
+                let err = read_batch_script(script).expect_err(script);
+                assert!(err.1.contains(needle), "{script:?}: {}", err.1);
+            }
+            let lines = read_batch_script(
+                "CONNECT --profile=Koofr\nLS /\nCONNECT_SOURCE_PROFILE \"My A\"\nCONNECT_DEST_PROFILE B\nTRANSFER /a /b\n",
+            )
+            .unwrap_or_else(|e| panic!("{}", e.1));
+            assert_eq!(lines[0].target, Some(BatchTarget::Profile("Koofr".into())));
+            assert_eq!(lines[2].args, ["My A"]);
+        });
+    }
+
+    /// `sync --delete --backup-dir`: a backup that cannot be written keeps
+    /// the file and reports it, instead of a warning and the delete.
+    #[test]
+    fn a_failed_backup_keeps_the_file_it_was_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"keep me").unwrap();
+        // The backup folder cannot exist: a file has its name.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let backup_dir = blocked.join("sub");
+        let outcome = backup_then_delete_local(
+            file.to_str().unwrap(),
+            Some(backup_dir.to_str().unwrap()),
+            "",
+            "a.txt",
+            false,
+        );
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+
+        let good = dir.path().join("bak");
+        backup_then_delete_local(
+            file.to_str().unwrap(),
+            Some(good.to_str().unwrap()),
+            ".old",
+            "a.txt",
+            false,
+        )
+        .unwrap();
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(good.join("a.txt.old")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn max_delete_is_a_count_or_a_percentage() {
+        assert_eq!(MaxDeleteCap::parse("10"), Ok(MaxDeleteCap::Count(10)));
+        assert_eq!(MaxDeleteCap::parse("0"), Ok(MaxDeleteCap::Count(0)));
+        assert_eq!(MaxDeleteCap::parse("50%"), Ok(MaxDeleteCap::Percent(50.0)));
+        assert_eq!(
+            MaxDeleteCap::parse("12.5%"),
+            Ok(MaxDeleteCap::Percent(12.5))
+        );
+        for bad in ["", "0.5", "50pct", "half", "150%", "-1", "-5%", "NaN%", "%"] {
+            assert!(MaxDeleteCap::parse(bad).is_err(), "{bad:?} was accepted");
+        }
+        assert_eq!(MaxDeleteCap::Percent(50.0).limit(7), 4);
+        assert_eq!(MaxDeleteCap::Count(3).limit(100), 3);
+    }
+
+    #[test]
+    fn connect_takes_a_url_or_a_saved_profile() {
+        let url = read_batch_script("CONNECT sftp://me@host/\n").unwrap();
+        assert_eq!(
+            url[0].target,
+            Some(BatchTarget::Url("sftp://me@host/".into()))
+        );
+        let profile = read_batch_script("CONNECT --profile \"My Koofr\"\n").unwrap();
+        assert_eq!(
+            profile[0].target,
+            Some(BatchTarget::Profile("My Koofr".into()))
+        );
+
+        let bare = read_batch_script("CONNECT Koofr\n").unwrap_err();
+        assert!(bare.1.contains("CONNECT --profile \"Koofr\""), "{}", bare.1);
+        let empty = read_batch_script("CONNECT --profile \"\"\n").unwrap_err();
+        assert!(
+            empty.1.contains("needs a saved profile name"),
+            "{}",
+            empty.1
+        );
+        let unquoted = read_batch_script("CONNECT --profile My Koofr\n").unwrap_err();
+        assert!(unquoted.1.contains("quote a name"), "{}", unquoted.1);
+    }
+
+    #[test]
+    fn an_unknown_flag_or_token_stops_the_script_before_it_runs() {
+        on_big_stack(|| {
+            // Every error here is raised while reading, before line 1 executes.
+            for (script, needle) in [
+                (
+                    "CONNECT sftp://h/\nSYNC /a /b --direktion download\n",
+                    "--direktion",
+                ),
+                (
+                    "CONNECT sftp://h/\nSYNC /a /b --profile Other\n",
+                    "--profile",
+                ),
+                (
+                    "CONNECT sftp://h/\nSYNC /a\n",
+                    "SYNC requires <local> <remote>",
+                ),
+                ("CONNECT sftp://h/\nSYNC /a /b --local\n", "--local"),
+                ("CONNECT sftp://h/\nLS --long /\n", "unknown flag '--long'"),
+                (
+                    "CONNECT sftp://h/\nGET /a /b /c\n",
+                    "GET takes 1 to 2 arguments",
+                ),
+                ("CONNECT sftp://h/\nDF /\n", "DF takes 0 arguments"),
+                ("ON_ERROR\n", "ON_ERROR takes 1 argument"),
+                ("ON_ERROR MAYBE\n", "CONTINUE or FAIL"),
+                ("--direction download\n", "Unknown command '--DIRECTION'"),
+                ("CONNECT sftp://h/\nLS \"/unterminated\n", "unmatched quote"),
+                (
+                    "SYNC /a /b \\\n\n  --delete\n",
+                    "must be followed by its continuation",
+                ),
+                ("SYNC /a /b \\\n", "ends inside"),
+            ] {
+                let err = read_batch_script(script).expect_err(script);
+                assert!(err.1.contains(needle), "{script:?}: {}", err.1);
+            }
+        });
+    }
+
+    #[test]
+    fn flags_are_not_read_as_paths() {
+        let lines =
+            read_batch_script("CONNECT sftp://h/\nLS -l /data\nRM -r /old\nRM -- -odd\n").unwrap();
+        assert_eq!(lines[1].args, ["/data"]);
+        assert!(lines[1].has_flag("-l"));
+        assert_eq!(lines[2].args, ["/old"]);
+        assert!(lines[2].has_flag("-r"));
+        assert_eq!(lines[3].args, ["-odd"], "`--` ends the flags");
+    }
+
+    #[test]
+    fn set_applies_in_order_and_quotes_keep_empty_arguments() {
+        let lines = read_batch_script("SET A=1\nECHO $A\nSET A=2\nECHO ${A} $$A\n").unwrap();
+        assert_eq!(lines[1].expanded, "ECHO 1");
+        assert_eq!(lines[3].expanded, "ECHO 2 $A");
+        assert_eq!(
+            ftp_client_gui_lib::sync_script::tokenize_script_line("X \"\" \"a b\"").unwrap(),
+            ["X", "", "a b"]
+        );
+    }
+
+    fn all_script_profiles() -> Vec<AerosyncScriptProfile> {
+        let mut out = Vec::new();
+        for preset in SyncProfile::builtins() {
+            out.push(AerosyncScriptProfile {
+                profile: preset.clone(),
+                local_path: "/Users/John Smith/Docs".into(),
+                remote_path: "/remote dir".into(),
+                connect_profile: Some("My Server".into()),
+                connect_url: None,
+                dry_run: false,
+                conflict_mode: None,
+                track_renames: false,
+                skip_matching: false,
+                resync: false,
+                watch: false,
+            });
+            out.push(AerosyncScriptProfile {
+                profile: preset,
+                // A Windows path: the exporter's escapes and the batch reader
+                // must agree on every backslash.
+                local_path: r"C:\Users\Jane\My Docs".into(),
+                remote_path: "/r".into(),
+                connect_profile: None,
+                connect_url: Some("sftp://me@host:22/".into()),
+                dry_run: true,
+                conflict_mode: Some("rename".into()),
+                track_renames: true,
+                skip_matching: true,
+                resync: true,
+                watch: true,
+            });
+        }
+        out
+    }
+
+    /// generate_script -> batch reader -> the `sync` parameters of the preset,
+    /// for every builtin. The destructurings below list every field: a field
+    /// added to SyncProfile or AerosyncScriptProfile does not compile until it
+    /// is either checked against a `sync` flag here or named in
+    /// SETTINGS_NOT_APPLIED_BY_CLI, which can therefore only shrink.
+    #[test]
+    fn exported_script_runs_the_preset_it_was_exported_from() {
+        on_big_stack(|| {
+            for exported in all_script_profiles() {
+                let AerosyncScriptProfile {
+                    profile,
+                    local_path,
+                    remote_path,
+                    connect_profile,
+                    connect_url,
+                    dry_run: want_dry_run,
+                    conflict_mode: want_conflict,
+                    track_renames: want_track,
+                    skip_matching: want_skip,
+                    resync: want_resync,
+                    watch: want_watch,
+                } = exported.clone();
+                let SyncProfile {
+                    id: _,
+                    name: _,
+                    builtin: _,
+                    direction: want_direction,
+                    // Not applied by `sync` yet: named in the script comment.
+                    compare_timestamp: _,
+                    compare_size: _,
+                    compare_checksum: _,
+                    retry_policy: _,
+                    verify_policy: _,
+                    exclude_patterns: want_exclude,
+                    delete_orphans: want_delete,
+                    // Not preset settings: the runner never applied them and the
+                    // GUI is dropping the controls, so the script does not name them.
+                    parallel_streams: _,
+                    compression_mode: _,
+                } = profile.clone();
+
+                let script = generate_script(&exported, "test");
+                let lines =
+                    read_batch_script(&script).unwrap_or_else(|e| panic!("{}: {script}", e.1));
+
+                let connect = lines.iter().find(|l| l.cmd == "CONNECT").unwrap();
+                let want_target = match (connect_profile, connect_url) {
+                    (Some(name), _) => BatchTarget::Profile(name),
+                    (None, Some(url)) => BatchTarget::Url(url),
+                    (None, None) => unreachable!(),
+                };
+                assert_eq!(connect.target.as_ref(), Some(&want_target));
+
+                let syncs: Vec<&BatchLine> = lines.iter().filter(|l| l.cmd == "SYNC").collect();
+                assert_eq!(syncs.len(), 1, "{script}");
+                let Commands::Sync {
+                    local,
+                    remote,
+                    direction,
+                    dry_run,
+                    delete,
+                    exclude,
+                    track_renames,
+                    conflict_mode,
+                    skip_matching,
+                    resync,
+                    watch,
+                    max_delete,
+                    ..
+                } = sync_of(syncs[0])
+                else {
+                    panic!("not a sync");
+                };
+                assert_eq!(local, local_path);
+                assert_eq!(remote, remote_path);
+                let want_direction = match want_direction {
+                    CompareDirection::LocalToRemote => "upload",
+                    CompareDirection::RemoteToLocal => "download",
+                    CompareDirection::Bidirectional => "both",
+                };
+                assert_eq!(direction, want_direction, "{}", profile.id);
+                assert_eq!(delete, want_delete, "{}", profile.id);
+                // An unattended --delete needs a cap or sync refuses it.
+                assert_eq!(
+                    max_delete.as_deref(),
+                    want_delete.then_some(UNATTENDED_MAX_DELETE),
+                    "{}",
+                    profile.id
+                );
+                assert_eq!(exclude, want_exclude, "{}", profile.id);
+                assert_eq!(dry_run, want_dry_run);
+                assert_eq!(track_renames, want_track);
+                assert_eq!(skip_matching, want_skip);
+                assert_eq!(resync, want_resync);
+                assert_eq!(watch, want_watch);
+                // A one-way run applies `skip` only; another mode stays off
+                // the line and is named in the comment (sync_script).
+                let one_way = want_direction != "both";
+                let want_on_line = want_conflict
+                    .clone()
+                    .filter(|mode| !one_way || mode == "skip" || mode == "source");
+                assert_eq!(conflict_mode, want_on_line, "{}", profile.id);
+                if let Some(mode) =
+                    want_conflict.filter(|mode| one_way && mode != "skip" && mode != "source")
+                {
+                    assert!(
+                        script.contains(&format!("#   conflict mode: {mode} ")),
+                        "{script}"
+                    );
+                }
+
+                // Every setting `sync` cannot apply yet is named, never dropped.
+                for setting in SETTINGS_NOT_APPLIED_BY_CLI {
+                    assert!(
+                        script.contains(&format!("#   {}: ", setting)),
+                        "{setting} missing from:\n{script}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Every batch example in docs/CLI-GUIDE.md passes the reader: the public
+    /// docs site had drifted to `SYNC remote local` and a `-r` sync flag that
+    /// the batch now rejects before running.
+    #[test]
+    fn the_cli_guide_batch_examples_pass_the_reader() {
+        on_big_stack(|| {
+            let guide = include_str!("../../../docs/CLI-GUIDE.md");
+            let mut checked = 0;
+            for block in guide.split("```").skip(1).step_by(2) {
+                let Some(body) = block.strip_prefix('\n') else {
+                    continue; // a fenced block with a language tag is not a batch script
+                };
+                let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                let is_batch = [
+                    "SET ",
+                    "CONNECT ",
+                    "# deploy.aeroftp-script",
+                    "# Comment lines",
+                ]
+                .iter()
+                .any(|p| first.starts_with(p));
+                if !is_batch {
+                    continue;
+                }
+                read_batch_script(body)
+                    .unwrap_or_else(|e| panic!("line {}: {}\n{body}", e.0 + 1, e.1));
+                checked += 1;
+            }
+            assert!(checked >= 3, "found {checked} batch examples in the guide");
+        });
+    }
+
+    #[test]
+    fn the_wrappers_invoke_a_batch_command_the_cli_accepts() {
+        on_big_stack(|| {
+            let sh = sh_wrapper("nightly.aeroftp-script");
+            let ps1 = ps1_wrapper("nightly.aeroftp-script");
+            assert!(
+                sh.contains("exec aeroftp-cli batch \"$here/nightly.aeroftp-script\" \"$@\""),
+                "{sh}"
+            );
+            assert!(
+                ps1.contains(
+                    "& aeroftp-cli batch (Join-Path $here 'nightly.aeroftp-script') @args"
+                ),
+                "{ps1}"
+            );
+            // What the wrappers run, with and without a forwarded global flag.
+            for argv in [
+                vec!["aeroftp-cli", "batch", "/s/nightly.aeroftp-script"],
+                vec![
+                    "aeroftp-cli",
+                    "batch",
+                    "/s/nightly.aeroftp-script",
+                    "--quiet",
+                ],
+            ] {
+                let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                assert!(
+                    matches!(cli.command, Commands::Batch { ref file } if file == "/s/nightly.aeroftp-script")
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn the_ai_sync_suggestion_is_a_command_the_cli_accepts() {
+        on_big_stack(|| {
+            use ftp_client_gui_lib::ai_core::remote_tools::suggest_sync_command;
+            let line = suggest_sync_command(
+                "My Server",
+                "/home/me/a dir",
+                "/remote",
+                " --direction download --dry-run --json --delete --track-renames --exclude \"*.tmp\"",
+            );
+            assert!(!line.contains("--checksum"));
+            let argv = ftp_client_gui_lib::sync_script::tokenize_script_line(&line).unwrap();
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert_eq!(cli.profile.as_deref(), Some("My Server"));
+            let Commands::Sync {
+                url,
+                local,
+                direction,
+                delete,
+                exclude,
+                ..
+            } = cli.command
+            else {
+                panic!("not a sync: {line}");
+            };
+            // With --profile, the dispatcher reads the first positional as LOCAL.
+            assert_eq!(
+                (url.as_str(), local.as_str()),
+                ("/home/me/a dir", "/remote")
+            );
+            assert_eq!(direction, "download");
+            assert!(delete);
+            assert_eq!(exclude, ["*.tmp"]);
+        });
     }
 }
 
@@ -64810,6 +69324,7 @@ async fn main() {
 
     if matches!(&cli.command, Commands::Tui) {
         let exit_code = cmd_tui(&mut cli, format).await;
+        render_pending_warnings(format);
         std::process::exit(exit_code);
     }
 
@@ -64962,41 +69477,19 @@ async fn main() {
             } else {
                 (url.as_str(), local.as_str(), remote.as_deref())
             };
-            let max_attempts = effective_max_attempts(&cli, format);
-            let sleep_dur = parse_retry_sleep(&cli.retries_sleep);
-            let max_transfer_limit = resolve_max_transfer(&cli);
-            let mut last_code = 0i32;
-            for attempt in 1..=max_attempts {
-                last_code = cmd_put(
-                    u,
-                    l,
-                    r,
-                    *recursive,
-                    *no_clobber,
-                    *delta,
-                    *access,
-                    &cli,
-                    format,
-                    cancelled.clone(),
-                )
-                .await;
-                if !is_retryable_exit(last_code)
-                    || session_transfer_exceeded(max_transfer_limit)
-                    || attempt == max_attempts
-                {
-                    break;
-                }
-                if !cli.quiet {
-                    eprintln!(
-                        "Attempt {}/{} failed (exit {}), retrying in {:?}...",
-                        attempt, max_attempts, last_code, sleep_dur
-                    );
-                }
-                if !sleep_dur.is_zero() {
-                    tokio::time::sleep(sleep_dur).await;
-                }
-            }
-            last_code
+            put_with_retries(
+                u,
+                l,
+                r,
+                *recursive,
+                *no_clobber,
+                *delta,
+                *access,
+                &cli,
+                format,
+                cancelled.clone(),
+            )
+            .await
         }
         Commands::Mkdir {
             url,
@@ -65085,6 +69578,8 @@ async fn main() {
             one_way,
             checkfile,
             algorithm,
+            password_form,
+            salt_form,
         } => {
             let (u, l, r) = if cli.profile.is_some() && !url.contains("://") && url != "_" {
                 ("_", url.as_str(), local.as_str())
@@ -65097,6 +69592,7 @@ async fn main() {
                 r,
                 password.clone(),
                 password2.clone(),
+                (password_form.form(), salt_form.form()),
                 filename_encryption,
                 suffix.as_deref(),
                 *one_way,
@@ -65113,13 +69609,26 @@ async fn main() {
             find,
             replace,
             first,
+            allow_non_atomic,
         } => {
             let (u, p, f, r) = if cli.profile.is_some() && !url.contains("://") && url != "_" {
                 ("_", url.as_str(), path.as_str(), find.as_str())
             } else {
                 (url.as_str(), path.as_str(), find.as_str(), replace.as_str())
             };
-            cmd_edit(u, p, f, r, !first, &cli, format).await
+            cmd_edit(
+                u,
+                p,
+                f,
+                r,
+                CliEditOptions {
+                    replace_all: !first,
+                    allow_non_atomic: *allow_non_atomic,
+                },
+                &cli,
+                format,
+            )
+            .await
         }
         Commands::Cat { url, path } => {
             let (u, p) = if cli.profile.is_some() && !url.contains("://") && url != "_" {
@@ -65621,181 +70130,8 @@ async fn main() {
                 7
             }
         }
-        Commands::Sync {
-            url,
-            local,
-            remote,
-            direction,
-            dry_run,
-            delete,
-            exclude,
-            error_correction,
-            ec_max_overhead,
-            track_renames,
-            max_delete,
-            backup_dir,
-            backup_suffix,
-            suffix_keep_extension,
-            compare_dest,
-            copy_dest,
-            from_reconcile,
-            conflict_mode,
-            skip_matching,
-            resync,
-            watch,
-            watch_mode,
-            watch_debounce_ms,
-            watch_cooldown,
-            watch_rescan,
-            watch_no_initial,
-            local_only,
-            no_local_delta,
-            delta,
-        } => {
-            // Z.2.2: local-to-local fast path. With `--local` the positional
-            // args become `<SRC> <DST>` (url=SRC, local=DST). Without
-            // `--local` the legacy 3-arg shape `<URL> <LOCAL> <REMOTE>`
-            // applies. Auto-detection also kicks in if both positional
-            // candidates look like real local fs paths (no scheme, exists or
-            // absolute) and no profile/URL was given.
-            let local_to_local_src;
-            let local_to_local_dst;
-            let local_to_local_match;
-            if *local_only {
-                local_to_local_src = url.as_str();
-                local_to_local_dst = local.as_str();
-                local_to_local_match = true;
-            } else if cli.profile.is_none()
-                && is_local_to_local_sync(false, url, cli.profile.as_deref(), local)
-            {
-                // Shape `<URL> <LOCAL> <REMOTE>` where URL is actually a path.
-                local_to_local_src = url.as_str();
-                local_to_local_dst = local.as_str();
-                local_to_local_match = true;
-            } else {
-                local_to_local_src = "";
-                local_to_local_dst = "";
-                local_to_local_match = false;
-            }
-
-            if local_to_local_match {
-                if error_correction.is_some() && !cli.quiet {
-                    eprintln!("Warning: --error-correction is ignored for local-to-local sync");
-                }
-                let stats = cmd_sync_local_to_local(
-                    local_to_local_src,
-                    local_to_local_dst,
-                    *dry_run,
-                    exclude,
-                    *no_local_delta,
-                    &cli,
-                    format,
-                    cancelled.clone(),
-                )
-                .await;
-                stats.exit_code
-            } else {
-                match parse_sync_error_correction_level_pct(error_correction.as_deref()) {
-                    Err(err) => {
-                        print_error(format, &err, 5);
-                        5
-                    }
-                    Ok(error_correction_pct) => {
-                        let (u, l, r) =
-                            if cli.profile.is_some() && !url.contains("://") && url != "_" {
-                                ("_", url.as_str(), local.as_str())
-                            } else {
-                                (url.as_str(), local.as_str(), remote.as_str())
-                            };
-
-                        if *watch {
-                            cmd_sync_watch(
-                                u,
-                                l,
-                                r,
-                                direction,
-                                *dry_run,
-                                *delete,
-                                exclude,
-                                error_correction_pct,
-                                *ec_max_overhead,
-                                *track_renames,
-                                max_delete.as_deref(),
-                                backup_dir.as_deref(),
-                                backup_suffix,
-                                *suffix_keep_extension,
-                                compare_dest.as_deref(),
-                                copy_dest.as_deref(),
-                                from_reconcile.as_deref(),
-                                conflict_mode,
-                                *skip_matching,
-                                *resync,
-                                watch_mode,
-                                *watch_debounce_ms,
-                                *watch_cooldown,
-                                *watch_rescan,
-                                *watch_no_initial,
-                                &cli,
-                                format,
-                                cancelled.clone(),
-                            )
-                            .await
-                        } else {
-                            let max_attempts = effective_max_attempts(&cli, format);
-                            let sleep_dur = parse_retry_sleep(&cli.retries_sleep);
-                            let max_transfer_limit = resolve_max_transfer(&cli);
-                            let mut last_code = 0i32;
-                            for attempt in 1..=max_attempts {
-                                last_code = cmd_sync(
-                                    u,
-                                    l,
-                                    r,
-                                    direction,
-                                    *dry_run,
-                                    *delete,
-                                    exclude,
-                                    error_correction_pct,
-                                    *ec_max_overhead,
-                                    *track_renames,
-                                    max_delete.as_deref(),
-                                    backup_dir.as_deref(),
-                                    backup_suffix,
-                                    *suffix_keep_extension,
-                                    compare_dest.as_deref(),
-                                    copy_dest.as_deref(),
-                                    from_reconcile.as_deref(),
-                                    conflict_mode,
-                                    *skip_matching,
-                                    *resync,
-                                    &cli,
-                                    format,
-                                    cancelled.clone(),
-                                    None,
-                                    *delta,
-                                )
-                                .await
-                                .exit_code;
-                                if !is_retryable_exit(last_code)
-                                    || session_transfer_exceeded(max_transfer_limit)
-                                    || attempt == max_attempts
-                                {
-                                    break;
-                                }
-                                if !cli.quiet {
-                                    eprintln!(
-                                        "Attempt {}/{} failed (exit {}), retrying in {:?}...",
-                                        attempt, max_attempts, last_code, sleep_dur
-                                    );
-                                }
-                                if !sleep_dur.is_zero() {
-                                    tokio::time::sleep(sleep_dur).await;
-                                }
-                            }
-                            last_code
-                        }
-                    }
-                }
-            }
+        command @ Commands::Sync { .. } => {
+            dispatch_sync(command, &cli, format, cancelled.clone()).await
         }
         Commands::SyncDoctor {
             url,
@@ -67910,6 +72246,10 @@ async fn main() {
                         }
                     }
                 },
+                CryptCommands::SetForm {
+                    password_form,
+                    salt_form,
+                } => cmd_crypt_set_form(*password_form, *salt_form, &cli, format),
                 CryptCommands::ToHeaded {
                     url,
                     path,
@@ -68274,6 +72614,8 @@ async fn main() {
                     remote,
                     password,
                     salt,
+                    password_form,
+                    salt_form,
                     filename_encryption,
                     dir_iv_base64,
                     remote_name,
@@ -68295,6 +72637,7 @@ async fn main() {
                             remote,
                             &pw,
                             salt.as_deref().unwrap_or(""),
+                            (password_form.form(), salt_form.form()),
                             *filename_encryption,
                             dir_iv_base64.as_deref(),
                             remote_name.as_deref(),
@@ -68762,6 +73105,7 @@ async fn main() {
         exit_code
     };
 
+    render_pending_warnings(format);
     std::process::exit(exit_code);
 }
 
@@ -69425,18 +73769,6 @@ mod tests {
                 "label {label} must parse back to {dir:?}"
             );
         }
-    }
-
-    /// Building the full `Cli` clap command tree overflows the 2MB default test
-    /// stack (the tree is enormous), so run clap-parsing assertions on a 32MB
-    /// thread exactly like `dispatcher_allowlist_matches_clap_subcommands`.
-    fn on_big_stack<F: FnOnce() + Send + 'static>(f: F) {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn(f)
-            .expect("spawn big-stack test thread")
-            .join()
-            .expect("big-stack test body panicked");
     }
 
     #[test]
@@ -70779,9 +75111,11 @@ mod tests {
 
         let mut upload_sizes = sync_doctor_planned_upload_sizes(
             "upload",
-            "newer",
+            "source",
+            ModifyWindow::default(),
             &local_entries,
             &remote_entries,
+            None,
             None,
         );
         upload_sizes.sort_unstable();
@@ -70790,8 +75124,10 @@ mod tests {
         let mut both_sizes = sync_doctor_planned_upload_sizes(
             "both",
             "newer",
+            ModifyWindow::default(),
             &local_entries,
             &remote_entries,
+            None,
             None,
         );
         both_sizes.sort_unstable();
@@ -70799,9 +75135,11 @@ mod tests {
 
         assert!(sync_doctor_planned_upload_sizes(
             "download",
-            "newer",
+            "source",
+            ModifyWindow::default(),
             &local_entries,
             &remote_entries,
+            None,
             None
         )
         .is_empty());
@@ -71407,24 +75745,550 @@ mod tests {
 
     #[test]
     fn destination_is_current_when_not_older_than_the_source() {
+        let w = ModifyWindow::default();
         let src = Some("2026-09-05T04:36:40Z");
         // Written after the source last changed (S3 upload time): current.
-        assert!(destination_is_current(src, Some("2026-09-05T06:11:32Z")));
+        assert!(destination_is_current(src, Some("2026-09-05T06:11:32Z"), w));
         // Same second: current.
-        assert!(destination_is_current(src, Some("2026-09-05T04:36:40Z")));
-        // Within the 2 s tolerance either way: current.
-        assert!(destination_is_current(src, Some("2026-09-05T04:36:38Z")));
+        assert!(destination_is_current(src, Some("2026-09-05T04:36:40Z"), w));
+        // Within the 2 s window either way: current.
+        assert!(destination_is_current(src, Some("2026-09-05T04:36:38Z"), w));
         // Source edited after the destination was written: not current, transfer.
-        assert!(!destination_is_current(src, Some("2026-09-05T04:36:37Z")));
+        assert!(!destination_is_current(
+            src,
+            Some("2026-09-05T04:36:37Z"),
+            w
+        ));
         assert!(!destination_is_current(
             Some("2026-09-05T07:00:00Z"),
-            Some("2026-09-05T06:11:32Z")
+            Some("2026-09-05T06:11:32Z"),
+            w
         ));
-        // Unparsable or missing timestamps fall back to exact equality.
-        assert!(!destination_is_current(src, None));
-        assert!(destination_is_current(None, None));
-        assert!(destination_is_current(Some("weird"), Some("weird")));
-        assert!(!destination_is_current(Some("weird"), Some("other")));
+        // A wider window (a backend that keeps coarser times) takes more in.
+        let minute = ModifyWindow::Seconds { secs: 60 };
+        assert!(destination_is_current(
+            src,
+            Some("2026-09-05T04:35:41Z"),
+            minute
+        ));
+        // A date that is missing or does not read leaves the equal sizes to
+        // decide, as the GUI compare does; it used to compare the raw strings,
+        // so `weird` against `other` was a transfer and `weird` against itself
+        // was not.
+        assert!(destination_is_current(src, None, w));
+        assert!(destination_is_current(None, None, w));
+        assert!(destination_is_current(Some("weird"), Some("other"), w));
+        // A size-only window never reads the dates.
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        assert!(destination_is_current(
+            Some("2026-09-05T07:00:00Z"),
+            Some("2020-01-01T00:00:00Z"),
+            size_only
+        ));
+    }
+
+    fn one_way_rule(conflict_mode: &str, update: bool) -> SyncPairRule<'_> {
+        SyncPairRule {
+            conflict_mode,
+            skip_matching: false,
+            update,
+            modify_window: None,
+            checksum: false,
+        }
+    }
+
+    const T0: &str = "2026-09-05T10:00:00Z";
+    const T0_PLUS_1: &str = "2026-09-05T10:00:01Z";
+    const T0_PLUS_60: &str = "2026-09-05T10:01:00Z";
+
+    /// One-way sync decides its conflicts with `source` (the old behaviour,
+    /// now named) or `skip`; the two-way policies are refused there instead of
+    /// being ignored, `newer` excepted because every exported script carries
+    /// it. `source` means nothing in `both` and is refused there.
+    #[test]
+    fn conflict_mode_is_checked_against_the_direction() {
+        assert_eq!(
+            resolve_sync_conflict_mode(None, "upload").unwrap(),
+            "source"
+        );
+        assert_eq!(
+            resolve_sync_conflict_mode(None, "download").unwrap(),
+            "source"
+        );
+        assert_eq!(resolve_sync_conflict_mode(None, "both").unwrap(), "newer");
+        assert_eq!(
+            resolve_sync_conflict_mode(Some("skip"), "upload").unwrap(),
+            "skip"
+        );
+        assert_eq!(
+            resolve_sync_conflict_mode(Some("newer"), "download").unwrap(),
+            "source"
+        );
+        for mode in ["older", "larger", "smaller", "rename", "largest"] {
+            let err = resolve_sync_conflict_mode(Some(mode), "upload").unwrap_err();
+            assert!(err.contains("needs --direction both"), "{mode}: {err}");
+        }
+        let err = resolve_sync_conflict_mode(Some("source"), "both").unwrap_err();
+        assert!(err.contains("upload or download"), "{err}");
+        assert!(resolve_sync_conflict_mode(Some("bogus"), "both").is_err());
+        assert!(resolve_sync_conflict_mode(Some("bogus"), "upload").is_err());
+        assert!(one_way_newer_notice(Some("newer"), "upload").is_some());
+        assert!(one_way_newer_notice(Some("newer"), "both").is_none());
+        assert!(one_way_newer_notice(Some("source"), "upload").is_none());
+        assert!(one_way_newer_notice(None, "download").is_none());
+    }
+
+    /// `--update`: a destination copy newer than the source beyond the window
+    /// is left alone; without it the source wins (Mirror). A source newer
+    /// than the destination moves either way.
+    #[test]
+    fn update_leaves_a_newer_destination_alone() {
+        let w = ModifyWindow::default();
+        let mirror = one_way_rule("source", false);
+        let update = one_way_rule("source", true);
+        // Destination newer by a minute, different size.
+        assert_eq!(
+            plan_one_way_pair(&mirror, w, 10, Some(T0), 12, Some(T0_PLUS_60), None),
+            OneWayPair::Transfer
+        );
+        assert_eq!(
+            plan_one_way_pair(&update, w, 10, Some(T0), 12, Some(T0_PLUS_60), None),
+            OneWayPair::Skip
+        );
+        // Source newer: transferred with and without --update.
+        for rule in [&mirror, &update] {
+            assert_eq!(
+                plan_one_way_pair(rule, w, 10, Some(T0_PLUS_60), 12, Some(T0), None),
+                OneWayPair::Transfer
+            );
+        }
+    }
+
+    /// A change the dates cannot order (a different size inside the window, or
+    /// a date that is unknown) is a conflict: `source` transfers it, `skip`
+    /// leaves it open, and reported.
+    #[test]
+    fn conflict_mode_skip_leaves_a_one_way_conflict_alone() {
+        let w = ModifyWindow::default();
+        let source = one_way_rule("source", false);
+        let skip = one_way_rule("skip", false);
+        assert_eq!(
+            plan_one_way_pair(&source, w, 10, Some(T0), 12, Some(T0_PLUS_1), None),
+            OneWayPair::Transfer
+        );
+        assert_eq!(
+            plan_one_way_pair(&skip, w, 10, Some(T0), 12, Some(T0_PLUS_1), None),
+            OneWayPair::LeftOpen
+        );
+        assert_eq!(
+            plan_one_way_pair(&skip, w, 10, None, 12, Some(T0), None),
+            OneWayPair::LeftOpen
+        );
+        // A size-only window orders nothing: every changed size is a conflict,
+        // and --update cannot tell which copy is newer.
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        assert_eq!(
+            plan_one_way_pair(&skip, size_only, 10, Some(T0_PLUS_60), 12, Some(T0), None),
+            OneWayPair::LeftOpen
+        );
+        // M2 (review of #949): --update protects a destination that may be
+        // newer; when the dates cannot order the pair it may be, so it stays.
+        assert_eq!(
+            plan_one_way_pair(
+                &one_way_rule("source", true),
+                size_only,
+                10,
+                Some(T0),
+                12,
+                Some(T0_PLUS_60),
+                None
+            ),
+            OneWayPair::LeftOpen
+        );
+        assert_eq!(
+            plan_one_way_pair(
+                &one_way_rule("source", true),
+                w,
+                10,
+                None,
+                12,
+                Some(T0),
+                None
+            ),
+            OneWayPair::LeftOpen
+        );
+        // The same size under a size-only window is current.
+        assert_eq!(
+            plan_one_way_pair(&source, size_only, 12, Some(T0_PLUS_60), 12, Some(T0), None),
+            OneWayPair::Skip
+        );
+    }
+
+    /// `--checksum`: a matching checksum is current whatever the dates; a
+    /// mismatch at the same size is a changed file, ordered by the dates like
+    /// any other.
+    #[test]
+    fn a_checksum_verdict_decides_a_same_size_pair() {
+        let w = ModifyWindow::default();
+        let mirror = one_way_rule("source", false);
+        let update = one_way_rule("source", true);
+        assert_eq!(
+            plan_one_way_pair(&mirror, w, 12, Some(T0_PLUS_60), 12, Some(T0), Some(true)),
+            OneWayPair::Skip
+        );
+        // Same size, same second, different bytes: a size and time rule calls
+        // it current, the checksum does not.
+        assert_eq!(
+            plan_one_way_pair(&mirror, w, 12, Some(T0), 12, Some(T0), None),
+            OneWayPair::Skip
+        );
+        assert_eq!(
+            plan_one_way_pair(&mirror, w, 12, Some(T0), 12, Some(T0), Some(false)),
+            OneWayPair::Transfer
+        );
+        assert_eq!(
+            plan_one_way_pair(&update, w, 12, Some(T0), 12, Some(T0_PLUS_60), Some(false)),
+            OneWayPair::Skip
+        );
+    }
+
+    /// `--modify-window` is the same-instant window of `--direction both` too
+    /// (it used to demand the exact second there). A date that is not an
+    /// instant (an FTP `LIST` date) orders nothing: the same size is then
+    /// current unless the snapshot says the local copy changed.
+    #[test]
+    fn both_compares_times_within_the_window() {
+        let w = ModifyWindow::default();
+        let current = |local: Option<&str>, remote: Option<&str>, window, snapshot| {
+            bisync_pair_is_current(snapshot, "a.txt", (12, local), (12, remote), window)
+        };
+        assert!(current(Some(T0), Some(T0_PLUS_1), w, None));
+        assert!(!current(Some(T0_PLUS_60), Some(T0), w, None));
+        assert!(current(
+            Some(T0_PLUS_60),
+            Some(T0),
+            ModifyWindow::Seconds { secs: 120 },
+            None
+        ));
+        assert!(current(Some(T0), Some("Sep 24 19:41"), w, None));
+        let snapshot = BisyncSnapshot {
+            synced_at: "2020-01-01T00:00:00Z".to_string(),
+            files: HashMap::from([("a.txt".to_string(), (12, T0_PLUS_60.to_string()))]),
+        };
+        assert!(
+            !current(Some(T0), Some("Sep 24 19:41"), w, Some(&snapshot)),
+            "the local copy moved since the snapshot"
+        );
+    }
+
+    /// M1 (review of #949): `newer` and `older` cannot be decided by size when
+    /// the dates do not order the pair; the larger copy used to win.
+    #[test]
+    fn newer_is_not_decided_by_size_when_dates_do_not_order() {
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        assert_eq!(
+            resolve_conflict("newer", 5000, Some(T0), 5120, Some(T0_PLUS_60), size_only),
+            "skip"
+        );
+        assert_eq!(
+            resolve_conflict("older", 5120, Some(T0), 5000, Some(T0_PLUS_60), size_only),
+            "skip"
+        );
+        // Sizes stay the rule of the size modes.
+        assert_eq!(
+            resolve_conflict("larger", 5000, Some(T0), 5120, Some(T0_PLUS_60), size_only),
+            "download"
+        );
+    }
+
+    /// Minor 2 (re-review of #949): dates the same within the window do not
+    /// say which copy is newer either, and the larger one won there too,
+    /// against the guide's promise that the size never stands in for the date.
+    #[test]
+    fn newer_is_not_decided_by_size_when_the_dates_are_the_same() {
+        let w = ModifyWindow::Seconds { secs: 2 };
+        assert_eq!(
+            resolve_conflict("newer", 5000, Some(T0), 5120, Some(T0_PLUS_1), w),
+            "skip"
+        );
+        assert_eq!(
+            resolve_conflict("older", 5120, Some(T0), 5000, Some(T0_PLUS_1), w),
+            "skip"
+        );
+    }
+
+    /// The `sync-doctor` EC estimate for `both` takes the decision `sync`
+    /// takes, the snapshot included: a pair the dates cannot order is an
+    /// upload when the snapshot says the local side changed, and nothing
+    /// without a snapshot.
+    #[test]
+    fn the_doctor_estimate_for_both_follows_the_snapshot() {
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        let local_entries = HashMap::from([("a.txt".to_string(), (5000, Some(T0.to_string())))]);
+        let remote_entries =
+            HashMap::from([("a.txt".to_string(), (5120, Some(T0_PLUS_60.to_string())))]);
+        let snapshot = BisyncSnapshot {
+            synced_at: "2020-01-01T00:00:00Z".to_string(),
+            files: HashMap::from([("a.txt".to_string(), (5120, T0.to_string()))]),
+        };
+        let estimate = |snapshot| {
+            sync_doctor_planned_upload_sizes(
+                "both",
+                "newer",
+                size_only,
+                &local_entries,
+                &remote_entries,
+                None,
+                snapshot,
+            )
+        };
+        assert_eq!(estimate(Some(&snapshot)), vec![5000]);
+        assert!(estimate(None).is_empty());
+    }
+
+    /// Minor 1 (re-review of #949): `--update` leaves a destination that may
+    /// be newer. One whose date is the same within the window is not newer,
+    /// and a changed pair of that kind is transferred, as rsync does.
+    #[test]
+    fn update_transfers_a_changed_pair_whose_dates_are_the_same() {
+        let rule = SyncPairRule {
+            conflict_mode: "source",
+            skip_matching: false,
+            update: true,
+            modify_window: None,
+            checksum: false,
+        };
+        let w = ModifyWindow::Seconds { secs: 2 };
+        assert_eq!(
+            plan_one_way_pair(&rule, w, 10, Some(T0), 12, Some(T0_PLUS_1), None),
+            OneWayPair::Transfer
+        );
+        // A destination the dates cannot order still stays.
+        let size_only = ModifyWindow::SizeOnly {
+            reason: ftp_client_gui_lib::sync_core::mtime::SizeOnlyReason::FtpListDates,
+        };
+        assert_eq!(
+            plan_one_way_pair(&rule, size_only, 10, Some(T0), 12, Some(T0_PLUS_1), None),
+            OneWayPair::LeftOpen
+        );
+    }
+
+    /// m2 (review of #949): `sync --local` copies source to destination, one
+    /// way: `--direction upload` says exactly that and is accepted, `download`
+    /// is refused.
+    #[test]
+    fn local_to_local_accepts_the_direction_it_performs() {
+        let flags = |direction| LocalToLocalFlags {
+            direction,
+            delete: false,
+            track_renames: false,
+            max_delete: false,
+            backup_dir: false,
+            compare_dest: false,
+            copy_dest: false,
+            from_reconcile: false,
+            conflict_mode: false,
+            skip_matching: false,
+            update: false,
+            modify_window: false,
+            checksum: false,
+            resync: false,
+            watch: false,
+            files_from: false,
+            files_from_raw: false,
+        };
+        assert!(local_to_local_ignored_flags(&flags("upload")).is_empty());
+        assert!(local_to_local_ignored_flags(&flags("both")).is_empty());
+        assert_eq!(
+            local_to_local_ignored_flags(&flags("download")),
+            vec!["--direction"]
+        );
+    }
+
+    /// `sync --local` copies every file and plans nothing: each planning flag
+    /// is named in the refusal instead of being ignored.
+    #[test]
+    fn local_to_local_names_every_flag_it_would_ignore() {
+        let none = LocalToLocalFlags {
+            direction: "both",
+            delete: false,
+            track_renames: false,
+            max_delete: false,
+            backup_dir: false,
+            compare_dest: false,
+            copy_dest: false,
+            from_reconcile: false,
+            conflict_mode: false,
+            skip_matching: false,
+            update: false,
+            modify_window: false,
+            checksum: false,
+            resync: false,
+            watch: false,
+            files_from: false,
+            files_from_raw: false,
+        };
+        assert!(local_to_local_ignored_flags(&none).is_empty());
+        let all = LocalToLocalFlags {
+            direction: "download",
+            delete: true,
+            track_renames: true,
+            max_delete: true,
+            backup_dir: true,
+            compare_dest: true,
+            copy_dest: true,
+            from_reconcile: true,
+            conflict_mode: true,
+            skip_matching: true,
+            update: true,
+            modify_window: true,
+            checksum: true,
+            resync: true,
+            watch: true,
+            files_from: true,
+            files_from_raw: true,
+        };
+        assert_eq!(
+            local_to_local_ignored_flags(&all),
+            vec![
+                "--direction",
+                "--delete",
+                "--track-renames",
+                "--max-delete",
+                "--backup-dir",
+                "--compare-dest",
+                "--copy-dest",
+                "--from-reconcile",
+                "--conflict-mode",
+                "--skip-matching",
+                "--update",
+                "--modify-window",
+                "--checksum",
+                "--resync",
+                "--watch",
+                "--files-from",
+                "--files-from-raw",
+            ]
+        );
+    }
+
+    /// The directories `sync --delete` may remove: parents of the deleted
+    /// orphans that hold no source file, the exclude list does not name and
+    /// the scans saw; deepest first.
+    #[test]
+    fn orphan_dir_candidates_are_the_emptied_parents_deepest_first() {
+        let excludes = compile_sync_excludes(&["cache".to_string()], OutputFormat::Json)
+            .expect("patterns compile");
+        let deleted = [
+            "old/sub/x.txt",
+            "old/y.txt",
+            "keep/z.txt",
+            "cache/c.bin",
+            "u/v/w.txt",
+        ];
+        let source = ["keep/a.txt", "top.txt"];
+        let got = sync_orphan_dir_candidates(&deleted, source, &excludes, |d| d == "u/v");
+        assert_eq!(got, vec!["old/sub", "old", "u"]);
+    }
+
+    #[test]
+    fn checksum_pick_takes_the_strongest_locally_computable_digest() {
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            sync_checksum_pick(&map(&[("MD5", "AB"), ("SHA-256", "CD")])),
+            Some((HashAlgorithm::Sha256, "cd".to_string()))
+        );
+        assert_eq!(
+            sync_checksum_pick(&map(&[("sha1", " ef ")])),
+            Some((HashAlgorithm::Sha1, "ef".to_string()))
+        );
+        // Proprietary digests cannot be computed locally.
+        assert_eq!(
+            sync_checksum_pick(&map(&[("quickxor", "x"), ("dropbox", "y")])),
+            None
+        );
+        assert_eq!(sync_checksum_pick(&HashMap::new()), None);
+    }
+
+    /// `dedupe --mode newest` keeps the file with a date over one without,
+    /// and no longer orders two unreadable dates by their text.
+    #[test]
+    fn dedupe_orders_a_dated_file_after_an_undated_one() {
+        assert_eq!(
+            dedupe_mtime_order(Some(T0), None),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            dedupe_mtime_order(Some(T0), Some(T0_PLUS_1)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            dedupe_mtime_order(Some("zzz"), Some("aaa")),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn sync_parses_the_parity_flags() {
+        // clap builds the whole command tree: more stack than a test thread has.
+        on_big_stack(|| {
+            let parsed = Cli::try_parse_from([
+                "aeroftp-cli",
+                "sync",
+                "sftp://h",
+                "/l",
+                "/r",
+                "--direction",
+                "upload",
+                "--update",
+                "--size-only",
+                "--modify-window",
+                "5",
+                "--conflict-mode",
+                "skip",
+            ])
+            .expect("parses");
+            let Commands::Sync {
+                update,
+                skip_matching,
+                modify_window,
+                conflict_mode,
+                checksum,
+                ..
+            } = parsed.command
+            else {
+                panic!("not a sync");
+            };
+            assert!(update && skip_matching && !checksum);
+            assert_eq!(modify_window, Some(5));
+            assert_eq!(conflict_mode.as_deref(), Some("skip"));
+            let conflict = Cli::try_parse_from([
+                "aeroftp-cli",
+                "sync",
+                "sftp://h",
+                "/l",
+                "/r",
+                "--checksum",
+                "--size-only",
+            ]);
+            assert!(
+                matches!(&conflict, Err(e) if e.kind() == clap::error::ErrorKind::ArgumentConflict),
+                "--checksum and --size-only contradict each other"
+            );
+        });
     }
 
     #[test]
@@ -72835,6 +77699,22 @@ mod tests {
         );
         assert!(resolve_served_backend_path("/base", "../secret.txt").is_err());
         assert!(resolve_served_backend_path("/base", "docs/../../secret.txt").is_err());
+    }
+
+    /// `serve ftp` and `serve sftp` hand over raw paths, which the resolver
+    /// percent-decoded: DELE, RNFR or STOR of `a%41.txt` acted on `aA.txt`.
+    /// A literal `%` stays in the name, and `..` is still refused.
+    #[test]
+    fn a_served_ftp_or_sftp_path_is_not_percent_decoded() {
+        assert_eq!(
+            resolve_served_backend_path("/base", "a%41.txt").unwrap(),
+            "/base/a%41.txt"
+        );
+        assert_eq!(
+            resolve_served_backend_path("/base", "%2e%2e/x").unwrap(),
+            "/base/%2e%2e/x"
+        );
+        assert!(resolve_served_backend_path("/base", "d/../../x").is_err());
     }
 
     #[test]
@@ -75059,21 +79939,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_iso8601_to_unix_handles_rfc3339_and_naive() {
-        // Z-suffix RFC 3339
-        let ts = parse_iso8601_to_unix("2025-01-01T00:00:00Z").unwrap();
-        assert_eq!(ts, 1735689600);
-        // With timezone offset
-        let ts = parse_iso8601_to_unix("2025-01-01T01:00:00+01:00").unwrap();
-        assert_eq!(ts, 1735689600);
-        // Naive variant (no tz, no Z)
-        let ts = parse_iso8601_to_unix("2025-01-01T00:00:00").unwrap();
-        assert_eq!(ts, 1735689600);
-        // Garbage returns None
-        assert!(parse_iso8601_to_unix("not-a-date").is_none());
-    }
-
-    #[test]
     fn audit_report_serializes_status_lowercase_and_flattens_details() {
         let r = AuditResult {
             server: "s1".into(),
@@ -75637,9 +80502,30 @@ mod tests {
     /// run that tried to change the tree fails instead of passing on a no-op.
     /// Deletes are also recorded, refused or not, so a test can tell a delete
     /// the run attempted from one it never planned.
+    #[derive(Default)]
     struct MemTreeProvider {
         dirs: HashMap<String, Vec<RemoteEntry>>,
         delete_attempts: Arc<Mutex<Vec<String>>>,
+        /// Opt-in: a delete removes the file, and `rmdir` removes a directory
+        /// that lists empty (and refuses one that does not), instead of every
+        /// mutation being refused.
+        mutable: bool,
+        /// Every `rmdir` the run attempted, removed or refused.
+        rmdir_attempts: Arc<Mutex<Vec<String>>>,
+        /// Server-side checksums by full path; none means the backend offers
+        /// none (`supports_checksum` is false).
+        checksums: HashMap<String, HashMap<String, String>>,
+        /// The backend this tree pretends to be (SFTP when unset).
+        kind: Option<ProviderType>,
+        /// The precision its times are listed with, when not the declared one
+        /// for `kind` (`Some(None)`: no comparable time, size only).
+        precision: Option<Option<std::time::Duration>>,
+        /// `rmdir` removes the directory with everything under it, as the
+        /// object stores and most cloud APIs do.
+        recursive_rmdir: bool,
+        /// Full paths a listing leaves out although they are stored (a crypt
+        /// overlay's sentinels, a listing that is not authoritative).
+        hidden: std::collections::HashSet<String>,
     }
 
     impl MemTreeProvider {
@@ -75676,7 +80562,7 @@ mod tests {
             }
             Self {
                 dirs,
-                delete_attempts: Arc::default(),
+                ..Default::default()
             }
         }
     }
@@ -75687,7 +80573,12 @@ mod tests {
             self
         }
         fn provider_type(&self) -> ProviderType {
-            ProviderType::Sftp
+            self.kind.unwrap_or(ProviderType::Sftp)
+        }
+        fn mtime_precision(&self) -> Option<std::time::Duration> {
+            self.precision.unwrap_or_else(|| {
+                ftp_client_gui_lib::providers::declared_mtime_precision(self.provider_type())
+            })
         }
         fn display_name(&self) -> String {
             "mem-tree".to_string()
@@ -75702,10 +80593,13 @@ mod tests {
             true
         }
         async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
-            self.dirs
+            let mut listing = self
+                .dirs
                 .get(path)
                 .cloned()
-                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))?;
+            listing.retain(|entry| !self.hidden.contains(&entry.path));
+            Ok(listing)
         }
         async fn pwd(&mut self) -> Result<String, ProviderError> {
             Ok("/".to_string())
@@ -75746,10 +80640,54 @@ mod tests {
                 .lock()
                 .expect("delete log")
                 .push(path.to_string());
-            Err(ProviderError::NotSupported("delete".to_string()))
+            if !self.mutable {
+                return Err(ProviderError::NotSupported("delete".to_string()));
+            }
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let listing = self
+                .dirs
+                .get_mut(parent)
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))?;
+            let before = listing.len();
+            listing.retain(|entry| entry.path != path || entry.is_dir);
+            if listing.len() == before {
+                return Err(ProviderError::NotFound(path.to_string()));
+            }
+            Ok(())
         }
-        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
-            Err(ProviderError::NotSupported("rmdir".to_string()))
+        async fn rmdir(&mut self, path: &str) -> Result<(), ProviderError> {
+            self.rmdir_attempts
+                .lock()
+                .expect("rmdir log")
+                .push(path.to_string());
+            if !self.mutable {
+                return Err(ProviderError::NotSupported("rmdir".to_string()));
+            }
+            match self.dirs.get(path) {
+                None => return Err(ProviderError::NotFound(path.to_string())),
+                Some(listing) if !listing.is_empty() && !self.recursive_rmdir => {
+                    return Err(ProviderError::Other(format!("{path}: not empty")))
+                }
+                Some(_) => {}
+            }
+            // A recursive backend takes everything under it, listed or not.
+            let prefix = format!("{path}/");
+            self.dirs
+                .retain(|dir, _| dir != path && !dir.starts_with(&prefix));
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if let Some(listing) = self.dirs.get_mut(parent) {
+                listing.retain(|entry| entry.path != path);
+            }
+            Ok(())
+        }
+        fn supports_checksum(&self) -> bool {
+            !self.checksums.is_empty()
+        }
+        async fn checksum(&mut self, path: &str) -> Result<HashMap<String, String>, ProviderError> {
+            self.checksums
+                .get(path)
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
         }
         async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
             Err(ProviderError::NotSupported("rmdir_recursive".to_string()))
@@ -75772,6 +80710,2689 @@ mod tests {
         async fn server_info(&mut self) -> Result<String, ProviderError> {
             Ok("mem-tree".to_string())
         }
+    }
+
+    /// What [`SharedTreeProvider`] runs after each download it writes.
+    type AfterDownload = Arc<dyn Fn(&str) + Send + Sync>;
+
+    /// The time [`SharedTreeProvider`] lists for every file it holds.
+    const SHARED_TREE_MTIME: &str = "2026-09-26T12:00:00";
+
+    /// A remote tree whose files hold bytes, shared by every connection a
+    /// command opens: uploads and downloads move the bytes, so a sync runs
+    /// for real and the next run reads what the previous one left. It lists
+    /// like FTP with `LIST` dates by default (no comparable time).
+    #[derive(Clone, Default)]
+    struct SharedTreeProvider {
+        /// Full path to bytes.
+        files: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+        /// The precision its times are listed with (`None`: size only).
+        precision: Option<std::time::Duration>,
+        /// Runs with the local path after each download has written it: a
+        /// test's way to act while the run is still going.
+        after_download: Option<AfterDownload>,
+        /// Clone-backed, like the FTP connection pool: batches go through the
+        /// shared executor, which enforces `--max-transfer` by count.
+        pooled: bool,
+    }
+
+    impl SharedTreeProvider {
+        fn with_files(files: &[(&str, &[u8])]) -> Self {
+            let tree = Self::default();
+            tree.put(files);
+            tree
+        }
+
+        /// Replace (or add) files, as a change made on the server.
+        fn put(&self, files: &[(&str, &[u8])]) {
+            let mut held = self.files.lock().expect("tree");
+            for (path, bytes) in files {
+                held.insert(format!("/root/{path}"), bytes.to_vec());
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for SharedTreeProvider {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Ftp
+        }
+        fn mtime_precision(&self) -> Option<std::time::Duration> {
+            self.precision
+        }
+        fn transfer_executor_kind(
+            &self,
+        ) -> ftp_client_gui_lib::providers::ProviderTransferExecutorKind {
+            use ftp_client_gui_lib::providers::ProviderTransferExecutorKind;
+            if self.pooled {
+                ProviderTransferExecutorKind::FtpConnectionPool
+            } else {
+                ProviderTransferExecutorKind::LockedSingle
+            }
+        }
+        fn clone_for_transfer(&self) -> Result<Box<dyn StorageProvider>, ProviderError> {
+            if self.pooled {
+                Ok(Box::new(self.clone()))
+            } else {
+                Err(ProviderError::NotSupported(
+                    "clone_for_transfer".to_string(),
+                ))
+            }
+        }
+        fn display_name(&self) -> String {
+            "shared-tree".to_string()
+        }
+        async fn connect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let held = self.files.lock().expect("tree");
+            let mut out: Vec<RemoteEntry> = Vec::new();
+            for (full, bytes) in held.iter() {
+                let Some(rest) = full.strip_prefix(&prefix) else {
+                    continue;
+                };
+                match rest.split_once('/') {
+                    None => {
+                        let mut entry =
+                            RemoteEntry::file(rest.to_string(), full.clone(), bytes.len() as u64);
+                        entry.modified = Some(SHARED_TREE_MTIME.to_string());
+                        out.push(entry);
+                    }
+                    Some((dir, _)) => {
+                        let dir_path = format!("{prefix}{dir}");
+                        if !out.iter().any(|entry| entry.path == dir_path) {
+                            out.push(RemoteEntry::directory(dir.to_string(), dir_path));
+                        }
+                    }
+                }
+            }
+            if out.is_empty() && path != "/root" {
+                return Err(ProviderError::NotFound(path.to_string()));
+            }
+            Ok(out)
+        }
+        async fn pwd(&mut self) -> Result<String, ProviderError> {
+            Ok("/".to_string())
+        }
+        async fn cd(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn cd_up(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn download(
+            &mut self,
+            remote_path: &str,
+            local_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            let bytes = self.download_to_bytes(remote_path).await?;
+            std::fs::write(local_path, bytes).map_err(|e| ProviderError::Other(e.to_string()))?;
+            if let Some(hook) = &self.after_download {
+                hook(local_path);
+            }
+            Ok(())
+        }
+        async fn download_to_bytes(&mut self, remote_path: &str) -> Result<Vec<u8>, ProviderError> {
+            self.files
+                .lock()
+                .expect("tree")
+                .get(remote_path)
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(remote_path.to_string()))
+        }
+        async fn upload(
+            &mut self,
+            local_path: &str,
+            remote_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            let bytes =
+                std::fs::read(local_path).map_err(|e| ProviderError::Other(e.to_string()))?;
+            self.files
+                .lock()
+                .expect("tree")
+                .insert(remote_path.to_string(), bytes);
+            Ok(())
+        }
+        async fn mkdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn delete(&mut self, path: &str) -> Result<(), ProviderError> {
+            self.files
+                .lock()
+                .expect("tree")
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+        }
+        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("rmdir_recursive".to_string()))
+        }
+        async fn rename(&mut self, _from: &str, _to: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("rename".to_string()))
+        }
+        async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
+            let size = self.size(path).await?;
+            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            let mut entry = RemoteEntry::file(name, path.to_string(), size);
+            entry.modified = Some(SHARED_TREE_MTIME.to_string());
+            Ok(entry)
+        }
+        async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
+            self.files
+                .lock()
+                .expect("tree")
+                .get(path)
+                .map(|bytes| bytes.len() as u64)
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+        }
+        async fn exists(&mut self, path: &str) -> Result<bool, ProviderError> {
+            Ok(self.size(path).await.is_ok())
+        }
+        async fn keep_alive(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn server_info(&mut self) -> Result<String, ProviderError> {
+            Ok("shared-tree".to_string())
+        }
+    }
+
+    /// Scripted answers for the delete fallback of the served WebDAV
+    /// DELETE; every call is recorded by name.
+    struct DeleteFallbackProvider {
+        delete: fn() -> Result<(), ProviderError>,
+        stat: fn() -> Result<RemoteEntry, ProviderError>,
+        rmdir: fn() -> Result<(), ProviderError>,
+        list: fn() -> Result<Vec<RemoteEntry>, ProviderError>,
+        calls: Vec<&'static str>,
+    }
+
+    impl DeleteFallbackProvider {
+        fn new(
+            delete: fn() -> Result<(), ProviderError>,
+            stat: fn() -> Result<RemoteEntry, ProviderError>,
+        ) -> Self {
+            Self {
+                delete,
+                stat,
+                rmdir: || Ok(()),
+                list: || Ok(Vec::new()),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for DeleteFallbackProvider {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Sftp
+        }
+        fn display_name(&self) -> String {
+            "delete-fallback".to_string()
+        }
+        async fn connect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        async fn list(&mut self, _path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+            self.calls.push("list");
+            (self.list)()
+        }
+        async fn pwd(&mut self) -> Result<String, ProviderError> {
+            Ok("/".to_string())
+        }
+        async fn cd(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn cd_up(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn download(
+            &mut self,
+            _remote_path: &str,
+            _local_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("download".to_string()))
+        }
+        async fn download_to_bytes(
+            &mut self,
+            _remote_path: &str,
+        ) -> Result<Vec<u8>, ProviderError> {
+            Err(ProviderError::NotSupported("download_to_bytes".to_string()))
+        }
+        async fn upload(
+            &mut self,
+            _local_path: &str,
+            _remote_path: &str,
+            _progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("upload".to_string()))
+        }
+        async fn mkdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("mkdir".to_string()))
+        }
+        async fn delete(&mut self, _path: &str) -> Result<(), ProviderError> {
+            self.calls.push("delete");
+            (self.delete)()
+        }
+        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            self.calls.push("rmdir");
+            (self.rmdir)()
+        }
+        async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
+            self.calls.push("rmdir_recursive");
+            Ok(())
+        }
+        async fn rename(&mut self, _from: &str, _to: &str) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported("rename".to_string()))
+        }
+        async fn stat(&mut self, _path: &str) -> Result<RemoteEntry, ProviderError> {
+            self.calls.push("stat");
+            (self.stat)()
+        }
+        async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
+            Err(ProviderError::NotFound(path.to_string()))
+        }
+        async fn exists(&mut self, _path: &str) -> Result<bool, ProviderError> {
+            Ok(true)
+        }
+        async fn keep_alive(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn server_info(&mut self) -> Result<String, ProviderError> {
+            Ok("delete-fallback".to_string())
+        }
+    }
+
+    fn ambiguous() -> ProviderError {
+        ProviderError::InvalidPath("'/photos' names an asset and a folder".to_string())
+    }
+
+    /// The served DELETE used to escalate to `rmdir_recursive` after any
+    /// failure: an ambiguous path emptied the folder, and a file refused for a
+    /// transient reason erased the directory of the same name.
+    #[tokio::test]
+    async fn served_delete_escalates_only_for_a_directory() {
+        let mut amb = DeleteFallbackProvider::new(|| Err(ambiguous()), || Err(ambiguous()));
+        amb.rmdir = || Err(ProviderError::ServerError("not empty".to_string()));
+        let result = served_webdav_delete(&mut amb, "/photos").await;
+        assert!(
+            matches!(result, Err(ProviderError::InvalidPath(_))),
+            "{result:?}"
+        );
+        assert_eq!(amb.calls, ["delete", "stat"]);
+
+        let mut file = DeleteFallbackProvider::new(
+            || Err(ProviderError::ServerError("503".to_string())),
+            || Ok(RemoteEntry::file("x".to_string(), "/x".to_string(), 1)),
+        );
+        file.rmdir = || Err(ProviderError::ServerError("not empty".to_string()));
+        let result = served_webdav_delete(&mut file, "/x").await;
+        assert!(
+            matches!(result, Err(ProviderError::ServerError(_))),
+            "{result:?}"
+        );
+        assert_eq!(file.calls, ["delete", "stat"]);
+
+        let mut dir = DeleteFallbackProvider::new(
+            || Err(ProviderError::InvalidPath("/d is a directory".to_string())),
+            || Ok(RemoteEntry::directory("d".to_string(), "/d".to_string())),
+        );
+        dir.rmdir = || Err(ProviderError::ServerError("not empty".to_string()));
+        assert!(served_webdav_delete(&mut dir, "/d").await.is_ok());
+        assert_eq!(dir.calls, ["delete", "stat", "rmdir", "rmdir_recursive"]);
+
+        let mut unseen = DeleteFallbackProvider::new(
+            || Err(ProviderError::NotFound("/d".to_string())),
+            || Err(ProviderError::NotFound("/d".to_string())),
+        );
+        unseen.rmdir = || Err(ProviderError::ServerError("not empty".to_string()));
+        assert!(served_webdav_delete(&mut unseen, "/d").await.is_ok());
+        assert_eq!(
+            unseen.calls,
+            ["delete", "stat", "list", "rmdir", "rmdir_recursive"]
+        );
+
+        // A key that is gone and a path nobody can list: the delete error
+        // stays, and nothing recursive runs (CodeRabbit on a630c990).
+        let mut gone = DeleteFallbackProvider::new(
+            || Err(ProviderError::NotFound("/x".to_string())),
+            || Err(ProviderError::NotFound("/x".to_string())),
+        );
+        gone.list = || Err(ProviderError::NotFound("/x".to_string()));
+        let result = served_webdav_delete(&mut gone, "/x").await;
+        assert!(
+            matches!(result, Err(ProviderError::NotFound(_))),
+            "{result:?}"
+        );
+        assert_eq!(gone.calls, ["delete", "stat", "list"]);
+    }
+
+    /// A `stat` that failed says nothing about the path: escalating on it
+    /// reached the directory of the same name (recursive `rmdir` on S3 and
+    /// Azure). Only an answer that the provider cannot describe the path
+    /// (NotFound, NotSupported, ParseError as Box and GitHub give for a
+    /// folder) keeps the old fallback.
+    #[tokio::test]
+    async fn a_failed_stat_keeps_the_delete_error() {
+        for stat in [
+            (|| Err(ProviderError::NetworkError("reset".to_string())))
+                as fn() -> Result<RemoteEntry, ProviderError>,
+            || Err(ProviderError::ServerError("503".to_string())),
+            || Err(ProviderError::Timeout),
+            || Err(ProviderError::Cancelled),
+        ] {
+            let mut served = DeleteFallbackProvider::new(
+                || Err(ProviderError::ServerError("503".to_string())),
+                stat,
+            );
+            let result = served_webdav_delete(&mut served, "/x").await;
+            assert!(
+                matches!(result, Err(ProviderError::ServerError(_))),
+                "{result:?}"
+            );
+            assert_eq!(served.calls, ["delete", "stat"]);
+        }
+    }
+
+    /// A link to a directory is not the directory: the served DELETE listed
+    /// through it and emptied the target.
+    #[tokio::test]
+    async fn a_link_to_a_directory_is_not_removed_as_one() {
+        let link = || {
+            let mut entry = RemoteEntry::directory("l".to_string(), "/l".to_string());
+            entry.is_symlink = true;
+            Ok(entry)
+        };
+        let mut served = DeleteFallbackProvider::new(
+            || Err(ProviderError::PermissionDenied("/l".to_string())),
+            link,
+        );
+        let result = served_webdav_delete(&mut served, "/l").await;
+        assert!(
+            matches!(result, Err(ProviderError::PermissionDenied(_))),
+            "{result:?}"
+        );
+        assert_eq!(served.calls, ["delete", "stat"]);
+    }
+
+    /// `import rclone` printed section names, types and reasons from the file
+    /// as they were, so a section named with escape sequences could clear or
+    /// rewrite the terminal the report went to (CWE-150).
+    #[test]
+    fn import_rclone_listing_prints_no_terminal_control_sequence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = dir.path().join("rclone.conf");
+        std::fs::write(
+            &conf,
+            "[ok\x1b[2Jcleared]\ntype = ftp\nhost = h\x1b]0;title\x07.example\nuser = u\x1b[31m\n\n\
+             [odd\x1b[1Aup]\ntype = x\x1b[2Kline\n\n\
+             [ix\x1b[5mblink]\ntype = internxt\nemail = me@example.com\npass = S3cr3tPass!\n",
+        )
+        .expect("write the config");
+        let result = ftp_client_gui_lib::rclone_import::import_rclone(&conf).expect("import");
+        assert_eq!(result.servers.len(), 2, "{:?}", result.skipped.len());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.warnings.len(), 1);
+
+        let listing = rclone_import_listing(&result);
+        assert!(
+            !listing.chars().any(|c| c == '\x1b' || c == '\x07'),
+            "a control sequence reaches the terminal: {listing:?}"
+        );
+        for kept in [
+            "okcleared",
+            "oddup",
+            "ixblink",
+            "Importable (2)",
+            "Skipped (1)",
+            "Warnings (1)",
+        ] {
+            assert!(listing.contains(kept), "'{kept}' missing: {listing:?}");
+        }
+    }
+
+    /// `import rclone --json` printed every server's `options` as imported,
+    /// under a comment promising no plaintext password on stdout: a crypt
+    /// overlay's password and salt and a Filen API key went out revealed. The
+    /// values below come from the real `rclone obscure` (v1.75.1).
+    #[test]
+    fn import_rclone_json_prints_no_revealed_secret() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conf = dir.path().join("rclone.conf");
+        std::fs::write(
+            &conf,
+            "\
+[base]
+type = sftp
+host = example.com
+user = me
+
+[vault]
+type = crypt
+remote = base:vault
+password = BgXYaxA3d0gsDcU-bvJ2XJz6EdJONj19szH2IdXkKg
+password2 = mjtTXNyNZn88PP0n-rDRojtkDnqkqRio7KzRQqJl-w
+
+[filen-acct]
+type = filen
+email = me@example.com
+password = CrJEBaRGAs70RSR0bcBPEkueD6ODk8bYD49QQDiJCQ
+api_key = kNaQ0gIj57D0wb8CFzBMYQQMoWUZUopy0HOLAMHtu0uD
+",
+        )
+        .expect("write the config");
+        let result = ftp_client_gui_lib::rclone_import::import_rclone(&conf).expect("import");
+        assert_eq!(result.servers.len(), 3, "base, vault and filen-acct import");
+
+        let printed =
+            serde_json::to_string(&rclone_import_json(&result, false, None)).expect("serialize");
+        for secret in [
+            "CryptPassPlain1",
+            "CryptSaltPlain2",
+            "FilenApiKeyPlain3",
+            "FilenPassPlain4",
+        ] {
+            assert!(!printed.contains(secret), "'{secret}' on stdout: {printed}");
+        }
+        // What is left still says what was found.
+        assert!(printed.contains("\"rcloneCryptEnabled\":true"), "{printed}");
+        assert!(printed.contains("\"hasCredential\":true"), "{printed}");
+    }
+
+    /// What every `WorkerFake` a test hands out did, and how the fake should
+    /// misbehave.
+    #[derive(Default)]
+    struct WorkerFakeState {
+        files: HashMap<String, Vec<u8>>,
+        next_id: usize,
+        /// Connections handed out by `WorkerFake::dial`, and dials attempted.
+        dials: usize,
+        dial_attempts: usize,
+        disconnects: usize,
+        /// `(connection id, remote path)` for every transfer attempted.
+        served: Vec<(usize, String)>,
+        /// Paths whose transfer fails because of the file (`NotFound`).
+        file_errors: std::collections::HashSet<String>,
+        /// Paths whose transfer takes the session down, and how many times.
+        session_kills: HashMap<String, u32>,
+        /// Dials still to refuse.
+        refuse_dials: u32,
+        /// Refuse every other dial, starting with the first.
+        refuse_alternate: bool,
+        /// A connection's `disconnect` never returns.
+        hang_disconnect: bool,
+        /// The first transfer on this connection takes the session down.
+        kill_first_on: Option<usize>,
+        /// An upload that takes the session down leaves half the file at the
+        /// remote path, as SFTP does (it opens the file there, then writes).
+        partial_on_kill: bool,
+        /// Offer a transfer pool, so that batches take the pooled executor.
+        pooled: bool,
+        /// Paths whose `stat` fails with something other than "not found".
+        stat_errors: std::collections::HashSet<String>,
+        /// The provider type the fake reports (SFTP when unset).
+        kind: Option<ProviderType>,
+        /// `reports_exact_size` says no, as the size-changing overlays do.
+        inexact_sizes: bool,
+        /// Paths whose `stat` loses the session, and how many times. The
+        /// upload that may follow still goes through, as an SFTP upload does:
+        /// it dials again by itself (`ensure_connected`).
+        stat_session_lost: HashMap<String, u32>,
+        /// `stat` cannot read sizes: it reports 0 and the FTP marker, as for
+        /// an MLST without a size fact.
+        unreadable_sizes: bool,
+        /// `(connection id, path, transfers served before it)` for every
+        /// `mkdir`.
+        mkdirs: Vec<(usize, String, usize)>,
+    }
+
+    /// A provider without a transfer pool (SFTP type, no `clone_for_transfer`),
+    /// so every batch command takes the legacy per-worker path. Its transfers
+    /// yield first, as real ones do on their I/O, so workers interleave.
+    struct WorkerFake {
+        id: usize,
+        alive: bool,
+        state: Arc<Mutex<WorkerFakeState>>,
+    }
+
+    type FakeDial = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Box<dyn StorageProvider>, String>>>,
+    >;
+
+    impl WorkerFake {
+        fn state() -> Arc<Mutex<WorkerFakeState>> {
+            Arc::default()
+        }
+
+        /// A connection the caller already holds, like a command's scan
+        /// connection: not counted as a dial.
+        fn held(state: &Arc<Mutex<WorkerFakeState>>) -> Box<dyn StorageProvider> {
+            let mut st = state.lock().unwrap();
+            st.next_id += 1;
+            Box::new(Self {
+                id: st.next_id,
+                alive: true,
+                state: state.clone(),
+            })
+        }
+
+        /// A connector for `run_on_worker_connections`: it suspends, as a real
+        /// dial does, and refuses while `refuse_dials` lasts.
+        fn dial(state: &Arc<Mutex<WorkerFakeState>>) -> impl Fn() -> FakeDial {
+            let state = state.clone();
+            move || {
+                let state = state.clone();
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.dial_attempts += 1;
+                        if st.refuse_alternate && st.dial_attempts % 2 == 1 {
+                            return Err("dial refused".to_string());
+                        }
+                        if st.refuse_dials > 0 {
+                            st.refuse_dials -= 1;
+                            return Err("dial refused".to_string());
+                        }
+                        st.dials += 1;
+                    }
+                    Ok(Self::held(&state))
+                })
+            }
+        }
+
+        fn record(&mut self, remote_path: &str) -> Result<(), ProviderError> {
+            if !self.alive {
+                return Err(ProviderError::NotConnected);
+            }
+            let mut st = self.state.lock().unwrap();
+            let first_here = !st.served.iter().any(|(id, _)| *id == self.id);
+            st.served.push((self.id, remote_path.to_string()));
+            if first_here && st.kill_first_on == Some(self.id) {
+                st.kill_first_on = None;
+                self.alive = false;
+                return Err(ProviderError::ConnectionLost(format!(
+                    "session lost during {remote_path}"
+                )));
+            }
+            if let Some(left) = st.session_kills.get_mut(remote_path) {
+                if *left > 0 {
+                    *left -= 1;
+                    self.alive = false;
+                    return Err(ProviderError::ConnectionLost(format!(
+                        "session lost during {remote_path}"
+                    )));
+                }
+            }
+            if st.file_errors.contains(remote_path) {
+                return Err(ProviderError::NotFound(remote_path.to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for WorkerFake {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn provider_type(&self) -> ProviderType {
+            self.state
+                .lock()
+                .unwrap()
+                .kind
+                .unwrap_or(ProviderType::Sftp)
+        }
+        fn display_name(&self) -> String {
+            "worker-fake".to_string()
+        }
+        fn reports_exact_size(&self) -> bool {
+            !self.state.lock().unwrap().inexact_sizes
+        }
+        async fn connect(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), ProviderError> {
+            self.alive = false;
+            let hang = {
+                let mut st = self.state.lock().unwrap();
+                st.disconnects += 1;
+                st.hang_disconnect
+            };
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            self.alive
+        }
+        async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+            let st = self.state.lock().unwrap();
+            let prefix = format!("{}/", path.trim_end_matches('/'));
+            let mut entries: Vec<RemoteEntry> = st
+                .files
+                .iter()
+                .filter_map(|(full, bytes)| {
+                    let name = full.strip_prefix(&prefix)?;
+                    (!name.contains('/')).then(|| {
+                        let mut entry =
+                            RemoteEntry::file(name.to_string(), full.clone(), bytes.len() as u64);
+                        entry.modified = Some(FIXTURE_MTIME.to_string());
+                        entry
+                    })
+                })
+                .collect();
+            entries.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(entries)
+        }
+        async fn pwd(&mut self) -> Result<String, ProviderError> {
+            Ok("/".to_string())
+        }
+        async fn cd(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn cd_up(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn download(
+            &mut self,
+            remote_path: &str,
+            local_path: &str,
+            progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            tokio::task::yield_now().await;
+            // A first chunk arrived before anything could fail.
+            if let Some(progress) = &progress {
+                progress(1, 2);
+            }
+            self.record(remote_path)?;
+            let bytes = self
+                .state
+                .lock()
+                .unwrap()
+                .files
+                .get(remote_path)
+                .cloned()
+                .ok_or_else(|| ProviderError::NotFound(remote_path.to_string()))?;
+            std::fs::write(local_path, bytes).map_err(|e| ProviderError::Other(e.to_string()))
+        }
+        async fn download_to_bytes(&mut self, remote_path: &str) -> Result<Vec<u8>, ProviderError> {
+            Err(ProviderError::NotFound(remote_path.to_string()))
+        }
+        async fn upload(
+            &mut self,
+            local_path: &str,
+            remote_path: &str,
+            progress: Option<Box<dyn Fn(u64, u64) + Send>>,
+        ) -> Result<(), ProviderError> {
+            tokio::task::yield_now().await;
+            let bytes =
+                std::fs::read(local_path).map_err(|e| ProviderError::Other(e.to_string()))?;
+            // Half of it went out before anything could fail.
+            if let Some(progress) = &progress {
+                progress(bytes.len() as u64 / 2, bytes.len() as u64);
+            }
+            if let Err(err) = self.record(remote_path) {
+                let mut st = self.state.lock().unwrap();
+                if st.partial_on_kill && err.is_connection_lost() {
+                    let half = bytes[..bytes.len() / 2].to_vec();
+                    st.files.insert(remote_path.to_string(), half);
+                }
+                return Err(err);
+            }
+            self.state
+                .lock()
+                .unwrap()
+                .files
+                .insert(remote_path.to_string(), bytes);
+            Ok(())
+        }
+        async fn mkdir(&mut self, path: &str) -> Result<(), ProviderError> {
+            let mut st = self.state.lock().unwrap();
+            let served = st.served.len();
+            st.mkdirs.push((self.id, path.to_string(), served));
+            Ok(())
+        }
+        async fn delete(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rmdir_recursive(&mut self, _path: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn rename(&mut self, _from: &str, _to: &str) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
+            let mut st = self.state.lock().unwrap();
+            if let Some(left) = st.stat_session_lost.get_mut(path) {
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(ProviderError::ConnectionLost(
+                        "the connection to the server ended".to_string(),
+                    ));
+                }
+            }
+            if st.stat_errors.contains(path) {
+                return Err(ProviderError::PermissionDenied(path.to_string()));
+            }
+            let bytes = st
+                .files
+                .get(path)
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))?;
+            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+            let mut entry = RemoteEntry::file(name, path.to_string(), bytes.len() as u64);
+            entry.modified = Some(FIXTURE_MTIME.to_string());
+            if st.unreadable_sizes {
+                entry.size = 0;
+                entry
+                    .metadata
+                    .insert("ftp.size_unreadable".to_string(), "1".to_string());
+            }
+            Ok(entry)
+        }
+        async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
+            Ok(self.stat(path).await?.size)
+        }
+        async fn exists(&mut self, path: &str) -> Result<bool, ProviderError> {
+            Ok(self.state.lock().unwrap().files.contains_key(path))
+        }
+        async fn keep_alive(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn server_info(&mut self) -> Result<String, ProviderError> {
+            Ok("worker-fake".to_string())
+        }
+        fn transfer_executor_kind(
+            &self,
+        ) -> ftp_client_gui_lib::providers::ProviderTransferExecutorKind {
+            use ftp_client_gui_lib::providers::ProviderTransferExecutorKind;
+            if self.state.lock().unwrap().pooled {
+                ProviderTransferExecutorKind::SftpConnectionPool
+            } else {
+                ProviderTransferExecutorKind::LockedSingle
+            }
+        }
+        fn transfer_executor_max_sessions(&self) -> u16 {
+            if self.state.lock().unwrap().pooled {
+                4
+            } else {
+                1
+            }
+        }
+        fn clone_for_transfer(&self) -> Result<Box<dyn StorageProvider>, ProviderError> {
+            if self.state.lock().unwrap().pooled {
+                Ok(Self::held(&self.state))
+            } else {
+                Err(ProviderError::NotSupported(
+                    "clone_for_transfer".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// A job that uploads nothing: it records `path` on the connection it was
+    /// given, and classifies a failure with the production classifier.
+    async fn record_on(
+        conn: Result<Box<dyn StorageProvider>, String>,
+        path: String,
+    ) -> WorkerJobDone<String> {
+        let mut conn = match conn {
+            Ok(conn) => conn,
+            Err(err) => return WorkerJobDone::without_transfer(None, err),
+        };
+        tokio::task::yield_now().await;
+        let outcome = conn
+            .as_any_mut()
+            .downcast_mut::<WorkerFake>()
+            .expect("a WorkerFake")
+            .record(&path);
+        let outcome =
+            outcome.map_err(|err| TransferOnError::from_provider(conn.as_ref(), err, &[&path]));
+        WorkerJobDone::from_transfer(conn, outcome, |_| path, |err| err)
+    }
+
+    fn job_paths(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("/root/f{i:02}")).collect()
+    }
+
+    /// Runs the helper as the commands do, with nothing cancelled and no
+    /// `--max-transfer` budget.
+    async fn run_jobs(
+        state: &Arc<Mutex<WorkerFakeState>>,
+        seed: Option<Box<dyn StorageProvider>>,
+        workers: usize,
+        jobs: Vec<String>,
+    ) -> Vec<Result<String, String>> {
+        run_on_worker_connections(
+            seed,
+            workers,
+            jobs,
+            &AtomicBool::new(false),
+            None,
+            WorkerFake::dial(state),
+            record_on,
+        )
+        .await
+    }
+
+    fn errors(results: &[Result<String, String>]) -> usize {
+        results.iter().filter(|r| r.is_err()).count()
+    }
+
+    /// The defect: the legacy batch dialled once per file. N files on W
+    /// workers now cost W connections, each closed once at the end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_dial_once_per_worker_not_per_file() {
+        let state = WorkerFake::state();
+        let results = run_jobs(&state, None, 3, job_paths(10)).await;
+        assert_eq!((results.len(), errors(&results)), (10, 0), "{results:?}");
+        let st = state.lock().unwrap();
+        assert_eq!(st.dials, 3, "one dial per worker");
+        assert_eq!(st.disconnects, 3, "each connection closed once");
+    }
+
+    /// Workers dial when they take their first job: fewer jobs than workers
+    /// open no idle connections.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_dial_no_more_than_the_jobs_need() {
+        let state = WorkerFake::state();
+        let results = run_jobs(&state, None, 8, job_paths(2)).await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(state.lock().unwrap().dials, 2);
+    }
+
+    /// A connection the caller already holds serves the first worker, and
+    /// with one worker nothing else is dialled; a seed no job needed is
+    /// closed rather than leaked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_start_from_the_held_connection() {
+        let state = WorkerFake::state();
+        let seed = WorkerFake::held(&state);
+        let results = run_jobs(&state, Some(seed), 1, job_paths(5)).await;
+        assert_eq!(errors(&results), 0, "{results:?}");
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(st.dial_attempts, 0, "the held connection was enough");
+            assert!(st.served.iter().all(|(id, _)| *id == 1), "all on the seed");
+            assert_eq!(st.disconnects, 1);
+        }
+
+        let state = WorkerFake::state();
+        let seed = WorkerFake::held(&state);
+        let results = run_jobs(&state, Some(seed), 4, Vec::new()).await;
+        assert!(results.is_empty());
+        let st = state.lock().unwrap();
+        assert_eq!(
+            (st.dial_attempts, st.disconnects),
+            (0, 1),
+            "unused seed closed"
+        );
+    }
+
+    /// A failure of the file (here `NotFound`) keeps the connection, on a
+    /// fresh connection and on a proven one alike: a batch with scattered bad
+    /// files must not sign in again for each of them (Internxt answers 429).
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_keep_the_session_on_a_file_error() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().file_errors = ["/root/f01", "/root/f03", "/root/f05"]
+            .map(String::from)
+            .into();
+        let results = run_jobs(&state, None, 1, job_paths(6)).await;
+        assert_eq!(errors(&results), 3, "{results:?}");
+        let st = state.lock().unwrap();
+        assert_eq!(st.dials, 1, "one connection for the whole batch");
+        assert_eq!(st.disconnects, 1);
+    }
+
+    /// A session that had completed a job and then breaks fails that job, as
+    /// its own connection would have on main, and the next job gets a fresh
+    /// connection: one broken session costs one file and one dial.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_redial_after_a_proven_session_breaks() {
+        let state = WorkerFake::state();
+        state
+            .lock()
+            .unwrap()
+            .session_kills
+            .insert("/root/f02".to_string(), 1);
+        let results = run_jobs(&state, None, 1, job_paths(3)).await;
+        assert_eq!(errors(&results), 1, "only f02 fails: {results:?}");
+        let st = state.lock().unwrap();
+        assert_eq!(st.dials, 2, "the broken session is replaced once");
+        assert_eq!(st.disconnects, 2, "the broken one and the last one");
+        let ids: Vec<usize> = st.served.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1, 1, 2], "f03 runs on the fresh connection");
+    }
+
+    /// A blip on the first file with one worker (the Internxt case): the
+    /// connection is lost before it completed anything, so the job goes back
+    /// to the queue once, and a new connection carries the whole batch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_retry_the_first_file_after_a_blip() {
+        let state = WorkerFake::state();
+        state
+            .lock()
+            .unwrap()
+            .session_kills
+            .insert("/root/f01".to_string(), 1);
+        let results = run_jobs(&state, None, 1, job_paths(4)).await;
+        assert_eq!((results.len(), errors(&results)), (4, 0), "{results:?}");
+        let st = state.lock().unwrap();
+        assert_eq!(st.dials, 2, "one extra dial for the blip");
+        let f01: Vec<usize> = st
+            .served
+            .iter()
+            .filter(|(_, p)| p == "/root/f01")
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(f01, vec![1, 2], "f01 tried on two connections");
+    }
+
+    /// A file that takes down every connection it touches fails on its own and
+    /// every other file goes through: one bad file does not stop the batch.
+    /// With one worker it meets two fresh connections (the rule for a job lost
+    /// twice); with several it may meet a proven one (the rule for a broken
+    /// proven session). Either way, one failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_fail_a_poisoned_file_alone() {
+        for (workers, max_dials) in [(1, 3), (3, 3 + 2)] {
+            let state = WorkerFake::state();
+            state
+                .lock()
+                .unwrap()
+                .session_kills
+                .insert("/root/f01".to_string(), u32::MAX);
+            let results = run_jobs(&state, None, workers, job_paths(9)).await;
+            assert_eq!(results.len(), 9, "{workers} workers: no job dropped");
+            assert_eq!(errors(&results), 1, "{workers} workers: {results:?}");
+            assert!(results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| e.contains("/root/f01")));
+            let st = state.lock().unwrap();
+            assert!(
+                st.dials <= max_dials,
+                "{workers} workers: bounded dials, {}",
+                st.dials
+            );
+            if workers == 1 {
+                let f01: Vec<usize> = st
+                    .served
+                    .iter()
+                    .filter(|(_, p)| p == "/root/f01")
+                    .map(|(id, _)| *id)
+                    .collect();
+                assert_eq!(f01, vec![1, 2], "tried on two fresh connections, then left");
+            }
+        }
+    }
+
+    /// Each of the three signs of a lost session counts on its own, and a
+    /// failure of the file alone keeps the session.
+    #[test]
+    fn transfer_error_classification_reads_each_sign_of_a_lost_session() {
+        let state = WorkerFake::state();
+        let connected = WorkerFake::held(&state);
+        let mut gone = WorkerFake::held(&state);
+        gone.as_any_mut()
+            .downcast_mut::<WorkerFake>()
+            .unwrap()
+            .alive = false;
+        let lost = |provider: &dyn StorageProvider, err: ProviderError| {
+            TransferOnError::from_provider(provider, err, &[]).session_lost
+        };
+        // The error kind alone.
+        assert!(lost(
+            connected.as_ref(),
+            ProviderError::ConnectionLost("peer went away".into())
+        ));
+        assert!(lost(connected.as_ref(), ProviderError::Timeout));
+        // The message alone.
+        assert!(lost(
+            connected.as_ref(),
+            ProviderError::Other("write failed: broken pipe".into())
+        ));
+        // The provider alone.
+        assert!(lost(gone.as_ref(), ProviderError::NotFound("/x".into())));
+        // None of them: the file's failure, the session stays.
+        assert!(!lost(
+            connected.as_ref(),
+            ProviderError::NotFound("/x".into())
+        ));
+        assert!(!lost(
+            connected.as_ref(),
+            ProviderError::PermissionDenied("/x".into())
+        ));
+        // A timeout: the session stopped answering. russh-sftp's request
+        // timeout and a TCP one, neither of them in SESSION_CLOSED_NEEDLES.
+        assert!(lost(
+            connected.as_ref(),
+            ProviderError::TransferFailed("Read error: Timeout".into())
+        ));
+        assert!(lost(
+            connected.as_ref(),
+            ProviderError::TransferFailed("Remote write error: Connection timed out".into())
+        ));
+        // What SFTP reports for a request timeout on a remote file it writes
+        // (#963): a failed transfer, and still a session that stopped
+        // answering.
+        assert!(lost(
+            connected.as_ref(),
+            ProviderError::TransferFailed(
+                "Failed to create remote file: the server did not answer in time (timeout); the remote file may be incomplete"
+                    .into()
+            )
+        ));
+        // The job's own path is not read as a sign: a missing file called
+        // "connection reset.txt" is the file's failure.
+        let path = "/root/connection reset.txt";
+        let missing = || ProviderError::NotFound(format!("Failed to open {path}"));
+        assert!(
+            !TransferOnError::from_provider(connected.as_ref(), missing(), &[path]).session_lost
+        );
+        assert!(
+            lost(connected.as_ref(), missing()),
+            "the path is what matched"
+        );
+    }
+
+    /// An endpoint that drops every session it accepts: a worker gives each of
+    /// two jobs two connections, then stops, and the jobs left report the
+    /// error. Four dials, not one per file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_stop_when_every_fresh_session_is_lost() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().session_kills =
+            job_paths(5).into_iter().map(|p| (p, u32::MAX)).collect();
+        let results = run_jobs(&state, None, 1, job_paths(5)).await;
+        assert_eq!((results.len(), errors(&results)), (5, 5), "{results:?}");
+        let with = |needle: &str| {
+            results
+                .iter()
+                .filter(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
+                .count()
+        };
+        // The two jobs tried report their loss; the three left say what
+        // happened to them, not another file's error.
+        assert_eq!(with("session lost"), 2, "{results:?}");
+        assert_eq!(
+            with("not transferred: no connection left"),
+            3,
+            "{results:?}"
+        );
+        assert_eq!(state.lock().unwrap().dials, 4);
+    }
+
+    /// A dial that fails puts its job back: the next dial carries it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_requeue_the_job_of_a_failed_dial() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().refuse_dials = 1;
+        let results = run_jobs(&state, None, 1, job_paths(3)).await;
+        assert_eq!((results.len(), errors(&results)), (3, 0), "{results:?}");
+        let st = state.lock().unwrap();
+        assert_eq!((st.dial_attempts, st.dials), (2, 1));
+    }
+
+    /// No connection opens at all: each worker tries twice and stops, and no
+    /// job is dropped. A gateway answering 429 sees 4 attempts here, not 5.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_report_every_job_when_no_connection_opens() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().refuse_dials = u32::MAX;
+        let results = run_jobs(&state, None, 2, job_paths(5)).await;
+        assert_eq!((results.len(), errors(&results)), (5, 5));
+        assert!(results
+            .iter()
+            .all(|r| r.as_ref().err().is_some_and(|e| e.contains("dial refused"))));
+        assert_eq!(state.lock().unwrap().dial_attempts, 4);
+    }
+
+    /// A connection is closed after `WORKER_CONNECTION_MAX_JOBS` jobs, as the
+    /// pooled executor retires its warm workers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_retire_a_connection_after_its_quota() {
+        let state = WorkerFake::state();
+        let total = WORKER_CONNECTION_MAX_JOBS as usize + 2;
+        let results = run_jobs(&state, None, 1, job_paths(total)).await;
+        assert_eq!(errors(&results), 0);
+        let st = state.lock().unwrap();
+        assert_eq!((st.dials, st.disconnects), (2, 2));
+        let first = st.served.iter().filter(|(id, _)| *id == 1).count();
+        assert_eq!(first, WORKER_CONNECTION_MAX_JOBS as usize);
+    }
+
+    /// Nothing is dialled for a job the `--max-transfer` budget already rules
+    /// out, nor once the run is cancelled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_do_not_dial_for_a_job_that_cannot_run() {
+        let state = WorkerFake::state();
+        let results = run_on_worker_connections(
+            None,
+            3,
+            job_paths(4),
+            &AtomicBool::new(false),
+            Some(0),
+            WorkerFake::dial(&state),
+            record_on,
+        )
+        .await;
+        assert_eq!((results.len(), errors(&results)), (4, 4));
+        assert!(results
+            .iter()
+            .all(|r| r.as_ref().err().is_some_and(|e| e.contains("max-transfer"))));
+        assert_eq!(state.lock().unwrap().dial_attempts, 0);
+
+        let state = WorkerFake::state();
+        let results = run_on_worker_connections(
+            None,
+            3,
+            job_paths(4),
+            &AtomicBool::new(true),
+            None,
+            WorkerFake::dial(&state),
+            record_on,
+        )
+        .await;
+        assert_eq!((results.len(), errors(&results)), (4, 4));
+        assert_eq!(state.lock().unwrap().dial_attempts, 0);
+    }
+
+    /// A dial that suspends, as a real one does. The seed's lock guard used to
+    /// stay alive across the dial, a second worker locking it blocked the one
+    /// thread the workers share, and the batch hung (live, `put -r
+    /// --immutable` over SFTP). Run on its own thread so a hang fails the test
+    /// instead of stalling the suite.
+    #[test]
+    fn worker_connections_do_not_hold_a_lock_across_a_dial() {
+        let state = WorkerFake::state();
+        let batch_state = state.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let state = batch_state;
+            let results = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(async {
+                    let seed = WorkerFake::held(&state);
+                    run_jobs(&state, Some(seed), 4, job_paths(12)).await
+                });
+            let _ = done_tx.send(results);
+        });
+        let results = done_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the batch hung");
+        assert_eq!((results.len(), errors(&results)), (12, 0));
+        assert_eq!(state.lock().unwrap().dials, 3, "the seed plus three dials");
+    }
+
+    /// A failed transfer on a held connection takes back the bytes it put on
+    /// the batch's progress: both call sites wire the take-back, not only the
+    /// type that makes it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_transfer_on_a_held_connection_takes_back_its_progress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let local = dir.path().join("up.bin");
+        std::fs::write(&local, vec![7u8; 1000]).unwrap();
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            st.session_kills = HashMap::from([
+                ("/root/up.bin".to_string(), 1),
+                ("/root/down.bin".to_string(), 1),
+            ]);
+            st.files.insert("/root/down.bin".to_string(), vec![1u8; 10]);
+        }
+        let cli = test_cli();
+        let aggregate = Arc::new(AtomicU64::new(0));
+        let mut conn = WorkerFake::held(&state);
+        let up = upload_transfer_on(
+            conn.as_mut(),
+            local.to_string_lossy().into_owned(),
+            "/root/up.bin".to_string(),
+            &cli,
+            false,
+            true,
+            Some(aggregate.clone()),
+            None,
+            None,
+        )
+        .await;
+        assert!(up.is_err());
+        assert_eq!(aggregate.load(Ordering::Relaxed), 0, "upload");
+        let mut conn = WorkerFake::held(&state);
+        let down = download_transfer_on(
+            conn.as_mut(),
+            "/root/down.bin".to_string(),
+            dir.path().join("down.bin").to_string_lossy().into_owned(),
+            None,
+            &cli,
+            Some(aggregate.clone()),
+            None,
+            None,
+        )
+        .await;
+        assert!(down.is_err());
+        assert_eq!(aggregate.load(Ordering::Relaxed), 0, "download");
+    }
+
+    /// A file error whose path reads like a lost session keeps the session:
+    /// both call sites hand their paths to the classifier.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_named_like_a_lost_session_keeps_the_connection() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let local = dir.path().join("connection reset.txt");
+        std::fs::write(&local, b"x").unwrap();
+        let remote = "/root/connection reset.txt".to_string();
+        let state = WorkerFake::state();
+        state.lock().unwrap().file_errors.insert(remote.clone());
+        let cli = test_cli();
+        let mut conn = WorkerFake::held(&state);
+        let up = upload_transfer_on(
+            conn.as_mut(),
+            local.to_string_lossy().into_owned(),
+            remote.clone(),
+            &cli,
+            false,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!up.expect_err("the file error").session_lost, "upload");
+        let down = download_transfer_on(
+            conn.as_mut(),
+            remote.clone(),
+            dir.path().join("out.txt").to_string_lossy().into_owned(),
+            None,
+            &cli,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!down.expect_err("the file error").session_lost, "download");
+    }
+
+    /// The `--immutable` size check compares only a size it can trust: not
+    /// on a provider that says its sizes are not exact (the size-changing
+    /// overlays), not on Proton Drive, and not a 0 on WebDAV or Google Drive
+    /// (no length sent, a native Doc). Elsewhere a 0 is exact, and it is what
+    /// an upload cut between its create and its first write leaves.
+    #[test]
+    fn the_immutable_size_check_compares_only_sizes_it_can_trust() {
+        let cli = Cli {
+            immutable: true,
+            ..test_cli()
+        };
+        let there = |size| RemoteEntry::file("f".into(), "/f".into(), size);
+        assert!(immutable_size_mismatch(&cli, "/f", &there(3), Some(6), true).is_some());
+        assert!(immutable_size_mismatch(&cli, "/f", &there(6), Some(6), true).is_none());
+        assert!(immutable_size_mismatch(&cli, "/f", &there(3), Some(6), false).is_none());
+        assert!(immutable_size_mismatch(&cli, "/f", &there(3), None, true).is_none());
+        let no_clobber = test_cli();
+        assert!(immutable_size_mismatch(&no_clobber, "/f", &there(3), Some(6), true).is_none());
+
+        let exact = |kind: ProviderType, inexact: bool, size: u64| {
+            let state = WorkerFake::state();
+            {
+                let mut st = state.lock().unwrap();
+                st.kind = Some(kind);
+                st.inexact_sizes = inexact;
+            }
+            remote_size_is_exact(WorkerFake::held(&state).as_ref(), &there(size))
+        };
+        assert!(exact(ProviderType::Sftp, false, 0), "a 0 on SFTP is exact");
+        assert!(exact(ProviderType::Sftp, false, 5));
+        assert!(!exact(ProviderType::Sftp, true, 5), "the provider says no");
+        assert!(!exact(ProviderType::WebDav, false, 0), "no length sent");
+        assert!(exact(ProviderType::WebDav, false, 5));
+        assert!(!exact(ProviderType::GoogleDrive, false, 0), "a native Doc");
+        assert!(
+            !exact(ProviderType::Proton, false, 5),
+            "maybe the encrypted size"
+        );
+        // FTP marks a size it could not read (an MLST without a size fact, a
+        // LIST row without a readable one): the 0 it reads is not a size.
+        assert!(exact(ProviderType::Ftp, false, 0), "a 0 FTP read is exact");
+        let state = WorkerFake::state();
+        state.lock().unwrap().kind = Some(ProviderType::Ftp);
+        let mut unread = there(0);
+        unread
+            .metadata
+            .insert("ftp.size_unreadable".to_string(), "1".to_string());
+        assert!(
+            !remote_size_is_exact(WorkerFake::held(&state).as_ref(), &unread),
+            "a size FTP could not read"
+        );
+    }
+
+    /// A batch summary names what arrived, and the total only when not all
+    /// of it did.
+    #[test]
+    fn batch_summaries_say_what_arrived() {
+        assert_eq!(batch_bytes_summary(1024, 1024), format_size(1024));
+        assert_eq!(
+            batch_bytes_summary(512, 4096),
+            format!("{} of {}", format_size(512), format_size(4096))
+        );
+        assert_eq!(shared_batch_bytes(true, 4096, None), 4096);
+        assert_eq!(shared_batch_bytes(false, 4096, None), 0);
+    }
+
+    /// A failed attempt takes back the bytes it added to the batch's
+    /// progress: a job that goes back to the queue starts again from zero,
+    /// and its first attempt used to be counted twice.
+    #[test]
+    fn a_failed_attempt_takes_back_its_progress() {
+        let aggregate = Arc::new(AtomicU64::new(500));
+        let (first, attempt) = make_aggregate_progress_cb(aggregate.clone(), None);
+        first(100, 300);
+        first(250, 300);
+        assert_eq!(aggregate.load(Ordering::Relaxed), 750);
+        attempt.take_back();
+        assert_eq!(aggregate.load(Ordering::Relaxed), 500);
+        let (second, _) = make_aggregate_progress_cb(aggregate.clone(), None);
+        second(300, 300);
+        assert_eq!(aggregate.load(Ordering::Relaxed), 800, "counted once");
+    }
+
+    /// A job that may not run again (an `--immutable` upload that reached the
+    /// remote file) fails when it loses a fresh connection instead of going
+    /// back to the queue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_connections_do_not_requeue_a_job_that_may_not_run_again() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().session_kills = HashMap::from([("/root/f01".to_string(), 1)]);
+        let results = run_on_worker_connections(
+            None,
+            1,
+            job_paths(2),
+            &AtomicBool::new(false),
+            None,
+            WorkerFake::dial(&state),
+            |conn, path| async move {
+                let mut done = record_on(conn, path).await;
+                done.retry_safe = false;
+                done
+            },
+        )
+        .await;
+        assert_eq!((results.len(), errors(&results)), (2, 1), "{results:?}");
+        let st = state.lock().unwrap();
+        let tries = st.served.iter().filter(|(_, p)| p == "/root/f01").count();
+        assert_eq!(tries, 1, "tried once, not requeued");
+    }
+
+    /// A connection that waited for a job no longer counts as proven: the
+    /// server may have dropped it while it sat idle. Its loss then puts the
+    /// job back for a fresh connection, where it used to fail the job.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_a_connection_that_waited_is_not_proven() {
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            st.refuse_dials = 1;
+            st.session_kills = HashMap::from([("/root/f02".to_string(), 1)]);
+        }
+        let seed = WorkerFake::held(&state);
+        let results = run_jobs(&state, Some(seed), 2, job_paths(2)).await;
+        assert_eq!((results.len(), errors(&results)), (2, 0), "{results:?}");
+    }
+
+    /// Only a job that kept its session resets a worker's counts. An endpoint
+    /// that refuses every other dial and drops every session it accepts stops
+    /// the worker at its second failed dial: three attempts, where resetting
+    /// the count on each accepted dial let it go on to eight.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_count_a_failure_streak_until_a_job_completes() {
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            st.refuse_alternate = true;
+            st.session_kills = job_paths(3).into_iter().map(|p| (p, u32::MAX)).collect();
+        }
+        let results = run_jobs(&state, None, 1, job_paths(3)).await;
+        assert_eq!((results.len(), errors(&results)), (3, 3), "{results:?}");
+        assert_eq!(state.lock().unwrap().dial_attempts, 3);
+    }
+
+    /// A worker with nothing left to take waits while another still holds a
+    /// job: the job a failed dial puts back runs on the waiting worker's live
+    /// connection, where it used to fail for want of one after the second
+    /// failed dial.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_idle_worker_takes_a_job_that_comes_back() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().refuse_dials = u32::MAX;
+        let seed = WorkerFake::held(&state);
+        let results = run_jobs(&state, Some(seed), 2, job_paths(2)).await;
+        assert_eq!((results.len(), errors(&results)), (2, 0), "{results:?}");
+        let st = state.lock().unwrap();
+        assert_eq!(st.dial_attempts, 1);
+        assert!(
+            st.served.iter().all(|(id, _)| *id == 1),
+            "both on the seed: {:?}",
+            st.served
+        );
+    }
+
+    /// A failed dial is followed by a pause before the next one, so a short
+    /// outage is ridden out instead of spending both attempts at once.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_pause_before_dialling_again() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().refuse_dials = 1;
+        let started = tokio::time::Instant::now();
+        let results = run_jobs(&state, None, 1, job_paths(1)).await;
+        assert_eq!(errors(&results), 0);
+        assert_eq!(state.lock().unwrap().dial_attempts, 2);
+        assert_eq!(started.elapsed(), WORKER_REDIAL_PAUSE);
+    }
+
+    /// Closing a connection whose peer stopped answering is bounded: the
+    /// batch ends instead of waiting on the close.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_connections_bound_the_close_of_a_silent_peer() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().hang_disconnect = true;
+        let started = tokio::time::Instant::now();
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_jobs(&state, None, 1, job_paths(2)),
+        )
+        .await
+        .expect("the batch waited on a close that never returns");
+        assert_eq!(errors(&results), 0);
+        assert_eq!(state.lock().unwrap().disconnects, 1);
+        assert_eq!(started.elapsed(), WORKER_CLOSE_TIMEOUT);
+    }
+
+    /// Runs `command` against the fake: the first `create_and_connect` gets
+    /// `seed`, every later one a new connection from the factory, counted as
+    /// a dial. So a command that dials per file shows it in `dials`.
+    fn run_on_fake<T: Send, F: std::future::Future<Output = T>>(
+        state: &Arc<Mutex<WorkerFakeState>>,
+        command: impl FnOnce() -> F + Send,
+    ) -> T {
+        let state = state.clone();
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("worker-connection-command".to_string())
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    let seed = WorkerFake::held(&state);
+                    TEST_CONNECTED_PROVIDER.with(|slot| *slot.borrow_mut() = Some(seed));
+                    let factory_state = state.clone();
+                    TEST_PROVIDER_FACTORY.with(|slot| {
+                        *slot.borrow_mut() = Some(std::rc::Rc::new(move || {
+                            let mut st = factory_state.lock().unwrap();
+                            st.dials += 1;
+                            st.dial_attempts += 1;
+                            drop(st);
+                            WorkerFake::held(&factory_state)
+                        }))
+                    });
+                    let out = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("test runtime")
+                        .block_on(command());
+                    TEST_PROVIDER_FACTORY.with(|slot| *slot.borrow_mut() = None);
+                    out
+                })
+                .expect("spawn the command thread")
+                .join()
+                .expect("the command thread panicked")
+        })
+    }
+
+    /// Five local files under `dir/up`, and a CLI with `workers` workers.
+    fn local_batch(dir: &tempfile::TempDir, workers: usize) -> (String, Cli) {
+        let local = dir.path().join("up");
+        std::fs::create_dir(&local).expect("local dir");
+        for i in 1..=5 {
+            std::fs::write(local.join(format!("f{i}.txt")), format!("file {i}")).unwrap();
+        }
+        let cli = Cli {
+            quiet: true,
+            parallel: workers,
+            ..test_cli()
+        };
+        (local.to_string_lossy().into_owned(), cli)
+    }
+
+    fn remote_batch(state: &Arc<Mutex<WorkerFakeState>>) {
+        let mut st = state.lock().unwrap();
+        for i in 1..=5 {
+            st.files
+                .insert(format!("/root/f{i}.txt"), format!("file {i}").into_bytes());
+        }
+    }
+
+    fn local_files(dir: &std::path::Path) -> usize {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .count()
+    }
+
+    /// `put -r` to a provider without a transfer pool (Internxt, MEGA, Filen
+    /// and the other single-session APIs) closed its scan connection and
+    /// dialled once per file: 60 files to Internxt were 60 logins. With one
+    /// worker it now uploads every file on the scan connection, dialling
+    /// nothing, and with four it dials three more, not five.
+    #[test]
+    fn put_recursive_on_a_poolless_provider_dials_once_per_worker() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        for (workers, dials) in [(1, 0), (4, 3)] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, cli) = local_batch(&dir, workers);
+            let state = WorkerFake::state();
+            let code = run_on_fake(&state, || async {
+                cmd_put_recursive(
+                    "memory://",
+                    &local_dir,
+                    Some("/root"),
+                    false,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            let st = state.lock().unwrap();
+            assert_eq!(code, 0, "{workers} workers: {:?}", st.served);
+            assert_eq!(st.files.len(), 5, "{workers} workers: every file uploaded");
+            assert_eq!(st.dials, dials, "{workers} workers");
+            assert_eq!(
+                st.disconnects,
+                dials + 1,
+                "{workers} workers: each closed once"
+            );
+        }
+    }
+
+    /// The download twin: `get -r` from a provider without a transfer pool.
+    #[test]
+    fn get_recursive_on_a_poolless_provider_dials_once_per_worker() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        for (workers, dials) in [(1, 0), (4, 3)] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let state = WorkerFake::state();
+            remote_batch(&state);
+            let cli = Cli {
+                quiet: true,
+                parallel: workers,
+                ..test_cli()
+            };
+            let local_base = dir.path().join("down").to_string_lossy().into_owned();
+            let code = run_on_fake(&state, || async {
+                cmd_get_recursive(
+                    "memory://",
+                    "/root",
+                    Some(&local_base),
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            let st = state.lock().unwrap();
+            assert_eq!(code, 0, "{workers} workers: {:?}", st.served);
+            assert_eq!(st.served.len(), 5, "{workers} workers");
+            assert_eq!(st.dials, dials, "{workers} workers");
+            assert_eq!(local_files(&dir.path().join("down")), 5);
+        }
+    }
+
+    /// `--immutable` skips the files already there without dropping the
+    /// connection: the skip says nothing about the session.
+    #[test]
+    fn put_recursive_immutable_skips_keep_the_connection() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, mut cli) = local_batch(&dir, 1);
+        cli.immutable = true;
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            // The size of the local files ("file N"), so each is a skip.
+            for name in ["f1.txt", "f3.txt"] {
+                st.files.insert(format!("/root/{name}"), b"there!".to_vec());
+            }
+        }
+        run_on_fake(&state, || async {
+            cmd_put_recursive(
+                "memory://",
+                &local_dir,
+                Some("/root"),
+                false,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.served.len(),
+            3,
+            "three uploads, two skips: {:?}",
+            st.served
+        );
+        assert_eq!(st.files["/root/f1.txt"], b"there!", "not overwritten");
+        assert_eq!(st.dials, 0, "one connection throughout");
+        assert_eq!(st.disconnects, 1);
+    }
+
+    /// `--immutable` and a fresh connection lost in the middle of an upload:
+    /// the upload had already created the remote file, and a second attempt
+    /// found that partial, skipped it as already there and exited 0 on a
+    /// truncated file. The loss is reported instead.
+    #[test]
+    fn put_recursive_immutable_reports_an_upload_cut_by_a_lost_connection() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        // `--no-clobber` skips an existing file the same way, so the same
+        // requeue would hide the same partial.
+        for no_clobber in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, mut cli) = local_batch(&dir, 2);
+            cli.immutable = !no_clobber;
+            let state = WorkerFake::state();
+            {
+                let mut st = state.lock().unwrap();
+                // Connection 1 is the scan connection, 2 the first one dialled.
+                st.kill_first_on = Some(2);
+                st.partial_on_kill = true;
+            }
+            let code = run_on_fake(&state, || async {
+                cmd_put_recursive(
+                    "memory://",
+                    &local_dir,
+                    Some("/root"),
+                    no_clobber,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            let st = state.lock().unwrap();
+            let (_, cut) = st
+                .served
+                .iter()
+                .find(|(id, _)| *id == 2)
+                .expect("connection 2 took a job");
+            assert!(st.files[cut].len() < 6, "the fake left a partial at {cut}");
+            assert_eq!(
+                code, 4,
+                "no_clobber {no_clobber}: the cut upload is a failure: {:?}",
+                st.served
+            );
+        }
+    }
+
+    /// `--immutable` and a remote file of another size, most often the
+    /// partial a lost connection left: an error, not a skip. It was counted
+    /// as skipped, and the run reported the truncated file as done, then and
+    /// on every later run.
+    #[test]
+    fn put_recursive_immutable_refuses_a_remote_file_of_another_size() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, mut cli) = local_batch(&dir, 1);
+        cli.immutable = true;
+        let state = WorkerFake::state();
+        state
+            .lock()
+            .unwrap()
+            .files
+            .insert("/root/f2.txt".to_string(), b"fil".to_vec());
+        let code = run_on_fake(&state, || async {
+            cmd_put_recursive(
+                "memory://",
+                &local_dir,
+                Some("/root"),
+                false,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(code, 4, "{:?}", st.served);
+        assert_eq!(st.files["/root/f2.txt"], b"fil", "not overwritten");
+        assert_eq!(st.files.len(), 5, "the other four uploaded");
+    }
+
+    /// The same for a single `put`: a remote file of another size is refused
+    /// with exit 4, one of the same size is still the skip it was (exit 9).
+    #[test]
+    fn put_immutable_refuses_a_remote_file_of_another_size() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let local = dir.path().join("one.txt");
+        std::fs::write(&local, b"123456").unwrap();
+        let local = local.to_string_lossy().into_owned();
+        let cli = Cli {
+            quiet: true,
+            immutable: true,
+            ..test_cli()
+        };
+        for (there, expected) in [(&b"123"[..], 4), (&b"abcdef"[..], 9)] {
+            let state = WorkerFake::state();
+            state
+                .lock()
+                .unwrap()
+                .files
+                .insert("/root/one.txt".to_string(), there.to_vec());
+            let code = run_on_fake(&state, || {
+                cmd_put(
+                    "memory://",
+                    &local,
+                    Some("/root/one.txt"),
+                    false,
+                    false,
+                    false,
+                    None,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+            });
+            assert_eq!(code, expected, "remote of {} bytes", there.len());
+            let st = state.lock().unwrap();
+            assert_eq!(st.files["/root/one.txt"], there, "never overwritten");
+        }
+    }
+
+    /// A single `put -n` whose existence check lost the connection went on as
+    /// if the file were absent, and the upload, which dials again by itself
+    /// (SFTP since #963), overwrote the very file `-n` protects. The write is
+    /// refused with the provider's code instead (1, retried by `--retries`,
+    /// whose next attempt connects afresh, finds the file and skips it).
+    #[test]
+    fn put_no_clobber_refuses_when_its_existence_check_lost_the_connection() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let local = dir.path().join("one.txt");
+        std::fs::write(&local, b"new bytes").unwrap();
+        let local = local.to_string_lossy().into_owned();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            st.files
+                .insert("/root/one.txt".to_string(), b"old".to_vec());
+            st.stat_session_lost.insert("/root/one.txt".to_string(), 1);
+        }
+        let code = run_on_fake(&state, || {
+            cmd_put(
+                "memory://",
+                &local,
+                Some("/root/one.txt"),
+                false,
+                true,
+                false,
+                None,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let st = state.lock().unwrap();
+        assert!(st.served.is_empty(), "nothing written: {:?}", st.served);
+        assert_eq!(st.files["/root/one.txt"], b"old", "not overwritten");
+        assert_eq!(code, 1, "the provider's code for a lost connection");
+    }
+
+    /// `put -r -n` and `put -n` with a glob honoured `--no-clobber` only on
+    /// the single-file path: the batches overwrote an existing remote file
+    /// without a word. Both skip it now, on a provider with a transfer pool
+    /// too (the pooled uploader has no existence check, so `-n` stays off it).
+    #[test]
+    fn put_batches_honour_no_clobber() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        for pooled in [false, true] {
+            for glob in [false, true] {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let (local_dir, cli) = local_batch(&dir, 2);
+                let state = WorkerFake::state();
+                {
+                    let mut st = state.lock().unwrap();
+                    st.pooled = pooled;
+                    st.files.insert("/root/f1.txt".to_string(), b"old".to_vec());
+                }
+                let pattern = format!("{local_dir}/*.txt");
+                let code = run_on_fake(&state, || async {
+                    if glob {
+                        cmd_put_glob(
+                            "memory://",
+                            &pattern,
+                            Some("/root"),
+                            true,
+                            &cli,
+                            OutputFormat::Text,
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                        .await
+                    } else {
+                        cmd_put_recursive(
+                            "memory://",
+                            &local_dir,
+                            Some("/root"),
+                            true,
+                            &cli,
+                            OutputFormat::Text,
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                        .await
+                    }
+                });
+                let st = state.lock().unwrap();
+                let case = format!("glob {glob}, pooled {pooled}");
+                assert_eq!(st.files["/root/f1.txt"], b"old", "{case}: not overwritten");
+                assert_eq!(st.files.len(), 5, "{case}: the rest uploaded");
+                assert_eq!(code, 0, "{case}");
+            }
+        }
+    }
+
+    /// The text mode's `--retries` reruns a failed `put`. A rerun of `put -r
+    /// -n` or `put -n` used to find the partial the failed attempt left and
+    /// skip it as already there, ending with exit 9 or 0 on a truncated file
+    /// (a cron `put -r -n dir/ /backup` over a flaky link kept it truncated
+    /// for good). The rerun now reports it as an error, and since no later
+    /// attempt can change that, it is the last attempt.
+    #[test]
+    fn put_retries_report_the_partial_an_earlier_attempt_left() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        for recursive in [true, false] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, mut cli) = local_batch(&dir, 2);
+            cli.retries = 3;
+            cli.retries_sleep = "0".to_string();
+            let state = WorkerFake::state();
+            {
+                let mut st = state.lock().unwrap();
+                // `put -r`: connection 2 is its first dialled worker. A
+                // single `put` uploads on the first connection it opens.
+                st.kill_first_on = Some(if recursive { 2 } else { 1 });
+                st.partial_on_kill = true;
+            }
+            let local = if recursive {
+                local_dir.clone()
+            } else {
+                format!("{local_dir}/f1.txt")
+            };
+            let remote = if recursive { "/root" } else { "/root/f1.txt" };
+            let code = run_on_fake(&state, || {
+                put_with_retries(
+                    "memory://",
+                    &local,
+                    Some(remote),
+                    recursive,
+                    true,
+                    false,
+                    None,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+            });
+            let st = state.lock().unwrap();
+            let case = format!("recursive {recursive}");
+            let (_, cut) = st
+                .served
+                .iter()
+                .find(|(id, _)| *id == if recursive { 2 } else { 1 })
+                .expect("the cut connection took a job");
+            assert!(
+                st.files[cut].len() < 6,
+                "{case}: the fake left a partial at {cut}"
+            );
+            assert_eq!(code, 4, "{case}: the partial is a failure: {:?}", st.served);
+            let attempts_on_cut = st.served.iter().filter(|(_, p)| p == cut).count();
+            assert_eq!(
+                attempts_on_cut, 1,
+                "{case}: never uploaded again, only refused"
+            );
+            if !recursive {
+                // Attempt 1 ran on the first connection, attempt 2 dialled
+                // one and refused; a refusal ends the retries, so no third.
+                assert_eq!(st.dials, 1, "{case}: two attempts, not three");
+            }
+        }
+    }
+
+    /// A refusal ends the retries only when it is all that failed. Here one
+    /// file is refused (another size under `--immutable`) and another loses
+    /// its session: the second attempt runs, uploads that file, meets the
+    /// refusal again and stops there. A refusal used to switch the retries
+    /// off for the whole batch, and the other file never went up.
+    #[test]
+    fn put_retries_go_on_past_a_refusal_when_something_else_failed() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, mut cli) = local_batch(&dir, 1);
+        cli.immutable = true;
+        cli.retries = 3;
+        cli.retries_sleep = "0".to_string();
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            st.files.insert("/root/f1.txt".to_string(), b"fil".to_vec());
+            st.session_kills = HashMap::from([("/root/f2.txt".to_string(), 1)]);
+        }
+        let code = run_on_fake(&state, || {
+            put_with_retries(
+                "memory://",
+                &local_dir,
+                Some("/root"),
+                true,
+                false,
+                false,
+                None,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(code, 4, "the refusal stays a failure: {:?}", st.served);
+        assert_eq!(
+            st.files["/root/f2.txt"], b"file 2",
+            "uploaded on the second attempt"
+        );
+        assert_eq!(st.files["/root/f1.txt"], b"fil", "never overwritten");
+        // Attempt 1 dialled a successor after the lost session, attempt 2
+        // its scan connection; a third attempt would dial once more.
+        assert_eq!(st.dials, 2, "two attempts: {:?}", st.served);
+    }
+
+    /// Under `--immutable` a remote file of 0 bytes on a provider whose sizes
+    /// are exact (here SFTP) is refused like any other size: it is what an
+    /// upload cut between its create and its first write leaves. On a
+    /// provider whose sizes are not exact the file is skipped, as before.
+    #[test]
+    fn put_recursive_immutable_trusts_only_exact_sizes() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        for inexact in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, mut cli) = local_batch(&dir, 1);
+            cli.immutable = true;
+            let state = WorkerFake::state();
+            {
+                let mut st = state.lock().unwrap();
+                st.inexact_sizes = inexact;
+                st.files.insert("/root/f2.txt".to_string(), Vec::new());
+            }
+            let code = run_on_fake(&state, || async {
+                cmd_put_recursive(
+                    "memory://",
+                    &local_dir,
+                    Some("/root"),
+                    false,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            let st = state.lock().unwrap();
+            assert_eq!(code, if inexact { 0 } else { 4 }, "inexact {inexact}");
+            assert!(st.files["/root/f2.txt"].is_empty(), "never overwritten");
+        }
+    }
+
+    /// Under `--immutable` the batches refuse to write a file whose absence
+    /// they cannot verify, as a single `put` does; they used to go ahead.
+    #[test]
+    fn put_recursive_immutable_refuses_what_it_cannot_stat() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, mut cli) = local_batch(&dir, 1);
+        cli.immutable = true;
+        let state = WorkerFake::state();
+        state
+            .lock()
+            .unwrap()
+            .stat_errors
+            .insert("/root/f2.txt".to_string());
+        let code = run_on_fake(&state, || async {
+            cmd_put_recursive(
+                "memory://",
+                &local_dir,
+                Some("/root"),
+                false,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(code, 4, "{:?}", st.served);
+        assert!(!st.files.contains_key("/root/f2.txt"), "not written");
+        assert_eq!(st.files.len(), 4, "the others uploaded");
+    }
+
+    /// `put` with a glob that skips every file ends with exit 9, as `put -r`
+    /// does, and leaves them all alone.
+    #[test]
+    fn put_glob_that_skips_everything_exits_9() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, mut cli) = local_batch(&dir, 2);
+        cli.immutable = true;
+        let state = WorkerFake::state();
+        remote_batch(&state);
+        let pattern = format!("{local_dir}/*.txt");
+        let code = run_on_fake(&state, || async {
+            cmd_put_glob(
+                "memory://",
+                &pattern,
+                Some("/root"),
+                false,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(code, 9, "{:?}", st.served);
+        assert!(st.served.is_empty(), "nothing uploaded: {:?}", st.served);
+    }
+
+    /// `put` and `get` with a glob take the same helper.
+    #[test]
+    fn globs_on_a_poolless_provider_dial_once_per_worker() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, cli) = local_batch(&dir, 2);
+        let state = WorkerFake::state();
+        let pattern = format!("{local_dir}/*.txt");
+        let code = run_on_fake(&state, || async {
+            cmd_put_glob(
+                "memory://",
+                &pattern,
+                Some("/root"),
+                false,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        {
+            let st = state.lock().unwrap();
+            assert_eq!(code, 0, "put glob: {:?}", st.served);
+            assert_eq!(st.files.len(), 5);
+            assert!(st.dials <= 2, "put glob dials: {}", st.dials);
+        }
+
+        let state = WorkerFake::state();
+        remote_batch(&state);
+        let local_base = dir.path().join("globbed").to_string_lossy().into_owned();
+        let code = run_on_fake(&state, || async {
+            cmd_get_glob(
+                "memory://",
+                "/root/*.txt",
+                Some(&local_base),
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(code, 0, "get glob: {:?}", st.served);
+        assert_eq!(st.served.len(), 5);
+        assert!(st.dials <= 2, "get glob dials: {}", st.dials);
+        assert_eq!(local_files(&dir.path().join("globbed")), 5);
+    }
+
+    /// `-n` or `--immutable` on a held connection whose session ended between
+    /// two jobs: the next job's existence check lost the session at once (an
+    /// SFTP stat does not dial again), `-n` went on as if nothing were there,
+    /// and the upload, which does dial again (#963), truncated the very file
+    /// `-n` protects; `--immutable` failed the job (exit 4). Nothing was
+    /// written, so the job goes back to the queue whatever the connection had
+    /// completed, and the new connection sees the file and skips it.
+    #[test]
+    fn a_lost_existence_check_requeues_the_upload_instead_of_writing() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let mut wrong = Vec::new();
+        for no_clobber in [true, false] {
+            let flag = if no_clobber { "-n" } else { "--immutable" };
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, mut cli) = local_batch(&dir, 1);
+            cli.immutable = !no_clobber;
+            let state = WorkerFake::state();
+            {
+                let mut st = state.lock().unwrap();
+                // The local file's size, so a skip under either flag.
+                st.files
+                    .insert("/root/f2.txt".to_string(), b"old!!!".to_vec());
+                st.stat_session_lost.insert("/root/f2.txt".to_string(), 1);
+            }
+            let code = run_on_fake(&state, || async {
+                cmd_put_recursive(
+                    "memory://",
+                    &local_dir,
+                    Some("/root"),
+                    no_clobber,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            let st = state.lock().unwrap();
+            let written = st.served.iter().any(|(_, path)| path == "/root/f2.txt");
+            if written || st.files["/root/f2.txt"] != b"old!!!" {
+                wrong.push(format!("{flag}: f2 written: {:?}", st.served));
+            }
+            if code != 0 {
+                wrong.push(format!("{flag}: exit {code}"));
+            }
+            if st.files.len() != 5 || st.dials != 1 {
+                wrong.push(format!(
+                    "{flag}: {} files, {} dials (the other four uploaded, one new connection)",
+                    st.files.len(),
+                    st.dials
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `put -r --immutable` to an FTP server whose MLST sends no size fact:
+    /// every size reads 0, which was trusted as exact, so every complete file
+    /// was refused as a partial (exit 4, and the retries stopped there). A
+    /// size FTP could not read is not compared, and the files are skipped.
+    #[test]
+    fn put_recursive_immutable_skips_files_whose_size_ftp_could_not_read() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, mut cli) = local_batch(&dir, 1);
+        cli.immutable = true;
+        let state = WorkerFake::state();
+        // Every file is there already, complete.
+        remote_batch(&state);
+        {
+            let mut st = state.lock().unwrap();
+            st.kind = Some(ProviderType::Ftp);
+            st.unreadable_sizes = true;
+        }
+        let code = run_on_fake(&state, || async {
+            cmd_put_recursive(
+                "memory://",
+                &local_dir,
+                Some("/root"),
+                false,
+                &cli,
+                OutputFormat::Text,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let st = state.lock().unwrap();
+        assert_eq!(code, 9, "every file skipped: {:?}", st.served);
+        assert!(st.served.is_empty(), "nothing uploaded: {:?}", st.served);
+    }
+
+    /// `put` with a glob under `-n` or `--immutable` created the remote base
+    /// once per file, on the connection of the worker that ran it: on Google
+    /// Drive, which allows two folders of one name, two workers could each
+    /// create `/newdir`. It is created once, on the command's own connection,
+    /// before any upload.
+    #[test]
+    fn put_glob_creates_the_remote_base_once_before_the_workers() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let mut wrong = Vec::new();
+        for no_clobber in [true, false] {
+            let flag = if no_clobber { "-n" } else { "--immutable" };
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, mut cli) = local_batch(&dir, 2);
+            cli.immutable = !no_clobber;
+            let state = WorkerFake::state();
+            let pattern = format!("{local_dir}/*.txt");
+            let code = run_on_fake(&state, || async {
+                cmd_put_glob(
+                    "memory://",
+                    &pattern,
+                    Some("/root"),
+                    no_clobber,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            let st = state.lock().unwrap();
+            if code != 0 || st.files.len() != 5 {
+                wrong.push(format!("{flag}: exit {code}, {} files", st.files.len()));
+            }
+            // Connection 1 is the command's own.
+            if st.mkdirs != [(1, "/root".to_string(), 0)] {
+                wrong.push(format!("{flag}: mkdirs {:?}", st.mkdirs));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `put -r` and the upload phase of `sync` create every remote folder
+    /// before their workers start, so a worker must not create its file's
+    /// parent again: on Google Drive, which allows two folders of one name, two
+    /// workers doing it at once could make two `/root`. Each folder is created
+    /// only on the command's own connection, before any upload.
+    #[test]
+    fn put_recursive_and_sync_create_each_folder_once() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let mut wrong = Vec::new();
+        for verb in ["put -r -n", "sync"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, cli) = local_batch(&dir, 2);
+            let state = WorkerFake::state();
+            let moved = if verb == "sync" {
+                let stats = run_on_fake(&state, || {
+                    cmd_sync(
+                        "memory://",
+                        &local_dir,
+                        "/root",
+                        "upload",
+                        false,
+                        false,
+                        &[],
+                        None,
+                        0,
+                        false,
+                        None,
+                        None,
+                        "",
+                        false,
+                        None,
+                        None,
+                        None,
+                        SyncPairRule {
+                            conflict_mode: "source",
+                            skip_matching: false,
+                            update: false,
+                            modify_window: None,
+                            checksum: false,
+                        },
+                        false,
+                        &cli,
+                        OutputFormat::Json,
+                        Arc::new(AtomicBool::new(false)),
+                        None,
+                        false,
+                    )
+                });
+                stats.uploaded as usize
+            } else {
+                let code = run_on_fake(&state, || {
+                    put_with_retries(
+                        "memory://",
+                        &local_dir,
+                        Some("/root"),
+                        true,
+                        true,
+                        false,
+                        None,
+                        &cli,
+                        OutputFormat::Text,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                });
+                if code != 0 {
+                    wrong.push(format!("{verb}: exit {code}"));
+                }
+                state.lock().unwrap().files.len()
+            };
+            let st = state.lock().unwrap();
+            if moved != 5 {
+                wrong.push(format!("{verb}: {moved} files"));
+            }
+            // Connection 1 is the command's own, where the folders are made
+            // before any upload; a worker makes none.
+            if st
+                .mkdirs
+                .iter()
+                .any(|(id, _, served)| *id != 1 || *served != 0)
+            {
+                wrong.push(format!(
+                    "{verb}: a worker created a folder: {:?}",
+                    st.mkdirs
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A worker's strikes count the failures since its last job that kept its
+    /// session, not since its last upload. A rerun that skips every file
+    /// completed nothing, so with the connection closed every
+    /// `WORKER_CONNECTION_MAX_JOBS` jobs, two refused logins spread over the
+    /// whole batch stopped the worker, and the files left reported that no
+    /// connection was left for them (exit 4).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn worker_strikes_reset_on_a_job_that_kept_its_session() {
+        let state = WorkerFake::state();
+        state.lock().unwrap().refuse_alternate = true;
+        let total = 2 * WORKER_CONNECTION_MAX_JOBS as usize + 10;
+        let results = run_on_worker_connections(
+            None,
+            1,
+            job_paths(total),
+            &AtomicBool::new(false),
+            None,
+            WorkerFake::dial(&state),
+            |conn, path| async move {
+                let conn = match conn {
+                    Ok(conn) => conn,
+                    Err(err) => return WorkerJobDone::without_transfer(None, err),
+                };
+                let skip = format!("{UPLOAD_SKIP_PREFIX}--no-clobber): {path}");
+                WorkerJobDone::from_transfer(
+                    conn,
+                    Err::<(), _>(TransferOnError::skipped(skip)),
+                    |()| path,
+                    |err| err,
+                )
+            },
+        )
+        .await;
+        let count = |needle: &str| {
+            results
+                .iter()
+                .filter(|r| r.as_ref().err().is_some_and(|e| e.contains(needle)))
+                .count()
+        };
+        assert_eq!(
+            (count(UPLOAD_SKIP_PREFIX), count("no connection left")),
+            (total, 0),
+            "every file skipped, none left without a connection"
+        );
+    }
+
+    /// `put` with a glob printed nothing in text mode about the files it
+    /// failed on: a refusal showed only as exit 4, and only `--json` said
+    /// why. It prints them after its summary, as `put -r` does. The command
+    /// runs in a child process of this test binary whose stderr the test
+    /// reads, since libtest captures what the test's own threads print.
+    #[test]
+    fn put_glob_prints_its_errors_in_text_mode() {
+        const CHILD: &str = "AEROFTP_CLI_TEST_PUT_GLOB_ERRORS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, mut cli) = local_batch(&dir, 1);
+            cli.quiet = false;
+            cli.immutable = true;
+            let state = WorkerFake::state();
+            state
+                .lock()
+                .unwrap()
+                .files
+                .insert("/root/f2.txt".to_string(), b"fil".to_vec());
+            let pattern = format!("{local_dir}/*.txt");
+            let code = run_on_fake(&state, || async {
+                cmd_put_glob(
+                    "memory://",
+                    &pattern,
+                    Some("/root"),
+                    false,
+                    &cli,
+                    OutputFormat::Text,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            });
+            assert_eq!(code, 4, "a refusal is a failed file");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "tests::put_glob_prints_its_errors_in_text_mode",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child: {stdout}\n{stderr}"
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim_start().starts_with("Error: ")
+                    && line.contains("/root/f2.txt exists with 3 bytes")),
+            "the refusal is printed: {stderr}"
+        );
+    }
+
+    /// `sync` opens a base connection for its transfer batch, which a
+    /// provider without a pool hands back: the uploads and the downloads then
+    /// run on it, one worker, no dial per file.
+    #[test]
+    fn sync_on_a_poolless_provider_dials_once_per_batch() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        for direction in ["upload", "download"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (local_dir, cli) = local_batch(&dir, 1);
+            let state = WorkerFake::state();
+            if direction == "download" {
+                std::fs::remove_dir_all(&local_dir).unwrap();
+                std::fs::create_dir(&local_dir).unwrap();
+                remote_batch(&state);
+            }
+            let stats = run_on_fake(&state, || {
+                cmd_sync(
+                    "memory://",
+                    &local_dir,
+                    "/root",
+                    direction,
+                    false,
+                    false,
+                    &[],
+                    None,
+                    0,
+                    false,
+                    None,
+                    None,
+                    "",
+                    false,
+                    None,
+                    None,
+                    None,
+                    SyncPairRule {
+                        conflict_mode: "source",
+                        skip_matching: false,
+                        update: false,
+                        modify_window: None,
+                        checksum: false,
+                    },
+                    false,
+                    &cli,
+                    OutputFormat::Json,
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    false,
+                )
+            });
+            let st = state.lock().unwrap();
+            let moved = stats.uploaded + stats.downloaded;
+            assert_eq!(moved, 5, "{direction}: {:?}", st.served);
+            assert_eq!(st.served.len(), 5, "{direction}");
+            assert_eq!(st.dials, 1, "{direction}: the batch's base connection only");
+            let ids: std::collections::HashSet<usize> =
+                st.served.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids.len(), 1, "{direction}: every file on one connection");
+        }
+    }
+
+    /// `sync` up with error correction keeps the per-file result path (its
+    /// sidecars follow only the uploads that succeeded) and opens no base
+    /// connection: its uploads run on one connection per worker, where they
+    /// dialled once per file.
+    #[test]
+    fn sync_with_error_correction_dials_once_per_worker() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, cli) = local_batch(&dir, 2);
+        let state = WorkerFake::state();
+        let stats = run_on_fake(&state, || {
+            cmd_sync(
+                "memory://",
+                &local_dir,
+                "/root",
+                "upload",
+                false,
+                false,
+                &[],
+                Some(10),
+                0,
+                false,
+                None,
+                None,
+                "",
+                false,
+                None,
+                None,
+                None,
+                SyncPairRule {
+                    conflict_mode: "source",
+                    skip_matching: false,
+                    update: false,
+                    modify_window: None,
+                    checksum: false,
+                },
+                false,
+                &cli,
+                OutputFormat::Json,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+            )
+        });
+        let st = state.lock().unwrap();
+        let data: Vec<&(usize, String)> = st
+            .served
+            .iter()
+            .filter(|(_, p)| p.ends_with(".txt"))
+            .collect();
+        assert_eq!(stats.uploaded, 5, "{:?}", st.served);
+        assert_eq!(data.len(), 5, "{:?}", st.served);
+        assert!(st.dials <= 2, "one per worker at most: {} dials", st.dials);
+    }
+
+    /// `sync` both ways keeping both sides of a conflict: the local copies go
+    /// up under their conflict names on one connection, not one each.
+    #[test]
+    fn sync_conflict_uploads_share_one_connection() {
+        let _session = SESSION_TRANSFER_TEST_LOCK.blocking_lock();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (local_dir, cli) = local_batch(&dir, 4);
+        let state = WorkerFake::state();
+        {
+            let mut st = state.lock().unwrap();
+            for i in 1..=5 {
+                st.files.insert(
+                    format!("/root/f{i}.txt"),
+                    format!("remote copy {i}").into_bytes(),
+                );
+            }
+        }
+        run_on_fake(&state, || {
+            cmd_sync(
+                "memory://",
+                &local_dir,
+                "/root",
+                "both",
+                false,
+                false,
+                &[],
+                None,
+                0,
+                false,
+                None,
+                None,
+                "",
+                false,
+                None,
+                None,
+                None,
+                SyncPairRule {
+                    conflict_mode: "rename",
+                    skip_matching: false,
+                    update: false,
+                    modify_window: None,
+                    checksum: false,
+                },
+                false,
+                &cli,
+                OutputFormat::Json,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+            )
+        });
+        let st = state.lock().unwrap();
+        let conflicts: Vec<usize> = st
+            .served
+            .iter()
+            .filter(|(_, p)| p.contains(".conflict-"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(conflicts.len(), 5, "{:?}", st.served);
+        let ids: std::collections::HashSet<usize> = conflicts.into_iter().collect();
+        assert_eq!(ids.len(), 1, "one connection for them all: {:?}", st.served);
     }
 
     static SESSION_TRANSFER_TEST_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -76566,6 +84187,132 @@ mod tests {
         )
     }
 
+    /// Export the Mirror preset against `remote`, then run its `SYNC` line the
+    /// way the batch does (batch parser, then `dispatch_sync`). Returns the exit
+    /// code and every delete the run attempted.
+    fn run_exported_mirror(
+        remote: MemTreeProvider,
+        local_files: &[(&str, usize)],
+    ) -> (i32, Vec<String>) {
+        use ftp_client_gui_lib::sync::SyncProfile;
+        use ftp_client_gui_lib::sync_script::{generate_script, AerosyncScriptProfile};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let local = dir.path().join("local");
+        std::fs::create_dir(&local).expect("local dir");
+        for (name, size) in local_files {
+            let path = local.join(name);
+            std::fs::write(&path, vec![b'x'; *size]).expect("write local file");
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| {
+                    file.set_modified(
+                        std::time::UNIX_EPOCH
+                            + std::time::Duration::from_secs(FIXTURE_MTIME_EPOCH_SECS),
+                    )
+                })
+                .expect("stamp the local mtime");
+        }
+        let script = generate_script(
+            &AerosyncScriptProfile {
+                profile: SyncProfile::mirror(),
+                local_path: local.to_string_lossy().into_owned(),
+                remote_path: "/root".into(),
+                connect_profile: None,
+                connect_url: Some("memory://".into()),
+                dry_run: false,
+                conflict_mode: None,
+                track_renames: false,
+                skip_matching: false,
+                resync: false,
+                watch: false,
+            },
+            "test",
+        );
+        let lines = read_batch_script(&script).expect("the exported script reads");
+        let sync = lines.iter().find(|l| l.cmd == "SYNC").expect("a SYNC line");
+        let command = parse_batch_sync("memory://", &sync.sync_args).expect("SYNC parses");
+        let deletes = Arc::clone(&remote.delete_attempts);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let code = run_against_remote(remote, move || async move {
+            dispatch_sync(
+                &command,
+                &cli,
+                OutputFormat::Json,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        });
+        let deleted = deletes.lock().expect("delete log").clone();
+        (code, deleted)
+    }
+
+    /// The Mirror preset exported and run by the batch, unattended: its `SYNC`
+    /// line goes through the batch parser and `dispatch_sync`, as a script
+    /// does. With the source in place it deletes only the orphan; with the
+    /// source nearly emptied the exported cap stops it before anything is deleted.
+    #[test]
+    fn exported_mirror_runs_unattended_and_stops_on_a_nearly_emptied_source() {
+        on_big_stack(|| {
+            // Source in place: one orphan on the destination, deleted, run succeeds.
+            let (code, deleted) = run_exported_mirror(
+                MemTreeProvider::root_files(&[("a.txt", 3), ("b.txt", 4), ("orphan.txt", 5)]),
+                &[("a.txt", 3), ("b.txt", 4)],
+            );
+            // The run got past the unattended --delete refusal and the cap and
+            // tried exactly the orphan (the fixture refuses the delete itself,
+            // so the exit code is not the signal here).
+            assert_ne!(code, 5, "an unattended --delete must not be refused");
+            assert_eq!(deleted, vec!["/root/orphan.txt".to_string()]);
+
+            // Source that lost most of its files: four of the five destination
+            // files would go (4 > 50% of the 6 files on both sides). The cap stops
+            // the run before any delete, exit 4 "Safety abort". A source with no
+            // file at all is refused by a separate guard, so it cannot show the cap.
+            let (code, deleted) = run_exported_mirror(
+                MemTreeProvider::root_files(&[
+                    ("a.txt", 3),
+                    ("b.txt", 4),
+                    ("c.txt", 5),
+                    ("d.txt", 6),
+                    ("e.txt", 7),
+                ]),
+                &[("a.txt", 3)],
+            );
+            assert_eq!(
+                code, 4,
+                "the cap must stop a mirror whose source lost most files"
+            );
+            assert!(deleted.is_empty(), "nothing may be deleted: {deleted:?}");
+        });
+    }
+
+    /// The `--max-delete N%` base was the file count of both sides added
+    /// together: a Mirror whose source was replaced by 100 new files against
+    /// 100 old ones planned 100 deletes out of a base of 200, exactly 50%, and
+    /// emptied the destination. A percentage now applies to the file count of
+    /// the side the deletes happen on.
+    #[test]
+    fn exported_mirror_cap_stops_a_fully_replaced_source() {
+        on_big_stack(|| {
+            let old: Vec<String> = (0..100).map(|i| format!("old-{i:03}.txt")).collect();
+            let new: Vec<String> = (0..100).map(|i| format!("new-{i:03}.txt")).collect();
+            let remote_files: Vec<(&str, u64)> = old.iter().map(|n| (n.as_str(), 3)).collect();
+            let local_files: Vec<(&str, usize)> = new.iter().map(|n| (n.as_str(), 3)).collect();
+            let (_code, deleted) =
+                run_exported_mirror(MemTreeProvider::root_files(&remote_files), &local_files);
+            assert!(
+                deleted.is_empty(),
+                "the cap let {} of the 100 destination files be deleted",
+                deleted.len()
+            );
+        });
+    }
+
     /// The real `cmd_sync` with `--delete` against `remote`, as a dry run or
     /// not. A run that is not dry reaches the scan guards (TX-01) and the
     /// deletes themselves, which the remote records and refuses.
@@ -76599,8 +84346,17 @@ mod tests {
                 None,
                 None,
                 from_reconcile,
-                "newer",
-                false,
+                SyncPairRule {
+                    conflict_mode: if direction == "both" {
+                        "newer"
+                    } else {
+                        "source"
+                    },
+                    skip_matching: false,
+                    update: false,
+                    modify_window: None,
+                    checksum: false,
+                },
                 false,
                 cli,
                 OutputFormat::Json,
@@ -76609,6 +84365,1310 @@ mod tests {
                 false,
             )
         })
+    }
+
+    /// Run `f` on a thread with a wide stack and return what it returns: clap
+    /// builds the whole command tree, more than a test thread's stack holds.
+    fn on_big_stack_value<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn the big-stack thread")
+            .join()
+            .expect("the big-stack thread panicked")
+    }
+
+    /// The real `cmd_sync` against `remote` with the planning flags of `rule`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_sync_rule(
+        remote: MemTreeProvider,
+        local: &str,
+        direction: &str,
+        dry_run: bool,
+        delete: bool,
+        exclude: &[String],
+        rule: SyncPairRule<'static>,
+        cli: &Cli,
+    ) -> SyncCycleStats {
+        run_against_remote(remote, move || {
+            cmd_sync(
+                "memory://",
+                local,
+                "/root",
+                direction,
+                dry_run,
+                delete,
+                exclude,
+                None,
+                0,
+                false,
+                delete.then_some("1000"),
+                None,
+                "",
+                false,
+                None,
+                None,
+                None,
+                rule,
+                false,
+                cli,
+                OutputFormat::Json,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+            )
+        })
+    }
+
+    const SOURCE_WINS: SyncPairRule<'static> = SyncPairRule {
+        conflict_mode: "source",
+        skip_matching: false,
+        update: false,
+        modify_window: None,
+        checksum: false,
+    };
+
+    /// `sync --direction upload --delete` removed the orphan files and left
+    /// their directories behind, empty. Now a directory the deletes emptied
+    /// goes too, deepest first; one that still holds a file the scan did not
+    /// see (an excluded one), and one the source has (even empty), stay.
+    #[test]
+    fn upload_delete_removes_the_directories_it_emptied() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        std::fs::create_dir_all(Path::new(&local).join("emptydir")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        let mut remote = MemTreeProvider::tree(&[
+            ("keep/a.txt", 1),
+            ("old/sub/x.txt", 1),
+            ("old/y.txt", 1),
+            ("mixed/a.txt", 1),
+            ("mixed/b.log", 1),
+            ("emptydir/o.txt", 1),
+        ]);
+        remote.mutable = true;
+        let rmdirs = Arc::clone(&remote.rmdir_attempts);
+        let deletes = Arc::clone(&remote.delete_attempts);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(
+            remote,
+            &local,
+            "upload",
+            false,
+            true,
+            &["*.log".to_string()],
+            SOURCE_WINS,
+            &cli,
+        );
+        assert_eq!(stats.exit_code, 0);
+        let mut deleted = deletes.lock().unwrap().clone();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec![
+                "/root/emptydir/o.txt",
+                "/root/mixed/a.txt",
+                "/root/old/sub/x.txt",
+                "/root/old/y.txt"
+            ]
+        );
+        assert_eq!(
+            *rmdirs.lock().unwrap(),
+            vec!["/root/old/sub".to_string(), "/root/old".to_string()]
+        );
+    }
+
+    /// C2 (review of #949): `sync --delete` removed an emptied directory with
+    /// `rmdir`, which object stores and most cloud APIs run recursively, after
+    /// a listing that can leave stored objects out (a crypt overlay's
+    /// sentinels, a listing that is not authoritative). The object the listing
+    /// hid went with the directory, uncounted by `--max-delete`. A backend whose
+    /// `rmdir` is not known to refuse a non-empty directory keeps its
+    /// directories.
+    #[test]
+    fn an_emptied_directory_on_a_recursive_backend_is_left_alone() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        let mut remote =
+            MemTreeProvider::tree(&[("keep/a.txt", 1), ("old/x.txt", 1), ("old/sentinel", 1)]);
+        remote.mutable = true;
+        remote.kind = Some(ProviderType::S3);
+        remote.recursive_rmdir = true;
+        remote.hidden.insert("/root/old/sentinel".to_string());
+        let rmdirs = Arc::clone(&remote.rmdir_attempts);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(
+            remote,
+            &local,
+            "upload",
+            false,
+            true,
+            &[],
+            SOURCE_WINS,
+            &cli,
+        );
+        assert_eq!(stats.exit_code, 0);
+        assert!(
+            rmdirs.lock().unwrap().is_empty(),
+            "a recursive rmdir after a listing that hides objects deletes them: {:?}",
+            rmdirs.lock().unwrap()
+        );
+    }
+
+    /// Minor 3 (re-review of #949): a one-way pair `--update` leaves alone
+    /// because the dates cannot order it was only a `skipped` count; it is
+    /// reported by path now, since the destination is not current.
+    #[test]
+    fn a_pair_update_leaves_open_is_reported() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 3);
+        let local = fixture.local();
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 5)]);
+        remote.precision = Some(None);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let rule = SyncPairRule {
+            update: true,
+            ..SOURCE_WINS
+        };
+        let stats = run_sync_rule(remote, &local, "upload", true, false, &[], rule, &cli);
+        assert_eq!((stats.uploaded, stats.skipped), (0, 1));
+        assert_eq!(stats.conflicts_open, vec!["a.txt".to_string()]);
+    }
+
+    /// Minor 5 (re-review of #949): a removal that fails keeps the directory
+    /// with a note that `--quiet` silences; the JSON result lists it under
+    /// `dirs_kept`, so the run still says so.
+    #[test]
+    fn a_directory_that_refuses_removal_is_listed_as_kept() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        let mut remote =
+            MemTreeProvider::tree(&[("keep/a.txt", 1), ("old/x.txt", 1), ("old/.hidden", 1)]);
+        remote.mutable = true;
+        remote.kind = Some(ProviderType::Ftp);
+        remote.hidden.insert("/root/old/.hidden".to_string());
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(
+            remote,
+            &local,
+            "upload",
+            false,
+            true,
+            &[],
+            SOURCE_WINS,
+            &cli,
+        );
+        assert_eq!(stats.exit_code, 0);
+        let kept: Vec<&str> = stats
+            .dirs_kept
+            .iter()
+            .map(|dir| dir.path.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["old"],
+            "RMD refused the directory the listing showed empty"
+        );
+    }
+
+    /// A dry run removes no directory: it lists the candidates and stops.
+    #[test]
+    fn a_dry_run_removes_no_directory() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        let mut remote = MemTreeProvider::tree(&[("keep/a.txt", 1), ("old/sub/x.txt", 1)]);
+        remote.mutable = true;
+        let rmdirs = Arc::clone(&remote.rmdir_attempts);
+        let deletes = Arc::clone(&remote.delete_attempts);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(remote, &local, "upload", true, true, &[], SOURCE_WINS, &cli);
+        assert_eq!(stats.exit_code, 0);
+        assert!(deletes.lock().unwrap().is_empty());
+        assert!(rmdirs.lock().unwrap().is_empty());
+    }
+
+    /// `sync --direction download --delete` removes the LOCAL directories its
+    /// deletes emptied (a local `remove_dir` refuses a non-empty directory),
+    /// and never the `--backup-dir` the deleted files were copied into.
+    #[test]
+    fn download_delete_removes_the_local_directories_it_emptied_and_keeps_the_backups() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        std::fs::create_dir_all(Path::new(&local).join("keep")).unwrap();
+        std::fs::create_dir_all(Path::new(&local).join("old/sub")).unwrap();
+        fixture.local_file("keep/a.txt", 1);
+        fixture.local_file("old/sub/x.txt", 1);
+        let backup = Path::new(&local).join(".bak");
+        let backup_str = backup.to_string_lossy().into_owned();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let excludes = vec![".bak".to_string()];
+        let stats = run_against_remote(MemTreeProvider::tree(&[("keep/a.txt", 1)]), || {
+            cmd_sync(
+                "memory://",
+                &local,
+                "/root",
+                "download",
+                false,
+                true,
+                &excludes,
+                None,
+                0,
+                false,
+                Some("1000"),
+                Some(backup_str.as_str()),
+                "",
+                false,
+                None,
+                None,
+                None,
+                SOURCE_WINS,
+                false,
+                &cli,
+                OutputFormat::Json,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                false,
+            )
+        });
+        assert_eq!(stats.exit_code, 0);
+        assert!(!Path::new(&local).join("old/sub/x.txt").exists());
+        assert!(
+            !Path::new(&local).join("old").exists(),
+            "the emptied tree goes"
+        );
+        assert!(backup.is_dir(), "the backup directory stays");
+        assert!(Path::new(&local).join("keep/a.txt").exists());
+    }
+
+    /// M2 (review of #949): `--update` is a one-way rule; `--direction both`
+    /// ignored it, which read as a protection the run did not give.
+    #[test]
+    fn update_is_refused_with_direction_both() {
+        let fixture = FilesFromFixture::new();
+        let local = fixture.local();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let code = on_big_stack_value(move || {
+            let parsed = Cli::try_parse_from([
+                "aeroftp-cli",
+                "sync",
+                "memory://",
+                local.as_str(),
+                "/root",
+                "--update",
+            ])
+            .expect("parses");
+            run_against_remote(MemTreeProvider::root_files(&[]), move || async move {
+                dispatch_sync(
+                    &parsed.command,
+                    &cli,
+                    OutputFormat::Json,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            })
+        });
+        assert_eq!(code, 5, "--update needs a one-way direction");
+    }
+
+    /// The flags reach the planner through `dispatch_sync`, not only clap:
+    /// with `--update` a destination copy that is newer is left alone, without
+    /// it the source wins (the fixture refuses the upload, so the attempt is
+    /// what the exit code shows).
+    #[test]
+    fn update_reaches_the_planner_through_dispatch() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 3);
+        let local = fixture.local();
+        let run = |extra: Option<&'static str>| {
+            let local = local.clone();
+            on_big_stack_value(move || {
+                let mut args = vec![
+                    "aeroftp-cli".to_string(),
+                    "sync".to_string(),
+                    "memory://".to_string(),
+                    local,
+                    "/root".to_string(),
+                    "--direction".to_string(),
+                    "upload".to_string(),
+                ];
+                args.extend(extra.map(str::to_string));
+                let parsed = Cli::try_parse_from(args).expect("parses");
+                let cli = Cli {
+                    quiet: true,
+                    ..test_cli()
+                };
+                let mut remote = MemTreeProvider::root_files(&[("a.txt", 5)]);
+                // The remote copy is newer than the local one (FIXTURE_MTIME).
+                for entry in remote.dirs.get_mut("/root").unwrap() {
+                    entry.modified = Some("2030-01-01T00:00:00".to_string());
+                }
+                run_against_remote(remote, move || async move {
+                    dispatch_sync(
+                        &parsed.command,
+                        &cli,
+                        OutputFormat::Json,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                })
+            })
+        };
+        assert_eq!(
+            run(Some("--update")),
+            0,
+            "--update leaves the newer remote copy"
+        );
+        assert_ne!(run(None), 0, "without --update the upload is attempted");
+    }
+
+    /// M1 (review of #949): with no comparable time (FTP without MLSD,
+    /// FileLu, a size-only window) `--conflict-mode newer` fell back to the
+    /// larger copy, and a local edit that shortened a file lost to the older,
+    /// larger remote one. The bisync snapshot says which side changed since
+    /// the last sync, and that side is the newer one.
+    #[test]
+    fn newer_follows_the_side_that_changed_when_dates_do_not_order() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5000);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            r#"{"synced_at":"2020-01-01T00:00:00Z","files":{"a.txt":[5120,""]}}"#,
+        )
+        .unwrap();
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 5120)]);
+        remote.precision = Some(None);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let rule = SyncPairRule {
+            conflict_mode: "newer",
+            ..SOURCE_WINS
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], rule, &cli);
+        assert_eq!(
+            (stats.uploaded, stats.downloaded),
+            (1, 0),
+            "the local edit is the newer copy"
+        );
+    }
+
+    /// Minor 2 (re-review of #949): dates the same within the window order
+    /// nothing either; the snapshot decides there too, instead of the larger
+    /// copy (here the remote one, which did not change).
+    #[test]
+    fn newer_follows_the_side_that_changed_when_the_dates_are_the_same() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5000);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[5120,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let remote = MemTreeProvider::root_files(&[("a.txt", 5120)]);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let rule = SyncPairRule {
+            conflict_mode: "newer",
+            ..SOURCE_WINS
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], rule, &cli);
+        assert_eq!(
+            (stats.uploaded, stats.downloaded),
+            (1, 0),
+            "the local edit is the newer copy"
+        );
+    }
+
+    /// The real `cmd_sync` against a [`SharedTreeProvider`]: every connection
+    /// the run opens (the scan, each transfer) reaches the same tree.
+    fn run_sync_shared(
+        remote: &SharedTreeProvider,
+        local: &str,
+        dry_run: bool,
+        rule: SyncPairRule<'static>,
+        cli: &Cli,
+    ) -> SyncCycleStats {
+        let tree = remote.clone();
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("shared-tree-sync".to_string())
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    TEST_PROVIDER_FACTORY.with(|slot| {
+                        *slot.borrow_mut() = Some(std::rc::Rc::new(move || {
+                            Box::new(tree.clone()) as Box<dyn StorageProvider>
+                        }));
+                    });
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("test runtime")
+                        .block_on(async move {
+                            // `--max-transfer` counts the whole process.
+                            let _session = SESSION_TRANSFER_TEST_LOCK.lock().await;
+                            SESSION_TRANSFERRED_BYTES.store(0, Ordering::Relaxed);
+                            let stats = cmd_sync(
+                                "memory://",
+                                local,
+                                "/root",
+                                "both",
+                                dry_run,
+                                false,
+                                &[],
+                                None,
+                                0,
+                                false,
+                                None,
+                                None,
+                                "",
+                                false,
+                                None,
+                                None,
+                                None,
+                                rule,
+                                false,
+                                cli,
+                                OutputFormat::Json,
+                                Arc::new(AtomicBool::new(false)),
+                                None,
+                                false,
+                            )
+                            .await;
+                            SESSION_TRANSFERRED_BYTES.store(0, Ordering::Relaxed);
+                            stats
+                        })
+                })
+                .expect("spawn the command thread")
+                .join()
+                .expect("the command thread panicked")
+        })
+    }
+
+    const NEWER_WINS: SyncPairRule<'static> = SyncPairRule {
+        conflict_mode: "newer",
+        ..SOURCE_WINS
+    };
+
+    /// Critical 1 (re-review of #949): the bisync snapshot recorded every
+    /// path of the scan taken BEFORE the run, the pairs the run left alone
+    /// included. A pair no date could order was skipped, then recorded as
+    /// synced, and the next run read the remote side as the one that changed
+    /// and downloaded it over the local edit. A pair the run did not settle
+    /// keeps what the snapshot said before, here nothing.
+    #[test]
+    fn a_pair_left_open_stays_open_on_the_next_run() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("index.html", 5000);
+        let local = fixture.local();
+        let remote = SharedTreeProvider::with_files(&[("index.html", &[b'r'; 5120])]);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        for run in ["first", "second"] {
+            let stats = run_sync_shared(&remote, &local, false, NEWER_WINS, &cli);
+            assert_eq!(
+                (stats.exit_code, stats.uploaded, stats.downloaded),
+                (0, 0, 0),
+                "{run} run: no date orders the pair and nothing says which side changed"
+            );
+            assert_eq!(
+                stats.conflicts_open,
+                vec!["index.html".to_string()],
+                "{run} run: the pair is reported as left open"
+            );
+        }
+        assert_eq!(
+            std::fs::read(Path::new(&local).join("index.html")).unwrap(),
+            vec![b'x'; 5000],
+            "the local edit is still there"
+        );
+    }
+
+    /// Critical 1, second half: after a download the snapshot kept the local
+    /// file as it was BEFORE the run, so an undo made on the server afterwards
+    /// read as a local change, and the old copy would go back up over the
+    /// restore. The snapshot records the file the download left on disk.
+    #[test]
+    fn a_download_is_recorded_as_the_file_it_left_on_disk() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5120);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[5120,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let remote = SharedTreeProvider::with_files(&[("a.txt", &[b'r'; 5200])]);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let first = run_sync_shared(&remote, &local, false, NEWER_WINS, &cli);
+        assert_eq!(
+            (first.exit_code, first.uploaded, first.downloaded),
+            (0, 0, 1),
+            "the remote side changed since the snapshot"
+        );
+        // The change is undone on the server.
+        remote.put(&[("a.txt", &[b'u'; 5120])]);
+        let second = run_sync_shared(&remote, &local, true, NEWER_WINS, &cli);
+        assert_eq!(
+            (second.uploaded, second.downloaded),
+            (0, 1),
+            "the undo is the change, not the file the last run downloaded"
+        );
+    }
+
+    /// N2 (third review of #949): the downloads were read back when the
+    /// snapshot was saved, after the rest of the run. A local edit landing in
+    /// between was recorded as the synced state, and the next run, seeing the
+    /// remote side differ from it, downloaded over the edit. A download is
+    /// recorded as it was when it completed.
+    #[test]
+    fn a_local_edit_after_a_download_completes_is_not_recorded_as_synced() {
+        local_edit_after_a_download_completes(false);
+    }
+
+    /// The same through the shared batch executor, where the state is taken
+    /// from the executor's `file_complete` event.
+    #[test]
+    fn a_local_edit_after_a_pooled_download_completes_is_not_recorded_as_synced() {
+        local_edit_after_a_download_completes(true);
+    }
+
+    fn local_edit_after_a_download_completes(pooled: bool) {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5120);
+        fixture.local_file("b.txt", 5120);
+        let local = fixture.local();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[5120,"{FIXTURE_MTIME}"],"b.txt":[5120,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut remote =
+            SharedTreeProvider::with_files(&[("a.txt", &[b'r'; 5200]), ("b.txt", &[b'r'; 5200])]);
+        remote.pooled = pooled;
+        // When the second download lands, the file downloaded first is edited,
+        // as a user saving it while the run goes on.
+        let edited = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&edited);
+        remote.after_download = Some(Arc::new(move |just_written: &str| {
+            let dir = Path::new(just_written).parent().unwrap();
+            for other in ["a.txt", "b.txt"] {
+                let path = dir.join(other);
+                if path.to_str() != Some(just_written)
+                    && std::fs::metadata(&path).ok().map(|m| m.len()) == Some(5200)
+                    && !flag.swap(true, Ordering::SeqCst)
+                {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    std::io::Write::write_all(&mut file, b"edit").unwrap();
+                }
+            }
+        }));
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let first = run_sync_shared(&remote, &local, false, NEWER_WINS, &cli);
+        assert_eq!((first.exit_code, first.downloaded), (0, 2));
+        assert!(
+            edited.load(Ordering::SeqCst),
+            "the edit landed during the run"
+        );
+        let second = run_sync_shared(&remote, &local, true, NEWER_WINS, &cli);
+        assert_eq!(
+            (second.uploaded, second.downloaded),
+            (1, 0),
+            "the edited file is the newer copy"
+        );
+    }
+
+    /// N3 (third review of #949): with no comparable time, `--direction both`
+    /// read a pair of the same size as current, so a same-size local edit was
+    /// never uploaded (and a later remote change downloaded over it). The
+    /// snapshot says the local side changed.
+    #[test]
+    fn a_same_size_local_edit_without_comparable_times_is_uploaded() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 100);
+        let local = fixture.local();
+        std::fs::File::options()
+            .write(true)
+            .open(Path::new(&local).join("a.txt"))
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(FIXTURE_MTIME_EPOCH_SECS + 3600),
+            )
+            .unwrap();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[100,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 100)]);
+        remote.precision = Some(None);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], NEWER_WINS, &cli);
+        assert_eq!((stats.uploaded, stats.downloaded), (1, 0));
+    }
+
+    /// N1 (third review of #949): the snapshot's local side was read with
+    /// `--modify-window`. Two local clocks have no skew, but a large window is
+    /// normal (3600 for a server in another zone): a same-size local edit a
+    /// minute after the snapshot read as unchanged, and the remote change was
+    /// downloaded over it. Both sides changed: the pair is left open.
+    #[test]
+    fn the_snapshot_reads_the_local_side_with_the_local_clock() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 100);
+        let local = fixture.local();
+        std::fs::File::options()
+            .write(true)
+            .open(Path::new(&local).join("a.txt"))
+            .unwrap()
+            .set_modified(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_secs(FIXTURE_MTIME_EPOCH_SECS + 60),
+            )
+            .unwrap();
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            format!(
+                r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[100,"{FIXTURE_MTIME}"]}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 120)]);
+        remote.precision = Some(None);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let rule = SyncPairRule {
+            modify_window: Some(3600),
+            ..NEWER_WINS
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], rule, &cli);
+        assert_eq!((stats.uploaded, stats.downloaded), (0, 0));
+        assert_eq!(stats.conflicts_open, vec!["a.txt".to_string()]);
+    }
+
+    /// The snapshot's rule for transfers left behind, through `cmd_sync`: a
+    /// run that `--max-transfer` stopped part-way records none of its
+    /// uploads, which are known by count only. Recorded, the file it did not
+    /// upload would read next time as deleted on the remote side.
+    #[test]
+    fn a_run_stopped_by_the_transfer_budget_records_no_upload() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 3);
+        fixture.local_file("b.txt", 3);
+        let local = fixture.local();
+        let remote = SharedTreeProvider {
+            pooled: true,
+            ..Default::default()
+        };
+        let cli = Cli {
+            quiet: true,
+            // The budget admits files while less than it has moved: the
+            // first 3-byte file, not the second.
+            max_transfer: Some("2".to_string()),
+            ..test_cli()
+        };
+        let stats = run_sync_shared(&remote, &local, false, NEWER_WINS, &cli);
+        assert_eq!(
+            (stats.uploaded, stats.over_budget, stats.error_count),
+            (1, 1, 0),
+            "one upload fits the budget"
+        );
+        let snapshot = load_bisync_snapshot(&local).expect("the snapshot is saved");
+        let stored = remote.files.lock().unwrap().clone();
+        for path in snapshot.files.keys() {
+            assert!(
+                stored.contains_key(&format!("/root/{path}")),
+                "{path} is recorded as synced and is not on the remote"
+            );
+        }
+    }
+
+    /// The doctor's EC estimate for `both` reads the snapshot on disk, as the
+    /// run does: a pair the dates cannot order is an upload when the snapshot
+    /// says the local side changed, and nothing without one or under
+    /// `--resync`.
+    #[test]
+    fn sync_doctor_estimates_both_with_the_snapshot_on_disk() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 5000);
+        let local = fixture.local();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let estimate = |with_snapshot: bool, resync: bool| {
+            let snapshot = Path::new(&local).join(BISYNC_SNAPSHOT_FILE);
+            if with_snapshot {
+                std::fs::write(
+                    &snapshot,
+                    format!(
+                        r#"{{"synced_at":"2020-01-01T00:00:00Z","files":{{"a.txt":[5120,"{FIXTURE_MTIME}"]}}}}"#
+                    ),
+                )
+                .unwrap();
+            } else {
+                let _ = std::fs::remove_file(&snapshot);
+            }
+            let mut remote = MemTreeProvider::root_files(&[("a.txt", 5120)]);
+            remote.precision = Some(None);
+            run_against_remote(remote, || {
+                sync_doctor_report(
+                    "memory://",
+                    &local,
+                    "/root",
+                    "both",
+                    false,
+                    &[],
+                    Some(10),
+                    0,
+                    false,
+                    "newer",
+                    resync,
+                    false,
+                    &cli,
+                    OutputFormat::Json,
+                )
+            })
+            .unwrap_or_else(|code| panic!("sync-doctor failed with exit code {code}"))
+            .ec_estimated_sidecars
+        };
+        assert_eq!(estimate(true, false), Some(1));
+        assert_eq!(estimate(false, false), Some(0));
+        assert_eq!(estimate(true, true), Some(0));
+    }
+
+    /// Major 2 (fourth review of #949): events that came during a cycle or in
+    /// the cooldown after it were dropped. They are kept, due when the
+    /// cooldown ends, and handed whole to the cycle that runs then.
+    #[test]
+    fn watch_events_in_the_cooldown_wait_for_the_next_cycle() {
+        let local_path = std::path::Path::new("/l");
+        let start = tokio::time::Instant::now();
+        let cooldown_end = start + std::time::Duration::from_secs(15);
+        let mut deferred = WatchDeferred::default();
+        assert!(deferred.due.is_none());
+        deferred.defer(vec!["/l/a.txt".into()], cooldown_end);
+        deferred.defer(
+            vec!["/l/b.txt".into()],
+            cooldown_end + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(
+            deferred.due,
+            Some(cooldown_end),
+            "due when the cooldown ends"
+        );
+        let paths = deferred.take(local_path);
+        assert_eq!(
+            paths,
+            vec![
+                std::path::PathBuf::from("/l/a.txt"),
+                std::path::PathBuf::from("/l/b.txt")
+            ]
+        );
+        assert!(deferred.due.is_none() && deferred.take(local_path).is_empty());
+        // An event storm repeats paths: each is kept once (m5, verification
+        // of the fourth round of #949).
+        for _ in 0..3 {
+            deferred.defer(vec!["/l/a.txt".into()], cooldown_end);
+        }
+        assert_eq!(
+            deferred.take(local_path),
+            vec![std::path::PathBuf::from("/l/a.txt")]
+        );
+        // The limit itself is kept (nit, verification of the sixth round).
+        deferred.defer(
+            (0..WATCH_DEFERRED_LIMIT)
+                .map(|i| std::path::PathBuf::from(format!("/l/{i}.txt")))
+                .collect(),
+            cooldown_end,
+        );
+        assert!(!deferred.overflowed);
+        assert_eq!(deferred.take(local_path).len(), WATCH_DEFERRED_LIMIT);
+        // Past the limit the paths are dropped, and the cycle for them is a
+        // full one: the root alone (nit, verification of the fifth round).
+        deferred.defer(
+            (0..=WATCH_DEFERRED_LIMIT)
+                .map(|i| std::path::PathBuf::from(format!("/l/{i}.txt")))
+                .collect(),
+            cooldown_end,
+        );
+        assert!(deferred.paths.is_empty());
+        assert_eq!(deferred.take(local_path), vec![local_path.to_path_buf()]);
+        assert!(deferred.take(local_path).is_empty());
+    }
+
+    /// M1 (verification of round 4 of #949): every `both` cycle reads and
+    /// rewrites the bisync snapshot inside the watched root, and the watcher
+    /// forwarded both, the read as an open and the write as the rename of its
+    /// temporary. The event came in the cooldown, a cycle ran for it when the
+    /// cooldown ended, and that cycle read and rewrote the snapshot again: a
+    /// full listing every cooldown, forever. The real watcher on a real
+    /// directory: what a cycle does to the snapshot forwards nothing, and a
+    /// user's file still does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_snapshot_a_cycle_rewrites_does_not_start_the_next_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let local = root.to_string_lossy().into_owned();
+        let scanned = vec![("a.txt".to_string(), 1, Some(FIXTURE_MTIME.to_string()))];
+        let cycle = || {
+            let _ = load_bisync_snapshot(&local);
+            save_bisync_snapshot(
+                &local,
+                &scanned,
+                &scanned,
+                &BisyncOutcome::default(),
+                None,
+                &ftp_client_gui_lib::sync_core::ScanBound::default(),
+                &[],
+            );
+        };
+        // As the initial cycle leaves it, before the watch starts.
+        cycle();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _watcher = start_watch_watcher(&root, "native", 100, tx).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        cycle();
+        let forwarded: Vec<_> = rx
+            .recv_timeout(std::time::Duration::from_millis(1500))
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(
+            forwarded.is_empty(),
+            "a cycle's snapshot was forwarded: {forwarded:?}"
+        );
+        // The control: the same watcher forwards a user's file.
+        std::fs::write(root.join("b.txt"), b"b").unwrap();
+        let seen = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a user's file must be forwarded");
+        assert!(seen.iter().any(|p| p.ends_with("b.txt")), "{seen:?}");
+    }
+
+    /// m5 (same verification): an event that asks for a rescan (an inotify
+    /// queue overflow) has no paths, and was dropped; it now forwards the
+    /// watched root, which the loop reads as a full cycle. A read is not
+    /// forwarded at all.
+    #[test]
+    fn a_lost_event_queue_asks_for_a_full_cycle() {
+        let root = std::path::Path::new("/l");
+        let overflow =
+            notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert_eq!(watch_event_paths(&overflow, root), vec![root.to_path_buf()]);
+        let read = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Open(
+            notify::event::AccessMode::Any,
+        )))
+        .add_path("/l/a.txt".into());
+        assert!(watch_event_paths(&read, root).is_empty());
+        let write = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path("/l/a.txt".into());
+        assert_eq!(
+            watch_event_paths(&write, root),
+            vec![std::path::PathBuf::from("/l/a.txt")]
+        );
+        // Minor 1 (verification of the fifth round): a close after a write is
+        // all a program writing through a memory map produces.
+        let closed_after_writing = notify::Event::new(notify::EventKind::Access(
+            notify::event::AccessKind::Close(notify::event::AccessMode::Write),
+        ))
+        .add_path("/l/a.txt".into());
+        assert_eq!(
+            watch_event_paths(&closed_after_writing, root),
+            vec![std::path::PathBuf::from("/l/a.txt")]
+        );
+        // The snapshot is left out at the root only: a sync root deeper in the
+        // tree has its own, a file like any other (nit, same verification).
+        let snapshots = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))
+        .add_path(root.join(BISYNC_SNAPSHOT_FILE))
+        .add_path(root.join("sub").join(BISYNC_SNAPSHOT_FILE));
+        assert_eq!(
+            watch_event_paths(&snapshots, root),
+            vec![root.join("sub").join(BISYNC_SNAPSHOT_FILE)]
+        );
+    }
+
+    /// `target` as a path relative to the current directory.
+    fn relative_to_cwd(target: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let (cwd, target) = (
+            cwd.components().collect::<Vec<_>>(),
+            target.components().collect::<Vec<_>>(),
+        );
+        let common = cwd.iter().zip(&target).take_while(|(a, b)| a == b).count();
+        let mut relative = PathBuf::new();
+        for _ in common..cwd.len() {
+            relative.push("..");
+        }
+        for part in &target[common..] {
+            relative.push(part.as_os_str());
+        }
+        relative
+    }
+
+    /// Pre-existing Major (verification of the fifth round of #949): with a
+    /// relative local path, as every example in CLI-GUIDE uses, notify made
+    /// the watch path absolute, and the incremental scan stripped the relative
+    /// one off each event, failed, and dropped it: an edit waited for the
+    /// periodic rescan, and a remote change meanwhile downloaded over it. The
+    /// watch loop end to end, on a relative path: a file written once the
+    /// watch runs reaches the remote through the watcher's cycle (the rescan
+    /// is an hour away).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_watch_on_a_relative_path_syncs_what_the_watcher_sees() {
+        let fixture = FilesFromFixture::new();
+        let absolute = fixture.local();
+        let relative = relative_to_cwd(Path::new(&absolute))
+            .to_string_lossy()
+            .into_owned();
+        let remote = SharedTreeProvider::default();
+        let files = Arc::clone(&remote.files);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancelled);
+        let locked = Arc::new(AtomicBool::new(false));
+        let watch_locked = Arc::clone(&locked);
+        let user = std::thread::spawn(move || {
+            // The clock starts once the watch holds the session lock: a test
+            // holding it before could use up the wait while the watcher did
+            // not exist yet (verification of the sixth round).
+            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while !locked.load(Ordering::Relaxed) && std::time::Instant::now() < lock_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            std::fs::write(Path::new(&absolute).join("new.txt"), b"hello").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let arrived = loop {
+                if files.lock().unwrap().contains_key("/root/new.txt") {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            stop.store(true, Ordering::Relaxed);
+            arrived
+        });
+        let tree = remote.clone();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    TEST_PROVIDER_FACTORY.with(|slot| {
+                        *slot.borrow_mut() = Some(std::rc::Rc::new(move || {
+                            Box::new(tree.clone()) as Box<dyn StorageProvider>
+                        }));
+                    });
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("test runtime")
+                        .block_on(async move {
+                            let _session = SESSION_TRANSFER_TEST_LOCK.lock().await;
+                            watch_locked.store(true, Ordering::Relaxed);
+                            cmd_sync_watch(
+                                "memory://",
+                                &relative,
+                                "/root",
+                                "upload",
+                                false,
+                                false,
+                                &[],
+                                None,
+                                0,
+                                false,
+                                None,
+                                None,
+                                "",
+                                false,
+                                None,
+                                None,
+                                None,
+                                NEWER_WINS,
+                                false,
+                                "native",
+                                100,
+                                0,
+                                3600,
+                                true,
+                                &cli,
+                                OutputFormat::Json,
+                                cancelled,
+                            )
+                            .await
+                        })
+                })
+                .expect("spawn the watch thread")
+                .join()
+                .expect("the watch thread panicked")
+        });
+        assert!(
+            user.join().unwrap(),
+            "a file written under a watch on a relative path never reached the remote"
+        );
+    }
+
+    /// A watch cycle's JSON line names the pairs it left open and the
+    /// directories it kept, in the shape of the `sync` result, and only when
+    /// there are any.
+    #[test]
+    fn a_watch_cycle_line_names_open_pairs_and_kept_directories() {
+        let quiet_cycle = SyncCycleStats::default();
+        let line = watch_cycle_payload(1, "rescan", &quiet_cycle, 0.5, "now", false);
+        assert!(line.get("conflicts_open").is_none());
+        assert!(line.get("dirs_kept").is_none());
+
+        let busy = SyncCycleStats {
+            conflicts_open: vec!["a.txt".to_string()],
+            dirs_kept: vec![CliSyncKeptDir {
+                path: "old".to_string(),
+                reason: "not empty".to_string(),
+            }],
+            ..Default::default()
+        };
+        let line = watch_cycle_payload(2, "watcher: 1 paths", &busy, 0.5, "now", false);
+        assert_eq!(line["conflicts_open"], serde_json::json!(["a.txt"]));
+        assert_eq!(
+            line["dirs_kept"],
+            serde_json::json!([{"path": "old", "reason": "not empty"}])
+        );
+    }
+
+    /// The pairs left open are listed in a stable order, not the order a hash
+    /// map happens to give.
+    #[test]
+    fn the_pairs_left_open_are_listed_in_order() {
+        let fixture = FilesFromFixture::new();
+        // Eight names: a hash map gives them in order once in 40 320 runs.
+        let names = [
+            "e.txt", "h.txt", "b.txt", "g.txt", "d.txt", "a.txt", "f.txt", "c.txt",
+        ];
+        for name in names {
+            fixture.local_file(name, 5000);
+        }
+        let local = fixture.local();
+        let files: Vec<(&str, u64)> = names.iter().map(|name| (*name, 5120)).collect();
+        let mut remote = MemTreeProvider::root_files(&files);
+        remote.precision = Some(None);
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let stats = run_sync_rule(remote, &local, "both", true, false, &[], NEWER_WINS, &cli);
+        assert_eq!(
+            stats.conflicts_open,
+            vec!["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt", "h.txt"]
+        );
+    }
+
+    /// Minor 6 (re-review of #949): `sync --local` refused `--files-from` and
+    /// copied every file under `--files-from-raw`.
+    #[test]
+    fn local_to_local_refuses_files_from_raw() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 1);
+        let src = fixture.local();
+        let dst = tempfile::tempdir().expect("destination dir");
+        let dst_path = dst.path().to_string_lossy().into_owned();
+        let list = dst.path().join("list.txt");
+        std::fs::write(&list, "a.txt\n").unwrap();
+        let cli = Cli {
+            quiet: true,
+            files_from_raw: Some(list.to_string_lossy().into_owned()),
+            ..test_cli()
+        };
+        let target = dst_path.clone();
+        let code = on_big_stack_value(move || {
+            let parsed = Cli::try_parse_from([
+                "aeroftp-cli",
+                "sync",
+                src.as_str(),
+                target.as_str(),
+                "--local",
+            ])
+            .expect("parses");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(dispatch_sync(
+                    &parsed.command,
+                    &cli,
+                    OutputFormat::Json,
+                    Arc::new(AtomicBool::new(false)),
+                ))
+        });
+        assert_eq!(code, 5, "--files-from-raw is a flag the copier ignores");
+        assert!(!Path::new(&dst_path).join("a.txt").exists());
+    }
+
+    /// M3 (review of #949): `sync-doctor` states a size-only comparison.
+    #[test]
+    fn sync_doctor_states_a_size_only_comparison() {
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 1);
+        let local = fixture.local();
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let mut remote = MemTreeProvider::root_files(&[("a.txt", 1)]);
+        remote.precision = Some(None);
+        let report = run_against_remote(remote, || {
+            sync_doctor_report(
+                "memory://",
+                &local,
+                "/root",
+                "upload",
+                false,
+                &[],
+                None,
+                0,
+                false,
+                "newer",
+                false,
+                false,
+                &cli,
+                OutputFormat::Json,
+            )
+        })
+        .unwrap_or_else(|code| panic!("sync-doctor failed with exit code {code}"));
+        assert!(
+            report.risks.iter().any(|risk| risk.contains("size only")),
+            "{:?}",
+            report.risks
+        );
+    }
+
+    /// `sync --checksum`: a file of the same size and the same date whose
+    /// bytes changed is transferred; without the flag size and time call it
+    /// current. A checksum that matches is current whatever the dates.
+    #[test]
+    fn checksum_transfers_a_same_size_file_whose_bytes_changed() {
+        use sha2::Digest;
+        let fixture = FilesFromFixture::new();
+        fixture.local_file("a.txt", 3);
+        let local = fixture.local();
+        let remote_with = |content: &[u8]| {
+            let mut remote = MemTreeProvider::root_files(&[("a.txt", 3)]);
+            remote.checksums = HashMap::from([(
+                "/root/a.txt".to_string(),
+                HashMap::from([(
+                    "sha256".to_string(),
+                    format!("{:x}", sha2::Sha256::digest(content)),
+                )]),
+            )]);
+            remote
+        };
+        let cli = Cli {
+            quiet: true,
+            ..test_cli()
+        };
+        let plain = run_sync_rule(
+            remote_with(b"yyy"),
+            &local,
+            "upload",
+            true,
+            false,
+            &[],
+            SOURCE_WINS,
+            &cli,
+        );
+        assert_eq!((plain.uploaded, plain.skipped), (0, 1));
+        let checksum = SyncPairRule {
+            checksum: true,
+            ..SOURCE_WINS
+        };
+        let changed = run_sync_rule(
+            remote_with(b"yyy"),
+            &local,
+            "upload",
+            true,
+            false,
+            &[],
+            checksum,
+            &cli,
+        );
+        assert_eq!((changed.uploaded, changed.skipped), (1, 0));
+        let same = run_sync_rule(
+            remote_with(b"xxx"),
+            &local,
+            "upload",
+            true,
+            false,
+            &[],
+            checksum,
+            &cli,
+        );
+        assert_eq!((same.uploaded, same.skipped), (0, 1));
     }
 
     /// The data-loss case: `sync --direction upload --delete --files-from`
@@ -76827,6 +85887,19 @@ mod tests {
         );
     }
 
+    /// The outcome of a run that settled every path it saw.
+    fn settled_all(entries: &[(String, u64, Option<String>)]) -> BisyncOutcome {
+        BisyncOutcome {
+            settled: entries
+                .iter()
+                .map(|(path, size, mtime)| {
+                    (path.clone(), (*size, mtime.clone().unwrap_or_default()))
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     /// A `--files-from` run of `--direction both` saw only the listed paths,
     /// so the snapshot it saves rewrites only those and keeps the previous
     /// entries for every other path. A run without a list still replaces the
@@ -76858,6 +85931,7 @@ mod tests {
             &local,
             &synced,
             &synced,
+            &settled_all(&synced),
             Some(&listed),
             &ftp_client_gui_lib::sync_core::ScanBound::default(),
             &[],
@@ -76878,6 +85952,7 @@ mod tests {
             &local,
             &synced,
             &synced,
+            &settled_all(&synced),
             None,
             &ftp_client_gui_lib::sync_core::ScanBound::default(),
             &[],
@@ -76923,7 +85998,15 @@ mod tests {
             },
         );
         let synced = vec![("a.txt".to_string(), 2, Some(FIXTURE_MTIME.to_string()))];
-        save_bisync_snapshot(&local, &synced, &synced, None, &bound, &[]);
+        save_bisync_snapshot(
+            &local,
+            &synced,
+            &synced,
+            &settled_all(&synced),
+            None,
+            &bound,
+            &[],
+        );
         let saved = load_bisync_snapshot(&local).expect("the snapshot is saved");
         assert_eq!(
             saved.files.get("a.txt"),
@@ -76982,12 +86065,162 @@ mod tests {
         assert_eq!(reported.len(), 1, "but the run reports it all the same");
 
         let synced = vec![("a.txt".to_string(), 2, Some(FIXTURE_MTIME.to_string()))];
-        save_bisync_snapshot(&local, &synced, &synced, None, &bound, &reported);
+        save_bisync_snapshot(
+            &local,
+            &synced,
+            &synced,
+            &settled_all(&synced),
+            None,
+            &bound,
+            &reported,
+        );
         let saved = load_bisync_snapshot(&local).expect("the snapshot is saved");
         assert_eq!(
             saved.files.get("link/x.txt"),
             Some(&(1, FIXTURE_MTIME.to_string())),
             "the path under the local link keeps its previous entry"
+        );
+    }
+
+    /// A run that left a planned transfer behind (`--max-transfer`, a cancel)
+    /// knows its uploads by count only, so it records none of them; the pairs
+    /// it found in sync and the downloads known to have completed are
+    /// recorded either way, each download as it was when it completed.
+    #[test]
+    fn a_bisync_outcome_records_transfers_only_when_all_went_through() {
+        let local_map: HashMap<&str, (u64, Option<&str>)> = HashMap::from([
+            ("same.txt", (1, Some(FIXTURE_MTIME))),
+            ("up.txt", (3, Some(FIXTURE_MTIME))),
+            ("down.txt", (2, Some(FIXTURE_MTIME))),
+        ]);
+        let landed = HashMap::from([(
+            "down.txt".to_string(),
+            (7, "2026-09-26T12:00:00".to_string()),
+        )]);
+        let run = |complete| {
+            bisync_outcome(
+                &local_map,
+                BisyncRunPaths {
+                    in_sync: &["same.txt"],
+                    uploaded: &["up.txt"],
+                    downloaded: &landed,
+                    renamed: &[],
+                    deleted: &[],
+                },
+                complete,
+            )
+        };
+        let partial = run(false);
+        let mut settled: Vec<&String> = partial.settled.keys().collect();
+        settled.sort();
+        assert_eq!(
+            settled,
+            vec!["down.txt", "same.txt"],
+            "the pair found in sync and the completed download, not the upload"
+        );
+        let full = run(true);
+        assert_eq!(
+            full.settled.get("up.txt"),
+            Some(&(3, FIXTURE_MTIME.to_string()))
+        );
+        assert_eq!(
+            full.settled.get("down.txt"),
+            Some(&(7, "2026-09-26T12:00:00".to_string())),
+            "the state the download left when it completed"
+        );
+    }
+
+    /// A path deleted by the run, or renamed away, leaves the snapshot at
+    /// once: kept until the next run, a new file of that name appearing on one
+    /// side would read as deleted on the other.
+    #[test]
+    fn a_deleted_or_renamed_path_leaves_the_snapshot() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let local = dir.path().to_string_lossy().into_owned();
+        let previous = BisyncSnapshot {
+            synced_at: "2020-01-01T00:00:00Z".to_string(),
+            files: HashMap::from([
+                ("gone.txt".to_string(), (1, FIXTURE_MTIME.to_string())),
+                ("old.txt".to_string(), (1, FIXTURE_MTIME.to_string())),
+            ]),
+        };
+        std::fs::write(
+            Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+            serde_json::to_string(&previous).unwrap(),
+        )
+        .unwrap();
+        let scanned = vec![
+            ("gone.txt".to_string(), 1, Some(FIXTURE_MTIME.to_string())),
+            ("old.txt".to_string(), 1, Some(FIXTURE_MTIME.to_string())),
+            ("new.txt".to_string(), 1, Some(FIXTURE_MTIME.to_string())),
+        ];
+        let local_map = sync_entry_map(&scanned);
+        let outcome = bisync_outcome(
+            &local_map,
+            BisyncRunPaths {
+                in_sync: &[],
+                uploaded: &[],
+                downloaded: &HashMap::new(),
+                renamed: &[("old.txt", "new.txt")],
+                deleted: &["gone.txt"],
+            },
+            true,
+        );
+        save_bisync_snapshot(
+            &local,
+            &scanned,
+            &scanned,
+            &outcome,
+            None,
+            &ftp_client_gui_lib::sync_core::ScanBound::default(),
+            &[],
+        );
+        let saved = load_bisync_snapshot(&local).expect("the snapshot is saved");
+        let mut paths: Vec<&String> = saved.files.keys().collect();
+        paths.sort();
+        assert_eq!(paths, vec!["new.txt"]);
+    }
+
+    /// A pair the run saw and did not settle keeps its previous entry, except
+    /// after `--resync`, which decided without the snapshot: there the entry
+    /// goes, rather than outliving the resync to decide a later run.
+    #[test]
+    fn a_resync_drops_the_entries_it_did_not_settle() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let local = dir.path().to_string_lossy().into_owned();
+        let previous = BisyncSnapshot {
+            synced_at: "2020-01-01T00:00:00Z".to_string(),
+            files: HashMap::from([("open.txt".to_string(), (1, FIXTURE_MTIME.to_string()))]),
+        };
+        let scanned = vec![("open.txt".to_string(), 2, Some(FIXTURE_MTIME.to_string()))];
+        let save = |rebuilt| {
+            std::fs::write(
+                Path::new(&local).join(BISYNC_SNAPSHOT_FILE),
+                serde_json::to_string(&previous).unwrap(),
+            )
+            .unwrap();
+            save_bisync_snapshot(
+                &local,
+                &scanned,
+                &scanned,
+                &BisyncOutcome {
+                    rebuilt,
+                    ..Default::default()
+                },
+                None,
+                &ftp_client_gui_lib::sync_core::ScanBound::default(),
+                &[],
+            );
+            load_bisync_snapshot(&local).expect("the snapshot is saved")
+        };
+        assert_eq!(
+            save(false).files.get("open.txt"),
+            Some(&(1, FIXTURE_MTIME.to_string())),
+            "a pair left open keeps what the snapshot said"
+        );
+        assert!(
+            save(true).files.is_empty(),
+            "--resync keeps nothing it did not settle"
         );
     }
 
@@ -77850,7 +87083,7 @@ mod tests {
                     "/root/broken".to_string(),
                 )],
             )]),
-            delete_attempts: Arc::default(),
+            ..Default::default()
         }
     }
 
@@ -77889,6 +87122,7 @@ mod tests {
                 "/root",
                 Some("crypt password".to_string()),
                 Some(String::new()),
+                (None, None),
                 "off",
                 None,
                 one_way,
@@ -78138,7 +87372,7 @@ mod tests {
         link.is_symlink = true;
         MemTreeProvider {
             dirs: HashMap::from([("/root".to_string(), vec![link])]),
-            delete_attempts: Arc::default(),
+            ..Default::default()
         }
     }
 
@@ -78395,7 +87629,7 @@ mod tests {
                     "/root/unlisted".to_string(),
                 )],
             )]),
-            delete_attempts: Arc::default(),
+            ..Default::default()
         };
 
         let report = doctor_report_against(remote, &fixture.local());
@@ -78422,7 +87656,7 @@ mod tests {
                 ("/root".to_string(), vec![a, link]),
                 ("/root/link".to_string(), vec![x]),
             ]),
-            delete_attempts: Arc::default(),
+            ..Default::default()
         }
     }
 
@@ -78557,7 +87791,7 @@ mod tests {
                     RemoteEntry::directory("d1".to_string(), "/root/d1".to_string()),
                 ],
             )]),
-            delete_attempts: Arc::default(),
+            ..Default::default()
         };
         let cli = Cli {
             quiet: true,
@@ -78585,7 +87819,7 @@ mod tests {
         let stats = plan_sync_with_delete(
             MemTreeProvider {
                 dirs: HashMap::new(),
-                delete_attempts: Arc::default(),
+                ..Default::default()
             },
             &fixture.local(),
             "download",
@@ -78618,7 +87852,7 @@ mod tests {
         let stats = plan_sync_with_delete(
             MemTreeProvider {
                 dirs: HashMap::new(),
-                delete_attempts: Arc::default(),
+                ..Default::default()
             },
             &fixture.local(),
             "upload",
@@ -78657,8 +87891,13 @@ mod tests {
                 None,
                 None,
                 None,
-                "newer",
-                false,
+                SyncPairRule {
+                    conflict_mode: "source",
+                    skip_matching: false,
+                    update: false,
+                    modify_window: None,
+                    checksum: false,
+                },
                 false,
                 cli,
                 OutputFormat::Json,
@@ -78701,10 +87940,32 @@ mod tests {
         deleted: Vec<String>,
         rename_fails_with: Option<String>,
         replace_fails_with: Option<String>,
+        /// When set, `replace` refuses as AlreadyExists, as a backend does
+        /// for a file onto a folder.
+        replace_refuses_as_existing: bool,
         /// What this fake answers to `supports_atomic_replace`.
         atomic_replace: bool,
+        /// What this fake answers to `replace_sets_aside`.
+        sets_aside: bool,
         /// When set, `stat` fails with this instead of answering.
         stat_fails_with: Option<String>,
+        /// When set, a replace that succeeds leaves this warning, as a
+        /// set-aside replace does when it cannot delete the old copy.
+        replace_leaves_warning: Option<String>,
+        /// Unix mode per path, reported by `stat` as `-rw-r--r--`, the way
+        /// SFTP reports it. A new path gets 0644, the server default, and a
+        /// replace moves the mode of the file it moves, as posix-rename does.
+        modes: HashMap<String, u32>,
+        /// Symbolic links: path to the target `stat` reports.
+        links: HashMap<String, String>,
+        /// What `supports_chmod` answers.
+        chmod_supported: bool,
+        /// When set, `chmod` fails with this.
+        chmod_fails_with: Option<String>,
+        /// Empty directories: `stat` reports them as such, and both `rmdir`
+        /// and `delete` remove them, as on a backend whose delete of a
+        /// folder takes it along.
+        dirs: std::collections::HashSet<String>,
     }
 
     impl CliEditFakeProvider {
@@ -78717,8 +87978,16 @@ mod tests {
                 deleted: Vec::new(),
                 rename_fails_with: None,
                 replace_fails_with: None,
+                replace_refuses_as_existing: false,
                 atomic_replace: true,
+                sets_aside: false,
                 stat_fails_with: None,
+                replace_leaves_warning: None,
+                modes: HashMap::new(),
+                links: HashMap::new(),
+                chmod_supported: false,
+                chmod_fails_with: None,
+                dirs: std::collections::HashSet::new(),
             }
         }
     }
@@ -78793,6 +88062,7 @@ mod tests {
         ) -> Result<(), ProviderError> {
             let data = std::fs::read(local_path).map_err(ProviderError::IoError)?;
             self.uploads.push((remote_path.to_string(), data.clone()));
+            self.modes.entry(remote_path.to_string()).or_insert(0o644);
             self.remote_files.insert(remote_path.to_string(), data);
             Ok(())
         }
@@ -78803,11 +88073,13 @@ mod tests {
 
         async fn delete(&mut self, path: &str) -> Result<(), ProviderError> {
             self.remote_files.remove(path);
+            self.dirs.remove(path);
             self.deleted.push(path.to_string());
             Ok(())
         }
 
-        async fn rmdir(&mut self, _path: &str) -> Result<(), ProviderError> {
+        async fn rmdir(&mut self, path: &str) -> Result<(), ProviderError> {
+            self.dirs.remove(path);
             Ok(())
         }
 
@@ -78838,12 +88110,24 @@ mod tests {
             if let Some(msg) = &self.replace_fails_with {
                 return Err(ProviderError::TransferFailed(msg.clone()));
             }
+            if self.replace_refuses_as_existing {
+                return Err(ProviderError::AlreadyExists(format!(
+                    "cannot replace {to} with {from}"
+                )));
+            }
             let data = self
                 .remote_files
                 .remove(from)
                 .ok_or_else(|| ProviderError::NotFound(from.to_string()))?;
             self.remote_files.insert(to.to_string(), data);
+            if let Some(mode) = self.modes.remove(from) {
+                self.modes.insert(to.to_string(), mode);
+            }
+            self.links.remove(to);
             self.replaces.push((from.to_string(), to.to_string()));
+            if let Some(warning) = &self.replace_leaves_warning {
+                ftp_client_gui_lib::providers::report_warning(warning.clone());
+            }
             Ok(())
         }
 
@@ -78851,16 +88135,57 @@ mod tests {
             Ok(self.atomic_replace)
         }
 
+        fn replace_sets_aside(&self) -> bool {
+            self.sets_aside
+        }
+
+        fn supports_chmod(&self) -> bool {
+            self.chmod_supported
+        }
+
+        async fn chmod(&mut self, path: &str, mode: u32) -> Result<(), ProviderError> {
+            if let Some(message) = &self.chmod_fails_with {
+                return Err(ProviderError::ServerError(message.clone()));
+            }
+            self.modes.insert(path.to_string(), mode);
+            Ok(())
+        }
+
         async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
             if let Some(msg) = &self.stat_fails_with {
                 return Err(ProviderError::ConnectionFailed(msg.clone()));
             }
-            self.remote_files
+            if self.dirs.contains(path) {
+                let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                return Ok(RemoteEntry::directory(name, path.to_string()));
+            }
+            let mut entry = self
+                .remote_files
                 .get(path)
                 .map(|data| {
                     RemoteEntry::file(path.to_string(), path.to_string(), data.len() as u64)
                 })
-                .ok_or_else(|| ProviderError::NotFound(path.to_string()))
+                .ok_or_else(|| ProviderError::NotFound(path.to_string()))?;
+            entry.link_target = self.links.get(path).cloned();
+            entry.is_symlink = entry.link_target.is_some();
+            entry.permissions = self.modes.get(path).map(|mode| {
+                let bit = |mask: u32, letter: char| if mode & mask != 0 { letter } else { '-' };
+                [
+                    '-',
+                    bit(0o400, 'r'),
+                    bit(0o200, 'w'),
+                    bit(0o100, 'x'),
+                    bit(0o040, 'r'),
+                    bit(0o020, 'w'),
+                    bit(0o010, 'x'),
+                    bit(0o004, 'r'),
+                    bit(0o002, 'w'),
+                    bit(0o001, 'x'),
+                ]
+                .iter()
+                .collect()
+            });
+            Ok(entry)
         }
 
         async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
@@ -78914,7 +88239,7 @@ mod tests {
             .remote_files
             .insert("/target.txt".to_string(), b"old text".to_vec());
 
-        publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt")
+        publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", false)
             .await
             .expect("publish should succeed");
 
@@ -78949,6 +88274,288 @@ mod tests {
         assert!(provider.deleted.is_empty());
     }
 
+    /// A served WebDAV MOVE of `/a.txt` onto the existing `/b.txt`, with
+    /// `overwrite` as the Overwrite header when given. Returns the status and
+    /// the fake the handler worked on.
+    async fn served_move_onto_an_existing_file(
+        overwrite: Option<&'static str>,
+    ) -> (StatusCode, CliEditFakeProvider) {
+        served_move_onto_an_existing_file_with(overwrite, CliEditFakeProvider::new()).await
+    }
+
+    /// [`served_move_onto_an_existing_file`] on a given fake.
+    async fn served_move_onto_an_existing_file_with(
+        overwrite: Option<&'static str>,
+        fake: CliEditFakeProvider,
+    ) -> (StatusCode, CliEditFakeProvider) {
+        served_move_showing_warnings_to(overwrite, fake, ServedWarnings::stderr(OutputFormat::Text))
+            .await
+    }
+
+    /// [`served_move_onto_an_existing_file_with`], showing its warnings
+    /// through `warnings`.
+    async fn served_move_showing_warnings_to(
+        overwrite: Option<&'static str>,
+        mut fake: CliEditFakeProvider,
+        warnings: ServedWarnings,
+    ) -> (StatusCode, CliEditFakeProvider) {
+        fake.remote_files
+            .insert("/a.txt".to_string(), b"new".to_vec());
+        fake.remote_files
+            .insert("/b.txt".to_string(), b"old".to_vec());
+        let provider: Box<dyn StorageProvider> = Box::new(fake);
+        let state = ServeHttpState {
+            provider: Arc::new(AsyncMutex::new(provider)),
+            provider_label: "fake".to_string(),
+            base_path: "/".to_string(),
+            auth_token: None,
+            warnings,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Destination",
+            HeaderValue::from_static("http://127.0.0.1:8080/b.txt"),
+        );
+        if let Some(value) = overwrite {
+            headers.insert("Overwrite", HeaderValue::from_static(value));
+        }
+        let response = webdav_dispatch(
+            state.clone(),
+            Method::from_bytes(b"MOVE").unwrap(),
+            "a.txt".to_string(),
+            headers,
+            Bytes::new(),
+        )
+        .await;
+        let mut guard = state.provider.lock().await;
+        let fake = guard
+            .as_any_mut()
+            .downcast_mut::<CliEditFakeProvider>()
+            .expect("the fake");
+        let fake = std::mem::replace(fake, CliEditFakeProvider::new());
+        (response.status(), fake)
+    }
+
+    /// A DELETE of the served root recursed into the whole base path, and a
+    /// MOVE of it took the share away: both are 403 and nothing is touched.
+    #[tokio::test]
+    async fn the_served_root_cannot_be_deleted_or_moved() {
+        for method in ["DELETE", "MOVE"] {
+            let mut fake = CliEditFakeProvider::new();
+            fake.remote_files
+                .insert("/a.txt".to_string(), b"kept".to_vec());
+            let provider: Box<dyn StorageProvider> = Box::new(fake);
+            let state = ServeHttpState {
+                provider: Arc::new(AsyncMutex::new(provider)),
+                provider_label: "fake".to_string(),
+                base_path: "/".to_string(),
+                auth_token: None,
+                warnings: ServedWarnings::stderr(OutputFormat::Text),
+            };
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Destination",
+                HeaderValue::from_static("http://127.0.0.1:8080/moved"),
+            );
+            let response = webdav_dispatch(
+                state.clone(),
+                Method::from_bytes(method.as_bytes()).unwrap(),
+                String::new(),
+                headers,
+                Bytes::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+            let mut guard = state.provider.lock().await;
+            let fake = guard
+                .as_any_mut()
+                .downcast_mut::<CliEditFakeProvider>()
+                .expect("the fake");
+            assert!(fake.remote_files.contains_key("/a.txt"), "{method}");
+        }
+    }
+
+    /// Office and most WebDAV editors save by writing a temporary and
+    /// MOVEing it over the document with `Overwrite: T` (or no header, which
+    /// RFC 4918 reads as T). The handler always called `rename`, which
+    /// refuses an occupied destination, so every such save failed with 500.
+    #[tokio::test]
+    async fn served_webdav_move_with_overwrite_t_replaces_the_destination() {
+        for overwrite in [Some("T"), None] {
+            let (status, fake) = served_move_onto_an_existing_file(overwrite).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{overwrite:?}");
+            assert_eq!(
+                fake.replaces,
+                vec![("/a.txt".to_string(), "/b.txt".to_string())],
+                "{overwrite:?}"
+            );
+            assert_eq!(
+                fake.remote_files.get("/b.txt").map(Vec::as_slice),
+                Some(&b"new"[..]),
+                "{overwrite:?}"
+            );
+        }
+    }
+
+    /// 412 is the answer to `Overwrite: F` only. Under `Overwrite: T` the
+    /// client allowed the overwrite, so a replace the backend refuses (a
+    /// file onto a folder) is a conflict, 409, not a failed precondition.
+    #[tokio::test]
+    async fn served_webdav_move_whose_replace_is_refused_is_409() {
+        let mut fake = CliEditFakeProvider::new();
+        fake.replace_refuses_as_existing = true;
+        let (status, fake) = served_move_onto_an_existing_file_with(Some("T"), fake).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            fake.remote_files.get("/b.txt").map(Vec::as_slice),
+            Some(&b"old"[..])
+        );
+    }
+
+    /// `serve webdav` runs until stopped: a warning a MOVE's replace left
+    /// (its set-aside copy not deleted) is shown when the MOVE ends, in the
+    /// format the server was started with (with `--json`, one JSON object a
+    /// line), and it is this MOVE's own, not the process queue's.
+    #[tokio::test]
+    async fn served_webdav_move_shows_the_warning_its_replace_left() {
+        let mut fake = CliEditFakeProvider::new();
+        fake.replace_leaves_warning = Some("left /.b.txt.aeroftp-replaced-1".to_string());
+        let shown: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let warnings = ServedWarnings {
+            format: OutputFormat::Json,
+            out: shown.clone(),
+        };
+        let (status, _) = served_move_showing_warnings_to(Some("T"), fake, warnings).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let shown = String::from_utf8(shown.lock().unwrap().clone()).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(shown.trim_end()).expect("one JSON object");
+        assert_eq!(
+            line,
+            serde_json::json!({ "status": "warning", "warning": "left /.b.txt.aeroftp-replaced-1" })
+        );
+    }
+
+    /// One served WebDAV request `method` for `path` (as axum's `Path`
+    /// extractor hands it over, decoded once) with the `Destination`
+    /// `destination`, on `fake`; returns the status and the fake after.
+    async fn served_request(
+        method: &str,
+        path: &str,
+        destination: &'static str,
+        fake: CliEditFakeProvider,
+    ) -> (StatusCode, CliEditFakeProvider) {
+        let provider: Box<dyn StorageProvider> = Box::new(fake);
+        let state = ServeHttpState {
+            provider: Arc::new(AsyncMutex::new(provider)),
+            provider_label: "fake".to_string(),
+            base_path: "/".to_string(),
+            auth_token: None,
+            warnings: ServedWarnings::stderr(OutputFormat::Text),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("Destination", HeaderValue::from_static(destination));
+        let response = webdav_dispatch(
+            state.clone(),
+            Method::from_bytes(method.as_bytes()).unwrap(),
+            path.to_string(),
+            headers,
+            Bytes::new(),
+        )
+        .await;
+        let mut guard = state.provider.lock().await;
+        let fake = guard
+            .as_any_mut()
+            .downcast_mut::<CliEditFakeProvider>()
+            .expect("the fake");
+        let fake = std::mem::replace(fake, CliEditFakeProvider::new());
+        (response.status(), fake)
+    }
+
+    /// The name `a%41.txt` arrives as the request path `a%2541.txt`, which
+    /// axum decodes to `a%41.txt`; the handler decoded it again to `aA.txt`
+    /// while the Destination was decoded once. A MOVE of `a%41.txt` onto
+    /// itself missed its 403 and put `aA.txt` over it.
+    #[tokio::test]
+    async fn served_webdav_move_of_a_percent_name_onto_itself_is_403() {
+        let mut fake = CliEditFakeProvider::new();
+        fake.remote_files
+            .insert("/a%41.txt".to_string(), b"mine".to_vec());
+        fake.remote_files
+            .insert("/aA.txt".to_string(), b"other".to_vec());
+        let (status, fake) =
+            served_request("MOVE", "a%41.txt", "http://127.0.0.1:8080/a%2541.txt", fake).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(fake.renames.is_empty(), "{:?}", fake.renames);
+        assert!(fake.replaces.is_empty(), "{:?}", fake.replaces);
+        assert_eq!(fake.remote_files["/a%41.txt"], b"mine");
+    }
+
+    /// A COPY onto its own path went through the copy DAG; RFC 4918 section
+    /// 9.8.5 makes it 403, answered before the provider is asked.
+    #[tokio::test]
+    async fn served_webdav_copy_onto_itself_is_403() {
+        let mut fake = CliEditFakeProvider::new();
+        fake.remote_files
+            .insert("/a.txt".to_string(), b"mine".to_vec());
+        let (status, fake) =
+            served_request("COPY", "a.txt", "http://127.0.0.1:8080/a.txt", fake).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(fake.remote_files["/a.txt"], b"mine");
+    }
+
+    /// A MOVE onto its own path reached the backend's rename, a no-op, and
+    /// answered 204 as if something had moved. RFC 4918 section 9.9.4 makes
+    /// it 403, and the provider is not asked.
+    #[tokio::test]
+    async fn served_webdav_move_onto_itself_is_403() {
+        let mut fake = CliEditFakeProvider::new();
+        fake.remote_files
+            .insert("/a.txt".to_string(), b"new".to_vec());
+        let provider: Box<dyn StorageProvider> = Box::new(fake);
+        let state = ServeHttpState {
+            provider: Arc::new(AsyncMutex::new(provider)),
+            provider_label: "fake".to_string(),
+            base_path: "/".to_string(),
+            auth_token: None,
+            warnings: ServedWarnings::stderr(OutputFormat::Text),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Destination",
+            HeaderValue::from_static("http://127.0.0.1:8080/a.txt"),
+        );
+        let response = webdav_dispatch(
+            state.clone(),
+            Method::from_bytes(b"MOVE").unwrap(),
+            "a.txt".to_string(),
+            headers,
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let mut guard = state.provider.lock().await;
+        let fake = guard
+            .as_any_mut()
+            .downcast_mut::<CliEditFakeProvider>()
+            .expect("the fake");
+        assert!(fake.renames.is_empty(), "{:?}", fake.renames);
+        assert!(fake.replaces.is_empty(), "{:?}", fake.replaces);
+    }
+
+    /// `Overwrite: F` onto an existing destination is 412 (RFC 4918 section
+    /// 9.9.4), and nothing moves.
+    #[tokio::test]
+    async fn served_webdav_move_with_overwrite_f_is_412_and_moves_nothing() {
+        let (status, fake) = served_move_onto_an_existing_file(Some("F")).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert!(fake.replaces.is_empty() && fake.renames.is_empty());
+        assert_eq!(
+            fake.remote_files.get("/b.txt").map(Vec::as_slice),
+            Some(&b"old"[..])
+        );
+    }
+
     #[tokio::test]
     async fn cli_edit_publish_deletes_staged_temp_when_replace_fails() {
         let local = NamedTempFile::new().expect("temp file");
@@ -78960,9 +88567,10 @@ mod tests {
             .insert("/target.txt".to_string(), b"old text".to_vec());
         provider.replace_fails_with = Some("replace failed".to_string());
 
-        let err = publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt")
-            .await
-            .unwrap_err();
+        let err =
+            publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", false)
+                .await
+                .unwrap_err();
         assert!(err.to_string().contains("replace failed"), "got: {err}");
 
         let temp_path = provider.uploads[0].0.clone();
@@ -78991,9 +88599,10 @@ mod tests {
             .insert("/target.txt".to_string(), b"old text".to_vec());
         provider.atomic_replace = false;
 
-        let err = publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt")
-            .await
-            .unwrap_err();
+        let err =
+            publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", false)
+                .await
+                .unwrap_err();
 
         assert!(
             provider.uploads.is_empty(),
@@ -79015,6 +88624,288 @@ mod tests {
             text.contains("put"),
             "the error must name the explicit alternative, got: {text}"
         );
+        assert!(
+            !text.contains("allow-non-atomic"),
+            "a backend whose replace cannot set the file aside must not be offered \
+             the opt-in, got: {text}"
+        );
+
+        // A set-aside backend is refused the same way, and there the opt-in
+        // that would work is named.
+        provider.sets_aside = true;
+        let text =
+            publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", false)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            provider.uploads.is_empty(),
+            "uploads: {:?}",
+            provider.uploads
+        );
+        assert!(
+            text.contains("--allow-non-atomic"),
+            "the error must name the edit opt-in, got: {text}"
+        );
+    }
+
+    /// M1 of the 4.2.1 closeout: on a backend whose replace is its rename
+    /// (Box, 4shared, Internxt, WorkDrive, GitHub, SFTP without
+    /// posix-rename...) `--allow-non-atomic` uploaded the temporary before
+    /// the replace refused the taken name. It is now refused first.
+    #[tokio::test]
+    async fn cli_edit_publish_allow_non_atomic_refuses_a_rename_only_backend_before_it_uploads() {
+        let local = NamedTempFile::new().expect("temp file");
+        std::fs::write(local.path(), b"new text").expect("write replacement");
+        let local_path = local.path().to_string_lossy().to_string();
+        let mut provider = CliEditFakeProvider::new();
+        provider
+            .remote_files
+            .insert("/target.txt".to_string(), b"old text".to_vec());
+        provider.atomic_replace = false;
+
+        let err = publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", true)
+            .await
+            .unwrap_err();
+
+        assert!(
+            provider.uploads.is_empty(),
+            "the opt-in must be refused before anything is staged; uploads: {:?}",
+            provider.uploads
+        );
+        assert!(provider.replaces.is_empty() && provider.renames.is_empty());
+        assert!(
+            provider.deleted.is_empty(),
+            "deleted: {:?}",
+            provider.deleted
+        );
+        assert_eq!(
+            provider.remote_files.get("/target.txt").map(Vec::as_slice),
+            Some(b"old text".as_slice())
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("Nothing was written") && text.contains("--allow-non-atomic"),
+            "the refusal must name the opt-in it refuses and say the server is untouched, \
+             got: {text}"
+        );
+    }
+
+    /// `--allow-non-atomic` is the opt-in those backends were refused for.
+    /// The publish still goes through `replace` (set the old file aside, move
+    /// the new one in, delete the old), and it still happens only after the
+    /// caller asked.
+    #[tokio::test]
+    async fn cli_edit_publish_allow_non_atomic_replaces_without_an_atomic_backend() {
+        let local = NamedTempFile::new().expect("temp file");
+        std::fs::write(local.path(), b"new text").expect("write replacement");
+        let local_path = local.path().to_string_lossy().to_string();
+        let mut provider = CliEditFakeProvider::new();
+        provider
+            .remote_files
+            .insert("/target.txt".to_string(), b"old text".to_vec());
+        provider.atomic_replace = false;
+        provider.sets_aside = true;
+
+        publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", true)
+            .await
+            .expect("opted-in publish should use replace");
+
+        assert_eq!(provider.uploads.len(), 1);
+        let temp_path = provider.uploads[0].0.clone();
+        assert_eq!(
+            provider.replaces,
+            vec![(temp_path, "/target.txt".to_string())]
+        );
+        assert!(provider.renames.is_empty());
+        assert_eq!(
+            provider.remote_files.get("/target.txt").map(Vec::as_slice),
+            Some(b"new text".as_slice())
+        );
+    }
+
+    /// An SFTP-like target of mode 0600 and a local replacement to publish.
+    fn cli_edit_on_a_0600_target() -> (NamedTempFile, String, CliEditFakeProvider) {
+        let local = NamedTempFile::new().expect("temp file");
+        std::fs::write(local.path(), b"new text").expect("write replacement");
+        let local_path = local.path().to_string_lossy().to_string();
+        let mut provider = CliEditFakeProvider::new();
+        provider
+            .remote_files
+            .insert("/target.txt".to_string(), b"old text".to_vec());
+        provider.modes.insert("/target.txt".to_string(), 0o600);
+        provider.chmod_supported = true;
+        (local, local_path, provider)
+    }
+
+    /// M-A of the 4.2.1 closeout: the replace puts a NEW file over the
+    /// target, which on SFTP came back with the server default, so a 0600
+    /// `.env` became 0644. The mode is copied onto the temporary before the
+    /// replace.
+    #[tokio::test]
+    async fn cli_edit_publish_keeps_the_mode_of_the_file_it_replaces() {
+        let (_local, local_path, mut provider) = cli_edit_on_a_0600_target();
+
+        publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", false)
+            .await
+            .expect("publish");
+
+        assert_eq!(
+            provider.remote_files.get("/target.txt").map(Vec::as_slice),
+            Some(b"new text".as_slice())
+        );
+        assert_eq!(
+            provider.modes.get("/target.txt").copied(),
+            Some(0o600),
+            "the edited file must keep its mode, not the server default"
+        );
+    }
+
+    /// A chmod the server refuses leaves the edit done, and the warning says
+    /// which mode was not kept.
+    #[tokio::test]
+    async fn cli_edit_publish_says_which_permissions_it_could_not_keep() {
+        let (_local, local_path, mut provider) = cli_edit_on_a_0600_target();
+        provider.chmod_fails_with = Some("SITE CHMOD not understood".to_string());
+
+        let warnings = ftp_client_gui_lib::providers::CallWarnings::default();
+        warnings
+            .scope(publish_cli_edit_via_temp_rename(
+                &mut provider,
+                &local_path,
+                "/target.txt",
+                false,
+            ))
+            .await
+            .expect("the edit itself is done");
+
+        assert_eq!(
+            provider.remote_files.get("/target.txt").map(Vec::as_slice),
+            Some(b"new text".as_slice())
+        );
+        let taken = warnings.take();
+        assert!(
+            taken
+                .iter()
+                .any(|w| w.contains("0600") && w.contains("SITE CHMOD not understood")),
+            "the warning must name the mode that was not kept and why: {taken:?}"
+        );
+    }
+
+    /// The replace would put a regular file in the link's place and leave the
+    /// file it points to unchanged: a link is refused before anything is
+    /// staged.
+    #[tokio::test]
+    async fn cli_edit_publish_refuses_a_symlink_before_it_uploads() {
+        let (_local, local_path, mut provider) = cli_edit_on_a_0600_target();
+        provider
+            .links
+            .insert("/target.txt".to_string(), "/srv/real.txt".to_string());
+
+        let outcome =
+            publish_cli_edit_via_temp_rename(&mut provider, &local_path, "/target.txt", false)
+                .await;
+
+        assert!(
+            provider.uploads.is_empty() && provider.replaces.is_empty(),
+            "nothing may be staged over a link: {outcome:?}"
+        );
+        let text = outcome.unwrap_err().to_string();
+        assert!(
+            text.contains("symbolic link") && text.contains("/srv/real.txt"),
+            "{text}"
+        );
+        assert_eq!(
+            provider.remote_files.get("/target.txt").map(Vec::as_slice),
+            Some(b"old text".as_slice())
+        );
+    }
+
+    /// A served provider holding the empty directory `/d`.
+    fn served_provider_with_an_empty_directory() -> Arc<AsyncMutex<Box<dyn StorageProvider>>> {
+        let mut fake = CliEditFakeProvider::new();
+        fake.dirs.insert("/d".to_string());
+        let provider: Box<dyn StorageProvider> = Box::new(fake);
+        Arc::new(AsyncMutex::new(provider))
+    }
+
+    async fn served_directory_is_there(
+        provider: &Arc<AsyncMutex<Box<dyn StorageProvider>>>,
+    ) -> bool {
+        let mut guard = provider.lock().await;
+        guard
+            .as_any_mut()
+            .downcast_mut::<CliEditFakeProvider>()
+            .expect("the fake")
+            .dirs
+            .contains("/d")
+    }
+
+    /// DELE (RFC 959) deletes a file and RMD a directory. The served DELE
+    /// went through the non-recursive delete, which removes an empty
+    /// directory too: it now answers 550 and the directory stays, and RMD
+    /// still removes it.
+    #[tokio::test]
+    async fn served_ftp_dele_refuses_a_directory_and_rmd_removes_it() {
+        use unftp_core::storage::StorageBackend;
+        let provider = served_provider_with_an_empty_directory();
+        let backend = serve_ftp_backend::AeroFtpBackend::new(provider.clone(), "/".to_string());
+        let user = unftp_core::auth::DefaultUser;
+
+        let outcome = backend.del(&user, "/d").await;
+        assert!(
+            served_directory_is_there(&provider).await,
+            "DELE must not remove a directory: {outcome:?}"
+        );
+        let error = outcome.expect_err("DELE of a directory");
+        assert_eq!(
+            error.kind(),
+            unftp_core::storage::ErrorKind::PermanentFileNotAvailable,
+            "{error:?}"
+        );
+
+        backend
+            .rmd(&user, "/d")
+            .await
+            .expect("RMD of an empty directory");
+        assert!(!served_directory_is_there(&provider).await);
+    }
+
+    /// SSH_FXP_REMOVE is the file verb and SSH_FXP_RMDIR the directory one.
+    /// The served REMOVE removed an empty directory; it is now a failure and
+    /// the directory stays, and RMDIR still removes it.
+    #[test]
+    fn served_sftp_remove_refuses_a_directory_and_rmdir_removes_it() {
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("runtime"),
+        );
+        let provider = served_provider_with_an_empty_directory();
+        let mut handler = serve_sftp::AeroSftpHandler::for_tests(provider.clone(), rt.clone());
+        // SSH_FXP_REMOVE (13) or SSH_FXP_RMDIR (15), id 7, path `/d`.
+        let packet = |kind: u8| {
+            let mut packet = vec![kind];
+            packet.extend_from_slice(&7u32.to_be_bytes());
+            packet.extend_from_slice(&2u32.to_be_bytes());
+            packet.extend_from_slice(b"/d");
+            packet
+        };
+        // SSH_FXP_STATUS: type, id, then the status code.
+        let status = |reply: &[u8]| u32::from_be_bytes(reply[5..9].try_into().expect("code"));
+
+        let reply = handler.answer(&packet(13));
+        assert!(
+            rt.block_on(served_directory_is_there(&provider)),
+            "REMOVE must not remove a directory"
+        );
+        assert_eq!(status(&reply), 4, "SSH_FX_FAILURE");
+
+        let reply = handler.answer(&packet(15));
+        assert_eq!(status(&reply), 0, "SSH_FX_OK");
+        assert!(!rt.block_on(served_directory_is_there(&provider)));
     }
 
     #[test]
@@ -79119,6 +89010,7 @@ mod tests {
             &mut p,
             "/dest.txt",
             "--immutable",
+            None,
             &cli,
             OutputFormat::Text,
         )
@@ -79133,6 +89025,7 @@ mod tests {
             &mut p,
             "/fresh.txt",
             "--immutable",
+            None,
             &cli,
             OutputFormat::Json,
         )
@@ -79156,6 +89049,7 @@ mod tests {
             &mut p,
             "/dest.txt",
             "--immutable",
+            None,
             &cli,
             OutputFormat::Text,
         )
@@ -79170,10 +89064,158 @@ mod tests {
             &mut p,
             "/dest.txt",
             "--no-clobber",
+            None,
             &cli,
             OutputFormat::Text,
         )
         .await;
         assert_eq!(code, None, "--no-clobber keeps its fail-open reading");
+    }
+}
+
+/// The AeroSync Plan tab shows an `aeroftp-cli sync` line for the run it is
+/// about to do (`src/utils/aeroSyncCliCommand.ts`). This parses every fixture
+/// command with the real clap definition and checks it lands in the fields
+/// the Plan meant: the two paths in the slots `cmd_sync` reads them from
+/// under `--profile`, the direction, `--delete`, every exclusion and the
+/// error-correction level. The same fixture is asserted on the TypeScript
+/// side, so a change on either side that breaks the line fails here.
+#[cfg(test)]
+mod aerosync_plan_cli_line_tests {
+    use super::*;
+
+    /// Parsing the full `Cli` needs more stack than a test thread has, as for
+    /// the other parse tests in this file. A panic inside is re-raised as is.
+    fn on_big_stack(body: impl FnOnce() + Send + 'static) {
+        let handle = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(body)
+            .unwrap();
+        if let Err(panic) = handle.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn every_fixture_command_parses_into_the_run_the_plan_meant() {
+        on_big_stack(every_fixture_command_parses);
+    }
+
+    fn every_fixture_command_parses() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/aerosync/cli-commands.json"
+        ))
+        .expect("fixture is JSON");
+        let cases = cases.as_array().expect("fixture is a list");
+        assert!(cases.len() >= 2, "an empty fixture proves nothing");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let input = &case["input"];
+            let argv: Vec<String> = case["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("{name}: clap refused the Plan's command: {e}"));
+            assert_eq!(
+                cli.profile.as_deref(),
+                input["profileName"].as_str(),
+                "{name}"
+            );
+            let Commands::Sync {
+                url,
+                local,
+                remote,
+                direction,
+                delete,
+                exclude,
+                error_correction,
+                dry_run,
+                ..
+            } = &cli.command
+            else {
+                panic!("{name}: not a sync command");
+            };
+            // The slots cmd_sync reads, by the rule the dispatch applies.
+            let (l, r) = if profile_shifts_positionals(cli.profile.is_some(), url) {
+                (url.as_str(), local.as_str())
+            } else {
+                (local.as_str(), remote.as_str())
+            };
+            assert_eq!(
+                l,
+                input["localPath"].as_str().unwrap(),
+                "{name}: local path"
+            );
+            assert_eq!(
+                r,
+                input["remotePath"].as_str().unwrap(),
+                "{name}: remote path"
+            );
+            let local_is_left = input["pairKind"] == "local-remote";
+            let towards_right = input["direction"] == "left-to-right";
+            let expected_direction = if towards_right == local_is_left {
+                "upload"
+            } else {
+                "download"
+            };
+            assert_eq!(direction, expected_direction, "{name}");
+            assert!(*delete, "{name}: Mirror deletes");
+            assert!(!*dry_run, "{name}");
+            let expected_excludes: Vec<String> = input["excludes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(exclude, &expected_excludes, "{name}");
+            let expected_ec = if expected_direction == "upload" {
+                input["errorCorrectionPct"].as_u64().map(|p| p.to_string())
+            } else {
+                None
+            };
+            assert_eq!(error_correction, &expected_ec, "{name}: error correction");
+            if let Some(level) = error_correction {
+                assert_eq!(
+                    parse_sync_error_correction_level_pct(Some(level)),
+                    Ok(Some(expected_ec.as_deref().unwrap().parse().unwrap())),
+                    "{name}: the CLI reads the level as the percentage the Plan set"
+                );
+            }
+        }
+    }
+
+    /// Without the equals sign clap takes the flag's default level and hands
+    /// the number to the next free positional, which is why the Plan writes
+    /// `--error-correction=15` as one word.
+    #[test]
+    fn error_correction_needs_the_equals_sign() {
+        on_big_stack(error_correction_spaced);
+    }
+
+    fn error_correction_spaced() {
+        let spaced = Cli::try_parse_from([
+            "aeroftp-cli",
+            "--profile",
+            "S",
+            "sync",
+            "/l",
+            "/r",
+            "--error-correction",
+            "15",
+        ])
+        .unwrap();
+        let Commands::Sync {
+            remote,
+            error_correction,
+            ..
+        } = &spaced.command
+        else {
+            panic!("not a sync command");
+        };
+        assert_eq!(error_correction.as_deref(), Some("medium"));
+        assert_eq!(remote, "15");
     }
 }

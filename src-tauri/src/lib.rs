@@ -60,6 +60,8 @@ mod archive_browse;
 #[cfg(target_os = "linux")]
 mod localhost_security;
 mod openai_responses;
+#[cfg(target_os = "linux")]
+mod ui_server;
 
 /// Registered Tauri (GUI) command names, generated at build time from the
 /// `tauri::generate_handler!` block in this file. Consumed by `aeroftp-cli
@@ -204,6 +206,7 @@ mod health_check;
 mod host_key_check;
 mod infinicloud;
 pub mod keystore_export;
+pub mod keystore_profile_plan;
 mod local_panel_watcher;
 mod master_password;
 pub mod mc_import;
@@ -226,6 +229,9 @@ mod provider_commands;
 // PD-CLI-CONV-A). Additive visibility only: no behaviour change, no API
 // break (visibility only widens).
 pub mod copy_fallback;
+/// Class-level pin: every consumer of a provider time uses the single parser.
+#[cfg(test)]
+mod mtime_parse_audit;
 pub mod progress_governor;
 pub mod provider_transfer_executor;
 pub mod providers;
@@ -237,11 +243,13 @@ pub mod restic_import;
 pub mod restricted_chars;
 mod session_commands;
 mod session_manager;
+pub mod shell_quote;
 #[cfg(all(not(target_os = "macos"), feature = "local-stt"))]
 mod speech;
 pub mod ssh_config_import;
 mod ssh_shell;
 pub mod sync;
+pub mod sync_backup;
 mod sync_badge;
 /// Class-level pin against `#[tauri::command]`s that block the main thread.
 /// Tests only; see the module docs for why it reads the sources instead of
@@ -1372,9 +1380,15 @@ async fn rclone_crypt_provider_create_remote(
     suffix: Option<String>,
     directory_name_encryption: Option<bool>,
     target_subpath: Option<String>,
+    password_form: Option<String>,
+    salt_form: Option<String>,
 ) -> Result<rclone_crypt::RcloneCryptVaultInfo, String> {
-    let (name_key, data_key, name_tweak) =
-        rclone_crypt::derive_keys_with_tweak(&password, salt.as_deref().unwrap_or(""))?;
+    let (name_key, data_key, name_tweak) = rclone_crypt::derive_keys_with_forms(
+        &password,
+        rclone_crypt::CryptSecretForm::parse(password_form.as_deref()),
+        salt.as_deref().unwrap_or(""),
+        rclone_crypt::CryptSecretForm::parse(salt_form.as_deref()),
+    )?;
     let mode = match filename_encryption.as_deref() {
         Some("off") => rclone_crypt::FilenameEncryption::Off,
         Some("obfuscate") => rclone_crypt::FilenameEncryption::Obfuscate,
@@ -4291,16 +4305,26 @@ async fn upload_files_batch(
 /// Preserve remote file modification time on a downloaded local file.
 /// Parses the timestamp shapes providers report (see [`parse_remote_mtime`])
 /// and sets the file's mtime via `filetime`.
-/// Best-effort: silently ignores failures (e.g. permission denied, unparseable timestamp).
+/// Best-effort: a failure to set it (permission denied) is ignored. A date that
+/// is not an instant (an FTP `LIST` date is server-local, with no zone) is not
+/// written, and the debug log says so.
 pub fn preserve_remote_mtime(local_path: &str, remote_modified: Option<&str>) {
-    let Some(secs) = remote_modified.and_then(parse_remote_mtime) else {
+    let Some(text) = remote_modified else {
+        return;
+    };
+    let Some(secs) = parse_remote_mtime(text) else {
+        log::debug!("[mtime] {local_path}: '{text}' is not an instant with a known zone, mtime left as written");
         return;
     };
     let ft = filetime::FileTime::from_unix_time(secs, 0);
     let _ = filetime::set_file_mtime(local_path, ft);
 }
 
-/// Unix seconds of a provider-reported modification time: naive
+/// Unix seconds of a provider-reported modification time. Only an instant with
+/// seconds reads: an FTP `LIST` date (`2026-09-24 19:41`, `2025-09-24`, see
+/// `ftp_listing::list_date_text`) is server-local with no zone and is refused
+/// on purpose, so it never reaches a comparison or a downloaded file's mtime.
+/// The shapes read: naive
 /// `YYYY-MM-DD HH:MM:SS` / ISO 8601 (read as UTC, optional trailing `Z` added
 /// in v2.9.6), RFC 3339 with an offset, and RFC 2822 (`Thu, 24 Sep 2026
 /// 19:41:46 GMT`), which is what WebDAV `getlastmodified` carries. Without the
@@ -4316,10 +4340,18 @@ pub fn parse_remote_mtime(modified_str: &str) -> Option<i64> {
     chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%dT%H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%d %H:%M:%S%.f"))
         .map(|ndt| ndt.and_utc().timestamp())
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(trimmed).map(|dt| dt.timestamp()))
         .or_else(|_| chrono::DateTime::parse_from_rfc2822(trimmed).map(|dt| dt.timestamp()))
         .ok()
+}
+
+/// [`parse_remote_mtime`] as a UTC `DateTime`, for the comparisons that hold
+/// one. Every consumer of a provider-reported time reads it through these two
+/// functions; `mtime_parse_audit` fails if another parser appears.
+pub fn parse_remote_datetime(modified_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(parse_remote_mtime(modified_str)?, 0)
 }
 
 #[cfg(test)]
@@ -4340,6 +4372,9 @@ mod parse_remote_mtime_tests {
             "Thu, 24 Sep 2026 19:41:46 GMT",
             "Thu, 24 Sep 2026 21:41:46 +0200",
             "2026-09-24 19:41:46UTC",
+            "2026-09-24 19:41:46.250Z",
+            "2026-09-24 21:41:46+02:00",
+            "2026-09-24T19:41:46.123456",
         ] {
             assert_eq!(parse_remote_mtime(s), Some(EXPECTED), "{s}");
         }
@@ -4446,20 +4481,6 @@ struct FtpDownloadScanResult {
     cancelled: bool,
 }
 
-pub(crate) fn parse_remote_modified_datetime(
-    remote_modified: Option<&str>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let modified_str = remote_modified?;
-    let clean_str = modified_str.strip_suffix('Z').unwrap_or(modified_str);
-
-    chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%d %H:%M:%S")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%dT%H:%M:%S"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(clean_str, "%Y-%m-%dT%H:%M:%S%.f"))
-        .or_else(|_| chrono::DateTime::parse_from_rfc3339(modified_str).map(|dt| dt.naive_utc()))
-        .ok()
-        .map(|ndt| ndt.and_utc())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn scan_ftp_download_entries(
     app: &AppHandle,
@@ -4552,7 +4573,7 @@ async fn scan_ftp_download_entries(
             }
 
             result.total_files_discovered += 1;
-            let modified_dt = parse_remote_modified_datetime(file.modified.as_deref());
+            let modified_dt = file.modified.as_deref().and_then(parse_remote_datetime);
 
             if let Some(parent) = local_file_path.parent() {
                 if parent.exists() {
@@ -5104,7 +5125,7 @@ async fn prepare_ftp_upload_entries(
                             let remote_file_path =
                                 format!("{}/{}", remote_dir.trim_end_matches('/'), entry.name);
                             let modified_dt =
-                                parse_remote_modified_datetime(entry.modified.as_deref());
+                                entry.modified.as_deref().and_then(parse_remote_datetime);
                             remote_index
                                 .insert(remote_file_path, (entry.size.unwrap_or(0), modified_dt));
                         }
@@ -8079,13 +8100,19 @@ pub(crate) fn is_safe_archive_entry(entry_name: &str) -> bool {
     true
 }
 
-/// Copy exactly the entry's declared uncompressed size into `writer`. Reject
-/// both premature EOF and streams that expand past the declared size, so an
-/// incomplete decode cannot commit a truncated replacement. Mirrors the
-/// single-entry browse path (archive_browse.rs, CLAUDE-AV-015) so the
-/// whole-archive extractors get the same defense the preview path already had.
-/// (CLAUDE-AV-B1-04)
-fn copy_entry_bounded<R: std::io::Read + ?Sized, W: std::io::Write>(
+/// Copy an archive entry into `writer`, holding the stream to the entry's
+/// declared uncompressed size in both directions. A stream that expands past what
+/// its header claims is a decompression bomb (or a corrupt archive) and is
+/// rejected (CLAUDE-AV-015, CLAUDE-AV-B1-04). A stream that ends before it is
+/// rejected too: sevenz-rust2 verifies an entry's CRC only once the full declared
+/// size has been read, and a tar entry cut short by a truncated archive simply
+/// reaches end of file, so a truncated or corrupt archive, or a 7z opened with a
+/// wrong password whose decrypted stream happens to decode to an early end,
+/// otherwise extracted a short or empty file and reported success. The message
+/// names no password: a caller that holds one words the error for it (7z maps it
+/// to "Wrong password"). Shared by every extractor that knows an entry's size,
+/// whole-archive and single-entry alike.
+pub(crate) fn copy_entry_bounded<R: std::io::Read + ?Sized, W: std::io::Write>(
     reader: &mut R,
     writer: &mut W,
     declared: u64,
@@ -8100,8 +8127,11 @@ fn copy_entry_bounded<R: std::io::Read + ?Sized, W: std::io::Write>(
     }
     if written < declared {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "archive entry ended before its declared size",
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive entry ended before its declared size ({written} of {declared} bytes): \
+                 the archive is truncated or corrupt"
+            ),
         ));
     }
     Ok(written)
@@ -8114,6 +8144,11 @@ fn copy_entry_bounded<R: std::io::Read + ?Sized, W: std::io::Write>(
 /// path then left a partial file behind or, worse, truncated a file the user
 /// already had at that path. With this, a failed entry leaves the destination
 /// exactly as it was.
+///
+/// Its own errors (creating, finishing or renaming the temporary file) are
+/// marked with `destination_error`; errors from `fill` pass through as they are,
+/// so a caller that must tell a write error from a read error wraps its writer
+/// in `DestinationWriter`.
 fn write_entry_atomically<F>(out_path: &std::path::Path, fill: F) -> std::io::Result<u64>
 where
     F: FnOnce(&mut std::fs::File) -> std::io::Result<u64>,
@@ -8134,17 +8169,21 @@ where
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&tmp_path)?;
+        .open(&tmp_path)
+        .map_err(destination_error)?;
     let outcome = fill(&mut file).and_then(|written| {
         drop(file);
         // Replacing an existing regular file keeps its permissions, as the
         // in-place truncation this replaces did (an executable stays one).
         if let Ok(existing) = std::fs::symlink_metadata(out_path) {
             if existing.is_file() {
-                std::fs::set_permissions(&tmp_path, existing.permissions())?;
+                std::fs::set_permissions(&tmp_path, existing.permissions())
+                    .map_err(destination_error)?;
             }
         }
-        std::fs::rename(&tmp_path, out_path).map(|()| written)
+        std::fs::rename(&tmp_path, out_path)
+            .map(|()| written)
+            .map_err(destination_error)
     });
     if outcome.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
@@ -8152,16 +8191,119 @@ where
     outcome
 }
 
+/// An I/O error on the extraction destination (creating, writing or renaming
+/// the output), told apart from an error reading the archive. It reads as the
+/// error it wraps.
+#[derive(Debug)]
+struct DestinationError(std::io::Error);
+
+impl std::fmt::Display for DestinationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for DestinationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Marks `e` as a destination error (see `DestinationError`), keeping its kind.
+fn destination_error(e: std::io::Error) -> std::io::Error {
+    if is_destination_error(&e) {
+        return e;
+    }
+    std::io::Error::new(e.kind(), DestinationError(e))
+}
+
+fn is_destination_error(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<DestinationError>())
+}
+
+/// A writer whose errors are marked with `destination_error`, so that an entry
+/// copy that fails can say whether writing the output or reading the archive
+/// failed.
+struct DestinationWriter<W>(W);
+
+impl<W: std::io::Write> std::io::Write for DestinationWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf).map_err(destination_error)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(destination_error)
+    }
+}
+
+/// The error a 7z extractor hands back to sevenz-rust2 from inside
+/// `for_each_entries`. With a password set, sevenz-rust2 reports every I/O
+/// error without context as `MaybeBadPassword`. That is right for an error
+/// reading the entry (see `describe_7z_error`), so such an error goes back
+/// as it is. It is wrong for the destination: a full disk or a read-only
+/// folder read as "Wrong password", and the GUI asked for the password again.
+/// A destination error therefore goes back with a context, which sevenz-rust2
+/// leaves alone. The context names no path: the GUI takes any error that
+/// mentions "password" for a wrong password, and a file or folder name can.
+fn sevenz_entry_error(e: std::io::Error) -> sevenz_rust2::Error {
+    if is_destination_error(&e) {
+        sevenz_rust2::Error::Io(e, "Cannot write to the destination".into())
+    } else {
+        e.into()
+    }
+}
+
+/// Copies a 7z entry's stream into `writer`, held to `declared` (see
+/// `copy_entry_bounded`), failing with the error sevenz-rust2 expects back from
+/// inside `for_each_entries`: a read error as it is, a write error with a
+/// context (see `sevenz_entry_error`).
+pub(crate) fn copy_7z_entry<W: std::io::Write>(
+    stream: &mut dyn std::io::Read,
+    writer: W,
+    declared: u64,
+) -> Result<u64, sevenz_rust2::Error> {
+    copy_entry_bounded(stream, &mut DestinationWriter(writer), declared).map_err(sevenz_entry_error)
+}
+
 /// A 7z extraction error in words: the library's Debug form
 /// (`MaybeBadPassword(Custom { kind: InvalidData, .. })`) told neither the user
 /// nor AeroAgent that the password was the problem.
-fn describe_7z_error(err: &sevenz_rust2::Error) -> String {
+///
+/// sevenz-rust2 turns an I/O error returned from inside `for_each_entries` into
+/// `MaybeBadPassword` whenever a password is set, so on an encrypted archive an
+/// entry that ends before its declared size (see `copy_entry_bounded`) reads as
+/// a wrong password, which is what an early end under a password almost always
+/// is. Without a password the same error stays `Io` and is shown as its own
+/// message (truncated or corrupt), not as the Debug wrapper around it. A CRC
+/// mismatch travels as an `Io` error around sevenz-rust2's own
+/// `ChecksumVerificationFailed`, which is worded too. Destination errors carry
+/// a context (`sevenz_entry_error`) and read "Cannot write to the destination:
+/// <error>".
+pub(crate) fn describe_7z_error(err: &sevenz_rust2::Error) -> String {
     match err {
         sevenz_rust2::Error::PasswordRequired => {
             "This 7z archive is encrypted: a password is required to extract it".to_string()
         }
         sevenz_rust2::Error::MaybeBadPassword(_) => {
             "Wrong password for this 7z archive (or the archive is damaged)".to_string()
+        }
+        sevenz_rust2::Error::ChecksumVerificationFailed => {
+            "archive entry failed its CRC check: the archive is corrupt".to_string()
+        }
+        sevenz_rust2::Error::Io(e, context) => {
+            let message = match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<sevenz_rust2::Error>())
+            {
+                Some(inner) => describe_7z_error(inner),
+                None => e.to_string(),
+            };
+            if context.is_empty() {
+                message
+            } else {
+                format!("{context}: {message}")
+            }
         }
         other => other.to_string(),
     }
@@ -8228,24 +8370,38 @@ async fn extract_7z(
         .for_each_entries(|entry, reader| {
             let name = entry.name();
 
-            // Skip entries with unsafe paths (traversal, absolute, drive letters)
+            // Skip entries with unsafe paths (traversal, absolute, drive letters).
+            // Read through the entry all the same: in a solid block every entry
+            // continues one decoded stream, and sevenz-rust2 does not skip the
+            // bytes a caller leaves unread, so the next entry would start inside
+            // this one and fail its CRC check.
             if !is_safe_archive_entry(name) {
+                std::io::copy(reader, &mut std::io::sink())?;
                 return Ok(true); // skip this entry, continue to next
             }
 
             let out_path = dest.join(name);
 
             if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(|e| sevenz_entry_error(destination_error(e)))?;
             }
 
             if entry.is_directory() {
-                fs::create_dir_all(&out_path)?;
+                fs::create_dir_all(&out_path)
+                    .map_err(|e| sevenz_entry_error(destination_error(e)))?;
             } else {
+                // A wrong password usually fails inside the decoder, but when its
+                // noise decodes to an early end the entry is just short, with no
+                // checksum error (sevenz-rust2 checks the CRC only after the full
+                // declared size). The size check fails it, and the error goes
+                // back to sevenz-rust2 as it is, which reports it as
+                // MaybeBadPassword when a password is set. Destination errors go
+                // back with a context instead (`sevenz_entry_error`).
                 let declared = entry.size();
                 write_entry_atomically(&out_path, |outfile| {
-                    copy_entry_bounded(reader, outfile, declared)
-                })?;
+                    copy_entry_bounded(reader, &mut DestinationWriter(outfile), declared)
+                })
+                .map_err(sevenz_entry_error)?;
             }
 
             Ok(true) // continue
@@ -9123,7 +9279,8 @@ fn single_stream_member_name(archive_name: &str, codec: &str) -> String {
 }
 
 /// Decode a standalone single-stream codec file (gz/xz/bz2 with no tar wrapper)
-/// back to its lone member. `kind` forces the codec ("gz" | "xz" | "bz2"); when
+/// back to the one file it compresses, all of its members included (see
+/// `whole_file_decoder`). `kind` forces the codec ("gz" | "xz" | "bz2"); when
 /// None it is sniffed from the extension, so the CLI's `--archive-format` stays
 /// authoritative on extract exactly like the tar lane. `create_subfolder` nests
 /// the output under a per-archive stem folder (matching the other extractors).
@@ -9184,12 +9341,8 @@ async fn extract_single_impl(
         .saturating_mul(SINGLE_STREAM_MAX_RATIO)
         .max(SINGLE_STREAM_ABS_FLOOR);
     let infile = File::open(&archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
-    let mut reader: Box<dyn std::io::Read> = match codec.as_str() {
-        "gz" => Box::new(flate2::read::GzDecoder::new(infile)),
-        "xz" => Box::new(xz2::read::XzDecoder::new(infile)),
-        "bz2" => Box::new(bzip2::read::BzDecoder::new(infile)),
-        other => return Err(format!("Unrecognized single-stream format: {}", other)),
-    };
+    let mut reader = whole_file_decoder(&codec, infile)
+        .ok_or_else(|| format!("Unrecognized single-stream format: {}", codec))?;
     let over_cap =
         std::io::Error::other("Decompressed stream exceeds the size limit (compression bomb?)");
     write_entry_atomically(&out_path, |outfile| {
@@ -9206,7 +9359,7 @@ async fn extract_single_impl(
 }
 
 /// Extract a standalone single-stream codec file (gz/xz/bz2, no tar wrapper) back
-/// to its lone member. Codec sniffed from the extension; never encrypted.
+/// to the file it compresses. Codec sniffed from the extension; never encrypted.
 #[tauri::command]
 async fn extract_single(
     archive_path: String,
@@ -9243,13 +9396,146 @@ fn tar_reader_for(
             }
         }
     };
-    Ok(match pick.as_str() {
-        "tar.gz" => Box::new(flate2::read::GzDecoder::new(file)),
-        "tar.xz" => Box::new(xz2::read::XzDecoder::new(file)),
-        "tar.bz2" => Box::new(bzip2::read::BzDecoder::new(file)),
-        "tar" => Box::new(file),
+    let codec = match pick.as_str() {
+        "tar" => return Ok(Box::new(file)),
+        "tar.gz" => "gz",
+        "tar.xz" => "xz",
+        "tar.bz2" => "bz2",
         other => return Err(format!("Unrecognized archive format: {}", other)),
+    };
+    whole_file_decoder(codec, file).ok_or_else(|| format!("Unrecognized archive format: {}", pick))
+}
+
+/// A decoder for a whole gz, xz or bz2 file (`codec` "gz" | "xz" | "bz2"), or
+/// None for any other codec.
+///
+/// Each of these formats defines a file as one or more members (streams) back
+/// to back, and gzip, xz and bzip2 decompress all of them: `cat a.gz b.gz`,
+/// bgzip and pbzip2 write such files. `GzDecoder` and `BzDecoder` stop after
+/// the first member and `XzDecoder::new` decodes a single stream, so a
+/// multi-member file extracted cut to its first member with no error (gz, bz2)
+/// or failed on the second (xz). Every caller here reads a whole file, so none
+/// needs single-member semantics.
+///
+/// gz and bz2 go through `ConcatenatedMembers` rather than flate2's
+/// `MultiGzDecoder` and bzip2's `MultiBzDecoder`, which fail on bytes after
+/// the last member that gzip and bzip2 ignore. xz uses liblzma's concatenated
+/// mode, which, like xz, accepts stream padding and refuses other bytes.
+pub(crate) fn whole_file_decoder<R: std::io::Read + 'static>(
+    codec: &str,
+    input: R,
+) -> Option<Box<dyn std::io::Read>> {
+    Some(match codec {
+        "gz" => Box::new(ConcatenatedMembers::new(
+            Box::new(input),
+            2,
+            |head| head == [0x1f, 0x8b],
+            |source| MemberDecoder::Gz(Box::new(flate2::bufread::GzDecoder::new(source))),
+        )),
+        "xz" => Box::new(xz2::read::XzDecoder::new_multi_decoder(input)),
+        "bz2" => Box::new(ConcatenatedMembers::new(
+            Box::new(input),
+            4,
+            |head| head[..3] == *b"BZh" && (b'1'..=b'9').contains(&head[3]),
+            |source| MemberDecoder::Bz2(bzip2::bufread::BzDecoder::new(source)),
+        )),
+        _ => return None,
     })
+}
+
+/// What one member of a gzip or bzip2 file is decoded from: the bytes read
+/// ahead to recognise its start, then the rest of the file.
+type MemberSource =
+    std::io::Chain<std::io::Cursor<Vec<u8>>, std::io::BufReader<Box<dyn std::io::Read>>>;
+
+/// A decoder for one gzip member or one bzip2 stream. The gzip decoder is
+/// boxed: it is three times the size of the bzip2 one.
+enum MemberDecoder {
+    Gz(Box<flate2::bufread::GzDecoder<MemberSource>>),
+    Bz2(bzip2::bufread::BzDecoder<MemberSource>),
+}
+
+impl MemberDecoder {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Read;
+        match self {
+            Self::Gz(decoder) => decoder.read(buf),
+            Self::Bz2(decoder) => decoder.read(buf),
+        }
+    }
+
+    fn into_source(self) -> MemberSource {
+        match self {
+            Self::Gz(decoder) => (*decoder).into_inner(),
+            Self::Bz2(decoder) => decoder.into_inner(),
+        }
+    }
+}
+
+/// Every member of a gzip or bzip2 file, read the way gzip and bzip2 read
+/// them: another member follows a complete one only when the next bytes start
+/// one, and any other bytes there (tape padding, junk appended to a download)
+/// are trailing data the tools ignore, gzip silently for zeros and with a
+/// warning otherwise, bzip2 with a warning.
+struct ConcatenatedMembers {
+    /// How many bytes `starts_member` looks at.
+    head_len: usize,
+    starts_member: fn(&[u8]) -> bool,
+    open: fn(MemberSource) -> MemberDecoder,
+    /// None once the last member has ended.
+    current: Option<MemberDecoder>,
+}
+
+impl ConcatenatedMembers {
+    fn new(
+        input: Box<dyn std::io::Read>,
+        head_len: usize,
+        starts_member: fn(&[u8]) -> bool,
+        open: fn(MemberSource) -> MemberDecoder,
+    ) -> Self {
+        use std::io::Read;
+        // The first member is not checked here: its decoder refuses a file
+        // that does not start with one.
+        let source = std::io::Cursor::new(Vec::new()).chain(std::io::BufReader::new(input));
+        Self {
+            head_len,
+            starts_member,
+            open,
+            current: Some(open(source)),
+        }
+    }
+}
+
+impl std::io::Read for ConcatenatedMembers {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while let Some(decoder) = self.current.as_mut() {
+            let n = decoder.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            // The member ended (its decoder checked its trailer). Its source
+            // still holds the rest of the file; the read-ahead cursor was
+            // consumed with the member's own first bytes.
+            let Some(ended) = self.current.take() else {
+                break;
+            };
+            let (_, mut rest) = ended.into_source().into_inner();
+            let mut head = vec![0u8; self.head_len];
+            let mut got = 0;
+            while got < head.len() {
+                match rest.read(&mut head[got..]) {
+                    Ok(0) => break,
+                    Ok(k) => got += k,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if got == head.len() && (self.starts_member)(&head) {
+                self.current = Some((self.open)(std::io::Cursor::new(head).chain(rest)));
+            }
+        }
+        Ok(0)
+    }
 }
 
 /// Resolve the destination directory for a tar extraction, creating a per-archive
@@ -9399,7 +9685,13 @@ fn tar_unpack(
                 })?;
             }
 
-            let declared = entry.header().size().unwrap_or(0);
+            // `Entry::size` is the byte count the tar crate streams for this entry,
+            // a PAX `size` record and a GNU sparse real size included.
+            // `header().size()` ignores a PAX size, so an entry sized there (past
+            // the 8 GiB ustar field, or a header crafted to disagree) was held to
+            // the wrong bound. There is no unknown size to default: the tar crate
+            // refuses an entry whose size field does not parse.
+            let declared = entry.size();
             write_entry_atomically(&out_path, |outfile| {
                 copy_entry_bounded(&mut entry, outfile, declared)
             })
@@ -9472,10 +9764,41 @@ async fn extract_rar(
         unrar::Archive::new(&archive_path)
     };
 
-    let mut archive = archive
+    let archive = archive
         .open_for_processing()
         .map_err(|e| format!("Failed to open RAR archive: {}", e))?;
 
+    // UnRAR opens an entry's output with overwrite-all and deletes it when the
+    // entry fails (a CRC error, which is also what a wrong password gives on a
+    // RAR 4 archive), so extracting straight into place destroyed a file the
+    // user already had at that path. Entries go into a staging folder inside
+    // the destination instead, and what UnRAR extracted there is moved into
+    // place when the loop ends, whether it failed or not: a failed entry leaves
+    // the existing file untouched, as write_entry_atomically does for the other
+    // formats. Moving what is in the folder, rather than the entry names,
+    // keeps the names UnRAR writes (it corrects a name the platform does not
+    // allow). Moving at the end rather than entry by entry keeps an earlier
+    // entry where UnRAR looks for it when a later one is a RAR 5 file
+    // reference or hard link to it (its extraction folder, on Windows and
+    // macOS).
+    let staging = tempfile::Builder::new()
+        .prefix(".aeroftp-extract-")
+        .tempdir_in(&final_output)
+        .map_err(|e| format!("Failed to create a staging folder: {}", e))?;
+    let extracted = extract_rar_entries(archive, staging.path());
+    let moved = move_staged_tree(staging.path(), &final_output);
+    extracted?;
+    moved?;
+
+    Ok(final_output.to_string_lossy().to_string())
+}
+
+/// The entry loop of `extract_rar`: extracts every safe, non-link file entry
+/// under `base`.
+fn extract_rar_entries(
+    mut archive: unrar::OpenArchive<unrar::Process, unrar::CursorBeforeHeader>,
+    base: &std::path::Path,
+) -> Result<(), String> {
     while let Some(header) = archive
         .read_header()
         .map_err(|e| format!("Failed to read RAR header: {}", e))?
@@ -9507,7 +9830,7 @@ async fn extract_rar(
 
         archive = if header.entry().is_file() {
             header
-                .extract_with_base(&final_output)
+                .extract_with_base(base)
                 .map_err(|e| format!("Failed to extract RAR entry: {}", e))?
         } else {
             header
@@ -9515,8 +9838,40 @@ async fn extract_rar(
                 .map_err(|e| format!("Failed to skip RAR entry: {}", e))?
         };
     }
+    Ok(())
+}
 
-    Ok(final_output.to_string_lossy().to_string())
+/// Moves everything under `staging` to the same relative path under `dest`,
+/// replacing a file already there. Folders are recreated, not moved, so they
+/// merge with folders the destination already has. Links are moved as links.
+fn move_staged_tree(staging: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    // Listed first, moved after: the tree changes as it is emptied.
+    let staged: Vec<walkdir::DirEntry> = walkdir::WalkDir::new(staging)
+        .min_depth(1)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("Failed to read the staging folder: {}", e))?;
+    for entry in staged {
+        let relative = entry
+            .path()
+            .strip_prefix(staging)
+            .map_err(|e| format!("Failed to place an extracted entry: {}", e))?;
+        let to = dest.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&to)
+                .map_err(|e| format!("Failed to create directory '{}': {}", to.display(), e))?;
+        } else {
+            std::fs::rename(entry.path(), &to).map_err(|e| {
+                format!(
+                    "Failed to move extracted '{}' into place: {}",
+                    relative.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Check if a RAR archive is password protected
@@ -11390,6 +11745,9 @@ async fn compare_directories(
 ) -> Result<CompareReport, String> {
     let mut options = options.unwrap_or_default();
     sync::apply_error_correction_excludes(&mut options);
+    // A backup folder the archive would refuse must not quietly be compared.
+    options.parsed_backup_dir().map_err(|e| e.to_string())?;
+    options.modify_window = crate::sync_core::mtime::ModifyWindow::LEGACY_FTP;
 
     validate_path(&local_path)?;
     if remote_path.contains('\0') {
@@ -11545,6 +11903,14 @@ async fn compare_local_directories(
 ) -> Result<CompareReport, String> {
     let mut options = options.unwrap_or_default();
     sync::apply_error_correction_excludes(&mut options);
+    // A backup folder the archive would refuse must not quietly be compared.
+    options.parsed_backup_dir().map_err(|e| e.to_string())?;
+    options.modify_window = crate::sync_core::mtime::ModifyWindow::resolve(
+        None,
+        crate::sync_core::mtime::LOCAL_MTIME_PRECISION,
+        crate::sync_core::mtime::LOCAL_MTIME_PRECISION,
+        crate::sync_core::mtime::SizeOnlyReason::NoComparableTime,
+    );
 
     validate_path(&left_path)?;
     validate_path(&right_path)?;
@@ -12276,20 +12642,7 @@ async fn get_remote_files_recursive_with_progress(
                 name: entry.name.clone(),
                 path: format!("{}/{}", current_dir, entry.name),
                 size: entry.size.unwrap_or(0),
-                modified: entry.modified.and_then(|s| {
-                    let clean = s.strip_suffix('Z').unwrap_or(&s);
-                    chrono::NaiveDateTime::parse_from_str(clean, "%Y-%m-%d %H:%M")
-                        .or_else(|_| {
-                            chrono::NaiveDateTime::parse_from_str(clean, "%Y-%m-%d %H:%M:%S")
-                        })
-                        .ok()
-                        .map(|dt| {
-                            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                                dt,
-                                chrono::Utc,
-                            )
-                        })
-                }),
+                modified: entry.modified.as_deref().and_then(parse_remote_datetime),
                 is_dir: entry.is_dir,
                 checksum_alg: None,
                 checksum: None,
@@ -12866,99 +13219,6 @@ async fn get_transfer_optimization_hints(
     let hints = with_documented_file_limits(hints, &requested, active_protocol.as_deref());
 
     Ok(hints)
-}
-
-#[tauri::command]
-async fn get_transfer_capabilities(
-    state: State<'_, provider_commands::ProviderState>,
-    provider_type: Option<String>,
-) -> Result<transfer_dag::TransferCapabilities, String> {
-    let requested = provider_type.unwrap_or_default().to_lowercase();
-    let active_protocol = {
-        let provider_lock = state.provider.lock().await;
-        provider_lock
-            .as_ref()
-            .map(|provider| format!("{:?}", provider.provider_type()).to_lowercase())
-    };
-
-    if let Some(active) = active_protocol.as_deref() {
-        if requested.is_empty() || requested == active {
-            let provider_lock = state.provider.lock().await;
-            return Ok(provider_lock
-                .as_ref()
-                .map(|provider| provider.transfer_capabilities())
-                .unwrap_or_else(|| {
-                    transfer_dag::TransferCapabilities::from_provider_hints(
-                        provider_type_from_string(active).unwrap_or(providers::ProviderType::Ftp),
-                        &default_transfer_optimization_hints(active),
-                        false,
-                    )
-                }));
-        }
-    }
-
-    let provider_type = provider_type_from_string(&requested).ok_or_else(|| {
-        if requested.is_empty() {
-            "No active provider is connected".to_string()
-        } else {
-            format!("Unknown provider type: {}", requested)
-        }
-    })?;
-
-    Ok(transfer_dag::TransferCapabilities::from_provider_hints(
-        provider_type,
-        &default_transfer_optimization_hints(&requested),
-        false,
-    ))
-}
-
-fn provider_type_from_string(value: &str) -> Option<providers::ProviderType> {
-    match value {
-        "ftp" => Some(providers::ProviderType::Ftp),
-        "ftps" => Some(providers::ProviderType::Ftps),
-        "sftp" => Some(providers::ProviderType::Sftp),
-        "webdav" | "web_dav" => Some(providers::ProviderType::WebDav),
-        "s3" => Some(providers::ProviderType::S3),
-        "aerocloud" | "aero_cloud" => Some(providers::ProviderType::AeroCloud),
-        "googledrive" | "google_drive" | "google drive" => {
-            Some(providers::ProviderType::GoogleDrive)
-        }
-        "dropbox" => Some(providers::ProviderType::Dropbox),
-        "onedrive" | "one_drive" | "one drive" => Some(providers::ProviderType::OneDrive),
-        "mega" => Some(providers::ProviderType::Mega),
-        "proton" | "protondrive" => Some(providers::ProviderType::Proton),
-        "box" => Some(providers::ProviderType::Box),
-        "pcloud" | "p_cloud" => Some(providers::ProviderType::PCloud),
-        "azure" => Some(providers::ProviderType::Azure),
-        "filen" => Some(providers::ProviderType::Filen),
-        "fourshared" | "four_shared" | "4shared" => Some(providers::ProviderType::FourShared),
-        "zohoworkdrive" | "zoho_workdrive" | "zoho workdrive" => {
-            Some(providers::ProviderType::ZohoWorkdrive)
-        }
-        "internxt" => Some(providers::ProviderType::Internxt),
-        "kdrive" | "k_drive" => Some(providers::ProviderType::KDrive),
-        "jottacloud" => Some(providers::ProviderType::Jottacloud),
-        "drimecloud" | "drime_cloud" => Some(providers::ProviderType::DrimeCloud),
-        "filelu" | "file_lu" => Some(providers::ProviderType::FileLu),
-        "koofr" => Some(providers::ProviderType::Koofr),
-        "opendrive" | "open_drive" => Some(providers::ProviderType::OpenDrive),
-        "yandexdisk" | "yandex_disk" | "yandex disk" => Some(providers::ProviderType::YandexDisk),
-        "github" => Some(providers::ProviderType::GitHub),
-        "gitlab" => Some(providers::ProviderType::GitLab),
-        "swift" => Some(providers::ProviderType::Swift),
-        "googlephotos" | "google_photos" | "google photos" => {
-            Some(providers::ProviderType::GooglePhotos)
-        }
-        "immich" => Some(providers::ProviderType::Immich),
-        "twake" | "twakedrive" => Some(providers::ProviderType::Twake),
-        "imagekit" | "image_kit" => Some(providers::ProviderType::ImageKit),
-        "uploadcare" => Some(providers::ProviderType::Uploadcare),
-        "backblaze" | "b2" | "backblazeb2" | "backblaze_b2" => {
-            Some(providers::ProviderType::Backblaze)
-        }
-        "cloudinary" => Some(providers::ProviderType::Cloudinary),
-        _ => None,
-    }
 }
 
 #[tauri::command]
@@ -13891,7 +14151,11 @@ async fn sync_canary_run(
             if let Some(cached) = idx.files.get(rel_path) {
                 // File exists in index: check if it changed locally
                 let local_changed = info.size != cached.size
-                    || !sync::timestamps_equal(info.modified, cached.modified);
+                    || !sync::timestamps_equal(
+                        info.modified,
+                        cached.modified,
+                        crate::sync_core::mtime::ModifyWindow::default(),
+                    );
                 if local_changed {
                     "upload" // Changed since last sync
                 } else {
@@ -14543,11 +14807,7 @@ fn verify_local_transfer_blocking(
     expected_hash: Option<String>,
     policy: VerifyPolicy,
 ) -> VerifyResult {
-    let mtime = expected_mtime.and_then(|s| {
-        chrono::DateTime::parse_from_rfc3339(&s)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-    });
+    let mtime = expected_mtime.as_deref().and_then(parse_remote_datetime);
     verify_local_file(
         &local_path,
         expected_size,
@@ -15210,39 +15470,117 @@ fn versions_disk_usage_blocking() -> u64 {
     v.disk_usage()
 }
 
-/// Archive a local file before deleting it during sync (backup-before-delete safety net).
-/// Uses TrashCan strategy with 30-day retention, archiving to <sync_root>/.aeroversions/.
-#[tauri::command]
-async fn archive_before_sync_delete(
-    sync_root: String,
-    file_path: String,
-    versioning_strategy: Option<String>,
-) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        archive_before_sync_delete_blocking(sync_root, file_path, versioning_strategy)
-    })
-    .await
-    .unwrap_or_else(|err| Err(format!("archive_before_sync_delete task failed: {err}")))
+/// What the Plan tab learns about a backup folder before a run.
+#[derive(serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SyncBackupDirCheck {
+    /// The folder as it will be created, and the folders it sits in: the Plan
+    /// refuses a backup folder inside a folder the sync writes.
+    Valid {
+        dir: String,
+        ancestors: Vec<String>,
+    },
+    Invalid {
+        code: String,
+        message: String,
+    },
 }
 
-/// The body of `archive_before_sync_delete`, kept synchronous and run on the blocking pool.
-fn archive_before_sync_delete_blocking(
-    sync_root: String,
-    file_path: String,
-    versioning_strategy: Option<String>,
+/// Validate a versioned-backup folder with the rules the CLI applies too.
+#[tauri::command]
+async fn sync_backup_validate(dir: String) -> Result<SyncBackupDirCheck, String> {
+    Ok(match sync_backup::BackupDir::parse(&dir) {
+        Ok(parsed) => SyncBackupDirCheck::Valid {
+            ancestors: parsed.ancestors().into_iter().map(String::from).collect(),
+            dir: parsed.as_str().to_string(),
+        },
+        Err(e) => SyncBackupDirCheck::Invalid {
+            code: e.code().to_string(),
+            message: e.to_string(),
+        },
+    })
+}
+
+/// The stamp one run archives under (UTC, `YYYYMMDDTHHMMSSZ`).
+#[tauri::command]
+async fn sync_backup_run_stamp() -> Result<String, String> {
+    Ok(sync_backup::run_stamp(chrono::Utc::now()))
+}
+
+/// How the connected remote moves a file into another folder, asked before a
+/// run so the Plan can say it (or refuse) up front. `use_provider` picks the
+/// provider session; otherwise the answer is for the GUI's FTP session.
+#[tauri::command]
+async fn sync_backup_remote_move(
+    provider_state: State<'_, provider_commands::ProviderState>,
+    use_provider: bool,
 ) -> Result<String, String> {
-    // Security: validate file_path is within sync_root
-    let root = std::path::PathBuf::from(&sync_root);
-    let target = std::path::PathBuf::from(&file_path);
-    if file_path.contains("..") || !target.starts_with(&root) {
-        return Err("Invalid path: must be within sync root".to_string());
+    let support = if use_provider {
+        let lock = provider_state.provider.lock().await;
+        let provider = lock.as_ref().ok_or("Not connected to any provider")?;
+        sync_backup::remote_move_support(provider.provider_type())
+    } else {
+        sync_backup::RemoteMove::Native
+    };
+    Ok(match support {
+        sync_backup::RemoteMove::Native => "native",
+        sync_backup::RemoteMove::ServerCopyDelete => "server_copy",
+        sync_backup::RemoteMove::ClientCopyDelete => "client_copy",
+        sync_backup::RemoteMove::Unsupported(_) => "unsupported",
     }
-    let v = sync_versioning::SyncVersioning::new(
-        &root,
-        parse_versioning_strategy(versioning_strategy.as_deref()),
-    );
-    let archived = v.archive(&target)?;
-    Ok(archived.to_string_lossy().to_string())
+    .to_string())
+}
+
+/// Move `<root>/<rel>` into the backup folder on the local disk before the
+/// sync overwrites or deletes it. `None` when there was nothing to keep.
+#[tauri::command]
+async fn sync_backup_archive_local(
+    root: String,
+    dir: String,
+    stamp: String,
+    rel: String,
+) -> Result<Option<String>, String> {
+    validate_path(&root)?;
+    tokio::task::spawn_blocking(move || {
+        let dir = sync_backup::BackupDir::parse(&dir).map_err(|e| e.to_string())?;
+        sync::validate_relative_path(&rel)?;
+        sync_backup::archive_local(std::path::Path::new(&root), &dir, &stamp, &rel)
+            .map(|p| p.map(|p| p.to_string_lossy().to_string()))
+            .map_err(|e| format!("Backup of {} failed: {}", rel, e))
+    })
+    .await
+    .unwrap_or_else(|err| Err(format!("sync_backup_archive_local task failed: {err}")))
+}
+
+/// Move `<root>/<rel>` into the backup folder on the remote before the sync
+/// overwrites or deletes it. `None` when there was nothing to keep. Refuses
+/// before touching anything on a remote that cannot move across folders.
+#[tauri::command]
+async fn sync_backup_archive_remote(
+    app_state: State<'_, AppState>,
+    provider_state: State<'_, provider_commands::ProviderState>,
+    use_provider: bool,
+    root: String,
+    dir: String,
+    stamp: String,
+    rel: String,
+) -> Result<Option<String>, String> {
+    let dir = sync_backup::BackupDir::parse(&dir).map_err(|e| e.to_string())?;
+    sync::validate_relative_path(&rel)?;
+    let archived = if use_provider {
+        let source = format!("{}/{}", root.trim_end_matches('/'), rel);
+        let backup = format!("{}/{}", root.trim_end_matches('/'), dir.as_str());
+        // Same rule as every other write: no cleartext names through a raw
+        // backend while an encryption overlay should be in front of it.
+        provider_state.guard_no_raw_crypt_write_outside("Versioned backup", &[&source, &backup])?;
+        let mut lock = provider_state.provider.lock().await;
+        let provider = lock.as_mut().ok_or("Not connected to any provider")?;
+        sync_backup::archive_remote(provider.as_mut(), &root, &dir, &stamp, &rel).await
+    } else {
+        let mut ftp_manager = app_state.ftp_manager.lock().await;
+        sync_backup::archive_remote_on(&mut *ftp_manager, &root, &dir, &stamp, &rel).await
+    };
+    archived.map_err(|e| format!("Backup of {} failed: {}", rel, e))
 }
 
 /// List remote folder tree for the selective sync UI.
@@ -16541,8 +16879,10 @@ fn flatpak_config_import_status_blocking() -> serde_json::Value {
 /// B3: apply (`accept = true`) or decline (`accept = false`) the host-config
 /// import. Accept copies the native config into the sandbox with copy-only,
 /// never-overwrite semantics; either way the decision is recorded so the prompt
-/// is shown once. The vault is copied encrypted and still needs the master
-/// password to unlock.
+/// is shown once. `vault_imported` and `vault_skipped` say whether the host
+/// vault came in or stayed behind because this install already has its own;
+/// `nothing_importable` says that no file was copied because the host config
+/// holds none the import copies (see [`portable::FlatpakImportReport::to_json`]).
 #[tauri::command]
 async fn flatpak_config_import_apply(accept: bool) -> Result<serde_json::Value, String> {
     tokio::task::spawn_blocking(move || flatpak_config_import_apply_blocking(accept))
@@ -16552,12 +16892,7 @@ async fn flatpak_config_import_apply(accept: bool) -> Result<serde_json::Value, 
 
 /// The body of `flatpak_config_import_apply`, kept synchronous and run on the blocking pool.
 fn flatpak_config_import_apply_blocking(accept: bool) -> Result<serde_json::Value, String> {
-    let report = portable::flatpak_host_import_apply(accept)?;
-    Ok(serde_json::json!({
-        "imported": report.imported,
-        "source": report.source.map(|p| p.to_string_lossy().into_owned()),
-        "target": report.target.map(|p| p.to_string_lossy().into_owned()),
-    }))
+    portable::flatpak_host_import_apply(accept).map(|report| report.to_json())
 }
 
 #[tauri::command]
@@ -17614,7 +17949,15 @@ async fn import_keystore(
     import_sqlite: Option<bool>,
     import_files: Option<bool>,
     import_local_storage: Option<bool>,
+    // #347: per-profile decisions from the import preview. Absent keeps the
+    // import as it was (the first-run wizard and older callers).
+    profile_decisions: Option<Vec<keystore_profile_plan::ProfileDecisionInput>>,
+    // The `fingerprint` of the preview those decisions were made on.
+    profile_fingerprint: Option<String>,
 ) -> Result<keystore_export::KeystoreImportResult, String> {
+    if profile_decisions.is_some() && profile_fingerprint.is_none() {
+        return Err("Profile decisions need the fingerprint of their preview".to_string());
+    }
     let progress_app = app.clone();
     let progress_cb = move |phase: &str, current: u32, total: u32| {
         let _ = progress_app.emit(
@@ -17649,6 +17992,13 @@ async fn import_keystore(
             sections,
             config_dir.as_deref(),
             Some(&progress_cb),
+            profile_decisions
+                .as_deref()
+                .zip(profile_fingerprint.as_deref())
+                .map(|(decisions, fingerprint)| keystore_export::ProfileChoices {
+                    decisions,
+                    fingerprint,
+                }),
         )
         .map_err(|e| e.to_string())
     })
@@ -17670,6 +18020,30 @@ async fn import_keystore(
         );
     }
     Ok(result)
+}
+
+/// Decrypt a backup and list what importing it would change in the server
+/// profile list, per profile, without writing anything (#347).
+#[tauri::command]
+async fn preview_keystore_import(
+    app: tauri::AppHandle,
+    password: String,
+    file_path: String,
+    merge_strategy: String,
+) -> Result<keystore_profile_plan::ProfilePreview, String> {
+    let config_dir = portable::app_config_dir(&app).ok();
+    tokio::task::spawn_blocking(move || {
+        keystore_export::preview_keystore_import(
+            &password,
+            std::path::Path::new(&file_path),
+            &merge_strategy,
+            keystore_export::ImportSections::default(),
+            config_dir.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("preview_keystore_import join error: {e}"))?
 }
 
 #[tauri::command]
@@ -18180,7 +18554,8 @@ pub fn run() {
     //   - Another local account can reserve the fixed port before this app starts
     //   - Tauri IPC commands are available to the UI, so server ownership is verified
     //     before any webview loads this origin
-    //   - tauri-plugin-localhost is explicitly bound to 127.0.0.1
+    //   - `ui_server` binds 127.0.0.1 only and answers only a `Host` naming this
+    //     origin, so a DNS-rebound page cannot read it
     // This cannot be changed to HTTPS without a local TLS certificate infrastructure that
     // would add complexity with minimal security benefit for localhost-only traffic.
     //
@@ -18194,19 +18569,6 @@ pub fn run() {
     let localhost_nonce = uuid::Uuid::new_v4().to_string();
 
     let mut builder = tauri::Builder::default();
-
-    #[cfg(target_os = "linux")]
-    {
-        let response_nonce = localhost_nonce.clone();
-        builder = builder.plugin(
-            tauri_plugin_localhost::Builder::new(port)
-                .host("127.0.0.1")
-                .on_request(move |_, response| {
-                    response.add_header("X-AeroFTP-UI-Nonce", response_nonce.as_str());
-                })
-                .build(),
-        );
-    }
 
     builder = builder
         .plugin(tauri_plugin_fs::init())
@@ -18390,11 +18752,33 @@ pub fn run() {
             // frontend events without threading a handle through every call.
             crate::app_events::register_app_handle(app.handle().clone());
 
-            // The plugin binds on a background thread. A plain TCP connect
-            // would also accept another user's server that reserved the fixed
-            // port first. Verify a fresh response nonce before creating any
-            // webview, including the cold-start extract window. Our listener
-            // then keeps the unchanged origin reserved while the app runs.
+            // Serve the frontend on the fixed loopback origin. `ui_server`
+            // replaced tauri-plugin-localhost, whose tiny_http core could leave
+            // a cold-start request unread until another connection closed (a
+            // blank main window); the module doc has the measurement. A dev
+            // build does not start it: it embeds no frontend and its webviews
+            // load the Vite server (`devUrl`), so it would serve nobody, and
+            // it would hold the port an installed release needs.
+            #[cfg(target_os = "linux")]
+            if !cfg!(dev) {
+                if let Err(error) = ui_server::start(
+                    app.asset_resolver(),
+                    std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    localhost_nonce.clone(),
+                    ui_server::Limits::APP,
+                ) {
+                    // Not fatal here: the ownership check below names the
+                    // problem to the user (usually another process holding the
+                    // port).
+                    log::error!("AeroFTP UI server could not bind 127.0.0.1:{port}: {error}");
+                }
+            }
+
+            // A plain TCP connect would also accept another user's server that
+            // reserved the fixed port first. Verify a fresh response nonce
+            // before creating any webview, including the cold-start extract
+            // window. Our listener then keeps the unchanged origin reserved
+            // while the app runs.
             #[cfg(target_os = "linux")]
             if !cfg!(dev) {
                 if let Err(reason) =
@@ -18572,9 +18956,9 @@ pub fn run() {
 
             // === Main window ===
             // Built programmatically (not via tauri.conf.json) so the URL can
-            // be platform-specific and the window is created AFTER the
-            // tauri-plugin-localhost bind wait, with the final URL up-front
-            // and no post-creation navigation.
+            // be platform-specific and the window is created AFTER the UI
+            // server ownership check, with the final URL up-front and no
+            // post-creation navigation.
             //
             // On Linux production we load directly from the localhost server
             // because WebKitGTK has historically had rendering issues with
@@ -19397,7 +19781,6 @@ pub fn run() {
             save_sync_schedule_cmd,
             get_watcher_status_cmd,
             get_transfer_optimization_hints,
-            get_transfer_capabilities,
             sftp_probe_delta_eligibility,
             get_multi_path_config,
             save_multi_path_config_cmd,
@@ -19450,7 +19833,11 @@ pub fn run() {
             restore_file_version,
             cleanup_versions,
             versions_disk_usage,
-            archive_before_sync_delete,
+            sync_backup_validate,
+            sync_backup_run_stamp,
+            sync_backup_remote_move,
+            sync_backup_archive_local,
+            sync_backup_archive_remote,
             generate_share_link,
             generate_share_link_remote,
             generate_server_share_link,
@@ -19575,6 +19962,7 @@ pub fn run() {
             export_keystore,
             import_keystore,
             read_keystore_metadata,
+            preview_keystore_import,
             // Debug & dependencies commands
             dependency_index::get_dependencies,
             dependency_index::check_dependency_updates,
@@ -19727,6 +20115,7 @@ pub fn run() {
             cryptomator::cryptomator_save_all,
             // Rclone crypt compatibility support
             rclone_crypt::rclone_crypt_unlock,
+            rclone_crypt::rclone_crypt_secret_for_display,
             rclone_crypt::rclone_crypt_lock,
             rclone_crypt::rclone_crypt_decrypt_name,
             rclone_crypt::rclone_crypt_encrypt_name,
@@ -20878,6 +21267,19 @@ mod sevenz_mhe_tests {
     // cover. A wrong 7z password is only detected while decoding, so this also
     // pins what a failed extraction leaves behind: nothing, and in particular
     // not a truncated copy of a file that was already at the destination.
+    //
+    // The wrong-password leg runs on the random salt and IV that compress_7z_core
+    // draws. About one block in 256 decrypts to a stream whose first byte is the
+    // LZMA2 end marker, which decodes to an empty entry with no error. Entries are
+    // now held to their declared size, so every wrong-password outcome is an
+    // error (short of a CRC-32 collision on a stream that decodes to exactly the
+    // declared length) and this leg no longer passes or fails by luck on correct
+    // code. Without that check it fails only when the first block (test1.txt)
+    // ends early, about one run in 256: the empty test1.txt then replaces the
+    // user's file before the second block fails, or, when both blocks end early,
+    // the extraction succeeds. That is too rare to guard the fix, so the early
+    // end is pinned deterministically, on a committed fixture, by
+    // `wrong_7z_password_that_decodes_to_an_early_end_is_refused`.
     #[tokio::test]
     async fn password_7z_content_only_multi_file_roundtrips_and_fails_cleanly() {
         let dir = tempfile::tempdir().unwrap();
@@ -20961,6 +21363,271 @@ mod sevenz_mhe_tests {
             "unhelpful error: {err}"
         );
         assert_eq!(std::fs::read_dir(&none).unwrap().count(), 0);
+    }
+
+    /// A 7-Zip archive (content-only AES, one LZMA2 block, `payload.txt` of 512
+    /// bytes) with a wrong password chosen so that its key decrypts the first
+    /// packed byte to 0x00, the LZMA2 end-of-stream marker. See
+    /// tests/fixtures/7z-underrun/README.md.
+    const EARLY_END_7Z: &[u8] = include_bytes!("../tests/fixtures/7z-underrun/early-end.7z");
+    const EARLY_END_RIGHT: &str = "right-password";
+    const EARLY_END_WRONG: &str = "wrong-388";
+
+    // The deterministic form of the wrong-password early end: the entry decodes
+    // to nothing, sevenz-rust2 checks the CRC only after the full declared size,
+    // and the extraction used to write an empty payload.txt and succeed. Both
+    // the whole-archive path and the single-entry browse path must now refuse it
+    // as a wrong password and leave the destination as it was.
+    #[tokio::test]
+    async fn wrong_7z_password_that_decodes_to_an_early_end_is_refused() {
+        // Precondition, measured on the library itself: with the wrong password
+        // the entry yields 0 of its 512 bytes and no error. Should a decoder
+        // change turn this into an error, this fails here instead of the test
+        // quietly no longer exercising the early end.
+        {
+            use sevenz_rust2::{ArchiveReader, Password};
+            let mut reader = ArchiveReader::new(
+                std::io::Cursor::new(EARLY_END_7Z),
+                Password::from(EARLY_END_WRONG),
+            )
+            .expect("the header is in the clear");
+            let mut seen = Vec::new();
+            reader
+                .for_each_entries(|entry, stream| {
+                    let mut buf = Vec::new();
+                    stream.read_to_end(&mut buf)?;
+                    seen.push((entry.size(), buf.len()));
+                    Ok(true)
+                })
+                .expect("the early end carries no error of its own");
+            assert_eq!(seen, vec![(512, 0)], "fixture no longer ends early");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("early-end.7z");
+        std::fs::write(&archive, EARLY_END_7Z).unwrap();
+        let archive = archive.to_string_lossy().to_string();
+
+        let good = dir.path().join("good");
+        extract_7z_core(
+            archive.clone(),
+            good.to_string_lossy().to_string(),
+            Some(EARLY_END_RIGHT.to_string()),
+            false,
+        )
+        .await
+        .expect("the right password extracts");
+        let payload = std::fs::read(good.join("payload.txt")).unwrap();
+        assert_eq!(payload.len(), 512);
+        assert!(payload.starts_with(b"AeroFTP 7z underrun fixture"));
+
+        let wrong = dir.path().join("wrong");
+        std::fs::create_dir(&wrong).unwrap();
+        std::fs::write(wrong.join("payload.txt"), b"the user's own file").unwrap();
+        let result = extract_7z_core(
+            archive.clone(),
+            wrong.to_string_lossy().to_string(),
+            Some(EARLY_END_WRONG.to_string()),
+            false,
+        )
+        .await;
+        let kept = std::fs::read(wrong.join("payload.txt")).unwrap();
+        assert!(
+            kept == b"the user's own file",
+            "the existing file was replaced by {} bytes (result: {result:?})",
+            kept.len()
+        );
+        let err = result.expect_err("a wrong password that decodes to an early end must fail");
+        assert!(err.contains("Wrong password"), "unhelpful error: {err}");
+        let names: Vec<String> = std::fs::read_dir(&wrong)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["payload.txt".to_string()],
+            "left behind: {names:?}"
+        );
+
+        let browse = dir.path().join("browse");
+        std::fs::create_dir(&browse).unwrap();
+        let out = browse.join("payload.txt");
+        let err = crate::archive_browse::extract_7z_entry_impl(
+            archive,
+            "payload.txt".to_string(),
+            out.to_string_lossy().to_string(),
+            Some(EARLY_END_WRONG.to_string()),
+            None,
+        )
+        .await
+        .expect_err("the browse path must refuse the early end too");
+        assert!(err.contains("Wrong password"), "unhelpful error: {err}");
+        assert_eq!(
+            std::fs::read_dir(&browse).unwrap().count(),
+            0,
+            "the browse path left a file behind"
+        );
+    }
+
+    // Without a password the same early end is a truncated or corrupt archive,
+    // and the error must say so rather than blame a password the archive does
+    // not have. The first packed stream starts right after the 32-byte signature
+    // header; setting its first byte, an LZMA2 chunk control byte, to 0x00 (the
+    // end marker) makes the entry decode to nothing with no decoder error, and
+    // sevenz-rust2 does not verify the packed stream itself.
+    #[tokio::test]
+    async fn unencrypted_7z_entry_that_ends_early_is_refused_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("data.txt");
+        std::fs::write(&src, b"a line that compresses well\n".repeat(128)).unwrap();
+        let out = dir.path().join("plain.7z");
+        compress_7z_core(
+            vec![src.to_string_lossy().to_string()],
+            out.to_string_lossy().to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("compress");
+        let mut bytes = std::fs::read(&out).unwrap();
+        assert_ne!(bytes[32], 0x00, "expected an LZMA2 chunk at offset 32");
+        bytes[32] = 0x00;
+        std::fs::write(&out, &bytes).unwrap();
+
+        let dest = dir.path().join("out");
+        let err = extract_7z_core(
+            out.to_string_lossy().to_string(),
+            dest.to_string_lossy().to_string(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("an entry that ends early must fail");
+        // Exact: the message itself, not the library's Debug wrapper around it,
+        // and no password blamed.
+        assert_eq!(
+            err,
+            "Failed to extract 7z archive: archive entry ended before its declared size \
+             (0 of 3584 bytes): the archive is truncated or corrupt"
+        );
+        assert!(!dest.join("data.txt").exists(), "a short file was written");
+    }
+
+    // With a password set, sevenz-rust2 reports every I/O error without context
+    // raised while extracting as MaybeBadPassword, so an output that could not
+    // be written read as "Wrong password" and the GUI asked for the password
+    // again. Here the right password meets a folder where a file goes and a
+    // file where a folder goes (neither depends on permissions, so this holds
+    // when the tests run as root); both must say that writing failed, and not
+    // mention a password at all: the GUI's isWrongPasswordError takes any
+    // error containing "password" for a wrong password.
+    #[tokio::test]
+    async fn a_7z_destination_that_cannot_be_written_is_not_a_wrong_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), b"beta").unwrap();
+        let archive = dir.path().join("pw.7z").to_string_lossy().to_string();
+        compress_7z_core(
+            vec![
+                src.join("a.txt").to_string_lossy().to_string(),
+                src.join("sub").to_string_lossy().to_string(),
+            ],
+            archive.clone(),
+            Some("Test123!".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("compress");
+
+        // A non-empty folder where the file a.txt goes: the rename fails.
+        let folder_in_the_way = dir.path().join("dest1");
+        std::fs::create_dir_all(folder_in_the_way.join("a.txt")).unwrap();
+        std::fs::write(folder_in_the_way.join("a.txt").join("keep"), b"x").unwrap();
+        let folder_result = extract_7z_core(
+            archive.clone(),
+            folder_in_the_way.to_string_lossy().to_string(),
+            Some("Test123!".to_string()),
+            false,
+        )
+        .await;
+
+        // A file where the folder sub goes: creating the folder fails.
+        let file_in_the_way = dir.path().join("dest2");
+        std::fs::create_dir_all(&file_in_the_way).unwrap();
+        std::fs::write(file_in_the_way.join("sub"), b"a file, not a folder").unwrap();
+        let file_result = extract_7z_core(
+            archive,
+            file_in_the_way.to_string_lossy().to_string(),
+            Some("Test123!".to_string()),
+            false,
+        )
+        .await;
+
+        let mut failures = Vec::new();
+        for (case, result) in [("folder", folder_result), ("file", file_result)] {
+            match result {
+                Err(err)
+                    if err.starts_with(
+                        "Failed to extract 7z archive: Cannot write to the destination: ",
+                    ) && !err.to_lowercase().contains("password") => {}
+                other => failures.push(format!("{case} in the way: {other:?}")),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // The single-entry browse extractor copies inside sevenz-rust2's closure
+    // into a temporary file it created beforehand, so there the destination
+    // error is a failed write (a full disk). copy_7z_entry, which it copies
+    // through, must keep that error from reading as a wrong password.
+    #[tokio::test]
+    async fn a_7z_write_error_under_a_password_is_not_a_wrong_password() {
+        struct FullDisk;
+        impl std::io::Write for FullDisk {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("no space left (simulated)"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, b"alpha ".repeat(100)).unwrap();
+        let archive = dir.path().join("pw.7z");
+        compress_7z_core(
+            vec![src.to_string_lossy().to_string()],
+            archive.to_string_lossy().to_string(),
+            Some("Test123!".to_string()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("compress");
+
+        let mut reader = sevenz_rust2::ArchiveReader::new(
+            std::fs::File::open(&archive).unwrap(),
+            sevenz_rust2::Password::from("Test123!"),
+        )
+        .unwrap();
+        let err = reader
+            .for_each_entries(|entry, stream| {
+                super::copy_7z_entry(stream, FullDisk, entry.size())?;
+                Ok(true)
+            })
+            .expect_err("the write fails");
+        assert_eq!(
+            super::describe_7z_error(&err),
+            "Cannot write to the destination: no space left (simulated)"
+        );
     }
 
     // Overwriting a file that already exists keeps its permissions: before the
@@ -21249,6 +21916,201 @@ mod standalone_stream_tests {
         // No codec extension on the name -> safe fallback member "blob.bin.out".
         let restored = std::fs::read(outdir.join("blob.bin.out")).unwrap();
         assert_eq!(restored, original);
+    }
+
+    /// `data` as one complete gzip member, bzip2 stream or xz stream.
+    fn one_member(codec: &str, data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        match codec {
+            "gz" => {
+                let mut e =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                e.write_all(data).unwrap();
+                e.finish().unwrap()
+            }
+            "bz2" => {
+                let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+                e.write_all(data).unwrap();
+                e.finish().unwrap()
+            }
+            "xz" => {
+                let mut e = xz2::write::XzEncoder::new(Vec::new(), 6);
+                e.write_all(data).unwrap();
+                e.finish().unwrap()
+            }
+            other => panic!("no such codec: {other}"),
+        }
+    }
+
+    /// Two complete members back to back, the file `cat a.gz b.gz` makes and
+    /// the shape bgzip and pbzip2 write (one member per block).
+    fn two_members(codec: &str, first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut joined = one_member(codec, first);
+        joined.extend(one_member(codec, second));
+        joined
+    }
+
+    // A gzip, bzip2 or xz file is one or more members (streams) back to back,
+    // and gzip, bzip2 and xz decompress all of them. The decoders used here
+    // stopped after the first member and reported success, so the extracted
+    // file was silently cut to it.
+    #[tokio::test]
+    async fn a_multi_member_gz_bz2_xz_file_extracts_every_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "first member line\n".repeat(64).into_bytes();
+        let second = "second member line\n".repeat(64).into_bytes();
+        let mut whole = first.clone();
+        whole.extend_from_slice(&second);
+
+        let mut failures = Vec::new();
+        for codec in ["gz", "bz2", "xz"] {
+            let archive = dir.path().join(format!("joined.txt.{codec}"));
+            std::fs::write(&archive, two_members(codec, &first, &second)).unwrap();
+            let outdir = dir.path().join(format!("out_{codec}"));
+            std::fs::create_dir_all(&outdir).unwrap();
+            let result = extract_single_core(
+                archive.to_string_lossy().to_string(),
+                outdir.to_string_lossy().to_string(),
+                false,
+            )
+            .await;
+            let got = std::fs::read(outdir.join("joined.txt")).ok();
+            if got.as_deref() != Some(&whole[..]) {
+                failures.push(format!(
+                    "{codec}: extracted {:?} of {} bytes (result: {result:?})",
+                    got.as_ref().map(Vec::len),
+                    whole.len()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // Bytes after the last member that do not start another one (tape padding,
+    // junk appended to a download): gzip and bzip2 ignore them, and so did the
+    // single-member decoders used before, so reading every member must not
+    // start refusing such files, as flate2's MultiGzDecoder and bzip2's
+    // MultiBzDecoder do. xz, like the xz tool, accepts stream padding (zeros
+    // in multiples of four) and refuses anything else; the single-stream xz
+    // decoder used before refused the padding as well.
+    #[tokio::test]
+    async fn bytes_after_the_last_member_are_handled_like_the_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "the only member\n".repeat(32).into_bytes();
+        let cases: [(&str, &[u8], bool); 7] = [
+            ("gz", &[0u8; 512], true),
+            ("gz", b"JUNKJUNK", true),
+            ("gz", &[0x1f], true),
+            ("bz2", &[0u8; 512], true),
+            ("bz2", b"JUNKJUNK", true),
+            ("xz", &[0u8; 512], true),
+            ("xz", b"JUNKJUNK", false),
+        ];
+        let mut failures = Vec::new();
+        for (i, (codec, tail, extracts)) in cases.into_iter().enumerate() {
+            let mut bytes = one_member(codec, &payload);
+            bytes.extend_from_slice(tail);
+            let archive = dir.path().join(format!("tail{i}.txt.{codec}"));
+            std::fs::write(&archive, bytes).unwrap();
+            let outdir = dir.path().join(format!("tail_out{i}"));
+            std::fs::create_dir_all(&outdir).unwrap();
+            let result = extract_single_core(
+                archive.to_string_lossy().to_string(),
+                outdir.to_string_lossy().to_string(),
+                false,
+            )
+            .await;
+            let got = std::fs::read(outdir.join(format!("tail{i}.txt"))).ok();
+            let as_expected = if extracts {
+                got.as_deref() == Some(&payload[..])
+            } else {
+                result.is_err() && got.is_none()
+            };
+            if !as_expected {
+                failures.push(format!(
+                    "{codec} + {} trailing bytes: result {result:?}, extracted {:?} bytes",
+                    tail.len(),
+                    got.as_ref().map(Vec::len)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // bgzip and pbzip2 compress a tar in independent blocks, each a complete
+    // member, so a member can end exactly between two tar entries. The tar
+    // reader then meets end of input where a header is due, which it takes as
+    // the end of the archive: extraction, the browse listing and the browse
+    // extractor stopped after the first entry and reported success.
+    #[tokio::test]
+    async fn a_tar_split_across_codec_members_extracts_every_entry() {
+        let a = "entry a\n".repeat(100).into_bytes();
+        let b = "entry b\n".repeat(50).into_bytes();
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, data) in [("a.txt", &a), ("b.txt", &b)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &data[..]).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        // The first member ends where b.txt's header starts: a.txt's 512-byte
+        // header and its 800 bytes of data padded to 1024.
+        let split = 512 + 1024;
+        assert_eq!(&tar_bytes[split + 257..split + 262], b"ustar");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut failures = Vec::new();
+        for codec in ["gz", "bz2", "xz"] {
+            let archive = dir.path().join(format!("split.tar.{codec}"));
+            std::fs::write(
+                &archive,
+                two_members(codec, &tar_bytes[..split], &tar_bytes[split..]),
+            )
+            .unwrap();
+            let archive = archive.to_string_lossy().to_string();
+
+            let out = dir.path().join(format!("x_{codec}"));
+            std::fs::create_dir_all(&out).unwrap();
+            let result =
+                super::extract_tar_core(archive.clone(), out.to_string_lossy().to_string(), false)
+                    .await;
+            let got_a = std::fs::read(out.join("a.txt")).ok();
+            let got_b = std::fs::read(out.join("b.txt")).ok();
+            if got_a.as_deref() != Some(&a[..]) || got_b.as_deref() != Some(&b[..]) {
+                failures.push(format!(
+                    "{codec} extract: a.txt {:?}, b.txt {:?} bytes (result: {result:?})",
+                    got_a.as_ref().map(Vec::len),
+                    got_b.as_ref().map(Vec::len)
+                ));
+            }
+
+            let listed = crate::archive_browse::list_tar(archive.clone())
+                .await
+                .map(|entries| entries.into_iter().map(|e| e.name).collect::<Vec<_>>());
+            if listed.as_deref() != Ok(&["a.txt".to_string(), "b.txt".to_string()][..]) {
+                failures.push(format!("{codec} listing: {listed:?}"));
+            }
+
+            let browse = dir.path().join(format!("browse_{codec}.txt"));
+            let result = crate::archive_browse::extract_tar_entry_impl(
+                archive,
+                "b.txt".to_string(),
+                browse.to_string_lossy().to_string(),
+                None,
+            )
+            .await;
+            let got = std::fs::read(&browse).ok();
+            if got.as_deref() != Some(&b[..]) {
+                failures.push(format!(
+                    "{codec} browse b.txt: {:?} bytes (result: {result:?})",
+                    got.as_ref().map(Vec::len)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     // The reconstructed member name strips ONLY the trailing codec extension, so
@@ -21554,7 +22416,7 @@ mod standalone_stream_tests {
             let err =
                 write_entry_atomically(&target, |file| copy_entry_bounded(&mut decoded, file, 40))
                     .expect_err("a short entry must not replace an existing file");
-            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(std::fs::read(&target).unwrap(), original);
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
@@ -21563,6 +22425,248 @@ mod standalone_stream_tests {
         assert_eq!(
             copy_entry_bounded(&mut std::io::empty(), &mut Vec::new(), 0).unwrap(),
             0
+        );
+    }
+
+    // The other direction: a stream that ends before its declared size (a
+    // truncated or corrupt archive, or a 7z whose wrong password decodes to an
+    // early end) is rejected too, since not every decoder notices on its own.
+    // The message names no password: callers that hold one add that.
+    #[test]
+    fn copy_entry_bounded_rejects_an_entry_that_ends_early() {
+        use super::copy_entry_bounded;
+
+        let short = b"only nine".to_vec();
+        let mut out = Vec::new();
+        let err = copy_entry_bounded(&mut &short[..], &mut out, 512)
+            .expect_err("a stream shorter than declared must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ended before its declared size (9 of 512 bytes)")
+                && msg.contains("truncated or corrupt"),
+            "unhelpful error: {msg}"
+        );
+        assert!(!msg.contains("password"), "blames a password: {msg}");
+
+        // Nothing at all for a non-empty entry: the wrong-password shape.
+        copy_entry_bounded(&mut &b""[..], &mut Vec::new(), 1)
+            .expect_err("an empty stream for a one-byte entry must be rejected");
+
+        // An empty entry that is empty is fine.
+        assert_eq!(
+            copy_entry_bounded(&mut &b""[..], &mut Vec::new(), 0).unwrap(),
+            0
+        );
+    }
+
+    /// One regular 2000-byte entry, `doc.txt`, as a complete plain tar.
+    fn one_entry_tar() -> (Vec<u8>, Vec<u8>) {
+        let payload: Vec<u8> = (0..2000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "doc.txt", &payload[..])
+            .unwrap();
+        (builder.into_inner().unwrap(), payload)
+    }
+
+    // A tar cut in the middle of an entry's data: the tar crate's entry reader
+    // just reaches end of file, so the short entry used to be renamed into
+    // place (over a file the user already had) before the next header read
+    // failed. The entry must fail on its own size and leave the file untouched.
+    #[test]
+    fn tar_unpack_refuses_an_entry_cut_short_and_keeps_the_existing_file() {
+        use super::tar_unpack;
+
+        let (full, _) = one_entry_tar();
+        let truncated = full[..512 + 1000].to_vec();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("extracted");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("doc.txt"), b"the user's own file").unwrap();
+
+        let reader: Box<dyn std::io::Read> = Box::new(std::io::Cursor::new(truncated));
+        let result = tar_unpack(reader, &out);
+        let kept = std::fs::read(out.join("doc.txt")).unwrap();
+        assert!(
+            kept == b"the user's own file",
+            "the existing file was replaced by {} bytes (result: {result:?})",
+            kept.len()
+        );
+        let err = result.expect_err("a truncated tar must fail");
+        assert!(
+            err.contains("ended before its declared size (1000 of 2000 bytes)"),
+            "unhelpful error: {err}"
+        );
+        let names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["doc.txt".to_string()], "left behind: {names:?}");
+    }
+
+    // The single-entry browse path returned right after copying its entry, so
+    // there a truncated tar was not even an error: the short file was persisted
+    // and reported as extracted.
+    #[tokio::test]
+    async fn tar_browse_entry_cut_short_is_refused() {
+        let (full, _) = one_entry_tar();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("cut.tar");
+        std::fs::write(&archive, &full[..512 + 1000]).unwrap();
+        let browse = dir.path().join("browse");
+        std::fs::create_dir(&browse).unwrap();
+        let out = browse.join("doc.txt");
+
+        let result = crate::archive_browse::extract_tar_entry_impl(
+            archive.to_string_lossy().to_string(),
+            "doc.txt".to_string(),
+            out.to_string_lossy().to_string(),
+            None,
+        )
+        .await;
+        let err = result.expect_err("a truncated tar entry must fail");
+        assert!(
+            err.contains("ended before its declared size (1000 of 2000 bytes)"),
+            "unhelpful error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&browse).unwrap().count(),
+            0,
+            "a short file was left behind"
+        );
+
+        // The intact archive still extracts whole through the same path.
+        std::fs::write(&archive, &full).unwrap();
+        crate::archive_browse::extract_tar_entry_impl(
+            archive.to_string_lossy().to_string(),
+            "doc.txt".to_string(),
+            out.to_string_lossy().to_string(),
+            None,
+        )
+        .await
+        .expect("an intact entry extracts");
+        assert_eq!(std::fs::read(&out).unwrap(), one_entry_tar().1);
+    }
+
+    // An entry whose PAX `size` record (11) disagrees with its header field (0).
+    // The PAX record is authoritative and the tar crate streams that size, but
+    // the extractor bounded the entry by the header field and refused the entry
+    // as a compression bomb, while the browse listing showed 0 bytes. Both now
+    // use the size the tar crate streams.
+    #[tokio::test]
+    async fn tar_entry_sized_by_pax_extracts_and_lists_that_size() {
+        use super::tar_unpack;
+
+        let payload = b"hello world";
+        let record = b"11 size=11\n";
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut pax = tar::Header::new_ustar();
+        pax.set_entry_type(tar::EntryType::XHeader);
+        pax.set_path("PaxHeaders/pax.txt").unwrap();
+        pax.set_size(record.len() as u64);
+        pax.set_mode(0o644);
+        pax.set_cksum();
+        builder.append(&pax, &record[..]).unwrap();
+        let mut file = tar::Header::new_ustar();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_path("pax.txt").unwrap();
+        file.set_size(0);
+        file.set_mode(0o644);
+        file.set_cksum();
+        builder.append(&file, &payload[..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("extracted");
+        std::fs::create_dir_all(&out).unwrap();
+        let reader: Box<dyn std::io::Read> = Box::new(std::io::Cursor::new(bytes.clone()));
+        tar_unpack(reader, &out).expect("a PAX-sized entry must extract");
+        assert_eq!(std::fs::read(out.join("pax.txt")).unwrap(), payload);
+
+        let archive = dir.path().join("pax.tar");
+        std::fs::write(&archive, &bytes).unwrap();
+        let listed = crate::archive_browse::list_tar(archive.to_string_lossy().to_string())
+            .await
+            .expect("list");
+        let sizes: Vec<(String, u64)> = listed.into_iter().map(|e| (e.name, e.size)).collect();
+        assert_eq!(sizes, vec![("pax.txt".to_string(), 11)]);
+    }
+
+    // A stored zip member whose central directory declares 20 bytes over 10
+    // bytes of data (with the CRC of those 10): the zip crate yields the 10
+    // bytes, its CRC check passes, and both zip extractors used to write the
+    // short file as a success.
+    #[tokio::test]
+    async fn zip_entry_shorter_than_its_declared_size_is_refused() {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("payload.txt", opts).unwrap();
+        zw.write_all(b"0123456789").unwrap();
+        let mut bytes = zw.finish().unwrap().into_inner();
+        // Local header: uncompressed size at offset 22. Central directory
+        // entry: uncompressed size at offset 24 from its signature.
+        assert_eq!(&bytes[0..4], b"PK\x03\x04");
+        assert_eq!(&bytes[22..26], &10u32.to_le_bytes());
+        bytes[22..26].copy_from_slice(&20u32.to_le_bytes());
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory entry");
+        assert_eq!(&bytes[cd + 24..cd + 28], &10u32.to_le_bytes());
+        bytes[cd + 24..cd + 28].copy_from_slice(&20u32.to_le_bytes());
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("short.zip");
+        std::fs::write(&archive, &bytes).unwrap();
+        let archive = archive.to_string_lossy().to_string();
+
+        let dest = dir.path().join("whole");
+        let err = super::extract_archive_core(
+            archive.clone(),
+            dest.to_string_lossy().to_string(),
+            false,
+            None,
+        )
+        .await
+        .expect_err("a zip entry shorter than declared must fail");
+        assert!(
+            err.contains("ended before its declared size (10 of 20 bytes)"),
+            "unhelpful error: {err}"
+        );
+        assert!(
+            !dest.join("payload.txt").exists(),
+            "a short file was written"
+        );
+
+        let browse = dir.path().join("browse");
+        std::fs::create_dir(&browse).unwrap();
+        let out = browse.join("payload.txt");
+        let err = crate::archive_browse::extract_zip_entry_impl(
+            archive,
+            "payload.txt".to_string(),
+            out.to_string_lossy().to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the browse path must refuse it too");
+        assert!(
+            err.contains("ended before its declared size (10 of 20 bytes)"),
+            "unhelpful error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&browse).unwrap().count(),
+            0,
+            "the browse path left a file behind"
         );
     }
 
@@ -21771,6 +22875,144 @@ mod sevenz_advanced_tests {
         }
     }
 
+    // sevenz-rust2 decodes a solid block as one stream and hands each entry the
+    // next bytes of it; it does not skip bytes a caller leaves unread. The
+    // single-entry browse extractor returned without reading the entries before
+    // the one it wanted, so in a solid archive (7-Zip's default) that entry was
+    // read from the start of the previous one and failed its CRC check: only
+    // the first file of a solid block could be extracted from the browser.
+    #[tokio::test]
+    async fn a_solid_7z_extracts_any_entry_from_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("a.txt", "first file of the solid block\n".repeat(40)),
+            (
+                "b.txt",
+                "second file, the one the browser asks for\n".repeat(30),
+            ),
+            ("c.txt", "third\n".repeat(20)),
+        ];
+        let mut inputs = Vec::new();
+        for (name, body) in &files {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            inputs.push(path.to_string_lossy().to_string());
+        }
+        let archive = dir.path().join("solid.7z").to_string_lossy().to_string();
+        let adv = SevenZAdvanced {
+            solid: Some(true),
+            ..Default::default()
+        };
+        compress_7z_core(inputs, archive.clone(), None, Some(5), None, Some(adv))
+            .await
+            .expect("compress solid");
+        {
+            let reader = sevenz_rust2::ArchiveReader::new(
+                std::fs::File::open(&archive).unwrap(),
+                sevenz_rust2::Password::empty(),
+            )
+            .unwrap();
+            let parsed = reader.archive();
+            assert!(parsed.is_solid, "not a solid archive");
+            assert_eq!(parsed.stream_map.file_block_index, vec![Some(0); 3]);
+        }
+
+        for (name, body) in &files {
+            let out = dir.path().join(format!("got-{name}"));
+            crate::archive_browse::extract_7z_entry_impl(
+                archive.clone(),
+                name.to_string(),
+                out.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(std::fs::read(&out).unwrap(), body.as_bytes(), "{name}");
+        }
+    }
+
+    // The whole-archive extractor skips an entry with an unsafe name without
+    // reading it, so in a solid block the entry after it was read from the
+    // start of the skipped one and failed its CRC check.
+    #[tokio::test]
+    async fn a_solid_7z_entry_after_a_skipped_unsafe_one_extracts() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, SourceReader};
+        let evil = b"must never be written anywhere".repeat(8);
+        let good = b"the entry after the skipped one".repeat(12);
+        let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        writer
+            .push_archive_entries(
+                vec![
+                    ArchiveEntry::new_file("../evil.txt"),
+                    ArchiveEntry::new_file("good.txt"),
+                ],
+                vec![SourceReader::new(&evil[..]), SourceReader::new(&good[..])],
+            )
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("mixed.7z");
+        std::fs::write(&archive, bytes).unwrap();
+        let dest = dir.path().join("out");
+        extract_7z_core(
+            archive.to_string_lossy().to_string(),
+            dest.to_string_lossy().to_string(),
+            None,
+            false,
+        )
+        .await
+        .expect("the safe entry extracts");
+        assert_eq!(std::fs::read(dest.join("good.txt")).unwrap(), good);
+        assert!(
+            !dir.path().join("evil.txt").exists(),
+            "the unsafe entry was written"
+        );
+    }
+
+    // A CRC mismatch, without a password, read "Failed to extract 7z archive:
+    // ChecksumVerificationFailed": the library's variant name, not a sentence.
+    // A stored (COPY) entry with one data byte flipped decodes to its full size
+    // and fails only the CRC check.
+    #[tokio::test]
+    async fn a_7z_entry_that_fails_its_crc_says_so_in_words() {
+        use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod};
+        let payload = b"stored bytes, checked by CRC-32\n".repeat(4);
+        let mut writer = ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![EncoderMethod::COPY.into()]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("stored.txt"), Some(&payload[..]))
+            .unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        // COPY: the packed stream is the payload itself, right after the
+        // 32-byte signature header.
+        assert_eq!(&bytes[32..32 + payload.len()], &payload[..]);
+        bytes[40] ^= 0x01;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("flipped.7z");
+        std::fs::write(&archive, bytes).unwrap();
+        let dest = dir.path().join("out");
+        let err = extract_7z_core(
+            archive.to_string_lossy().to_string(),
+            dest.to_string_lossy().to_string(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("a CRC mismatch must fail");
+        assert_eq!(
+            err,
+            "Failed to extract 7z archive: archive entry failed its CRC check: \
+             the archive is corrupt"
+        );
+        assert!(
+            !dest.join("stored.txt").exists(),
+            "a corrupt file was written"
+        );
+    }
+
     // An unknown method must be rejected, not silently downgraded to the default
     // codec (which would hide a caller bug and mislabel the archive).
     #[tokio::test]
@@ -21797,6 +23039,128 @@ mod sevenz_advanced_tests {
             err.contains("unknown 7z method"),
             "unexpected error message: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rar_extract_tests {
+    use super::extract_rar_core;
+
+    /// RAR 4, one encrypted entry `.gitignore`, password `unrar`: the `unrar`
+    /// crate's own test archive (tests/fixtures/rar/README.md).
+    const CRYPTED_RAR: &[u8] = include_bytes!("../tests/fixtures/rar/crypted.rar");
+    /// The first volume of a multi-volume RAR whose last entry continues in a
+    /// second volume that is not there (tests/fixtures/rar/README.md).
+    const PART1_RAR: &[u8] = include_bytes!("../tests/fixtures/rar/archive.part1.rar");
+    const CRYPTED_CONTENT: &[u8] = b"target\nCargo.lock\n";
+    const USERS_FILE: &[u8] = b"the user's own file";
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // UnRAR opens an entry's output with overwrite-all and deletes it when the
+    // entry fails (on a RAR 4 archive a wrong password is a CRC failure), so a
+    // failed entry destroyed the file the user already had at that path. Every
+    // other extractor leaves an existing file untouched on a failed entry.
+    #[tokio::test]
+    async fn a_failed_rar_entry_keeps_the_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("crypted.rar");
+        std::fs::write(&archive, CRYPTED_RAR).unwrap();
+        let archive = archive.to_string_lossy().to_string();
+        let mut failures = Vec::new();
+
+        // Whole archive, then single entry from the archive browser: a wrong
+        // password over the user's file, then the right one replacing it.
+        for path in ["whole", "browse"] {
+            let dest = dir.path().join(path);
+            std::fs::create_dir(&dest).unwrap();
+            let out = dest.join(".gitignore");
+            std::fs::write(&out, USERS_FILE).unwrap();
+            for (password, expected) in [("not-it", USERS_FILE), ("unrar", CRYPTED_CONTENT)] {
+                let result = if path == "whole" {
+                    extract_rar_core(
+                        archive.clone(),
+                        dest.to_string_lossy().to_string(),
+                        Some(password.to_string()),
+                        false,
+                    )
+                    .await
+                } else {
+                    crate::archive_browse::extract_rar_entry_impl(
+                        archive.clone(),
+                        ".gitignore".to_string(),
+                        out.to_string_lossy().to_string(),
+                        Some(password.to_string()),
+                        None,
+                    )
+                    .await
+                };
+                let got = std::fs::read(&out).ok();
+                let left = names(&dest);
+                if got.as_deref() != Some(expected)
+                    || result.is_ok() != (password == "unrar")
+                    || left != [".gitignore"]
+                {
+                    failures.push(format!(
+                        "{path}, password {password}: result {result:?}, file {:?}, folder {left:?}",
+                        got.map(|g| String::from_utf8_lossy(&g).into_owned())
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // Entries are staged and moved into place when the loop ends, also when it
+    // ends on an error: what extracted before the failure lands where it did
+    // before (nested folders included), the entry that failed leaves nothing,
+    // and no staging folder is left behind.
+    #[tokio::test]
+    async fn a_rar_extraction_that_stops_part_way_keeps_what_it_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.part1.rar");
+        std::fs::write(&archive, PART1_RAR).unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir(&dest).unwrap();
+        let result = extract_rar_core(
+            archive.to_string_lossy().to_string(),
+            dest.to_string_lossy().to_string(),
+            None,
+            false,
+        )
+        .await;
+        let mut failures = Vec::new();
+        if result.is_ok() {
+            failures.push("the missing second volume did not fail".to_string());
+        }
+        for (name, size) in [
+            ("build.rs", 2396),
+            ("Cargo.toml", 313),
+            ("examples/lister.rs", 2693),
+            ("src/lib.rs", 7870),
+            ("vendor/unrar/acknow.txt", 4280),
+            ("vendor/unrar/arccmt.cpp", 4090),
+        ] {
+            let got = std::fs::metadata(dest.join(name)).map(|m| m.len()).ok();
+            if got != Some(size) {
+                failures.push(format!("{name}: {got:?} bytes, expected {size}"));
+            }
+        }
+        if dest.join("vendor/unrar/archive.cpp").exists() {
+            failures.push("the entry cut by the missing volume was left behind".to_string());
+        }
+        let top = names(&dest);
+        if top != ["Cargo.toml", "build.rs", "examples", "src", "vendor"] {
+            failures.push(format!("destination holds {top:?}"));
+        }
+        assert!(failures.is_empty(), "{failures:#?} (result: {result:?})");
     }
 }
 
@@ -22719,5 +24083,25 @@ mod documented_file_limits_command_tests {
         assert_eq!(unknown.max_file_size, None);
         let ftp = with_documented_file_limits(base, "ftp", None);
         assert_eq!(ftp.max_file_size, None);
+    }
+}
+
+#[cfg(test)]
+mod sync_backup_archive_local_tests {
+    /// The local archive command joins `root` with `rel` and renames the
+    /// result, so `root` is held to the same shape check as every other local
+    /// path command: absolute, no `..`, no NUL.
+    #[tokio::test]
+    async fn a_root_that_is_not_a_clean_absolute_path_is_refused() {
+        for root in ["relative/dir", "/tmp/../etc", "/tmp/a\0b"] {
+            let outcome = super::sync_backup_archive_local(
+                root.to_string(),
+                ".aeroftp-versions".to_string(),
+                "20260925T070000Z".to_string(),
+                "a.txt".to_string(),
+            )
+            .await;
+            assert!(outcome.is_err(), "{root:?} was accepted: {outcome:?}");
+        }
     }
 }

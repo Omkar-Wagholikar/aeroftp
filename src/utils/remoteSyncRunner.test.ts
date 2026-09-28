@@ -35,7 +35,7 @@ const baseConfig = (over: Partial<RemoteSyncConfig> = {}): RemoteSyncConfig => (
     retryPolicy: RETRY,
     verifyPolicy: 'none',
     deltaSyncEnabled: false,
-    versioningStrategy: null,
+    versionedBackup: null,
     transferBudget: 0,
     direction: 'bidirectional',
     ...over,
@@ -231,23 +231,7 @@ describe('remoteSyncRunner — orphan deletes', () => {
             && c.args?.path === '/srv/data/stale.txt')).toBe(true);
     });
 
-    it('archives a local file before deleting it when versioning is on', async () => {
-        const { invoke, calls } = makeInvoke();
-        const report = await runRemoteSync(
-            [file('old.txt', 'delete-local')],
-            noDirs,
-            baseConfig({ versioningStrategy: 'trash' }),
-            {},
-            noWaitDeps(invoke),
-        );
-        expect(report.deleted).toBe(1);
-        const archiveIdx = calls.findIndex((c) => c.cmd === 'archive_before_sync_delete');
-        const deleteIdx = calls.findIndex((c) => c.cmd === 'delete_local_file');
-        expect(archiveIdx).toBeGreaterThanOrEqual(0);
-        expect(deleteIdx).toBeGreaterThan(archiveIdx);
-    });
-
-    it('passes the isDir hint and skips archiving for directory deletes', async () => {
+    it('passes the isDir hint for directory deletes', async () => {
         const { invoke, calls } = makeInvoke();
         await runRemoteSync(
             [file('stale-dir', 'delete-remote', { isDir: true })],
@@ -258,29 +242,229 @@ describe('remoteSyncRunner — orphan deletes', () => {
         );
         const del = calls.find((c) => c.cmd === 'delete_remote_file');
         expect(del?.args).toEqual({ path: '/srv/data/stale-dir', isDir: true });
-
-        const { invoke: invoke2, calls: calls2 } = makeInvoke();
-        await runRemoteSync(
-            [file('old-dir', 'delete-local', { isDir: true })],
-            noDirs,
-            baseConfig({ versioningStrategy: 'trash' }),
-            {},
-            noWaitDeps(invoke2),
-        );
-        expect(calls2.some((c) => c.cmd === 'archive_before_sync_delete')).toBe(false);
-        expect(calls2.some((c) => c.cmd === 'delete_local_file')).toBe(true);
     });
+});
 
-    it('skips archiving when no versioning strategy is configured', async () => {
-        const { invoke, calls } = makeInvoke();
-        await runRemoteSync(
-            [file('old.txt', 'delete-local')],
+describe('remoteSyncRunner: versioned backup', () => {
+    const backup = { versionedBackup: { dir: '.aeroftp-versions' } };
+    const kept = (args: Record<string, unknown> | undefined) =>
+        `${String(args?.root)}/${String(args?.dir)}/${String(args?.stamp)}/${String(args?.rel)}`;
+    const stampedInvoke = (handlers: Record<string, (args: Record<string, unknown> | undefined, idx: number) => unknown> = {}) =>
+        makeInvoke({
+            sync_backup_run_stamp: () => '20260925T070000Z',
+            sync_backup_archive_local: kept,
+            sync_backup_archive_remote: kept,
+            ...handlers,
+        });
+    const idx = (calls: { cmd: string }[], cmd: string) => calls.findIndex((c) => c.cmd === cmd);
+
+    it('moves the remote copy aside before an upload overwrites it', async () => {
+        const { invoke, calls } = stampedInvoke();
+        const report = await runRemoteSync(
+            [file('docs/a.txt', 'upload', { overwritesExisting: true })],
             noDirs,
-            baseConfig({ versioningStrategy: 'disabled' }),
+            baseConfig(backup),
             {},
             noWaitDeps(invoke),
         );
-        expect(calls.some((c) => c.cmd === 'archive_before_sync_delete')).toBe(false);
+        expect(report.uploaded).toBe(1);
+        const archive = calls.find((c) => c.cmd === 'sync_backup_archive_remote');
+        expect(archive?.args).toEqual({
+            useProvider: false,
+            root: '/srv/data',
+            dir: '.aeroftp-versions',
+            stamp: '20260925T070000Z',
+            rel: 'docs/a.txt',
+        });
+        expect(idx(calls, 'sync_backup_archive_remote')).toBeLessThan(idx(calls, 'upload_file'));
+    });
+
+    it('moves the local copy aside before a download overwrites it', async () => {
+        const { invoke, calls } = stampedInvoke();
+        await runRemoteSync(
+            [file('b.txt', 'download', { overwritesExisting: true })],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        const archive = calls.find((c) => c.cmd === 'sync_backup_archive_local');
+        expect(archive?.args).toMatchObject({ root: '/home/u/work', rel: 'b.txt' });
+        expect(idx(calls, 'sync_backup_archive_local')).toBeLessThan(idx(calls, 'download_file'));
+    });
+
+    it('does not archive a new file or a keep-both copy', async () => {
+        const { invoke, calls } = stampedInvoke();
+        await runRemoteSync(
+            [file('new.txt', 'upload'), file('n.txt', 'download', { overwritesExisting: false })],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(calls.some((c) => c.cmd.startsWith('sync_backup_'))).toBe(false);
+    });
+
+    it('turns a file delete into the move, on either side, and leaves folders to the delete', async () => {
+        const { invoke, calls } = stampedInvoke();
+        const report = await runRemoteSync(
+            [
+                file('gone.txt', 'delete-remote'),
+                file('old.txt', 'delete-local'),
+                file('empty-dir', 'delete-remote', { isDir: true }),
+            ],
+            noDirs,
+            baseConfig({ ...backup, isProvider: true }),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(report.deleted).toBe(3);
+        expect(calls.find((c) => c.cmd === 'sync_backup_archive_remote')?.args)
+            .toMatchObject({ useProvider: true, rel: 'gone.txt' });
+        expect(calls.find((c) => c.cmd === 'sync_backup_archive_local')?.args)
+            .toMatchObject({ root: '/home/u/work', rel: 'old.txt' });
+        // The move replaced both file deletes; the folder is still deleted.
+        const deletes = calls.filter((c) => c.cmd === 'provider_delete_file' || c.cmd === 'delete_local_file');
+        expect(deletes.map((c) => c.args?.path)).toEqual(['/srv/data/empty-dir']);
+    });
+
+    it('asks for one stamp per run however many copies it keeps', async () => {
+        const { invoke, calls } = stampedInvoke();
+        await runRemoteSync(
+            [file('a.txt', 'delete-remote'), file('b.txt', 'delete-remote'), file('c.txt', 'upload', { overwritesExisting: true })],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(calls.filter((c) => c.cmd === 'sync_backup_run_stamp')).toHaveLength(1);
+        const stamps = new Set(calls.filter((c) => c.cmd === 'sync_backup_archive_remote').map((c) => c.args?.stamp));
+        expect([...stamps]).toEqual(['20260925T070000Z']);
+    });
+
+    it('fails a file whose backup fails without writing or deleting it, and goes on', async () => {
+        const { invoke, calls } = stampedInvoke({
+            sync_backup_archive_remote: (args) => {
+                if (args?.rel === 'locked.txt') throw new Error('versioned backup needs to move files');
+                return '/srv/data/.aeroftp-versions/x';
+            },
+        });
+        const report = await runRemoteSync(
+            [
+                file('locked.txt', 'upload', { overwritesExisting: true }),
+                file('locked.txt', 'delete-remote'),
+                file('fine.txt', 'upload', { overwritesExisting: true }),
+            ],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(report.errors.map((e) => e.file_path)).toEqual(['locked.txt', 'locked.txt']);
+        const uploads = calls.filter((c) => c.cmd === 'upload_file');
+        expect(uploads).toHaveLength(1);
+        expect((uploads[0].args as { params: { remote_path: string } }).params.remote_path).toBe('/srv/data/fine.txt');
+        expect(calls.some((c) => c.cmd === 'delete_remote_file')).toBe(false);
+    });
+
+    it('fails a file whose destination copy the backup cannot find, instead of writing over it', async () => {
+        const { invoke, calls } = stampedInvoke({ sync_backup_archive_remote: () => null });
+        const report = await runRemoteSync(
+            [file('a.txt', 'upload', { overwritesExisting: true }), file('b.txt', 'delete-remote')],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(report.errors.map((e) => e.file_path)).toEqual(['a.txt', 'b.txt']);
+        expect(report.errors[0].message).toContain('was not found');
+        expect(calls.some((c) => c.cmd === 'upload_file' || c.cmd === 'delete_remote_file')).toBe(false);
+        expect(report.deleted).toBe(0);
+    });
+
+    it('archives the right-hand folder on the local disk for a local-local pair', async () => {
+        const { invoke, calls } = stampedInvoke();
+        await runRemoteSync(
+            [file('r.txt', 'upload', { overwritesExisting: true })],
+            noDirs,
+            baseConfig({ ...backup, isLocalLocal: true }),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(calls.find((c) => c.cmd === 'sync_backup_archive_local')?.args)
+            .toMatchObject({ root: '/srv/data', rel: 'r.txt' });
+        expect(calls.some((c) => c.cmd === 'sync_backup_archive_remote')).toBe(false);
+    });
+
+    it('keeps the .aerocorrect sidecar with the copy it protects', async () => {
+        // The move replaced the delete and skipped the sidecar cleanup, so a
+        // sidecar stayed beside a file that was gone; the compare never lists
+        // sidecars, so no later run removed it.
+        const { invoke, calls } = stampedInvoke();
+        const report = await runRemoteSync(
+            [file('gone.txt', 'delete-remote'), file('c.txt', 'upload', { overwritesExisting: true })],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(report.errors).toEqual([]);
+        expect(calls.filter((c) => c.cmd === 'sync_backup_archive_remote').map((c) => c.args?.rel)).toEqual([
+            'gone.txt',
+            'gone.txt.aerocorrect',
+            'c.txt',
+            'c.txt.aerocorrect',
+        ]);
+        expect(calls.some((c) => c.cmd === 'delete_remote_file')).toBe(false);
+    });
+
+    it('deletes a sidecar it could not move, and still counts the file', async () => {
+        const { invoke, calls } = stampedInvoke({
+            sync_backup_archive_remote: (args) => {
+                if (String(args?.rel).endsWith('.aerocorrect')) throw new Error('move refused');
+                return kept(args);
+            },
+        });
+        const report = await runRemoteSync(
+            [file('gone.txt', 'delete-remote')],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(report.errors).toEqual([]);
+        expect(report.deleted).toBe(1);
+        expect(calls.find((c) => c.cmd === 'delete_remote_file')?.args)
+            .toEqual({ path: '/srv/data/gone.txt.aerocorrect', isDir: false });
+    });
+
+    it('does not archive or delete a sidecar that is not there', async () => {
+        const { invoke, calls } = stampedInvoke({
+            sync_backup_archive_remote: (args) =>
+                String(args?.rel).endsWith('.aerocorrect') ? null : kept(args),
+        });
+        const report = await runRemoteSync(
+            [file('gone.txt', 'delete-remote')],
+            noDirs,
+            baseConfig(backup),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(report.errors).toEqual([]);
+        expect(calls.some((c) => c.cmd === 'delete_remote_file')).toBe(false);
+    });
+
+    it('does nothing of the kind when versioned backup is off', async () => {
+        const { invoke, calls } = stampedInvoke();
+        await runRemoteSync(
+            [file('a.txt', 'upload', { overwritesExisting: true }), file('b.txt', 'delete-local')],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke),
+        );
+        expect(calls.some((c) => c.cmd.startsWith('sync_backup_'))).toBe(false);
+        expect(calls.some((c) => c.cmd === 'delete_local_file')).toBe(true);
     });
 });
 
@@ -793,6 +977,237 @@ describe('remoteSyncRunner — GAP-6 sync index', () => {
         // Standalone directory recorded as a directory.
         expect(files['emptydir']).toMatchObject({ is_dir: true });
     });
+
+    // Minor 1 (fourth review of #949): the time was read back when the index
+    // was saved, after the whole run, so a same-size edit made in between was
+    // recorded as the synced state. It is read when the download completes.
+    it('records the time a download left, not the one at index save', async () => {
+        let savedIndex: Record<string, unknown> | undefined;
+        let indexPhase = false;
+        const { invoke } = makeInvoke({
+            get_file_properties: () => ({
+                size: 7,
+                modified: indexPhase ? '2026-09-26T11:00:00' : '2026-09-26T10:00:00',
+            }),
+            load_sync_index_cmd: () => {
+                indexPhase = true;
+                return null;
+            },
+            save_sync_index_cmd: (args) => {
+                savedIndex = args?.index as Record<string, unknown>;
+            },
+        });
+        await runRemoteSync(
+            [file('from-list.txt', 'download', { size: 7, mtime: null })],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, { writeIndex: true }),
+        );
+        const files = (savedIndex?.files ?? {}) as Record<string, { modified: string | null }>;
+        expect(files['from-list.txt']?.modified).toBe('2026-09-26T10:00:00Z');
+    });
+
+    // Major 1 (re-review of #949): a download recorded the remote side's
+    // time, and a backend listing no comparable time (FTP LIST dates) gives
+    // none, so the local side of that file was compared by size alone on the
+    // next run and a same-size local edit went unseen. With no remote time the
+    // index takes the downloaded file's own, read back from disk.
+    it('records the downloaded file time when the remote gives none', async () => {
+        let savedIndex: Record<string, unknown> | undefined;
+        const { invoke } = makeInvoke({
+            get_file_properties: () => ({ size: 7, modified: '2026-09-26T10:00:00' }),
+            save_sync_index_cmd: (args) => {
+                savedIndex = args?.index as Record<string, unknown>;
+            },
+        });
+        await runRemoteSync(
+            [
+                file('from-list.txt', 'download', { size: 7, mtime: null }),
+                file('dated.txt', 'download', { size: 9 }),
+            ],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, { writeIndex: true }),
+        );
+        const files = (savedIndex?.files ?? {}) as Record<string, { modified: string | null }>;
+        expect(files['from-list.txt']?.modified).toBe('2026-09-26T10:00:00Z');
+        // A remote time is kept: the download stamped it on the local copy.
+        expect(files['dated.txt']?.modified).toBe('2026-05-22T10:00:00Z');
+    });
+
+    // CodeRabbit on #949 (a90e5933): a download the interrupted run finished
+    // is skipped on resume, so this run never reads its time, and the index
+    // entry the interrupted run wrote with it was replaced by null (the
+    // remote gives none): the next compare fell back to size alone. Minor 4
+    // (verification of the fifth round): the time is the one the journal
+    // entry recorded when the download completed, not whatever the index
+    // holds (a crashed run saved none, and a chain of resumes carries older
+    // runs' entries forward).
+    it('keeps the index time of a download the resumed journal finished', async () => {
+        const resumeJournal: SyncJournal = {
+            id: 'j-landed',
+            created_at: '2026-09-26T09:00:00Z',
+            updated_at: '2026-09-26T09:05:00Z',
+            local_path: '/home/u/work',
+            remote_path: '/srv/data',
+            direction: 'bidirectional',
+            retry_policy: RETRY,
+            verify_policy: 'none',
+            entries: [
+                // The size it recorded is not the one listed now (8 against 7),
+                // so the test tells which of the two the index takes.
+                { relative_path: 'done.txt', action: 'download', status: 'completed', attempts: 1, last_error: null, verified: null, bytes_transferred: 7, local_size: 8, local_modified: '2026-09-26T09:04:00Z' },
+                // Written before the journal kept these: no time.
+                { relative_path: 'resized.txt', action: 'download', status: 'completed', attempts: 1, last_error: null, verified: null, bytes_transferred: 9 },
+            ],
+            completed: false,
+        };
+        let savedIndex: Record<string, unknown> | undefined;
+        const { invoke, calls } = makeInvoke({
+            load_sync_index_cmd: () => ({
+                version: 2,
+                last_sync: '2026-09-26T09:05:00Z',
+                local_path: '/home/u/work',
+                remote_path: '/srv/data',
+                files: {
+                    // What an older run recorded: the journal wins.
+                    'done.txt': { size: 7, modified: '2026-09-20T08:00:00Z', is_dir: false },
+                    'resized.txt': { size: 9, modified: '2026-09-20T08:00:00Z', is_dir: false },
+                },
+            }),
+            save_sync_index_cmd: (args) => {
+                savedIndex = args?.index as Record<string, unknown>;
+            },
+        });
+        await runRemoteSync(
+            [
+                file('done.txt', 'download', { size: 7, mtime: null }),
+                file('resized.txt', 'download', { size: 9, mtime: null }),
+            ],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, { writeIndex: true, resumeJournal }),
+        );
+        expect(calls.filter((c) => c.cmd === 'download_file')).toHaveLength(0);
+        const files = (savedIndex?.files ?? {}) as Record<string, { modified: string | null; size: number }>;
+        expect(files['done.txt']).toMatchObject({ size: 8, modified: '2026-09-26T09:04:00Z' });
+        expect(files['resized.txt']?.modified).toBeNull();
+    });
+
+    const resumeOf = (entries: SyncJournal['entries']): SyncJournal => ({
+        id: 'j-resume',
+        created_at: '2026-09-26T09:00:00Z',
+        updated_at: '2026-09-26T09:05:00Z',
+        local_path: '/home/u/work',
+        remote_path: '/srv/data',
+        direction: 'bidirectional',
+        retry_policy: RETRY,
+        verify_policy: 'none',
+        entries,
+        completed: false,
+    });
+    const savedAt = (lastSync: string, files: Record<string, unknown>) => () => ({
+        version: 2,
+        last_sync: lastSync,
+        local_path: '/home/u/work',
+        remote_path: '/srv/data',
+        files,
+    });
+
+    // m3 (verification of the fourth round of #949): a run that crashed
+    // saved no index, and the entry there is from the run before it, of the
+    // file before the transfer. It was adopted when the size matched.
+    it('does not adopt an index entry saved before the resumed journal', async () => {
+        let savedIndex: Record<string, unknown> | undefined;
+        const { invoke } = makeInvoke({
+            load_sync_index_cmd: savedAt('2026-09-26T08:55:00Z', {
+                'done.txt': { size: 7, modified: '2026-09-20T08:00:00Z', is_dir: false },
+            }),
+            save_sync_index_cmd: (args) => {
+                savedIndex = args?.index as Record<string, unknown>;
+            },
+        });
+        await runRemoteSync(
+            [file('done.txt', 'download', { size: 7, mtime: null })],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, {
+                writeIndex: true,
+                resumeJournal: resumeOf([
+                    { relative_path: 'done.txt', action: 'download', status: 'completed', attempts: 1, last_error: null, verified: null, bytes_transferred: 7 },
+                ]),
+            }),
+        );
+        const files = (savedIndex?.files ?? {}) as Record<string, { modified: string | null }>;
+        expect(files['done.txt']?.modified).toBeNull();
+    });
+
+    // m4 (same verification): a run resumed from its journal knows neither
+    // the time nor the size of what it uploads (the journal keeps only the
+    // bytes of finished entries), and recorded the upload with no time: a
+    // same-size local edit went unseen. The file is read before it goes up;
+    // an upload the interrupted run finished keeps the time it saved.
+    it('records the time and size of the uploads of a resumed run', async () => {
+        let savedIndex: Record<string, unknown> | undefined;
+        const { invoke, calls } = makeInvoke({
+            get_file_properties: () => ({ size: 7, modified: '2026-09-26T10:00:00' }),
+            load_sync_index_cmd: savedAt('2026-09-26T09:05:00Z', {}),
+            save_sync_index_cmd: (args) => {
+                savedIndex = args?.index as Record<string, unknown>;
+            },
+        });
+        await runRemoteSync(
+            [
+                file('done.txt', 'upload', { size: 5, mtime: null }),
+                file('next.txt', 'upload', { size: 0, mtime: null }),
+            ],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, {
+                writeIndex: true,
+                resumeJournal: resumeOf([
+                    { relative_path: 'done.txt', action: 'upload', status: 'completed', attempts: 1, last_error: null, verified: true, bytes_transferred: 5, local_size: 5, local_modified: '2026-09-26T09:04:00Z' },
+                    { relative_path: 'next.txt', action: 'upload', status: 'pending', attempts: 0, last_error: null, verified: null, bytes_transferred: 0 },
+                ]),
+            }),
+        );
+        expect(calls.filter((c) => c.cmd === 'upload_file')).toHaveLength(1);
+        const files = (savedIndex?.files ?? {}) as Record<string, { size: number; modified: string | null }>;
+        expect(files['next.txt']).toMatchObject({ size: 7, modified: '2026-09-26T10:00:00Z' });
+        expect(files['done.txt']).toMatchObject({ size: 5, modified: '2026-09-26T09:04:00Z' });
+    });
+
+    // Minor 4 (verification of the fifth round): a completed transfer keeps
+    // in its journal entry what the index records for it, so a later resume
+    // has it even when this run saves no index (it crashes).
+    it('records in the journal what the index records for a transfer', async () => {
+        const journals: SyncJournal[] = [];
+        const { invoke } = makeInvoke({
+            get_file_properties: () => ({ size: 7, modified: '2026-09-26T10:00:00' }),
+            save_sync_journal_cmd: (args) => {
+                journals.push(JSON.parse(JSON.stringify(args?.journal)) as SyncJournal);
+            },
+        });
+        await runRemoteSync(
+            [
+                file('listed.txt', 'download', { size: 7, mtime: null }),
+                file('dated.txt', 'upload', { size: 9 }),
+            ],
+            noDirs,
+            baseConfig(),
+            {},
+            noWaitDeps(invoke, { writeIndex: true }),
+        );
+        const last = journals[journals.length - 1];
+        const byPath = Object.fromEntries(last.entries.map((e) => [e.relative_path, e]));
+        expect(byPath['listed.txt']).toMatchObject({ local_size: 7, local_modified: '2026-09-26T10:00:00Z' });
+        expect(byPath['dated.txt']).toMatchObject({ local_size: 9, local_modified: '2026-05-22T10:00:00Z' });
+    });
 });
 
 describe('remoteSyncRunner — GAP-7 keep-both rename', () => {
@@ -926,21 +1341,32 @@ describe('remoteSyncRunner — GAP-9a maniac mode', () => {
     });
 });
 
-describe('remoteSyncRunner — GAP-9b threaded transfer tuning', () => {
-    it('accepts parallelStreams + compressionMode config without altering the sequential run', async () => {
-        const { invoke, calls } = makeInvoke();
-        const report = await runRemoteSync(
-            [file('a.txt', 'upload'), file('b.txt', 'upload')],
-            noDirs,
-            baseConfig({ parallelStreams: 8, compressionMode: 'on' }),
-            {},
-            noWaitDeps(invoke),
-        );
-        // The run still completes both entries one at a time: the threaded
-        // tuning is config-only until APPENDIX-DAG-ENGINE Fase 2 consumes it.
-        expect(report.uploaded).toBe(2);
-        const uploads = calls.filter((c) => c.cmd === 'upload_file');
-        expect(uploads).toHaveLength(2);
+describe('remoteSyncRunner: speed mode reaches the transfer', () => {
+    // The speed mode's only transfer-level effect is the delta flag
+    // (SPEED_PRESETS); these pin that the flag reaches both transfer commands
+    // on both routes, since the Plan tab no longer shows stream or
+    // compression controls that would suggest otherwise.
+    it.each([true, false])('passes deltaSyncEnabled=%s to upload and download', async (delta) => {
+        for (const isProvider of [false, true]) {
+            const { invoke, calls } = makeInvoke();
+            await runRemoteSync(
+                [file('up.txt', 'upload'), file('down.txt', 'download')],
+                noDirs,
+                baseConfig({ deltaSyncEnabled: delta, isProvider }),
+                {},
+                noWaitDeps(invoke),
+            );
+            const transfers = calls.filter((c) => /^(provider_)?(upload|download)_file$/.test(c.cmd));
+            expect(transfers.map((c) => c.cmd).sort()).toEqual(
+                isProvider ? ['provider_download_file', 'provider_upload_file'] : ['download_file', 'upload_file'],
+            );
+            for (const c of transfers) {
+                const flag = isProvider
+                    ? (c.args as { useDelta?: boolean }).useDelta
+                    : (c.args as { params: { use_delta?: boolean } }).params.use_delta;
+                expect(flag, `${c.cmd} isProvider=${isProvider}`).toBe(delta);
+            }
+        }
     });
 });
 

@@ -10,7 +10,8 @@
 //! Imported credentials are stored in our AES-256-GCM vault, upgrading security
 //! from rclone's reversible obfuscation to proper authenticated encryption.
 
-use crate::profile_export::ServerProfileExport;
+// Public: it is the element type of `RcloneImportResult::servers`.
+pub use crate::profile_export::ServerProfileExport;
 use crate::util::endpoint_stays_on_this_machine;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,35 +25,193 @@ const RCLONE_CRYPT_KEY: [u8; 32] = [
     0xd3, 0x90, 0x19, 0x8e, 0xb8, 0x12, 0x8a, 0xfb, 0xf4, 0xde, 0x16, 0x2b, 0x8b, 0x95, 0xf6, 0x38,
 ];
 
-/// Reveal an rclone-obscured password.
-/// Format: base64url(IV_16bytes || AES-256-CTR(plaintext))
-pub(crate) fn reveal_obscured(obscured: &str) -> Result<String, String> {
+/// AES-256-CTR with rclone's published key over `IV (16 bytes) || ciphertext`,
+/// the bytes an obscured value decodes to.
+fn decrypt_obscured(bytes: &[u8]) -> Result<Vec<u8>, String> {
     use aes::cipher::{KeyIvInit, StreamCipher};
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
 
-    // rclone uses raw URL-safe base64 (no padding)
-    let ciphertext = URL_SAFE_NO_PAD
-        .decode(obscured)
-        .or_else(|_| {
-            // Some rclone versions may use standard base64
-            use base64::engine::general_purpose::STANDARD;
-            STANDARD.decode(obscured)
-        })
-        .map_err(|e| format!("base64 decode: {}", e))?;
-
-    if ciphertext.len() < 16 {
+    if bytes.len() < 16 {
         return Err("obscured value too short (need at least 16-byte IV)".into());
     }
-
-    let iv = &ciphertext[..16];
-    let mut buf = ciphertext[16..].to_vec();
+    let iv = &bytes[..16];
+    let mut buf = bytes[16..].to_vec();
 
     type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
     let mut cipher = Aes256Ctr::new((&RCLONE_CRYPT_KEY).into(), iv.into());
     cipher.apply_keystream(&mut buf);
+    Ok(buf)
+}
 
-    String::from_utf8(buf).map_err(|e| format!("UTF-8 decode after reveal: {}", e))
+/// Reveal an rclone-obscured value: base64url(IV_16bytes || AES-256-CTR(plaintext)).
+///
+/// rclone only ever writes raw URL-safe base64 (`obscure.Obscure`, v1.75.1).
+/// The retry in the standard alphabet is not a form rclone produces: it is
+/// AeroFTP's own leniency, kept for `rclone_crypt`, the caller that still
+/// accepts a value typed by hand. The importer reads `IsPassword` fields with
+/// [`reveal_rclone_password`], which does not retry.
+pub(crate) fn reveal_obscured(obscured: &str) -> Result<String, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(obscured)
+        .or_else(|_| {
+            use base64::engine::general_purpose::STANDARD;
+            STANDARD.decode(obscured)
+        })
+        .map_err(|e| format!("base64 decode: {}", e))?;
+    String::from_utf8(decrypt_obscured(&ciphertext)?)
+        .map_err(|e| format!("UTF-8 decode after reveal: {}", e))
+}
+
+/// Reveal an rclone `IsPassword` value the way rclone's `obscure.Reveal` does
+/// (v1.75.1): raw URL-safe base64 without padding, with the discarded low bits
+/// of the last symbol ignored as Go's `RawURLEncoding` ignores them, no retry
+/// in the standard alphabet and no plaintext fallback. One difference is left:
+/// rclone returns the decrypted bytes as they are, while this requires UTF-8,
+/// since the secret becomes a `String`; a value rclone obscured from typed text
+/// always is. rclone only ever writes these fields obscured and cannot use one
+/// that does not reveal, so a failure here means the remote carries no usable
+/// password, not that the value is the password.
+pub(crate) fn reveal_rclone_password(value: &str) -> Result<String, String> {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    use base64::Engine;
+
+    const RCLONE_REVEAL_BASE64: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+    // The decoder's own error names the offending character and its offset,
+    // which for a plaintext password is a piece of the password: keep it out
+    // of a message that reaches the log and the import report.
+    let bytes = RCLONE_REVEAL_BASE64
+        .decode(value)
+        .map_err(|_| "not raw URL-safe base64".to_string())?;
+    String::from_utf8(decrypt_obscured(&bytes)?)
+        .map_err(|_| "it reveals to bytes that are not UTF-8".to_string())
+}
+
+/// [`reveal_rclone_password`] for a value exactly as rclone writes one: raw
+/// URL-safe base64 whose discarded low bits are zero, as `obscure.Obscure`
+/// always leaves them. A probe for "could rclone have written this?": the
+/// lenient decoder also accepts values rclone never produces (about one
+/// 26-character string in twenty), which a probe must not count.
+pub(crate) fn reveal_canonical_rclone(value: &str) -> Result<String, String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| "not canonical raw URL-safe base64".to_string())?;
+    String::from_utf8(decrypt_obscured(&bytes)?)
+        .map_err(|_| "it reveals to bytes that are not UTF-8".to_string())
+}
+
+/// What an rclone `IsPassword` field of a remote holds.
+enum RcloneSecretField {
+    Absent,
+    Revealed(String),
+    /// Obscured, and revealing to nothing: `rclone obscure ""`.
+    Empty,
+    /// Present, but not a value rclone could reveal; the reason, which never
+    /// quotes the value.
+    Unreadable(String),
+}
+
+/// Reads an rclone `IsPassword` field of `remote` the way rclone does
+/// ([`reveal_rclone_password`]).
+fn rclone_password_field(remote: &RcloneRemote, key: &str) -> RcloneSecretField {
+    let Some(value) = remote.get(key).map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return RcloneSecretField::Absent;
+    };
+    match reveal_rclone_password(value) {
+        Ok(revealed) if revealed.is_empty() => RcloneSecretField::Empty,
+        Ok(revealed) => RcloneSecretField::Revealed(revealed),
+        Err(e) => RcloneSecretField::Unreadable(e),
+    }
+}
+
+/// What the header of an rclone.conf written by AeroFTP's own export says
+/// about it. Every AeroFTP export since the first one (v3.4.7) opens with
+/// `# Generated by AeroFTP` and `# Exported: <RFC 3339>`. Files that name the
+/// AeroFTP version put it on the first line (`# Generated by AeroFTP 4.2.0 - ...`).
+/// rclone keeps both lines when it rewrites the file. A build from before the
+/// version bump still writes the version it was compiled with, so the line is
+/// read from whatever version it names, not from a release number in this comment.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AeroftpExport {
+    /// `None` when the stamp is missing or does not parse.
+    exported: Option<chrono::DateTime<chrono::Utc>>,
+    /// `None` when the header does not name an AeroFTP version.
+    version: Option<(u32, u32, u32)>,
+}
+
+/// `major.minor.patch` of an AeroFTP version, ignoring a pre-release suffix.
+fn parse_aeroftp_version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.split(['-', '+']).next()?.split('.');
+    let mut next = || parts.next()?.parse::<u32>().ok();
+    let version = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(version)
+}
+
+/// The AeroFTP export header of `content`, `None` for any other rclone.conf.
+fn aeroftp_export_header(content: &str) -> Option<AeroftpExport> {
+    let mut export: Option<AeroftpExport> = None;
+    for line in content.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with('#') {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("# Generated by AeroFTP") {
+            let version = rest
+                .split_whitespace()
+                .next()
+                .and_then(parse_aeroftp_version);
+            export = Some(AeroftpExport {
+                exported: None,
+                version,
+            });
+        } else if let Some(stamp) = line.strip_prefix("# Exported:") {
+            if let Some(export) = export.as_mut() {
+                export.exported = chrono::DateTime::parse_from_rfc3339(stamp.trim())
+                    .ok()
+                    .map(|t| t.with_timezone(&chrono::Utc));
+            }
+        }
+    }
+    export
+}
+
+/// Until when AeroFTP's own export wrote a field obscured that rclone keeps
+/// plain, as the release of the version that fixed it: S3 `secret_access_key`
+/// and the Azure `key` until v3.7.6 (bfa25d257), the Swift `key` until v4.0.5
+/// (9abfe2634). A file stamped before that release came from a version that
+/// obscured the field.
+const AEROFTP_OBSCURED_S3_AZURE_UNTIL: (&str, &str) = ("2026-05-08T19:10:06Z", "3.7.6");
+const AEROFTP_OBSCURED_SWIFT_UNTIL: (&str, &str) = ("2026-06-16T18:48:54Z", "4.0.5");
+
+/// Shortest revealed plaintext accepted as a key AeroFTP used to obscure.
+/// A clear key of 23 to 31 characters decodes to 1 to 7 bytes, and those
+/// bytes are printable ASCII often enough (about 37% at one byte) to be
+/// stored as the secret. Eight characters is the shortest real secret this
+/// path is meant to recover (a Swift password); S3, Azure and B2 keys are longer.
+const MIN_REVEALED_PLAIN_SECRET_LEN: usize = 8;
+
+/// Appends the notes about credentials left out to the warning the profile
+/// already carries.
+fn with_credential_notes(mut mapped: MappedProfile, notes: Vec<String>) -> MappedProfile {
+    if !notes.is_empty() {
+        let notes = notes.join("; ");
+        mapped.credential_warning = Some(match mapped.credential_warning.take() {
+            Some(previous) => format!("{previous}; {notes}"),
+            None => notes,
+        });
+    }
+    mapped
 }
 
 /// Obscure a plaintext password using rclone's AES-256-CTR scheme.
@@ -135,6 +294,10 @@ fn parse_rclone_conf(content: &str) -> HashMap<String, RcloneRemote> {
 
 #[derive(Default)]
 struct MappedProfile {
+    /// Why a credential the remote carried was left out, e.g. an `IsPassword`
+    /// value that does not reveal. The profile still imports, without it, and
+    /// the reason reaches `RcloneImportResult::warnings`.
+    credential_warning: Option<String>,
     protocol: String,
     provider_id: Option<String>,
     host: String,
@@ -265,12 +428,24 @@ fn zoho_rclone_token_type(token_json: &str) -> String {
 /// `__aeroftp_oauth_*` keys. When every piece is present we emit a usable,
 /// refreshable remote; otherwise we emit a guidance comment instead of a
 /// silently broken half-remote. Issue #128-D.
-fn push_oauth_credentials(output: &mut String, options: Option<&serde_json::Value>) {
-    push_oauth_credentials_inner(output, options, None);
+///
+/// The guidance goes to `notes`, which the exporter writes above the
+/// `[remote]` header: rclone keeps a comment with the section that follows
+/// it, so a comment left inside the body moves under the NEXT remote the
+/// first time rclone rewrites the file (a reconnect does exactly that).
+fn push_oauth_credentials(
+    output: &mut String,
+    notes: &mut String,
+    remote_name: &str,
+    options: Option<&serde_json::Value>,
+) {
+    push_oauth_credentials_inner(output, notes, remote_name, options, None);
 }
 
 fn push_oauth_credentials_inner(
     output: &mut String,
+    notes: &mut String,
+    remote_name: &str,
     options: Option<&serde_json::Value>,
     force_token_type: Option<&str>,
 ) {
@@ -296,11 +471,12 @@ fn push_oauth_credentials_inner(
             output.push_str(&format!("token = {}\n", tok));
         }
         _ => {
-            output.push_str(
+            notes.push_str(&format!(
                 "# OAuth credentials not exported (client_id/client_secret/token\n\
-                 # unavailable in the vault). Run `rclone config reconnect <remote>:`\n\
+                 # unavailable in the vault). Run `rclone config reconnect {}`\n\
                  # to authorize this remote before use.\n",
-            );
+                rclone_shell_arg(remote_name, true)
+            ));
         }
     }
 }
@@ -338,24 +514,121 @@ fn rclone_jotta_to_aeroftp(remote: &RcloneRemote) -> Option<String> {
 // source for every importer instead of per-module duplicates.
 
 /// Convert a single rclone remote to an AeroFTP profile.
-fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
-    let rclone_type = remote.get("type")?.to_lowercase();
+/// `aeroftp_export` is what the header says when AeroFTP's own export wrote the
+/// file ([`aeroftp_export_header`]), `None` for any other rclone.conf.
+fn map_remote(
+    name: &str,
+    remote: &RcloneRemote,
+    aeroftp_export: Option<AeroftpExport>,
+) -> Result<MappedProfile, String> {
+    let rclone_type = remote
+        .get("type")
+        .ok_or_else(|| "missing type field".to_string())?
+        .to_lowercase();
 
-    // Helper to get and optionally reveal password
+    // An rclone `IsPassword` field. A value that does not reveal, or reveals
+    // to nothing, is left out, and why goes to the import report through
+    // `credential_notes`.
+    let credential_notes = std::cell::RefCell::new(Vec::new());
+    let note = |text: String| credential_notes.borrow_mut().push(text);
     let get_password = |key: &str| -> Option<String> {
-        remote.get(key).and_then(|v| {
-            if v.is_empty() {
-                return None;
+        match rclone_password_field(remote, key) {
+            RcloneSecretField::Absent => None,
+            RcloneSecretField::Revealed(secret) => Some(secret),
+            RcloneSecretField::Empty => {
+                note(format!(
+                    "{key} reveals to an empty value; imported without it"
+                ));
+                None
             }
-            // Try to reveal obscured password; fall back to plaintext
-            match reveal_obscured(v) {
-                Ok(revealed) if !revealed.is_empty() => Some(revealed),
-                _ => Some(v.clone()),
+            RcloneSecretField::Unreadable(why) => {
+                note(format!(
+                    "{key} does not reveal as an rclone-obscured password ({why}); imported without it"
+                ));
+                None
             }
-        })
+        }
     };
 
     let get_str = |key: &str| remote.get(key).map(|s| s.as_str());
+    // A secret rclone writes as it is, in a field that is not `IsPassword`
+    // (S3 `secret_access_key`, the Azure, Swift and B2 `key`, the Drime,
+    // Cloudinary and ImageKit keys): taken verbatim. Through the reveal codec,
+    // a key that happens to decode came back as the noise it decodes to, and
+    // was stored with no warning.
+    let get_plain_secret = |key: &str| get_str(key).filter(|v| !v.is_empty()).map(str::to_string);
+    // The same, for a field AeroFTP's own export once wrote obscured. Whether
+    // the file came from such a version is read from its header: the version
+    // when it names one, otherwise the date. rclone keeps that header when it
+    // rewrites the file, so a key fixed later by hand can sit in an old export
+    // in plain text, and a plain key can decode too. A reveal is therefore
+    // taken only when it gives a key's shape (printable ASCII, no spaces),
+    // and always reported; an empty one means no key.
+    let get_aeroftp_plain_secret = |key: &str, (until, fixed_in): (&str, &str)| {
+        let value = get_plain_secret(key)?;
+        let Some(export) = aeroftp_export else {
+            return Some(value);
+        };
+        let fixed = parse_aeroftp_version(fixed_in).expect("a constant version");
+        let until = chrono::DateTime::parse_from_rfc3339(until)
+            .expect("a constant RFC 3339 time")
+            .with_timezone(&chrono::Utc);
+        let written_obscured = match (export.version, export.exported) {
+            (Some(version), _) => version < fixed,
+            (None, Some(exported)) => exported < until,
+            // A header with neither says nothing: read the file as rclone does.
+            (None, None) => return Some(value),
+        };
+        let Ok(revealed) = reveal_rclone_password(&value) else {
+            return Some(value);
+        };
+        let key_shaped = revealed.len() >= MIN_REVEALED_PLAIN_SECRET_LEN
+            && revealed.bytes().all(|b| (0x21..=0x7e).contains(&b));
+        if !written_obscured {
+            if key_shaped && export.version.is_none() {
+                note(format!(
+                    "{key} also reads as an rclone-obscured value, the form AeroFTP \
+                     exports before {fixed_in} wrote; kept as written: if the profile \
+                     does not sign in, export it again from a current AeroFTP"
+                ));
+            }
+            return Some(value);
+        }
+        if revealed.is_empty() {
+            // A 22-character value in the rclone alphabet decodes to an IV and
+            // nothing else, so it reveals to empty whether it is obscure("")
+            // or a clear key of that length. Both are left out, and the note
+            // names both causes: calling every such value an obscured empty
+            // key is wrong when the user typed a real 22-character key.
+            note(format!(
+                "{key} is 22 characters and reveals to an empty value. That is true of \
+                 an obscured empty key and of a clear key of that length, so the two \
+                 cannot be told apart; imported without it. If this was a real key, \
+                 set it again"
+            ));
+            return None;
+        }
+        if !key_shaped {
+            // A real old Swift password can contain a space or a non-ASCII
+            // character, and a short clear key can reveal to one printable
+            // byte. Neither is stored as the revealed text. The note says so;
+            // the ciphertext stays as written, and the value itself stays out
+            // of the note.
+            note(format!(
+                "{key} reveals to a value this import does not take (shorter than \
+                 {MIN_REVEALED_PLAIN_SECRET_LEN} characters, or it contains a space or a \
+                 non-ASCII character), so it was kept as written. AeroFTP exports before \
+                 {fixed_in} wrote it obscured; if the profile does not sign in, set this \
+                 key again"
+            ));
+            return Some(value);
+        }
+        note(format!(
+            "{key} was revealed: AeroFTP exports before {fixed_in} wrote it obscured; \
+             if the profile does not sign in, check this key"
+        ));
+        Some(revealed)
+    };
     let get_port = |key: &str, default: u32| -> u32 {
         remote
             .get(key)
@@ -363,12 +636,12 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             .unwrap_or(default)
     };
 
-    match rclone_type.as_str() {
+    let mapped = match rclone_type.as_str() {
         // ---- FTP ----
         "ftp" => {
             let host = get_str("host").unwrap_or("").to_string();
             if host.is_empty() {
-                return None;
+                return Err("ftp remote has no host".to_string());
             }
             let flag = |k: &str| get_str(k).map(|v| v == "true" || v == "1").unwrap_or(false);
             // rclone's `tls` is implicit FTPS, `explicit_tls` is AUTH TLS on 21.
@@ -388,7 +661,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 21
             };
 
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: protocol.to_string(),
                 provider_id: None,
                 host,
@@ -399,6 +672,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
@@ -406,9 +680,9 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
         "sftp" => {
             let host = get_str("host").unwrap_or("").to_string();
             if host.is_empty() {
-                return None;
+                return Err("sftp remote has no host".to_string());
             }
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "sftp".to_string(),
                 provider_id: None,
                 host,
@@ -419,6 +693,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
@@ -448,7 +723,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 format!("s3.{}.amazonaws.com", region)
             } else {
                 // Generic S3: need endpoint
-                return None;
+                return Err("s3 remote has no endpoint".to_string());
             };
 
             let mut options = serde_json::Map::new();
@@ -473,17 +748,21 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 .unwrap_or(provider_id != "amazon-s3");
             options.insert("pathStyle".into(), serde_json::Value::Bool(path_style));
 
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "s3".to_string(),
                 provider_id: Some(provider_id.to_string()),
                 host,
                 port: 443,
                 username: get_str("access_key_id").unwrap_or("").to_string(),
-                password: get_password("secret_access_key"),
+                password: get_aeroftp_plain_secret(
+                    "secret_access_key",
+                    AEROFTP_OBSCURED_S3_AZURE_UNTIL,
+                ),
                 options: Some(serde_json::Value::Object(options)),
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
@@ -491,7 +770,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
         "webdav" => {
             let url = get_str("url").unwrap_or("").to_string();
             if url.is_empty() {
-                return None;
+                return Err("webdav remote has no url".to_string());
             }
             let vendor = get_str("vendor").unwrap_or("other");
             let provider_id = crate::bridge_shared::map_webdav_vendor(vendor);
@@ -504,7 +783,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 options.insert("basePath".into(), serde_json::Value::String(base_path));
             }
 
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "webdav".to_string(),
                 provider_id: Some(provider_id.to_string()),
                 host,
@@ -519,11 +798,12 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
         // ---- Google Drive ----
-        "drive" => Some(MappedProfile {
+        "drive" => Ok(MappedProfile {
             protocol: "googledrive".to_string(),
             provider_id: Some("googledrive".to_string()),
             host: "www.googleapis.com".to_string(),
@@ -537,10 +817,11 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             // with how `.aeroftp` exports carry credentials.
             oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- Google Photos ----
-        "gphotos" | "googlephotos" => Some(MappedProfile {
+        "gphotos" | "googlephotos" => Ok(MappedProfile {
             protocol: "googlephotos".to_string(),
             provider_id: Some("googlephotos".to_string()),
             host: "photoslibrary.googleapis.com".to_string(),
@@ -551,10 +832,11 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- Dropbox ----
-        "dropbox" => Some(MappedProfile {
+        "dropbox" => Ok(MappedProfile {
             protocol: "dropbox".to_string(),
             provider_id: Some("dropbox".to_string()),
             host: "api.dropboxapi.com".to_string(),
@@ -565,10 +847,11 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- OneDrive ----
-        "onedrive" => Some(MappedProfile {
+        "onedrive" => Ok(MappedProfile {
             protocol: "onedrive".to_string(),
             provider_id: Some("onedrive".to_string()),
             host: "graph.microsoft.com".to_string(),
@@ -579,10 +862,11 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- MEGA ----
-        "mega" => Some(MappedProfile {
+        "mega" => Ok(MappedProfile {
             protocol: "mega".to_string(),
             provider_id: Some("mega".to_string()),
             host: "mega.nz".to_string(),
@@ -593,7 +877,34 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: None,
             jotta_refresh: None,
+            credential_warning: None,
         }),
+
+        // ---- Internxt ----
+        // `email` + obscured `pass`, the pair AeroFTP signs in with. The host is
+        // the one the GUI gives a new Internxt profile. After its own sign-in
+        // rclone also stores `mnemonic` (obscured) and `token`: both are
+        // ignored, since AeroFTP derives the mnemonic and a token at every
+        // sign-in and keeps neither on disk.
+        "internxt" => {
+            let email = get_str("email").unwrap_or("").to_string();
+            if email.is_empty() {
+                return Err("internxt remote has no email".to_string());
+            }
+            Ok(MappedProfile {
+                protocol: "internxt".to_string(),
+                provider_id: Some("internxt".to_string()),
+                host: "gateway.internxt.com".to_string(),
+                port: 443,
+                username: email,
+                password: get_password("pass"),
+                options: None,
+                initial_path: None,
+                oauth_token: None,
+                jotta_refresh: None,
+                credential_warning: None,
+            })
+        }
 
         // ---- Filen ----
         // rclone's `filen` backend stores `email` + obscured `password` +
@@ -608,13 +919,13 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
         "filen" => {
             let email = get_str("email").unwrap_or("").to_string();
             if email.is_empty() {
-                return None;
+                return Err("filen remote has no email".to_string());
             }
             let mut options = serde_json::Map::new();
             if let Some(api_key) = get_password("api_key").filter(|k| !k.is_empty()) {
                 options.insert("filen_api_key".into(), serde_json::Value::String(api_key));
             }
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "filen".to_string(),
                 provider_id: Some("filen".to_string()),
                 host: "filen.io".to_string(),
@@ -629,11 +940,12 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
         // ---- Box ----
-        "box" => Some(MappedProfile {
+        "box" => Ok(MappedProfile {
             protocol: "box".to_string(),
             provider_id: Some("box".to_string()),
             host: "api.box.com".to_string(),
@@ -644,6 +956,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- pCloud ----
@@ -662,7 +975,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 "region".into(),
                 serde_json::Value::String(region.to_string()),
             );
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "pcloud".to_string(),
                 provider_id: Some("pcloud".to_string()),
                 host: hostname.to_string(),
@@ -673,6 +986,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
@@ -680,7 +994,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
         "azureblob" => {
             let account = get_str("account").unwrap_or("").to_string();
             if account.is_empty() {
-                return None;
+                return Err("azureblob remote has no account".to_string());
             }
             let mut options = serde_json::Map::new();
             if let Some(container) = get_str("container") {
@@ -690,13 +1004,13 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 );
             }
 
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "azure".to_string(),
                 provider_id: Some("azure-blob".to_string()),
                 host: format!("{}.blob.core.windows.net", account),
                 port: 443,
                 username: account,
-                password: get_password("key"),
+                password: get_aeroftp_plain_secret("key", AEROFTP_OBSCURED_S3_AZURE_UNTIL),
                 options: if options.is_empty() {
                     None
                 } else {
@@ -705,6 +1019,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
@@ -719,7 +1034,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 .unwrap_or("")
                 .to_string();
             if host.is_empty() {
-                return None;
+                return Err("swift remote has no auth URL".to_string());
             }
 
             let mut options = serde_json::Map::new();
@@ -745,13 +1060,13 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 );
             }
 
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "swift".to_string(),
                 provider_id: Some("custom-swift".to_string()),
                 host,
                 port: 443,
                 username: get_str("user").unwrap_or("").to_string(),
-                password: get_password("key"),
+                password: get_aeroftp_plain_secret("key", AEROFTP_OBSCURED_SWIFT_UNTIL),
                 options: if options.is_empty() {
                     None
                 } else {
@@ -760,13 +1075,14 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
         // ---- Yandex Disk ----
         // rclone's backend type is `yandex`; older configs and some forks used
         // `yandexdisk`. Accept both so a real `rclone config` remote imports.
-        "yandex" | "yandexdisk" => Some(MappedProfile {
+        "yandex" | "yandexdisk" => Ok(MappedProfile {
             protocol: "yandexdisk".to_string(),
             provider_id: Some("yandex-disk".to_string()),
             host: "webdav.yandex.ru".to_string(),
@@ -777,6 +1093,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- Zoho WorkDrive ----
@@ -794,7 +1111,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                     serde_json::Value::String(folder.to_string()),
                 );
             }
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "zohoworkdrive".to_string(),
                 provider_id: Some("zoho-workdrive".to_string()),
                 host: "workdrive.zoho.com".to_string(),
@@ -808,11 +1125,12 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 initial_path: None,
                 oauth_token: get_str("token").and_then(rclone_token_to_aeroftp),
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
         // ---- Koofr ----
-        "koofr" => Some(MappedProfile {
+        "koofr" => Ok(MappedProfile {
             protocol: "koofr".to_string(),
             provider_id: Some("koofr".to_string()),
             host: get_str("endpoint")
@@ -827,10 +1145,11 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: None,
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
         // ---- Jottacloud ----
-        "jottacloud" => Some(MappedProfile {
+        "jottacloud" => Ok(MappedProfile {
             protocol: "jottacloud".to_string(),
             provider_id: Some("jottacloud".to_string()),
             host: "jottacloud.com".to_string(),
@@ -841,6 +1160,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: None,
             jotta_refresh: rclone_jotta_to_aeroftp(remote),
+            credential_warning: None,
         }),
 
         // ---- Backblaze B2 (native API v4) ----
@@ -851,7 +1171,7 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
         "b2" => {
             let account = get_str("account").unwrap_or("").to_string();
             if account.is_empty() {
-                return None;
+                return Err("b2 remote has no account".to_string());
             }
 
             let mut options = serde_json::Map::new();
@@ -862,22 +1182,23 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
                 );
             }
 
-            Some(MappedProfile {
+            Ok(MappedProfile {
                 protocol: "backblaze".to_string(),
                 provider_id: Some("backblaze-native".to_string()),
                 host: "api.backblazeb2.com".to_string(),
                 port: 443,
                 username: account,
-                password: get_password("key"),
+                password: get_plain_secret("key"),
                 options: Some(serde_json::Value::Object(options)),
                 initial_path: None,
                 oauth_token: None,
                 jotta_refresh: None,
+                credential_warning: None,
             })
         }
 
         // ---- OpenDrive ----
-        "opendrive" => Some(MappedProfile {
+        "opendrive" => Ok(MappedProfile {
             protocol: "opendrive".to_string(),
             provider_id: Some("opendrive".to_string()),
             host: "od.lk".to_string(),
@@ -888,11 +1209,144 @@ fn map_remote(name: &str, remote: &RcloneRemote) -> Option<MappedProfile> {
             initial_path: None,
             oauth_token: None,
             jotta_refresh: None,
+            credential_warning: None,
         }),
 
+        // ---- Drime ----
+        // `access_token` is the API token AeroFTP sends as a Bearer token.
+        // AeroFTP opens the default workspace from its root, and rclone never
+        // writes `workspace_id` or `root_folder_id` itself: a remote carrying
+        // either was scoped by hand, and imported it would open other content.
+        "drime" => {
+            let token = get_plain_secret("access_token")
+                .ok_or_else(|| "drime remote has no access_token".to_string())?;
+            if let Some(ws) = get_str("workspace_id")
+                .map(str::trim)
+                .filter(|w| !w.is_empty() && *w != "0")
+            {
+                return Err(format!(
+                    "drime remote is pinned to workspace {ws}; AeroFTP opens the default workspace only"
+                ));
+            }
+            if let Some(folder) = get_str("root_folder_id")
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+            {
+                return Err(format!(
+                    "drime remote is rooted at folder id {folder}, which AeroFTP cannot open as a start folder"
+                ));
+            }
+            Ok(MappedProfile {
+                protocol: "drime".to_string(),
+                provider_id: Some("drime".to_string()),
+                host: "app.drime.cloud".to_string(),
+                port: 443,
+                username: "api-token".to_string(),
+                password: Some(token),
+                options: None,
+                initial_path: None,
+                oauth_token: None,
+                jotta_refresh: None,
+                credential_warning: None,
+            })
+        }
+
+        // ---- Cloudinary ----
+        // `cloud_name` lands where the app's form keeps it, `options.bucket`.
+        // AeroFTP calls api.cloudinary.com only, so a remote pointed at another
+        // regional endpoint through `upload_prefix` is refused.
+        "cloudinary" => {
+            let cloud_name = get_str("cloud_name")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .ok_or_else(|| "cloudinary remote has no cloud_name".to_string())?;
+            let api_key = get_str("api_key")
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| "cloudinary remote has no api_key".to_string())?;
+            if let Some(prefix) = get_str("upload_prefix")
+                .map(|p| p.trim().trim_end_matches('/'))
+                .filter(|p| !p.is_empty() && *p != "https://api.cloudinary.com")
+            {
+                return Err(format!(
+                    "cloudinary remote uses the endpoint {prefix}; AeroFTP calls api.cloudinary.com only"
+                ));
+            }
+            let api_secret = get_plain_secret("api_secret");
+            if api_secret.is_none() {
+                note("api_secret is missing; imported without it".to_string());
+            }
+            Ok(MappedProfile {
+                protocol: "cloudinary".to_string(),
+                provider_id: Some("cloudinary".to_string()),
+                host: "api.cloudinary.com".to_string(),
+                port: 443,
+                username: api_key.to_string(),
+                password: api_secret,
+                options: Some(serde_json::json!({ "bucket": cloud_name })),
+                initial_path: None,
+                oauth_token: None,
+                jotta_refresh: None,
+                credential_warning: None,
+            })
+        }
+
+        // ---- ImageKit ----
+        // The URL endpoint becomes the profile's "URL Endpoint ID", which takes
+        // the whole URL. The public key AeroFTP does not use is kept, so the
+        // profile can be exported back to rclone, which requires it.
+        "imagekit" => {
+            let endpoint = get_str("endpoint")
+                .map(|e| e.trim().trim_end_matches('/'))
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| "imagekit remote has no endpoint".to_string())?;
+            let public_key = get_str("public_key")
+                .map(str::trim)
+                .filter(|k| !k.is_empty());
+            if public_key.is_none() {
+                note(
+                    "public_key is missing: AeroFTP does not need it, but exporting \
+                     this profile back to rclone does"
+                        .to_string(),
+                );
+            }
+            let options = public_key.map(|k| serde_json::json!({ "imagekit_public_key": k }));
+            let private_key = get_plain_secret("private_key");
+            if private_key.is_none() {
+                note("private_key is missing; imported without it".to_string());
+            }
+            Ok(MappedProfile {
+                protocol: "imagekit".to_string(),
+                provider_id: Some("imagekit".to_string()),
+                host: "api.imagekit.io".to_string(),
+                port: 443,
+                username: endpoint.to_string(),
+                password: private_key,
+                options,
+                initial_path: None,
+                oauth_token: None,
+                jotta_refresh: None,
+                credential_warning: None,
+            })
+        }
+
+        // ---- FileLu ----
+        // The remote holds the FileLu Rclone key, which rclone sends to
+        // filelu.com/rclone. AeroFTP signs in to filelu.com/api with the
+        // account's Developer API key, a different key the remote does not hold.
+        "filelu" => Err(
+            "filelu remote holds the FileLu Rclone key, not the Developer API key \
+             AeroFTP signs in with (Account Settings)"
+                .to_string(),
+        ),
+
         // Unsupported rclone types: skip gracefully
-        _ => None,
-    }
+        _ => Err(format!("unsupported rclone type: {}", rclone_type)),
+    };
+    Ok(with_credential_notes(
+        mapped?,
+        credential_notes.into_inner(),
+    ))
 }
 
 /// Map AeroFTP's Zoho region slug to rclone's `zoho` backend `region`.
@@ -925,6 +1379,16 @@ fn zoho_region_from_rclone(region: &str) -> String {
     }
 }
 
+/// Whether `name` is made only of the characters rclone allows in a remote
+/// name (`[A-Za-z0-9_.+@ -]`, ASCII). Such a text names a section and carries
+/// no parameter, so a message may repeat it.
+fn is_rclone_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '@' | ' ' | '-'))
+}
+
 fn parse_crypt_remote_target(remote_target: &str) -> (String, Option<String>) {
     if let Some((base, subpath)) = remote_target.split_once(':') {
         let normalized = subpath.trim().trim_start_matches('/');
@@ -939,29 +1403,133 @@ fn parse_crypt_remote_target(remote_target: &str) -> (String, Option<String>) {
     }
 }
 
+/// The target a crypt's `remote = <name>:<path>` means once every `alias`
+/// remote in front of it is replaced by what it points at: `alias:sub` is
+/// `<the alias's remote>/sub`. This exporter writes a crypt over an alias for
+/// a profile that starts in a subfolder or pins a bucket, so its own export
+/// imports only with this. A target that is not an alias comes back as it
+/// is; a chain that does not end is refused with the crypt.
+fn resolve_alias_target(
+    remote_target: &str,
+    sections: &HashMap<String, RcloneRemote>,
+) -> Result<String, String> {
+    let mut target = remote_target.to_string();
+    for _ in 0..8 {
+        let Some((name, sub)) = target.split_once(':') else {
+            return Ok(target);
+        };
+        let Some(alias) = sections
+            .get(name.trim())
+            .filter(|section| section.get("type").map(|t| t.trim()) == Some("alias"))
+        else {
+            return Ok(target);
+        };
+        let inner = alias.get("remote").map(|r| r.trim()).unwrap_or("");
+        if inner.is_empty() {
+            return Err(format!(
+                "crypt remote wraps the alias '{}', which points at no remote",
+                name.trim()
+            ));
+        }
+        let sub = sub.trim().trim_start_matches('/');
+        target = if sub.is_empty() {
+            inner.to_string()
+        } else if inner.ends_with(':') || inner.ends_with('/') {
+            format!("{inner}{sub}")
+        } else {
+            format!("{inner}/{sub}")
+        };
+    }
+    Err("crypt remote wraps a chain of alias remotes that does not end".to_string())
+}
+
 fn map_crypt_remote(
     name: &str,
     remote: &RcloneRemote,
     sections: &HashMap<String, RcloneRemote>,
-) -> Option<MappedProfile> {
-    let remote_target = remote.get("remote")?.trim().to_string();
+    aeroftp_export: Option<AeroftpExport>,
+) -> Result<MappedProfile, String> {
+    let remote_target = remote
+        .get("remote")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
     if remote_target.is_empty() {
-        return None;
+        return Err("crypt remote has no remote to wrap".to_string());
     }
+    let remote_target = resolve_alias_target(&remote_target, sections)?;
 
+    if remote_target.starts_with(':') {
+        return Err(
+            "crypt remote wraps an on-the-fly backend, which AeroFTP cannot carry".to_string(),
+        );
+    }
     let (base_remote_name, crypt_subpath) = parse_crypt_remote_target(&remote_target);
-    let base_remote = sections.get(&base_remote_name)?;
-    let mut mapped = map_remote(&base_remote_name, base_remote)?;
+    // rclone also takes a connection string (`mys3,secret_access_key=...:bucket`),
+    // an on-the-fly backend (`:s3,...:bucket`) and a local path here. Their
+    // parameters can be secrets and AeroFTP has nowhere to keep them, so such a
+    // crypt is not imported, and the reason names at most the remote in front
+    // of the parameters, never the parameters.
+    if let Some((named, _parameters)) = base_remote_name.split_once(',') {
+        return Err(if is_rclone_remote_name(named) {
+            format!(
+                "crypt remote wraps '{}' with connection-string parameters, which AeroFTP cannot carry",
+                named
+            )
+        } else {
+            "crypt remote wraps a backend with connection-string parameters, which AeroFTP cannot carry"
+                .to_string()
+        });
+    }
+    if !is_rclone_remote_name(&base_remote_name) {
+        return Err(
+            "crypt remote wraps a local path or another target that is not a named remote, \
+             which AeroFTP cannot carry"
+                .to_string(),
+        );
+    }
+    let base_remote = sections.get(&base_remote_name).ok_or_else(|| {
+        format!(
+            "crypt remote wraps '{}', which is not in this file",
+            base_remote_name
+        )
+    })?;
+    let mut mapped = map_remote(&base_remote_name, base_remote, aeroftp_export)
+        .map_err(|e| format!("crypt remote wraps '{}': {}", base_remote_name, e))?;
 
     let get_str = |k: &str| remote.get(k).map(|s| s.as_str());
-    let get_password = |k: &str| {
-        get_str(k).and_then(|v| {
-            if v.is_empty() {
-                None
-            } else {
-                reveal_obscured(v).ok().or_else(|| Some(v.to_string()))
+    // `password` and `password2` are `IsPassword` fields. A crypt remote whose
+    // password or salt rclone could not reveal is not imported: the overlay
+    // would be enabled with a key derived from something else, and an
+    // unreadable salt left out would select rclone's default salt, so files
+    // would read as noise, or be written under a key rclone cannot open. An
+    // absent salt, or `obscure("")`, IS rclone's default salt. An empty
+    // password is valid in rclone, which then uses an all-zero key (rclone
+    // v1.75.1 `backend/crypt/cipher.go`, `Key`), but the overlay requires a
+    // password, so that remote is not imported either.
+    let password =
+        match rclone_password_field(remote, "password") {
+            RcloneSecretField::Absent => None,
+            RcloneSecretField::Revealed(password) => Some(password),
+            RcloneSecretField::Empty => return Err(
+                "crypt remote's password is empty (rclone then encrypts with an all-zero key), \
+                 and AeroFTP's crypt overlay requires a password"
+                    .to_string(),
+            ),
+            RcloneSecretField::Unreadable(why) => {
+                return Err(format!(
+                "crypt remote's password does not reveal as an rclone-obscured password ({why})"
+            ))
             }
-        })
+        };
+    let salt = match rclone_password_field(remote, "password2") {
+        RcloneSecretField::Absent | RcloneSecretField::Empty => None,
+        RcloneSecretField::Revealed(salt) => Some(salt),
+        RcloneSecretField::Unreadable(why) => {
+            return Err(format!(
+                "crypt remote's password2 (the salt) does not reveal as an rclone-obscured \
+                 password ({why}); without it the overlay would use rclone's default salt"
+            ))
+        }
     };
 
     let mut options = match mapped.options.take() {
@@ -979,10 +1547,10 @@ fn map_crypt_remote(
         serde_json::Value::String(name.to_string()),
     );
 
-    if let Some(pw) = get_password("password") {
+    if let Some(pw) = password {
         options.insert("rcloneCryptPassword".into(), serde_json::Value::String(pw));
     }
-    if let Some(pw2) = get_password("password2") {
+    if let Some(pw2) = salt {
         options.insert(
             "rcloneCryptPassword2".into(),
             serde_json::Value::String(pw2),
@@ -1008,7 +1576,7 @@ fn map_crypt_remote(
         mapped.initial_path = crypt_subpath;
     }
 
-    Some(mapped)
+    Ok(mapped)
 }
 
 /// Parse a WebDAV URL into (host, basePath, port).
@@ -1115,6 +1683,7 @@ pub fn default_rclone_config_path() -> Option<PathBuf> {
 pub struct RcloneImportResult {
     pub servers: Vec<ServerProfileExport>,
     pub skipped: Vec<RcloneSkippedRemote>,
+    pub warnings: Vec<RcloneImportWarning>,
     pub source_path: String,
     pub total_remotes: usize,
     /// Per-profile OAuth / Jotta token blobs imported from the rclone
@@ -1135,15 +1704,49 @@ pub struct RcloneSkippedRemote {
     pub reason: String,
 }
 
+/// Option keys the importer fills with a revealed secret: the rclone-crypt
+/// password and salt (`map_crypt_remote`) and the Filen CLI API key
+/// (`map_remote`). The save paths move them into the vault; whatever prints an
+/// import (the CLI `import rclone --json` report) leaves them out, as the GUI
+/// preview does.
+pub const IMPORT_SECRET_OPTION_KEYS: &[&str] = &[
+    "rcloneCryptPassword",
+    "rcloneCryptPassword2",
+    "filen_api_key",
+];
+
+/// `options` without the keys in [`IMPORT_SECRET_OPTION_KEYS`], for output.
+pub fn options_without_secrets(options: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let mut options = options?.clone();
+    if let Some(map) = options.as_object_mut() {
+        for key in IMPORT_SECRET_OPTION_KEYS {
+            map.remove(*key);
+        }
+    }
+    Some(options)
+}
+
+/// A remote that imported, but not whole: e.g. its password did not reveal,
+/// so the profile carries no credential. Kept apart from `skipped`, which
+/// lists remotes that did not import at all.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RcloneImportWarning {
+    pub name: String,
+    pub reason: String,
+}
+
 /// Import all supported remotes from an rclone.conf file.
 pub fn import_rclone(config_path: &Path) -> Result<RcloneImportResult, String> {
     let content =
         std::fs::read_to_string(config_path).map_err(|e| format!("Read rclone.conf: {}", e))?;
 
     let sections = parse_rclone_conf(&content);
+    let aeroftp_export = aeroftp_export_header(&content);
     let total_remotes = sections.len();
     let mut servers = Vec::new();
     let mut skipped = Vec::new();
+    let mut warnings = Vec::new();
     let mut provider_secrets: std::collections::HashMap<
         String,
         crate::profile_export::ProviderSecrets,
@@ -1163,13 +1766,20 @@ pub fn import_rclone(config_path: &Path) -> Result<RcloneImportResult, String> {
         let rclone_type = remote.get("type").map(|s| s.as_str()).unwrap_or("unknown");
 
         let mapped = if rclone_type == "crypt" {
-            map_crypt_remote(name, remote, &sections)
+            map_crypt_remote(name, remote, &sections, aeroftp_export)
         } else {
-            map_remote(name, remote)
+            map_remote(name, remote, aeroftp_export)
         };
 
         match mapped {
-            Some(mapped) => {
+            Ok(mapped) => {
+                if let Some(reason) = &mapped.credential_warning {
+                    tracing::warn!("[rclone import] remote '{}': {}", name, reason);
+                    warnings.push(RcloneImportWarning {
+                        name: name.clone(),
+                        reason: reason.clone(),
+                    });
+                }
                 let id = format!(
                     "rclone-{}-{}",
                     name.to_lowercase().replace(' ', "-"),
@@ -1226,12 +1836,7 @@ pub fn import_rclone(config_path: &Path) -> Result<RcloneImportResult, String> {
                     ..Default::default()
                 });
             }
-            None => {
-                let reason = if rclone_type == "unknown" {
-                    "missing type field".to_string()
-                } else {
-                    format!("unsupported rclone type: {}", rclone_type)
-                };
+            Err(reason) => {
                 skipped.push(RcloneSkippedRemote {
                     name: name.clone(),
                     rclone_type: rclone_type.to_string(),
@@ -1244,6 +1849,7 @@ pub fn import_rclone(config_path: &Path) -> Result<RcloneImportResult, String> {
     Ok(RcloneImportResult {
         servers,
         skipped,
+        warnings,
         source_path: config_path.display().to_string(),
         total_remotes,
         provider_secrets,
@@ -1266,6 +1872,16 @@ pub struct RcloneExportServer {
     pub options: Option<serde_json::Value>,
     pub provider_id: Option<String>,
     // Password is fetched from vault separately and passed in
+}
+
+/// One shell argument for an rclone command written into the exported file:
+/// `"My Internxt:"` for commands that take a remote, `"My Internxt"` for
+/// `rclone config update`, which takes the bare name. Names come out of
+/// `sanitize_rclone_remote_name`, which keeps only ASCII `[A-Za-z0-9_.+@ -]`,
+/// so a space is the only character that needs protecting and nothing in a
+/// name can close or expand a double-quoted string.
+fn rclone_shell_arg(remote_name: &str, with_colon: bool) -> String {
+    format!("\"{}{}\"", remote_name, if with_colon { ":" } else { "" })
 }
 
 /// Sanitize a saved-profile name into a valid rclone remote name.
@@ -1356,30 +1972,124 @@ fn sanitize_export_server(server: &RcloneExportServer) -> RcloneExportServer {
 /// section that no longer exists. Falls back to the pinned overlay scope
 /// (`rcloneCryptOverlayScope` / a leading-slash path). Empty scope means
 /// the whole remote: `base:`.
-fn crypt_export_remote_target(base_name: &str, options: &serde_json::Value) -> String {
+///
+/// The imported path is from the root of the clear remote (`clear_name`),
+/// while an alias base (the start folder, a pinned bucket) already points at
+/// `base_root` inside it: the path is taken relative to that folder, or, when
+/// it lies outside it, the crypt wraps the clear remote. Written as it was,
+/// `vault:/enc` exported over the alias `vault-path = vault:/enc` became
+/// `vault-path:/enc`, which is `vault:/enc/enc`. The overlay scope is already
+/// relative to the start folder.
+fn crypt_export_remote_target(
+    base_name: &str,
+    clear_name: &str,
+    base_root: Option<&str>,
+    options: &serde_json::Value,
+) -> String {
+    let trim = |p: &str| {
+        p.trim()
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let target = |name: &str, path: &str| {
+        if path.is_empty() {
+            format!("{name}:")
+        } else {
+            format!("{name}:/{path}")
+        }
+    };
     let from_imported = options
         .get("rcloneCryptRemote")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let path = if let Some(existing) = from_imported {
-        if existing.contains(':') {
+    if let Some(existing) = from_imported {
+        let path = trim(&if existing.contains(':') {
             parse_crypt_remote_target(existing).1.unwrap_or_default()
         } else {
             existing.to_string()
-        }
+        });
+        return match base_root.map(trim).filter(|root| !root.is_empty()) {
+            None => target(base_name, &path),
+            Some(root) if path == root => target(base_name, ""),
+            Some(root) => match path.strip_prefix(&format!("{root}/")) {
+                Some(rest) => target(base_name, rest),
+                None => target(clear_name, &path),
+            },
+        };
+    }
+    let scope = options
+        .get("rcloneCryptOverlayScope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    target(base_name, &trim(scope))
+}
+
+/// Cloudinary's account name. The app's form keeps it in `options.bucket`;
+/// a profile keyed by hand may carry it as the host instead, which is how
+/// the provider reads it too (`provider_commands.rs` and the CLI's profile
+/// loader).
+fn cloudinary_cloud_name(server: &RcloneExportServer) -> Option<String> {
+    server
+        .options
+        .as_ref()
+        .and_then(|o| o.get("bucket"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let host = server.host.trim();
+            (!host.is_empty() && host != "api.cloudinary.com").then(|| host.to_string())
+        })
+}
+
+/// The ImageKit public key, which AeroFTP itself never needs (it signs with
+/// the private key) and so only holds for a profile imported from an rclone
+/// remote.
+fn imagekit_public_key(options: Option<&serde_json::Value>) -> Option<&str> {
+    options
+        .and_then(|o| o.get("imagekit_public_key"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// rclone's `endpoint` is the whole URL endpoint. The app's "URL Endpoint ID"
+/// field holds either the bare id or the URL pasted from the dashboard, and a
+/// bare id lives under `ik.imagekit.io`.
+fn imagekit_rclone_endpoint(id: &str) -> String {
+    let id = id.trim().trim_end_matches('/');
+    if id.starts_with("https://") || id.starts_with("http://") {
+        id.to_string()
     } else {
-        options
-            .get("rcloneCryptOverlayScope")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let trimmed = path.trim().trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        format!("{base_name}:")
-    } else {
-        format!("{base_name}:/{trimmed}")
+        format!("https://ik.imagekit.io/{}", id.trim_start_matches('/'))
+    }
+}
+
+/// Why a Cloudinary or ImageKit profile cannot become a working rclone
+/// remote, when a field rclone needs is not on the profile. Checked before a
+/// section name is claimed, like Zoho's region and root folder.
+fn rclone_required_field_missing(proto: &str, server: &RcloneExportServer) -> Option<String> {
+    match proto {
+        // Without `cloud_name` rclone v1.75.1 still creates the remote, and
+        // every listing then fails on the HTML page Cloudinary answers with.
+        "cloudinary" if cloudinary_cloud_name(server).is_none() => Some(
+            "the profile has no Cloudinary cloud name, which rclone's cloudinary \
+             backend needs as `cloud_name`"
+                .to_string(),
+        ),
+        // rclone v1.75.1 refuses the remote outright: "ImageKit.io public key
+        // is required".
+        "imagekit" if imagekit_public_key(server.options.as_ref()).is_none() => Some(
+            "rclone's imagekit backend requires the account public key, and this \
+             profile has none: AeroFTP signs with the private key only, so a profile \
+             created in the app does not store it. Create the remote with \
+             `rclone config`, using the public key from the ImageKit dashboard."
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -1427,6 +2137,7 @@ enum CryptName {
 /// the clear.
 fn crypt_section_name(
     base_name: &str,
+    profile_section: &str,
     options: &serde_json::Value,
     names: &mut RcloneNamespace,
 ) -> CryptName {
@@ -1436,7 +2147,14 @@ fn crypt_section_name(
             .and_then(|v| v.as_str())
             .unwrap_or(""),
     );
-    if !requested.is_empty() && requested != base_name {
+    // The operator's name is used only when it is neither the clear remote's
+    // section nor the base this crypt wraps. Both of those would make
+    // `rclone sync <name>:` point at the crypt while that name is still the
+    // clear remote. Root and subfolder fall through to `<base>-crypt` the
+    // same way: in a subfolder `base` is the start-folder alias, not the
+    // profile section, so comparing only with `base` used to claim the
+    // profile's own name and refuse.
+    if !requested.is_empty() && requested != base_name && requested != profile_section {
         return if names.claim_exact(&requested) {
             CryptName::Free(requested)
         } else {
@@ -1465,6 +2183,8 @@ enum CryptSection {
 fn append_crypt_remote_section(
     output: &mut String,
     base_name: &str,
+    profile_section: &str,
+    base_root: Option<&str>,
     options: Option<&serde_json::Value>,
     names: &mut RcloneNamespace,
 ) -> CryptSection {
@@ -1472,7 +2192,21 @@ fn append_crypt_remote_section(
         Some(o) if o.get("rcloneCryptEnabled").and_then(|v| v.as_bool()) == Some(true) => o,
         _ => return CryptSection::None,
     };
-    let section = match crypt_section_name(base_name, opts, names) {
+    // A stored crypt secret that cannot be read safely (see
+    // `bridge_commands::put_stored_crypt_secrets`): no remote beats one with a
+    // key AeroFTP does not use.
+    if let Some(problem) = opts
+        .get("rcloneCryptSecretProblem")
+        .and_then(|v| v.as_str())
+    {
+        return CryptSection::Refused(problem.to_string());
+    }
+    let requested = sanitize_rclone_remote_name(
+        opts.get("rcloneCryptOverlayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    );
+    let section = match crypt_section_name(base_name, profile_section, opts, names) {
         CryptName::Free(name) => name,
         CryptName::Taken(name) => {
             return CryptSection::Refused(format!(
@@ -1482,33 +2216,50 @@ fn append_crypt_remote_section(
             ));
         }
     };
-    output.push_str(&format!("[{}]\n", section));
-    output.push_str("type = crypt\n");
-    output.push_str(&format!(
-        "remote = {}\n",
-        ini_value(&crypt_export_remote_target(base_name, opts))
-    ));
-    if let Some(pw) = opts
+    if !requested.is_empty() && requested != section {
+        output.push_str(&format!(
+            "# WARNING: `{requested}:` in this file is NOT encrypted; use `{section}:` for the \
+             encrypted remote. `{requested}` is the clear remote here, and a crypt cannot share \
+             its name.\n"
+        ));
+    }
+    // Never trimmed, not even to decide whether there is one: the key is
+    // derived from the secret as it is, spaces and all (a salt of spaces
+    // left out would select rclone's default salt), so the exported one must
+    // be the same.
+    let password = opts
         .get("rcloneCryptPassword")
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        output.push_str(&format!(
-            "password = {}\n",
-            obscure_password(pw).unwrap_or_default()
-        ));
-    } else {
+        .filter(|s| !s.is_empty());
+    // Above the header, where rclone keeps it with this section (see
+    // `export_rclone`).
+    if password.is_none() {
         output.push_str(
             "# password required but unavailable: store the rclone-crypt\n\
              # overlay password on this profile in AeroFTP and re-export,\n\
              # or run `rclone config` on this remote and set `password`.\n",
         );
     }
+    output.push_str(&format!("[{}]\n", section));
+    output.push_str("type = crypt\n");
+    output.push_str(&format!(
+        "remote = {}\n",
+        ini_value(&crypt_export_remote_target(
+            base_name,
+            profile_section,
+            base_root,
+            opts
+        ))
+    ));
+    if let Some(pw) = password {
+        output.push_str(&format!(
+            "password = {}\n",
+            obscure_password(pw).unwrap_or_default()
+        ));
+    }
     if let Some(pw2) = opts
         .get("rcloneCryptPassword2")
         .and_then(|v| v.as_str())
-        .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         output.push_str(&format!(
@@ -1687,7 +2438,12 @@ pub fn export_rclone(
     file_path: &Path,
 ) -> Result<RcloneExportOutcome, String> {
     let mut output = String::new();
-    output.push_str("# Generated by AeroFTP - https://aeroftp.app\n");
+    // The version tells a later import which fields this build wrote obscured
+    // (see `aeroftp_export_header`).
+    output.push_str(&format!(
+        "# Generated by AeroFTP {} - https://aeroftp.app\n",
+        env!("CARGO_PKG_VERSION")
+    ));
     output.push_str(&format!(
         "# Exported: {}\n\n",
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -1767,6 +2523,15 @@ pub fn export_rclone(
             }
         }
 
+        if let Some(reason) = rclone_required_field_missing(proto, server) {
+            output.push_str(&format!(
+                "# skipped profile '{}': {}\n\n",
+                sanitized, reason
+            ));
+            outcome.skip(&server.name, &reason);
+            continue;
+        }
+
         // The name this section will carry. A real profile name yields only to
         // a section already written, never to a name this exporter invented.
         let remote_name = match names.claim_profile(&sanitized) {
@@ -1782,12 +2547,20 @@ pub fn export_rclone(
         // the `type =` line that gives it a backend: rclone loads such a section
         // as a remote with no backend at all.
         let mut body = String::new();
+        // Guidance for this remote, written ABOVE its `[section]` header:
+        // rclone keeps a comment with the section that follows it, so one
+        // written inside the body moves under the next remote the first time
+        // rclone rewrites the file (measured on rclone v1.75.1).
+        let mut notes = String::new();
         // Sections this profile emits after its own (the S3 bucket alias).
         let mut trailing = String::new();
         // What a crypt overlay on this profile must wrap. The S3 arm points it
         // at the bucket alias, since wrapping the raw s3 remote makes rclone
         // look for a bucket named after the overlay path.
         let mut crypt_base = remote_name.clone();
+        // The folder of the clear remote that `crypt_base` points at when it
+        // is an alias (a pinned bucket, the start folder).
+        let mut crypt_base_root: Option<String> = None;
 
         match proto {
             "ftp" => {
@@ -2027,10 +2800,11 @@ pub fn export_rclone(
                                 // raw s3 remote, and it must wrap the name that
                                 // was actually written.
                                 crypt_base = alias_name;
+                                crypt_base_root = Some(bucket.to_string());
                             }
                             None => {
-                                trailing.push_str(&format!(
-                                    "\n# bucket alias for '{}' omitted: no free remote name near '{}'\n",
+                                notes.push_str(&format!(
+                                    "# bucket alias for '{}' omitted: no free remote name near '{}'\n",
                                     remote_name, desired
                                 ));
                             }
@@ -2112,11 +2886,11 @@ pub fn export_rclone(
             }
             "googledrive" => {
                 body.push_str("type = drive\n");
-                push_oauth_credentials(&mut body, options);
+                push_oauth_credentials(&mut body, &mut notes, &remote_name, options);
             }
             "dropbox" => {
                 body.push_str("type = dropbox\n");
-                push_oauth_credentials(&mut body, options);
+                push_oauth_credentials(&mut body, &mut notes, &remote_name, options);
             }
             "onedrive" => {
                 body.push_str("type = onedrive\n");
@@ -2154,7 +2928,7 @@ pub fn export_rclone(
                         body.push_str(&format!("drive_type = {}\n", drive_type));
                     }
                 }
-                push_oauth_credentials(&mut body, options);
+                push_oauth_credentials(&mut body, &mut notes, &remote_name, options);
             }
             "mega" => {
                 body.push_str("type = mega\n");
@@ -2165,6 +2939,51 @@ pub fn export_rclone(
                         obscure_password(pw).unwrap_or_default()
                     ));
                 }
+            }
+            "internxt" => {
+                // rclone's `internxt` backend signs in with the account email
+                // and password (`pass` is an `IsPassword` field, so obscured),
+                // and also needs the decrypted `mnemonic`, which its own login
+                // stores in the config. AeroFTP keeps the mnemonic in memory
+                // only, so the remote is written without it and rclone derives
+                // it on its own sign-in. Until then rclone refuses the remote
+                // with "mnemonic is required" (rclone v1.75.1).
+                body.push_str("type = internxt\n");
+                body.push_str(&format!("email = {}\n", server.username));
+                match password.filter(|pw| !pw.is_empty()) {
+                    Some(pw) => {
+                        body.push_str(&format!(
+                            "pass = {}\n",
+                            obscure_password(pw).unwrap_or_default()
+                        ));
+                        notes.push_str(&format!(
+                            "# Internxt: run `rclone config reconnect {}` once before use.\n\
+                             # rclone signs in with the email and password below and stores\n\
+                             # the encryption mnemonic it needs, which AeroFTP does not keep\n\
+                             # on disk.\n",
+                            rclone_shell_arg(&remote_name, true)
+                        ));
+                    }
+                    // Exported without credentials (the GUI "Include
+                    // credentials" switch off). A reconnect would sign in with
+                    // an empty password, since rclone does not ask for a
+                    // missing one; `update --all` asks for it (not echoed) and
+                    // then signs in (checked on rclone v1.75.1).
+                    None => {
+                        notes.push_str(&format!(
+                            "# Internxt: no password was exported for this remote. Run\n\
+                             # `rclone config update {} --all`: it asks for the password\n\
+                             # without echoing it, then signs in and stores the encryption\n\
+                             # mnemonic rclone needs.\n",
+                            rclone_shell_arg(&remote_name, false)
+                        ));
+                    }
+                }
+                notes.push_str(
+                    "# Internxt lets rclone sign in only on plans that include rclone\n\
+                     # access: on other plans, the free one included, the sign-in stops\n\
+                     # with 402 \"rclone access not allowed for this user tier\".\n",
+                );
             }
             "filen" => {
                 // rclone's `filen` backend marks `email`, `password` AND
@@ -2203,18 +3022,18 @@ pub fn export_rclone(
                     // and cannot derive it from the password, so the remote is
                     // incomplete. Emit a guidance comment (mirroring the OAuth
                     // "reconnect" path) instead of a silently broken remote.
-                    body.push_str(
+                    notes.push_str(
                         "# api_key required but unavailable: rclone's filen backend\n\
                          # cannot derive it from your password. Get one with the Filen\n\
                          # CLI `export-api-key` command, obscure it (`rclone obscure`),\n\
-                         # and add `api_key = <obscured>` here, or set a `Filen CLI API\n\
-                         # Key` on this profile in AeroFTP and re-export.\n",
+                         # and add `api_key = <obscured>` to the section below, or set a\n\
+                         # `Filen CLI API Key` on this profile in AeroFTP and re-export.\n",
                     );
                 }
             }
             "box" => {
                 body.push_str("type = box\n");
-                push_oauth_credentials(&mut body, options);
+                push_oauth_credentials(&mut body, &mut notes, &remote_name, options);
             }
             "pcloud" => {
                 body.push_str("type = pcloud\n");
@@ -2236,7 +3055,7 @@ pub fn export_rclone(
                 if is_eu {
                     body.push_str("hostname = eapi.pcloud.com\n");
                 }
-                push_oauth_credentials(&mut body, options);
+                push_oauth_credentials(&mut body, &mut notes, &remote_name, options);
             }
             "azure" => {
                 body.push_str("type = azureblob\n");
@@ -2285,7 +3104,7 @@ pub fn export_rclone(
                 // rclone's backend type is `yandex` (not `yandexdisk`); the old
                 // value produced a config rclone refused to load.
                 body.push_str("type = yandex\n");
-                push_oauth_credentials(&mut body, options);
+                push_oauth_credentials(&mut body, &mut notes, &remote_name, options);
             }
             "koofr" => {
                 body.push_str("type = koofr\n");
@@ -2386,7 +3205,13 @@ pub fn export_rclone(
                 {
                     body.push_str(&format!("root_folder_id = {}\n", ini_value(folder)));
                 }
-                push_oauth_credentials_inner(&mut body, options, Some("Zoho-oauthtoken"));
+                push_oauth_credentials_inner(
+                    &mut body,
+                    &mut notes,
+                    &remote_name,
+                    options,
+                    Some("Zoho-oauthtoken"),
+                );
             }
             "backblaze" => {
                 // AeroFTP's native Backblaze protocol maps to rclone's `b2`
@@ -2402,6 +3227,44 @@ pub fn export_rclone(
                     // (s3 secret_access_key, azure/swift key) so a crafted
                     // application key can't forge a second [section].
                     body.push_str(&format!("key = {}\n", ini_value(pw)));
+                }
+            }
+            // Drime, Cloudinary and ImageKit take the same secrets AeroFTP
+            // signs with. rclone v1.75.1 marks none of these fields
+            // `IsPassword`, so they are written plain, CR/LF stripped like the
+            // S3 and B2 keys; obscuring them would hand rclone a key it sends
+            // as is and the service refuses. FileLu is not among them: see
+            // `bridge_shared::bridge_export_refusal`.
+            "drime" => {
+                // The API token AeroFTP sends as a Bearer token. rclone reads
+                // the default workspace when `workspace_id` is left out, the
+                // same one AeroFTP addresses as `workspaceId=0`.
+                body.push_str("type = drime\n");
+                if let Some(pw) = password.filter(|p| !p.is_empty()) {
+                    body.push_str(&format!("access_token = {}\n", ini_value(pw)));
+                }
+            }
+            "cloudinary" => {
+                body.push_str("type = cloudinary\n");
+                if let Some(cloud_name) = cloudinary_cloud_name(server) {
+                    body.push_str(&format!("cloud_name = {}\n", cloud_name));
+                }
+                body.push_str(&format!("api_key = {}\n", server.username.trim()));
+                if let Some(pw) = password.filter(|p| !p.is_empty()) {
+                    body.push_str(&format!("api_secret = {}\n", ini_value(pw)));
+                }
+            }
+            "imagekit" => {
+                body.push_str("type = imagekit\n");
+                body.push_str(&format!(
+                    "endpoint = {}\n",
+                    imagekit_rclone_endpoint(&server.username)
+                ));
+                if let Some(public_key) = imagekit_public_key(options) {
+                    body.push_str(&format!("public_key = {}\n", public_key));
+                }
+                if let Some(pw) = password.filter(|p| !p.is_empty()) {
+                    body.push_str(&format!("private_key = {}\n", ini_value(pw)));
                 }
             }
             // Protocols without rclone equivalent: skip
@@ -2456,19 +3319,42 @@ pub fn export_rclone(
                         // A crypt overlay scoped by path must wrap the alias,
                         // so `rcloneCryptOverlayScope = /vault` resolves under
                         // the start folder, not under the account root. An
-                        // explicit imported `rcloneCryptRemote` keeps its own
-                        // base (`crypt_export_remote_target` reads it first).
+                        // imported `rcloneCryptRemote` is taken relative to
+                        // this folder (`crypt_export_remote_target`).
                         crypt_base = alias_name;
+                        crypt_base_root = Some(alias_path.to_string());
                     }
                     _ => {
-                        trailing.push_str(&format!(
-                            "\n# start-folder alias for '{}' omitted: no free remote name near '{}'\n",
+                        notes.push_str(&format!(
+                            "# start-folder alias for '{}' omitted: no free remote name near '{}'\n",
                             server.name.replace(['\n', '\r'], " "),
                             desired
                         ));
                     }
                 }
             }
+        }
+
+        // Rclone Crypt is a second remote wrapping this one. The overlay
+        // path is always at or below the server's remote path, so
+        // `remote = <base>:<path>` is derived rather than guessed. It is built
+        // before this remote is written so that a refusal can be noted above
+        // this remote's header, where it stays when rclone rewrites the file;
+        // the names it claims come after this remote's in either order.
+        let mut crypt_section = String::new();
+        let crypt = append_crypt_remote_section(
+            &mut crypt_section,
+            &crypt_base,
+            &remote_name,
+            crypt_base_root.as_deref(),
+            options,
+            &mut names,
+        );
+        if let CryptSection::Refused(reason) = &crypt {
+            notes.push_str(&format!(
+                "# crypt overlay for '{}' not written: {}\n",
+                crypt_base, reason
+            ));
         }
 
         // Header and body together, never one without the other.
@@ -2483,25 +3369,18 @@ pub fn export_rclone(
                 server.name.replace(['\n', '\r'], " ")
             ));
         }
+        output.push_str(&notes);
         output.push_str(&format!("[{}]\n", remote_name));
         output.push_str(&body);
         output.push_str(&trailing);
         output.push('\n');
         outcome.exported += 1;
 
-        // Rclone Crypt is a second remote wrapping this one. The overlay
-        // path is always at or below the server's remote path, so
-        // `remote = <base>:<path>` is derived rather than guessed.
-        match append_crypt_remote_section(&mut output, &crypt_base, options, &mut names) {
+        output.push_str(&crypt_section);
+        match crypt {
             CryptSection::Written => outcome.exported += 1,
             CryptSection::None => {}
-            CryptSection::Refused(reason) => {
-                output.push_str(&format!(
-                    "# crypt overlay for '{}' not written: {}\n\n",
-                    crypt_base, reason
-                ));
-                outcome.skip(&server.name, &reason);
-            }
+            CryptSection::Refused(reason) => outcome.skip(&server.name, &reason),
         }
     }
 
@@ -2548,15 +3427,7 @@ mod tests {
         servers: &[RcloneExportServer],
         tag: &str,
     ) -> (RcloneExportOutcome, String) {
-        let tmp = std::env::temp_dir().join(format!(
-            "aeroftp-test-export-{}-{}.conf",
-            tag,
-            std::process::id()
-        ));
-        let outcome = export_rclone(servers, &HashMap::new(), &tmp).expect("export");
-        let conf = std::fs::read_to_string(&tmp).expect("read export");
-        std::fs::remove_file(&tmp).ok();
-        (outcome, conf)
+        export_with_passwords(servers, &[], tag)
     }
 
     /// C-05. A crypt overlay names its section `<base>-crypt`, and nothing
@@ -2762,11 +3633,15 @@ mod tests {
     #[test]
     fn every_gated_protocol_writes_a_section_with_a_backend() {
         for proto in crate::bridge_shared::bridge_supported_protocols("rclone") {
-            // Zoho needs both, or it is skipped for the reasons above.
-            let options = if *proto == "zohoworkdrive" {
-                Some(serde_json::json!({ "region": "us", "root_folder_id": "abc123" }))
-            } else {
-                None
+            // Zoho needs both, Cloudinary its cloud name and ImageKit its
+            // public key, or they are skipped for the reasons above.
+            let options = match *proto {
+                "zohoworkdrive" => {
+                    Some(serde_json::json!({ "region": "us", "root_folder_id": "abc123" }))
+                }
+                "cloudinary" => Some(serde_json::json!({ "bucket": "demo-cloud" })),
+                "imagekit" => Some(serde_json::json!({ "imagekit_public_key": "public_x" })),
+                _ => None,
             };
             let servers = vec![export_server("remote", proto, options)];
             let (outcome, conf) = export_to_string(&servers, &format!("gate-{proto}"));
@@ -2879,7 +3754,7 @@ region = eu-west-1
         remote.insert("user".into(), "admin".into());
         remote.insert("port".into(), "21".into());
 
-        let mapped = map_remote("test-ftp", &remote).expect("should map FTP");
+        let mapped = map_remote("test-ftp", &remote, None).expect("should map FTP");
         assert_eq!(mapped.protocol, "ftp");
         assert_eq!(mapped.host, "ftp.example.com");
         assert_eq!(mapped.port, 21);
@@ -2894,7 +3769,7 @@ region = eu-west-1
         remote.insert("user".into(), "secure".into());
         remote.insert("tls".into(), "true".into());
 
-        let mapped = map_remote("test-ftps", &remote).expect("should map FTPS");
+        let mapped = map_remote("test-ftps", &remote, None).expect("should map FTPS");
         assert_eq!(mapped.protocol, "ftps");
     }
 
@@ -2903,7 +3778,7 @@ region = eu-west-1
         let mut remote = HashMap::new();
         remote.insert("type".into(), "fichier".into());
 
-        assert!(map_remote("unsupported", &remote).is_none());
+        assert!(map_remote("unsupported", &remote, None).is_err());
     }
 
     /// Issue #214: rclone stores `token = {"access_token", "refresh_token",
@@ -2961,7 +3836,7 @@ region = eu-west-1
             r#"{"access_token":"abc","token_type":"Bearer","refresh_token":"r","expiry":"2030-01-01T00:00:00Z"}"#
                 .into(),
         );
-        let mapped = map_remote("my-drive", &remote).expect("should map drive");
+        let mapped = map_remote("my-drive", &remote, None).expect("should map drive");
         assert_eq!(mapped.protocol, "googledrive");
         let oauth_json = mapped.oauth_token.expect("token must be propagated");
         let parsed: serde_json::Value = serde_json::from_str(&oauth_json).unwrap();
@@ -2983,7 +3858,7 @@ region = eu-west-1
             "token".into(),
             r#"{"access_token":"a","refresh_token":"rotated"}"#.into(),
         );
-        let mapped = map_remote("jotta", &remote).expect("should map jotta");
+        let mapped = map_remote("jotta", &remote, None).expect("should map jotta");
         assert_eq!(mapped.protocol, "jottacloud");
         assert_eq!(mapped.username, "alice@example.com");
         let refresh_json = mapped.jotta_refresh.expect("refresh must be propagated");
@@ -3006,12 +3881,23 @@ region = eu-west-1
         let mut crypt = HashMap::new();
         crypt.insert("type".into(), "crypt".into());
         crypt.insert("remote".into(), "mynas:/encrypted".into());
-        crypt.insert("password".into(), "topsecret".into());
-        crypt.insert("password2".into(), "saltsecret".into());
+        // `rclone obscure topsecret` and `rclone obscure saltsecret` (rclone
+        // v1.75.1): rclone refuses a crypt remote whose passwords are not
+        // obscured ("is it obscured?"), so plain text here is not a config
+        // rclone could have written.
+        crypt.insert(
+            "password".into(),
+            "I0foQLrVcrxA3fTR32MLs51K2uCFdW1sgw".into(),
+        );
+        crypt.insert(
+            "password2".into(),
+            "R7Q09CWMcogQNXenlf7eB09NfisKl3wFr9k".into(),
+        );
         crypt.insert("filename_encryption".into(), "standard".into());
         crypt.insert("directory_name_encryption".into(), "true".into());
 
-        let mapped = map_crypt_remote("mycrypt", &crypt, &sections).expect("should map crypt");
+        let mapped =
+            map_crypt_remote("mycrypt", &crypt, &sections, None).expect("should map crypt");
         assert_eq!(mapped.protocol, "sftp");
         assert_eq!(mapped.host, "192.168.1.10");
         assert_eq!(mapped.initial_path.as_deref(), Some("/encrypted"));
@@ -3688,6 +4574,943 @@ user = t
         );
     }
 
+    /// Export `servers` with `passwords` keyed by profile name, return the
+    /// outcome and the file text.
+    fn export_with_passwords(
+        servers: &[RcloneExportServer],
+        passwords: &[(&str, &str)],
+        tag: &str,
+    ) -> (RcloneExportOutcome, String) {
+        let passwords: HashMap<String, String> = passwords
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let tmp = std::env::temp_dir().join(format!(
+            "aeroftp-test-export-{}-{}.conf",
+            tag,
+            std::process::id()
+        ));
+        let outcome = export_rclone(servers, &passwords, &tmp).expect("export");
+        let conf = std::fs::read_to_string(&tmp).expect("read export");
+        std::fs::remove_file(&tmp).ok();
+        (outcome, conf)
+    }
+
+    /// The comment block directly above `[name]`, and the lines of that
+    /// section up to the next blank line.
+    fn notes_and_body<'a>(conf: &'a str, name: &str) -> (Vec<&'a str>, Vec<&'a str>) {
+        let lines: Vec<&str> = conf.lines().collect();
+        let header = format!("[{}]", name);
+        let at = lines
+            .iter()
+            .position(|l| *l == header)
+            .unwrap_or_else(|| panic!("no section {header}:\n{conf}"));
+        let mut notes: Vec<&str> = lines[..at]
+            .iter()
+            .rev()
+            .take_while(|l| l.starts_with('#'))
+            .copied()
+            .collect();
+        notes.reverse();
+        let body = lines[at + 1..]
+            .iter()
+            .take_while(|l| !l.trim().is_empty())
+            .copied()
+            .collect();
+        (notes, body)
+    }
+
+    fn internxt_server(name: &str) -> RcloneExportServer {
+        RcloneExportServer {
+            name: name.to_string(),
+            host: "gateway.internxt.com".to_string(),
+            port: 443,
+            username: "me@example.com".to_string(),
+            protocol: Some("internxt".to_string()),
+            options: None,
+            provider_id: Some("internxt".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_export_rclone_internxt_roundtrip() {
+        // Internxt used to be refused as "not exportable", with help text that
+        // called it OAuth. rclone's `internxt` backend takes the account email
+        // and password, which is what AeroFTP holds.
+        assert!(
+            crate::bridge_shared::bridge_supported_protocols("rclone").contains(&"internxt"),
+            "the CLI and the GUI export only what this list names"
+        );
+        let (outcome, conf) = export_with_passwords(
+            &[internxt_server("internxt-acct")],
+            &[("internxt-acct", "S3cr3tPass!")],
+            "internxt",
+        );
+
+        assert_eq!(outcome.exported, 1, "{conf}");
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let (notes, body) = notes_and_body(&conf, "internxt-acct");
+        assert_eq!(body[0], "type = internxt", "{conf}");
+        assert!(body.contains(&"email = me@example.com"), "{conf}");
+        let pass_line = body
+            .iter()
+            .find_map(|l| l.strip_prefix("pass = "))
+            .unwrap_or_else(|| panic!("missing pass:\n{conf}"));
+        assert_ne!(pass_line, "S3cr3tPass!", "pass must be obscured");
+        assert_eq!(reveal_obscured(pass_line).as_deref(), Ok("S3cr3tPass!"));
+        // rclone refuses the remote until its own sign-in stores the mnemonic,
+        // so the file names the command that does it, for this remote, and
+        // says which plans rclone can sign in on at all.
+        let notes = notes.join("\n");
+        assert!(
+            notes.contains("run `rclone config reconnect \"internxt-acct:\"` once before use"),
+            "{conf}"
+        );
+        assert!(notes.contains("402"), "plan restriction missing:\n{conf}");
+
+        let path = tmp_write(
+            &conf,
+            &format!("aeroftp-test-import-internxt-{}.conf", std::process::id()),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let internxt = result
+            .servers
+            .iter()
+            .find(|s| s.protocol.as_deref() == Some("internxt"))
+            .expect("internxt server present");
+        assert_eq!(internxt.username, "me@example.com");
+        assert_eq!(internxt.host, "gateway.internxt.com");
+        assert_eq!(internxt.provider_id.as_deref(), Some("internxt"));
+        assert_eq!(
+            internxt.credential.as_deref(),
+            Some("S3cr3tPass!"),
+            "password must round-trip"
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    /// Exported without credentials (the GUI "Include credentials" switch
+    /// off): `rclone config reconnect` would sign in with an empty password,
+    /// since rclone's internxt Config does not ask for a missing one, so the
+    /// file must point at the command that asks for it instead.
+    #[test]
+    fn test_export_rclone_internxt_without_password_says_how_to_set_it() {
+        for passwords in [&[][..], &[("internxt-acct", "")][..]] {
+            let (outcome, conf) = export_with_passwords(
+                &[internxt_server("internxt-acct")],
+                passwords,
+                "internxt-nopass",
+            );
+            assert_eq!(outcome.exported, 1, "{conf}");
+            let (notes, body) = notes_and_body(&conf, "internxt-acct");
+            assert!(
+                !body.iter().any(|l| l.starts_with("pass")),
+                "no pass line without a password:\n{conf}"
+            );
+            let notes = notes.join("\n");
+            assert!(notes.contains("no password was exported"), "{conf}");
+            assert!(
+                notes.contains("`rclone config update \"internxt-acct\" --all`"),
+                "{conf}"
+            );
+            assert!(
+                !notes.contains("config reconnect"),
+                "a reconnect cannot work without a password:\n{conf}"
+            );
+        }
+    }
+
+    /// rclone accepts spaces in a remote name, so a command written into the
+    /// file must keep the name one shell argument.
+    #[test]
+    fn test_export_rclone_quotes_a_remote_name_with_a_space() {
+        let mut dropbox = export_server("My Dropbox", "dropbox", None);
+        dropbox.provider_id = Some("dropbox".to_string());
+        let (_, conf) = export_with_passwords(
+            &[internxt_server("My Internxt"), dropbox],
+            &[("My Internxt", "pw")],
+            "internxt-space",
+        );
+        assert!(
+            conf.contains("rclone config reconnect \"My Internxt:\""),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("rclone config reconnect \"My Dropbox:\""),
+            "{conf}"
+        );
+        assert!(!conf.contains("reconnect My "), "{conf}");
+    }
+
+    /// rclone keeps a comment with the section that FOLLOWS it: a comment
+    /// left inside a section's body moves under the next remote the first
+    /// time rclone rewrites the file (measured on rclone v1.75.1 with
+    /// `rclone config update`). Every note about a remote (sign-in steps,
+    /// missing credentials, a refused or password-less crypt overlay) therefore
+    /// sits above that remote's header, and no body carries one.
+    #[test]
+    fn test_export_rclone_guidance_sits_above_its_own_section() {
+        let servers = vec![
+            internxt_server("internxt-acct"),
+            export_server("drop", "dropbox", None),
+            RcloneExportServer {
+                username: "me@example.com".to_string(),
+                ..export_server("filen-acct", "filen", None)
+            },
+            export_server("plain-ftp", "ftp", None),
+            // A crypt overlay with no password: its own guidance.
+            export_server(
+                "sealed",
+                "ftp",
+                Some(serde_json::json!({ "rcloneCryptEnabled": true })),
+            ),
+            // A crypt overlay whose name is taken: refused, noted on its base.
+            export_server(
+                "nas",
+                "ftp",
+                Some(serde_json::json!({
+                    "rcloneCryptEnabled": true,
+                    "rcloneCryptOverlayName": "vault",
+                    "rcloneCryptPassword": "pw",
+                })),
+            ),
+            export_server("vault", "ftp", None),
+        ];
+        let (outcome, conf) = export_with_passwords(
+            &servers,
+            &[
+                ("internxt-acct", "pw"),
+                ("filen-acct", "pw"),
+                ("plain-ftp", "pw"),
+                ("sealed", "pw"),
+                ("nas", "pw"),
+                ("vault", "pw"),
+            ],
+            "guidance-above",
+        );
+        // Seven base remotes and the one crypt overlay that has a free name.
+        assert_eq!(outcome.exported, 8, "{conf}");
+        for (name, needle) in [
+            (
+                "internxt-acct",
+                "rclone config reconnect \"internxt-acct:\"",
+            ),
+            ("drop", "rclone config reconnect \"drop:\""),
+            ("filen-acct", "api_key required but unavailable"),
+            ("sealed-crypt", "password required but unavailable"),
+            ("nas", "crypt overlay for 'nas' not written"),
+        ] {
+            let (notes, body) = notes_and_body(&conf, name);
+            assert!(
+                notes.join("\n").contains(needle),
+                "guidance for {name} is not directly above it:\n{conf}"
+            );
+            assert!(
+                !body.iter().any(|l| l.starts_with('#')),
+                "a comment inside {name}'s body would move on rewrite:\n{conf}"
+            );
+        }
+        for name in ["plain-ftp", "sealed", "vault"] {
+            let (notes, body) = notes_and_body(&conf, name);
+            assert!(notes.is_empty(), "no stray guidance above {name}:\n{conf}");
+            assert!(!body.iter().any(|l| l.starts_with('#')), "{conf}");
+        }
+    }
+
+    /// When no name is left for an alias the export invents (a start folder,
+    /// a pinned S3 bucket), the note saying so used to trail the remote's
+    /// body, where rclone's next rewrite hands it to the following section.
+    #[test]
+    fn test_export_rclone_omitted_alias_note_sits_above_its_remote() {
+        let mut servers = vec![
+            export_server(
+                "box",
+                "sftp",
+                Some(serde_json::json!({ "initial_path": "/data" })),
+            ),
+            export_server("store", "s3", Some(serde_json::json!({ "bucket": "b" }))),
+        ];
+        // Every name each alias could take is a real profile name, which a
+        // generated name always yields to.
+        for base in ["box-path", "store-b"] {
+            servers.push(export_server(base, "ftp", None));
+            for suffix in 2..=MAX_NAME_SUFFIX {
+                servers.push(export_server(&format!("{base}-{suffix}"), "ftp", None));
+            }
+        }
+        let (_, conf) = export_to_string(&servers, "alias-omitted");
+        for (name, needle) in [
+            ("box", "start-folder alias for 'box' omitted"),
+            ("store", "bucket alias for 'store' omitted"),
+        ] {
+            let (notes, body) = notes_and_body(&conf, name);
+            assert!(
+                notes.join("\n").contains(needle),
+                "'{needle}' is not directly above [{name}]"
+            );
+            assert!(!body.iter().any(|l| l.starts_with('#')), "[{name}] body");
+        }
+    }
+
+    #[test]
+    fn test_import_rclone_internxt_reveals_real_rclone_obscured() {
+        // `pass` below was produced by the real rclone binary (`rclone obscure
+        // TestPass123`, rclone v1.75.1), so this pins the reveal codec to
+        // rclone's actual output for the `internxt` backend's IsPassword field.
+        // The second remote has no email, which AeroFTP cannot sign in without,
+        // and the import says so instead of calling the type unsupported.
+        let conf = "\
+[internxt-real]
+type = internxt
+email = real@example.com
+pass = ANMkm3ZpMPvnz_0z5dZ-68G17MaOiI2s3wiL
+
+[internxt-no-email]
+type = internxt
+pass = ANMkm3ZpMPvnz_0z5dZ-68G17MaOiI2s3wiL
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-internxt-real-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let internxt: Vec<_> = result
+            .servers
+            .iter()
+            .filter(|s| s.protocol.as_deref() == Some("internxt"))
+            .collect();
+        assert_eq!(internxt.len(), 1, "only the remote with an email imports");
+        assert_eq!(internxt[0].username, "real@example.com");
+        assert_eq!(internxt[0].credential.as_deref(), Some("TestPass123"));
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].name, "internxt-no-email");
+        assert_eq!(result.skipped[0].reason, "internxt remote has no email");
+    }
+
+    /// Every secret the importer reveals into `options` is named in
+    /// `IMPORT_SECRET_OPTION_KEYS`, checked on the values rather than the key
+    /// names: the crypt password and salt and a Filen API key go in revealed,
+    /// and none of them survives `options_without_secrets`.
+    #[test]
+    fn test_import_secret_option_keys_cover_every_revealed_secret() {
+        let secrets = ["CryptPassPlain1", "CryptSaltPlain2", "FilenApiKeyPlain3"];
+        let obscured: Vec<String> = secrets
+            .iter()
+            .map(|s| obscure_password(s).expect("obscure"))
+            .collect();
+        let conf = format!(
+            "\
+[base]
+type = sftp
+host = example.com
+user = me
+
+[vault]
+type = crypt
+remote = base:vault
+password = {}
+password2 = {}
+
+[filen-acct]
+type = filen
+email = me@example.com
+password = {}
+api_key = {}
+",
+            obscured[0], obscured[1], obscured[0], obscured[2]
+        );
+        let path = tmp_write(
+            &conf,
+            &format!(
+                "aeroftp-test-import-secret-options-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let raw = serde_json::to_string(
+            &result
+                .servers
+                .iter()
+                .map(|s| s.options.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for secret in secrets {
+            assert!(
+                raw.contains(secret),
+                "the fixture must reach '{secret}':\n{raw}"
+            );
+        }
+        let shown = serde_json::to_string(
+            &result
+                .servers
+                .iter()
+                .map(|s| options_without_secrets(s.options.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for secret in secrets {
+            assert!(!shown.contains(secret), "'{secret}' survives:\n{shown}");
+        }
+    }
+
+    /// A crypt `remote =` may be a connection string, an on-the-fly backend or
+    /// a local path, whose parameters can be secrets. None of it is imported
+    /// and the reason never repeats a parameter; it used to quote the whole
+    /// base, `mys3,secret_access_key=...`, and call it missing from the file.
+    #[test]
+    fn test_import_rclone_crypt_reason_never_repeats_connection_parameters() {
+        let conf = "\
+[mys3]
+type = s3
+provider = AWS
+region = eu-west-1
+access_key_id = AKIAEXAMPLE
+
+[vault-params]
+type = crypt
+remote = mys3,secret_access_key=TopSecretValue42:bucket
+
+[vault-onthefly]
+type = crypt
+remote = :s3,access_key_id=AKIAOTHER,secret_access_key=OtherSecret99:bucket
+
+[vault-local]
+type = crypt
+remote = /home/me/private-vault
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-crypt-params-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let reason = |name: &str| {
+            result
+                .skipped
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.reason.clone())
+                .unwrap_or_else(|| panic!("{name} not skipped"))
+        };
+        assert_eq!(
+            reason("vault-params"),
+            "crypt remote wraps 'mys3' with connection-string parameters, which AeroFTP cannot carry"
+        );
+        let all = format!(
+            "{:?}",
+            result.skipped.iter().map(|s| &s.reason).collect::<Vec<_>>()
+        );
+        for leaked in [
+            "TopSecretValue42",
+            "OtherSecret99",
+            "AKIAOTHER",
+            "secret_access_key",
+            "private-vault",
+        ] {
+            assert!(!all.contains(leaked), "'{leaked}' in a skip reason: {all}");
+        }
+        assert_eq!(
+            reason("vault-onthefly"),
+            "crypt remote wraps an on-the-fly backend, which AeroFTP cannot carry"
+        );
+        assert!(
+            reason("vault-local").contains("not a named remote"),
+            "{}",
+            reason("vault-local")
+        );
+        assert!(
+            !result.servers.iter().any(|s| s.name.starts_with("vault")),
+            "no crypt imported over a base it cannot describe"
+        );
+    }
+
+    /// A remote that cannot import says why. Every missing required field
+    /// used to come back as "unsupported rclone type", which sends the reader
+    /// looking for a gap in AeroFTP instead of in the file.
+    #[test]
+    fn test_import_rclone_skip_reasons_name_what_is_missing() {
+        let conf = "\
+[ftp-no-host]
+type = ftp
+user = u
+
+[crypt-orphan]
+type = crypt
+remote = nowhere:vault
+
+[crypt-on-broken]
+type = crypt
+remote = ftp-no-host:vault
+
+[crypt-empty]
+type = crypt
+
+[odd]
+type = definitely-not-a-backend
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-skip-reasons-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let reason = |name: &str| {
+            result
+                .skipped
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.reason.clone())
+                .unwrap_or_else(|| panic!("{name} not skipped: {:?}", result.skipped.len()))
+        };
+        assert_eq!(reason("ftp-no-host"), "ftp remote has no host");
+        assert_eq!(
+            reason("crypt-orphan"),
+            "crypt remote wraps 'nowhere', which is not in this file"
+        );
+        assert_eq!(
+            reason("crypt-on-broken"),
+            "crypt remote wraps 'ftp-no-host': ftp remote has no host"
+        );
+        assert_eq!(reason("crypt-empty"), "crypt remote has no remote to wrap");
+        assert_eq!(
+            reason("odd"),
+            "unsupported rclone type: definitely-not-a-backend"
+        );
+        assert!(result.servers.is_empty());
+    }
+
+    /// `pass` is an rclone IsPassword field: rclone writes it obscured and
+    /// cannot use one that does not reveal. Such a value used to be kept as
+    /// the password itself; now the profile imports without one, and says so.
+    #[test]
+    fn test_import_rclone_internxt_unrevealable_pass_imports_without_it() {
+        // Neither is what rclone's Reveal accepts. The first is plain text.
+        // The second is the real `rclone obscure TestPass123` output with the
+        // URL-safe alphabet swapped for the standard one (`-` to `+`, `_` to
+        // `/`): rclone refuses it, while the lenient reveal used elsewhere
+        // retries standard base64 and would import it as "TestPass123".
+        for bad in ["S3cr3tPass!", "ANMkm3ZpMPvnz/0z5dZ+68G17MaOiI2s3wiL"] {
+            let conf =
+                format!("[internxt-bad]\ntype = internxt\nemail = me@example.com\npass = {bad}\n");
+            let path = tmp_write(
+                &conf,
+                &format!(
+                    "aeroftp-test-import-internxt-bad-{}.conf",
+                    std::process::id()
+                ),
+            );
+            let result = import_rclone(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            let internxt = result
+                .servers
+                .iter()
+                .find(|s| s.protocol.as_deref() == Some("internxt"))
+                .expect("the profile still imports");
+            assert_eq!(internxt.credential, None, "'{bad}' is not a password");
+            assert_eq!(result.warnings.len(), 1, "'{bad}': no warning");
+            assert_eq!(result.warnings[0].name, "internxt-bad");
+            let reason = &result.warnings[0].reason;
+            assert!(
+                reason.starts_with("pass does not reveal")
+                    && reason.contains("imported without it"),
+                "{reason}"
+            );
+            // The decoder names the offending symbol and its offset: for a
+            // plaintext password that is a piece of it, and this goes to logs.
+            assert!(
+                !reason.contains("symbol") && !reason.contains("offset"),
+                "the reason leaks a piece of the value: {reason}"
+            );
+        }
+    }
+
+    /// After `rclone config reconnect`, rclone's internxt Config stores the
+    /// obscured `mnemonic` and an OAuth-shaped `token` in the section. AeroFTP
+    /// derives both at every sign-in, so neither may leak into the profile.
+    #[test]
+    fn test_import_rclone_internxt_ignores_mnemonic_and_token() {
+        let conf = "\
+[internxt-after-reconnect]
+type = internxt
+email = real@example.com
+pass = ANMkm3ZpMPvnz_0z5dZ-68G17MaOiI2s3wiL
+mnemonic = ANMkm3ZpMPvnz_0z5dZ-68G17MaOiI2s3wiL
+token = {\"access_token\":\"eyJhbGciOi.x.y\",\"token_type\":\"Bearer\",\"expiry\":\"2026-10-04T00:00:00Z\"}
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-internxt-reconnected-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let internxt = result
+            .servers
+            .iter()
+            .find(|s| s.protocol.as_deref() == Some("internxt"))
+            .expect("internxt server present");
+        assert_eq!(internxt.credential.as_deref(), Some("TestPass123"));
+        assert_eq!(internxt.options, None, "no mnemonic or token in options");
+        assert!(result.provider_secrets.is_empty(), "no token imported");
+        assert!(result.warnings.is_empty());
+    }
+
+    fn api_key_server(
+        name: &str,
+        protocol: &str,
+        host: &str,
+        username: &str,
+        options: Option<serde_json::Value>,
+    ) -> RcloneExportServer {
+        RcloneExportServer {
+            name: name.to_string(),
+            host: host.to_string(),
+            port: 443,
+            username: username.to_string(),
+            protocol: Some(protocol.to_string()),
+            options,
+            provider_id: Some(protocol.to_string()),
+        }
+    }
+
+    /// Drime, Cloudinary and ImageKit used to be refused as "not
+    /// exportable". Their rclone fields are not `IsPassword` (rclone v1.75.1),
+    /// so the keys are written exactly as AeroFTP holds them: rclone sends
+    /// these fields as they are, and an obscured one is a wrong key.
+    #[test]
+    fn test_export_rclone_api_key_providers_write_their_keys_plain() {
+        let servers = vec![
+            api_key_server("dr", "drime", "app.drime.cloud", "api-token", None),
+            api_key_server(
+                "cl",
+                "cloudinary",
+                "api.cloudinary.com",
+                "599944212611461",
+                Some(serde_json::json!({ "bucket": "demo-cloud" })),
+            ),
+            api_key_server(
+                "ik",
+                "imagekit",
+                "api.imagekit.io",
+                "demo_id",
+                Some(serde_json::json!({ "imagekit_public_key": "public_abc=" })),
+            ),
+            // The dashboard URL pasted whole, trailing slash included.
+            api_key_server(
+                "ik-url",
+                "imagekit",
+                "api.imagekit.io",
+                "https://ik.imagekit.io/other_id/",
+                Some(serde_json::json!({ "imagekit_public_key": "public_def=" })),
+            ),
+        ];
+        let passwords: HashMap<String, String> = [
+            ("dr", "12|drimeTokenValue"),
+            ("cl", "hwPq3vxxVum2xqOoHU7bJ6Cqnp8"),
+            ("ik", "private_abc="),
+            ("ik-url", "private_def="),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "aeroftp-test-export-api-key-providers-{}.conf",
+            std::process::id()
+        ));
+        let outcome = export_rclone(&servers, &passwords, &tmp).expect("should export");
+        let conf = std::fs::read_to_string(&tmp).expect("read conf");
+        std::fs::remove_file(&tmp).ok();
+
+        assert_eq!(outcome.exported, 4, "{conf}");
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        for section in [
+            "[dr]\ntype = drime\naccess_token = 12|drimeTokenValue\n",
+            "[cl]\ntype = cloudinary\ncloud_name = demo-cloud\napi_key = 599944212611461\n\
+             api_secret = hwPq3vxxVum2xqOoHU7bJ6Cqnp8\n",
+            "[ik]\ntype = imagekit\nendpoint = https://ik.imagekit.io/demo_id\n\
+             public_key = public_abc=\nprivate_key = private_abc=\n",
+            "[ik-url]\ntype = imagekit\nendpoint = https://ik.imagekit.io/other_id\n\
+             public_key = public_def=\nprivate_key = private_def=\n",
+        ] {
+            assert!(conf.contains(section), "missing:\n{section}\nin:\n{conf}");
+        }
+    }
+
+    /// Written by the real rclone binary (`rclone config create`, v1.75.1),
+    /// which stores all three backends' keys plain. The keys decode as
+    /// obscured values, so a reveal anywhere on this path would change them.
+    #[test]
+    fn test_import_rclone_api_key_providers_from_real_rclone_config() {
+        let conf = "\
+[dr]
+type = drime
+access_token = jux3pFx5rDYgmXi0rjy5CWhBCyCRMiJMswW7zVQl
+
+[cl]
+type = cloudinary
+cloud_name = demo-cloud
+api_key = 599944212611461
+api_secret = hwPq3vxxVum2xqOoHU7bJ6Cqnp8
+
+[ik]
+type = imagekit
+endpoint = https://ik.imagekit.io/demo_id
+public_key = public_Xy12AbCdEfGhIjKlMnOpQrStU=
+private_key = private_PaLkUDUPvkI4w8tUjcdPfljtLGJv
+
+[lu]
+type = filelu
+key = RC_abcdefghijklmnopqrst
+";
+        for key in [
+            "jux3pFx5rDYgmXi0rjy5CWhBCyCRMiJMswW7zVQl",
+            "hwPq3vxxVum2xqOoHU7bJ6Cqnp8",
+            "private_PaLkUDUPvkI4w8tUjcdPfljtLGJv",
+        ] {
+            assert!(
+                matches!(reveal_obscured(key), Ok(ref r) if !r.is_empty()),
+                "{key} no longer decodes, so it no longer tests anything"
+            );
+        }
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-api-key-real-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let server = |name: &str| {
+            result
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} not imported"))
+        };
+
+        let dr = server("dr");
+        assert_eq!(dr.protocol.as_deref(), Some("drime"));
+        assert_eq!(dr.host, "app.drime.cloud");
+        assert_eq!(dr.username, "api-token");
+        assert_eq!(
+            dr.credential.as_deref(),
+            Some("jux3pFx5rDYgmXi0rjy5CWhBCyCRMiJMswW7zVQl")
+        );
+
+        let cl = server("cl");
+        assert_eq!(cl.protocol.as_deref(), Some("cloudinary"));
+        assert_eq!(cl.host, "api.cloudinary.com");
+        assert_eq!(cl.username, "599944212611461");
+        assert_eq!(
+            cl.credential.as_deref(),
+            Some("hwPq3vxxVum2xqOoHU7bJ6Cqnp8")
+        );
+        assert_eq!(
+            cl.options,
+            Some(serde_json::json!({ "bucket": "demo-cloud" }))
+        );
+
+        let ik = server("ik");
+        assert_eq!(ik.protocol.as_deref(), Some("imagekit"));
+        assert_eq!(ik.host, "api.imagekit.io");
+        assert_eq!(ik.username, "https://ik.imagekit.io/demo_id");
+        assert_eq!(
+            ik.credential.as_deref(),
+            Some("private_PaLkUDUPvkI4w8tUjcdPfljtLGJv")
+        );
+        assert_eq!(
+            ik.options,
+            Some(serde_json::json!({ "imagekit_public_key": "public_Xy12AbCdEfGhIjKlMnOpQrStU=" }))
+        );
+
+        let lu = result
+            .skipped
+            .iter()
+            .find(|s| s.name == "lu")
+            .expect("the FileLu remote is skipped");
+        assert!(lu.reason.contains("Rclone key"), "{}", lu.reason);
+        assert!(result.warnings.is_empty());
+    }
+
+    /// What AeroFTP exports for Drime, Cloudinary and ImageKit imports back as
+    /// the same profile, public key included.
+    #[test]
+    fn test_export_rclone_api_key_providers_roundtrip() {
+        let servers = vec![
+            api_key_server("dr", "drime", "app.drime.cloud", "api-token", None),
+            api_key_server(
+                "cl",
+                "cloudinary",
+                "api.cloudinary.com",
+                "599944212611461",
+                Some(serde_json::json!({ "bucket": "demo-cloud" })),
+            ),
+            api_key_server(
+                "ik",
+                "imagekit",
+                "api.imagekit.io",
+                "https://ik.imagekit.io/demo_id",
+                Some(serde_json::json!({ "imagekit_public_key": "public_abc=" })),
+            ),
+        ];
+        let passwords: HashMap<String, String> = [
+            ("dr", "12|drimeTokenValue"),
+            ("cl", "hwPq3vxxVum2xqOoHU7bJ6Cqnp8"),
+            ("ik", "private_abc="),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let tmp = std::env::temp_dir().join(format!(
+            "aeroftp-test-roundtrip-api-key-{}.conf",
+            std::process::id()
+        ));
+        export_rclone(&servers, &passwords, &tmp).expect("should export");
+        let result = import_rclone(&tmp).unwrap();
+        std::fs::remove_file(&tmp).ok();
+
+        assert_eq!(
+            result.servers.len(),
+            3,
+            "skipped: {:?}",
+            result.skipped.len()
+        );
+        for original in &servers {
+            let back = result
+                .servers
+                .iter()
+                .find(|s| s.name == original.name)
+                .unwrap_or_else(|| panic!("{} did not come back", original.name));
+            assert_eq!(back.protocol, original.protocol, "{}", original.name);
+            assert_eq!(back.host, original.host, "{}", original.name);
+            assert_eq!(back.username, original.username, "{}", original.name);
+            assert_eq!(back.options, original.options, "{}", original.name);
+            assert_eq!(
+                back.credential.as_deref(),
+                passwords.get(&original.name).map(String::as_str),
+                "{}",
+                original.name
+            );
+        }
+    }
+
+    /// Remotes AeroFTP would open onto other content, or cannot sign in to,
+    /// are skipped with the reason instead of imported.
+    #[test]
+    fn test_import_rclone_api_key_providers_refuse_what_aeroftp_cannot_open() {
+        let conf = "\
+[dr-ws]
+type = drime
+access_token = token
+workspace_id = 42
+
+[dr-root]
+type = drime
+access_token = token
+root_folder_id = 1234
+
+[dr-empty]
+type = drime
+
+[cl-eu]
+type = cloudinary
+cloud_name = demo-cloud
+api_key = 1
+api_secret = s
+upload_prefix = https://api-eu.cloudinary.com
+
+[cl-nameless]
+type = cloudinary
+api_key = 1
+api_secret = s
+
+[ik-no-endpoint]
+type = imagekit
+public_key = p
+private_key = k
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-api-key-refused-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(result.servers.is_empty(), "{:?}", result.servers.len());
+        for (name, needle) in [
+            ("dr-ws", "workspace 42"),
+            ("dr-root", "folder id 1234"),
+            ("dr-empty", "no access_token"),
+            ("cl-eu", "api-eu.cloudinary.com"),
+            ("cl-nameless", "no cloud_name"),
+            ("ik-no-endpoint", "no endpoint"),
+        ] {
+            let skipped = result
+                .skipped
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} not reported"));
+            assert!(
+                skipped.reason.contains(needle),
+                "{name}: {}",
+                skipped.reason
+            );
+        }
+    }
+
+    /// A Cloudinary profile without its cloud name and an ImageKit profile
+    /// without the public key would be remotes rclone cannot use (ImageKit's
+    /// it refuses to create), so neither is written and each says why.
+    #[test]
+    fn test_export_rclone_skips_api_key_providers_missing_a_required_field() {
+        let servers = vec![
+            api_key_server(
+                "cl",
+                "cloudinary",
+                "api.cloudinary.com",
+                "599944212611461",
+                None,
+            ),
+            api_key_server("ik", "imagekit", "api.imagekit.io", "demo_id", None),
+            api_key_server("dr", "drime", "app.drime.cloud", "api-token", None),
+        ];
+        let (outcome, conf) = export_to_string(&servers, "api-key-missing-field");
+
+        assert_eq!(outcome.exported, 1, "only Drime:\n{conf}");
+        assert!(!conf.contains("[cl]"), "{conf}");
+        assert!(!conf.contains("[ik]"), "{conf}");
+        let reason = |name: &str| {
+            outcome
+                .skipped
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.reason.clone())
+                .unwrap_or_else(|| panic!("{name} not reported: {:?}", outcome.skipped))
+        };
+        assert!(reason("cl").contains("cloud name"), "{}", reason("cl"));
+        assert!(reason("ik").contains("public key"), "{}", reason("ik"));
+    }
+
     #[test]
     fn test_export_rclone_filen_without_api_key_emits_guidance_comment() {
         // #128-D: rclone's `filen` backend marks `api_key` Required and cannot
@@ -3834,6 +5657,754 @@ api_key = 4BVmu-SCRQai2-0-hucKgbeyzH6-uqexma-skpRs4Kk
             conf.contains("key = K001abcdEFG키"),
             "b2 key must be emitted plain, not obscured:\n{conf}"
         );
+    }
+
+    /// rclone writes these secrets plain (none is `IsPassword` in v1.75.1), so
+    /// the import must store them as they are. They used to go through the
+    /// reveal codec, and a value that happens to decode came back as a few
+    /// bytes of noise, stored with no error or warning. Among random keys of
+    /// each shape, that is 0.03% of AWS secret keys and 0.4% of B2
+    /// application keys. The values below are such keys. Real 88-character
+    /// Azure keys almost never decode, but the field was read the same way,
+    /// so a shorter padded one stands in.
+    #[test]
+    fn test_import_rclone_reads_plain_secrets_verbatim() {
+        let aws = "ouaVyjxSEguS+NiX/v56YGxMK4/J/lodDY+S/On5";
+        let azure = "iUSqbsCq1b4r8llxjuIJDCkAT8YhG3eK+hUtI5D113g=";
+        let swift = "0M5gBRXoIPaqWVKLxLethR6aS2Nlr0nz";
+        let b2 = "K005ACpVVct0jQ2rTOZSGY64zPV3rB8";
+        for value in [aws, azure, swift, b2] {
+            assert!(
+                matches!(reveal_obscured(value), Ok(ref r) if !r.is_empty()),
+                "{value} no longer decodes, so it no longer tests anything"
+            );
+        }
+        let conf = format!(
+            "\
+[aws]
+type = s3
+provider = AWS
+access_key_id = AKIAEXAMPLE
+secret_access_key = {aws}
+
+[az]
+type = azureblob
+account = demoaccount
+key = {azure}
+
+[sw]
+type = swift
+auth = https://auth.example.com/v3
+user = demo
+key = {swift}
+
+[b2]
+type = b2
+account = 0051234567890ab0000000001
+key = {b2}
+"
+        );
+        let path = tmp_write(
+            &conf,
+            &format!(
+                "aeroftp-test-import-plain-secrets-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        for (name, expected) in [("aws", aws), ("az", azure), ("sw", swift), ("b2", b2)] {
+            let server = result
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} not imported: {:?}", result.skipped.len()));
+            assert_eq!(server.credential.as_deref(), Some(expected), "{name}");
+        }
+    }
+
+    /// Every field rclone marks `IsPassword` (v1.75.1) is revealed the way
+    /// rclone reveals it. A value rclone could not reveal used to be stored as
+    /// the secret itself, or, in the standard alphabet, revealed anyway: now
+    /// the profile imports without it and the import report says which field.
+    /// A value rclone did obscure still reveals, in every one of them.
+    #[test]
+    fn test_import_rclone_reveals_every_password_field_strictly() {
+        // `rclone obscure TestPass123` (rclone v1.75.1), and the same bytes in
+        // the standard base64 alphabet, which rclone's Reveal refuses.
+        let good = "ANMkm3ZpMPvnz_0z5dZ-68G17MaOiI2s3wiL";
+        let std_alphabet = "ANMkm3ZpMPvnz/0z5dZ+68G17MaOiI2s3wiL";
+        let remotes = |value: &str| {
+            format!(
+                "\
+[ftp]
+type = ftp
+host = ftp.example.com
+user = demo
+pass = {value}
+
+[sftp]
+type = sftp
+host = sftp.example.com
+user = demo
+pass = {value}
+
+[dav]
+type = webdav
+url = https://dav.example.com/remote.php/dav/files/demo
+user = demo
+pass = {value}
+
+[mega]
+type = mega
+user = me@example.com
+pass = {value}
+
+[filen]
+type = filen
+email = me@example.com
+password = {value}
+api_key = {value}
+
+[koofr]
+type = koofr
+user = me@example.com
+password = {value}
+
+[opendrive]
+type = opendrive
+username = me@example.com
+password = {value}
+
+[vault]
+type = crypt
+remote = ftp:/vault
+password = {value}
+password2 = {value}
+"
+            )
+        };
+        let import = |conf: String, tag: &str| {
+            let path = tmp_write(
+                &conf,
+                &format!(
+                    "aeroftp-test-import-strict-{tag}-{}.conf",
+                    std::process::id()
+                ),
+            );
+            let result = import_rclone(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            result
+        };
+        let secrets = |s: &ServerProfileExport| -> Vec<Option<String>> {
+            let opt = |k: &str| {
+                s.options
+                    .as_ref()
+                    .and_then(|o| o.get(k))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            };
+            match s.name.as_str() {
+                "filen" => vec![s.credential.clone(), opt("filen_api_key")],
+                "vault" => vec![opt("rcloneCryptPassword"), opt("rcloneCryptPassword2")],
+                _ => vec![s.credential.clone()],
+            }
+        };
+        let names = [
+            "ftp",
+            "sftp",
+            "dav",
+            "mega",
+            "filen",
+            "koofr",
+            "opendrive",
+            "vault",
+        ];
+
+        let result = import(remotes(good), "good");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings.len());
+        for name in names {
+            let server = result.servers.iter().find(|s| s.name == name).expect(name);
+            for secret in secrets(server) {
+                assert_eq!(secret.as_deref(), Some("TestPass123"), "{name}");
+            }
+        }
+
+        for (tag, bad) in [("plain", "S3cr3tPass!"), ("std", std_alphabet)] {
+            let result = import(remotes(bad), tag);
+            // A crypt remote with an unreadable password is not imported at
+            // all: an overlay without its key would decrypt nothing.
+            let vault = result
+                .skipped
+                .iter()
+                .find(|s| s.name == "vault")
+                .unwrap_or_else(|| panic!("vault still imports ('{bad}')"));
+            assert!(vault.reason.contains("password "), "{}", vault.reason);
+            for name in names.into_iter().filter(|n| *n != "vault") {
+                let server = result
+                    .servers
+                    .iter()
+                    .find(|s| s.name == name)
+                    .unwrap_or_else(|| panic!("{name} still imports ('{bad}')"));
+                for secret in secrets(server) {
+                    assert_eq!(secret, None, "{name}: '{bad}' is not a password");
+                }
+                let warning = result
+                    .warnings
+                    .iter()
+                    .find(|w| w.name == name)
+                    .unwrap_or_else(|| panic!("{name}: no warning for '{bad}'"));
+                assert!(
+                    warning.reason.contains("imported without"),
+                    "{name}: {}",
+                    warning.reason
+                );
+            }
+            let filen = result.warnings.iter().find(|w| w.name == "filen").unwrap();
+            assert!(
+                filen.reason.contains("password") && filen.reason.contains("api_key"),
+                "both filen fields are named: {}",
+                filen.reason
+            );
+        }
+    }
+
+    /// AeroFTP's own export wrote S3 `secret_access_key` and the Azure `key`
+    /// obscured from its first rclone export (v3.4.7) until v3.7.6, and the
+    /// Swift `key` until v4.0.5, although rclone keeps those fields plain. A
+    /// file from those versions says so in its header, and its keys are the
+    /// obscured ones: they must still import as the keys. The values below are
+    /// `rclone obscure` output (v1.75.1) for the keys in the assertions, and
+    /// the layout is the one v3.7.4 wrote.
+    #[test]
+    fn test_import_rclone_reveals_keys_an_older_aeroftp_export_obscured() {
+        let aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let aws_obscured =
+            "bgeHgvsu5PV96aZcpunIFC5EDvmaaHeNaaE7wuo2T7_GycW7y1zEI7a6f5iYPOi7Ropnc73qzcw";
+        let azure = "Eby8vdM02xNOcqFLqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let azure_obscured = "1aRH1kFnoBoRaUGK3K355gqn9cNXBgPNPS6nv13pJxOiiWO_ifHHQSDj8L3PLoGSjbs56nhq2oWmBu7NuQiHw09ECJsr_B6xh6CamylBVCinNhd4BMZKCnYVdnGZmmSqcODKPg8Lmfk";
+        let swift = "148%BlomPass";
+        let swift_obscured = "mTBDHNVmUspfrftDRi3tmN1Seri-0wMt2o6lKQ";
+        let file = |header: &str| {
+            format!(
+                "{header}\
+[aws]
+type = s3
+provider = AWS
+access_key_id = AKIAIOSFODNN7EXAMPLE
+secret_access_key = {aws_obscured}
+region = us-east-1
+
+[az]
+type = azureblob
+account = demoaccount
+key = {azure_obscured}
+
+[sw]
+type = swift
+user = demo
+key = {swift_obscured}
+auth = https://auth.example.com/v3
+
+"
+            )
+        };
+        let import = |conf: String, tag: &str| {
+            let path = tmp_write(
+                &conf,
+                &format!(
+                    "aeroftp-test-import-old-export-{tag}-{}.conf",
+                    std::process::id()
+                ),
+            );
+            let result = import_rclone(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            result
+        };
+        let key_of = |result: &RcloneImportResult, name: &str| {
+            result
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} not imported"))
+                .credential
+                .clone()
+        };
+        let header = |exported: &str| {
+            format!("# Generated by AeroFTP - https://aeroftp.app\n# Exported: {exported}\n\n")
+        };
+
+        // v3.7.4: all three written obscured. Each reveal is reported, since
+        // a key edited into such a file later can decode too.
+        let old = import(file(&header("2026-05-07T19:22:19Z")), "v374");
+        assert_eq!(key_of(&old, "aws").as_deref(), Some(aws));
+        assert_eq!(key_of(&old, "az").as_deref(), Some(azure));
+        assert_eq!(key_of(&old, "sw").as_deref(), Some(swift));
+        for (name, field) in [("aws", "secret_access_key"), ("az", "key"), ("sw", "key")] {
+            let note = old
+                .warnings
+                .iter()
+                .find(|w| w.name == name)
+                .unwrap_or_else(|| panic!("{name}: the reveal is not reported"));
+            assert!(
+                note.reason.starts_with(&format!("{field} was revealed")),
+                "{}",
+                note.reason
+            );
+        }
+
+        // Between v3.7.6 and v4.0.5 only the Swift key was still obscured.
+        let mid = import(file(&header("2026-06-01T08:00:00Z")), "v400");
+        assert_eq!(key_of(&mid, "sw").as_deref(), Some(swift));
+        assert_eq!(key_of(&mid, "aws").as_deref(), Some(aws_obscured));
+        let aws_note = mid
+            .warnings
+            .iter()
+            .find(|w| w.name == "aws")
+            .expect("an S3 key that reads as obscured, in a file after the fix, is flagged");
+        assert!(
+            aws_note.reason.contains("secret_access_key"),
+            "{}",
+            aws_note.reason
+        );
+
+        // A file that is not an AeroFTP export: rclone would send these values
+        // as they are, and so they are kept, with no note.
+        let foreign = import(file(""), "foreign");
+        assert_eq!(key_of(&foreign, "aws").as_deref(), Some(aws_obscured));
+        assert_eq!(key_of(&foreign, "sw").as_deref(), Some(swift_obscured));
+        assert!(foreign.warnings.is_empty());
+    }
+
+    /// rclone keeps the AeroFTP header when it rewrites a file, so an old
+    /// export used as rclone.conf can hold a key fixed later in plain text
+    /// (`rclone config update`). The file below is what rclone v1.75.1 wrote
+    /// after `rclone config update aws secret_access_key=K005...` on a v3.7.4
+    /// export: the S3 key is plain, a B2-shaped key that decodes to a few
+    /// bytes, and the Swift key is still the obscured one.
+    #[test]
+    fn test_import_rclone_keeps_a_plain_key_edited_into_an_old_aeroftp_export() {
+        let conf = "\
+# Generated by AeroFTP - https://aeroftp.app
+# Exported: 2026-05-07T19:22:19Z
+[aws]
+type = s3
+provider = AWS
+access_key_id = AKIAIOSFODNN7EXAMPLE
+secret_access_key = K00500UrPoPrwM702BIqoNhg9L3LlqY
+region = us-east-1
+
+[sw]
+type = swift
+user = demo
+key = mTBDHNVmUspfrftDRi3tmN1Seri-0wMt2o6lKQ
+auth = https://auth.example.com/v3
+";
+        assert!(
+            matches!(reveal_rclone_password("K00500UrPoPrwM702BIqoNhg9L3LlqY"), Ok(ref r) if !r.is_empty()),
+            "the edited key must still decode, or this tests nothing"
+        );
+        let path = tmp_write(
+            conf,
+            &format!("aeroftp-test-import-rewritten-{}.conf", std::process::id()),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let key_of = |name: &str| {
+            result
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .credential
+                .clone()
+        };
+        assert_eq!(
+            key_of("aws").as_deref(),
+            Some("K00500UrPoPrwM702BIqoNhg9L3LlqY")
+        );
+        assert_eq!(key_of("sw").as_deref(), Some("148%BlomPass"));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.name == "sw" && w.reason.starts_with("key was revealed")));
+    }
+
+    /// From this version on the header names the AeroFTP version, which says
+    /// for certain whether a field was written obscured. A header whose date
+    /// does not parse says nothing, and the file is read as any rclone.conf.
+    /// An old export holding an obscured empty key imports without one.
+    #[test]
+    fn test_import_rclone_reads_the_aeroftp_version_and_distrusts_a_bad_date() {
+        let aws_obscured =
+            "bgeHgvsu5PV96aZcpunIFC5EDvmaaHeNaaE7wuo2T7_GycW7y1zEI7a6f5iYPOi7Ropnc73qzcw";
+        let import = |header: &str, secret: &str, tag: &str| {
+            let conf = format!(
+                "{header}[aws]\ntype = s3\nprovider = AWS\naccess_key_id = AKIA\nsecret_access_key = {secret}\n"
+            );
+            let path = tmp_write(
+                &conf,
+                &format!(
+                    "aeroftp-test-import-version-{tag}-{}.conf",
+                    std::process::id()
+                ),
+            );
+            let result = import_rclone(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            result
+        };
+        let key = |r: &RcloneImportResult| r.servers[0].credential.clone();
+
+        // Written by a version that keeps the key plain: as it is, no note,
+        // whatever the date says.
+        let current = import(
+            "# Generated by AeroFTP 4.2.1 - https://aeroftp.app\n# Exported: 2026-04-20T10:00:00Z\n\n",
+            aws_obscured,
+            "current",
+        );
+        assert_eq!(key(&current).as_deref(), Some(aws_obscured));
+        assert!(current.warnings.is_empty());
+
+        // A pre-bump build writes 4.2.0 in the header. That line still names
+        // the AeroFTP version, so the key is kept as written.
+        let pre_bump = import(
+            "# Generated by AeroFTP 4.2.0 - https://aeroftp.app\n# Exported: 2026-04-20T10:00:00Z\n\n",
+            aws_obscured,
+            "pre-bump",
+        );
+        assert_eq!(key(&pre_bump).as_deref(), Some(aws_obscured));
+        assert!(pre_bump.warnings.is_empty());
+
+        // Written by 3.7.4, whatever the date says: revealed.
+        let old = import(
+            "# Generated by AeroFTP 3.7.4 - https://aeroftp.app\n# Exported: 2026-09-01T10:00:00Z\n\n",
+            aws_obscured,
+            "old",
+        );
+        assert_eq!(
+            key(&old).as_deref(),
+            Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        );
+
+        // No version and a date that does not parse: nothing to go by.
+        let bad_date = import(
+            "# Generated by AeroFTP - https://aeroftp.app\n# Exported: yesterday\n\n",
+            aws_obscured,
+            "bad-date",
+        );
+        assert_eq!(key(&bad_date).as_deref(), Some(aws_obscured));
+        assert!(bad_date.warnings.is_empty());
+
+        // `obscure("")` in a file that obscured the key: an empty key.
+        let empty = import(
+            "# Generated by AeroFTP - https://aeroftp.app\n# Exported: 2026-05-07T19:22:19Z\n\n",
+            "NwRHnkk6Illbhv8J59q1OQ",
+            "empty",
+        );
+        assert_eq!(key(&empty), None);
+        assert!(
+            empty.warnings[0].reason.contains("empty"),
+            "{}",
+            empty.warnings[0].reason
+        );
+    }
+
+    /// A 22-character clear key under an old header reveals to empty, the same
+    /// as `obscure("")`. It is dropped, and the note does not claim it was an
+    /// obscured empty value.
+    #[test]
+    fn test_import_rclone_names_why_a_22_character_clear_key_is_dropped() {
+        let clear = "A".repeat(22);
+        assert!(
+            reveal_rclone_password(&clear).unwrap().is_empty(),
+            "a 22-character rclone-alphabet key reveals to empty, or this tests nothing"
+        );
+        let conf = format!(
+            "# Generated by AeroFTP 3.7.4 - https://aeroftp.app\n\
+             # Exported: 2026-09-01T10:00:00Z\n\n\
+             [aws]\ntype = s3\nprovider = AWS\naccess_key_id = AKIA\n\
+             secret_access_key = {clear}\n"
+        );
+        let path = tmp_write(
+            &conf,
+            &format!("aeroftp-test-import-22char-{}.conf", std::process::id()),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(result.servers[0].credential.is_none());
+        let reason = &result.warnings[0].reason;
+        assert!(
+            reason.contains("22 characters"),
+            "the note must name the length, got: {reason}"
+        );
+        assert!(
+            !reason.contains("obscured empty value"),
+            "the note must not call a clear key an obscured empty value, got: {reason}"
+        );
+        assert!(!reason.contains(&clear));
+    }
+
+    /// A clear key short enough that its reveal is one printable byte used to
+    /// be stored as that byte. It is kept as written, with a note.
+    #[test]
+    fn test_import_rclone_keeps_a_short_clear_key_that_reveals() {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let clear = alphabet.iter().find_map(|&last| {
+            let mut key = "A".repeat(22);
+            key.push(last as char);
+            let Ok(revealed) = reveal_rclone_password(&key) else {
+                return None;
+            };
+            (revealed.len() == 1 && revealed.bytes().all(|b| (0x21..=0x7e).contains(&b)))
+                .then_some(key)
+        });
+        let clear = clear.expect("a 23-character key that reveals to one printable byte");
+        let conf = format!(
+            "# Generated by AeroFTP 3.7.4 - https://aeroftp.app\n\
+             # Exported: 2026-09-01T10:00:00Z\n\n\
+             [aws]\ntype = s3\nprovider = AWS\naccess_key_id = AKIA\n\
+             secret_access_key = {clear}\n"
+        );
+        let path = tmp_write(
+            &conf,
+            &format!("aeroftp-test-import-short-{}.conf", std::process::id()),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            result.servers[0].credential.as_deref(),
+            Some(clear.as_str())
+        );
+        let reason = &result.warnings[0].reason;
+        assert!(
+            reason.contains("kept as written"),
+            "a too-short reveal must be noted, got: {reason}"
+        );
+        assert!(
+            !reason.contains("was revealed:"),
+            "the short key must not be accepted as revealed, got: {reason}"
+        );
+    }
+
+    /// A real Swift password from before 4.0.5 that contains a space stays
+    /// obscured, and the import says so instead of dropping the note.
+    #[test]
+    fn test_import_rclone_notes_a_swift_password_whose_reveal_has_a_space() {
+        let obscured = obscure_password("pass word").expect("obscure");
+        let revealed = reveal_rclone_password(&obscured).expect("reveal");
+        assert!(
+            revealed.contains(' '),
+            "the fixture must reveal to a password with a space, got {revealed:?}"
+        );
+        let conf = format!(
+            "# Generated by AeroFTP 4.0.4 - https://aeroftp.app\n\
+             # Exported: 2026-09-01T10:00:00Z\n\n\
+             [sw]\ntype = swift\nuser = demo\nkey = {obscured}\n\
+             auth = https://auth.example.com/v3\n"
+        );
+        let path = tmp_write(
+            &conf,
+            &format!(
+                "aeroftp-test-import-swift-space-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            result.servers[0].credential.as_deref(),
+            Some(obscured.as_str())
+        );
+        let reason = &result.warnings[0].reason;
+        assert!(
+            reason.contains("kept as written") && reason.contains("space"),
+            "got: {reason}"
+        );
+        assert!(!reason.contains("pass word"));
+    }
+
+    /// The export header names the version, which the import reads back.
+    #[test]
+    fn test_export_rclone_header_names_the_aeroftp_version() {
+        let (_, conf) = export_to_string(&[export_server("f", "ftp", None)], "version-header");
+        let header = format!(
+            "# Generated by AeroFTP {} - https://aeroftp.app\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(conf.starts_with(&header), "{conf}");
+        let export = aeroftp_export_header(&conf).expect("recognised as an AeroFTP export");
+        assert_eq!(
+            export.version,
+            parse_aeroftp_version(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(export.version.is_some() && export.exported.is_some());
+    }
+
+    /// A crypt remote whose password or salt rclone could not reveal is not
+    /// imported. An unreadable salt used to be dropped, which selects rclone's
+    /// default salt with the overlay enabled: a wrong key and no error. An
+    /// omitted salt, or `obscure("")`, is rclone's default salt and imports.
+    #[test]
+    fn test_import_rclone_skips_a_crypt_remote_with_an_unreadable_secret() {
+        let password = "I0foQLrVcrxA3fTR32MLs51K2uCFdW1sgw"; // rclone obscure topsecret
+        let empty = "NwRHnkk6Illbhv8J59q1OQ"; // rclone obscure ""
+        let conf = format!(
+            "\
+[base]
+type = sftp
+host = sftp.example.com
+user = demo
+
+[plain-salt]
+type = crypt
+remote = base:/a
+password = {password}
+password2 = saltsecret
+
+[plain-password]
+type = crypt
+remote = base:/b
+password = topsecret
+
+[empty-password]
+type = crypt
+remote = base:/c
+password = {empty}
+
+[default-salt]
+type = crypt
+remote = base:/d
+password = {password}
+password2 = {empty}
+"
+        );
+        let path = tmp_write(
+            &conf,
+            &format!(
+                "aeroftp-test-import-crypt-unreadable-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        for (name, field) in [
+            ("plain-salt", "password2"),
+            ("plain-password", "password"),
+            ("empty-password", "password"),
+        ] {
+            assert!(
+                !result.servers.iter().any(|s| s.name == name),
+                "{name} must not import"
+            );
+            let skipped = result
+                .skipped
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name} not reported"));
+            assert!(
+                skipped.reason.contains(&format!("{field} ")),
+                "{name}: {}",
+                skipped.reason
+            );
+            assert!(
+                !skipped.reason.contains("saltsecret") && !skipped.reason.contains("topsecret")
+            );
+        }
+        let default_salt = result
+            .servers
+            .iter()
+            .find(|s| s.name == "default-salt")
+            .expect("an obscured empty salt is rclone's default salt");
+        let opts = default_salt.options.as_ref().unwrap();
+        assert_eq!(opts["rcloneCryptPassword"], "topsecret");
+        assert!(opts.get("rcloneCryptPassword2").is_none());
+        assert!(result.servers.iter().any(|s| s.name == "base"));
+    }
+
+    /// rclone's `obscure.Reveal` decodes with Go's `RawURLEncoding`, which
+    /// ignores the discarded low bits of the last symbol: rclone v1.75.1
+    /// reveals the value below, the real `rclone obscure TestPass12` output
+    /// with its final symbol changed in those bits only, as `TestPass12`. A
+    /// value that reveals to nothing is reported rather than dropped.
+    #[test]
+    fn test_import_rclone_reveals_as_rclone_does_and_reports_an_empty_password() {
+        let conf = "\
+[trailing-bits]
+type = ftp
+host = ftp.example.com
+user = demo
+pass = qYdmOWprn6ieRZz_gEOedn17FVXSDmM7bHN
+
+[empty]
+type = ftp
+host = ftp.example.com
+user = demo
+pass = NwRHnkk6Illbhv8J59q1OQ
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-reveal-edges-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let server = |name: &str| result.servers.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            server("trailing-bits").credential.as_deref(),
+            Some("TestPass12")
+        );
+        assert_eq!(server("empty").credential, None);
+        let note = result
+            .warnings
+            .iter()
+            .find(|w| w.name == "empty")
+            .expect("warned");
+        assert!(
+            note.reason.contains("pass reveals to an empty value"),
+            "{}",
+            note.reason
+        );
+        assert!(!result.warnings.iter().any(|w| w.name == "trailing-bits"));
+    }
+
+    /// A Cloudinary or ImageKit remote without the key AeroFTP signs with
+    /// imports without a credential, and says so.
+    #[test]
+    fn test_import_rclone_reports_api_key_providers_without_their_secret() {
+        let conf = "\
+[cl]
+type = cloudinary
+cloud_name = demo-cloud
+api_key = 1
+
+[ik]
+type = imagekit
+endpoint = https://ik.imagekit.io/demo_id
+";
+        let path = tmp_write(
+            conf,
+            &format!(
+                "aeroftp-test-import-api-key-no-secret-{}.conf",
+                std::process::id()
+            ),
+        );
+        let result = import_rclone(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        for (name, field) in [("cl", "api_secret"), ("ik", "private_key")] {
+            assert!(
+                result.servers.iter().any(|s| s.name == name),
+                "{name} imports"
+            );
+            let note = result
+                .warnings
+                .iter()
+                .find(|w| w.name == name)
+                .unwrap_or_else(|| panic!("{name}: no warning"));
+            assert!(note.reason.contains(field), "{name}: {}", note.reason);
+        }
     }
 
     /// #128-D: `aeroftp_token_to_rclone` is the exact inverse of
@@ -4152,6 +6723,57 @@ token = {\"access_token\":\"acc\",\"token_type\":\"Zoho-oauthtoken\",\"refresh_t
         );
     }
 
+    /// The key is derived from a crypt password as it is, spaces included, so
+    /// the export must not trim it: rclone would derive another key.
+    #[test]
+    fn test_export_rclone_crypt_password_is_not_trimmed() {
+        let servers = vec![export_server(
+            "vault",
+            "sftp",
+            Some(serde_json::json!({
+                "rcloneCryptEnabled": true,
+                "rcloneCryptPassword": " pass with spaces ",
+                "rcloneCryptPassword2": " salt ",
+            })),
+        )];
+        let (_, conf) = export_to_string(&servers, "crypt-no-trim");
+        let value = |key: &str| {
+            conf.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("no {key}:\n{conf}"))
+                .to_string()
+        };
+        assert_eq!(
+            reveal_obscured(&value("password")).as_deref(),
+            Ok(" pass with spaces ")
+        );
+        assert_eq!(
+            reveal_obscured(&value("password2")).as_deref(),
+            Ok(" salt ")
+        );
+
+        // Spaces only are a secret too: left out, a salt of spaces would
+        // select rclone's default salt.
+        let servers = vec![export_server(
+            "vault",
+            "sftp",
+            Some(serde_json::json!({
+                "rcloneCryptEnabled": true,
+                "rcloneCryptPassword": "   ",
+                "rcloneCryptPassword2": "  ",
+            })),
+        )];
+        let (_, conf) = export_to_string(&servers, "crypt-spaces-only");
+        let value = |key: &str| {
+            conf.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("no {key}:\n{conf}"))
+                .to_string()
+        };
+        assert_eq!(reveal_obscured(&value("password")).as_deref(), Ok("   "));
+        assert_eq!(reveal_obscured(&value("password2")).as_deref(), Ok("  "));
+    }
+
     #[test]
     fn test_export_rclone_crypt_emits_second_section() {
         let servers = vec![RcloneExportServer {
@@ -4204,6 +6826,214 @@ token = {\"access_token\":\"acc\",\"token_type\":\"Zoho-oauthtoken\",\"refresh_t
             conf.contains("directory_name_encryption = true"),
             "dir mode:\n{conf}"
         );
+    }
+
+    /// A crypt remote `vault` whose base is `base:/enc` imports as one sftp
+    /// profile named vault, starting in /enc. Export must not claim the
+    /// section `vault` for the crypt remote: that name is the clear profile,
+    /// and `rclone sync vault:` has to keep pointing at it. The crypt section
+    /// wraps the start-folder alias, the same fallback the root case uses.
+    #[test]
+    fn test_export_rclone_crypt_in_a_subfolder_does_not_take_the_profile_name() {
+        let password = obscure_password("topsecret").expect("obscure");
+        let conf = format!(
+            "[base]\ntype = sftp\nhost = sftp.example.com\nuser = demo\npass = {password}\n\n\
+             [vault]\ntype = crypt\nremote = base:/enc\npassword = {password}\n"
+        );
+        let path = tmp_write(
+            &conf,
+            &format!("aeroftp-test-crypt-subfolder-{}.conf", std::process::id()),
+        );
+        let imported = import_rclone(&path).expect("import");
+        std::fs::remove_file(&path).ok();
+        let vault = imported
+            .servers
+            .iter()
+            .find(|s| s.name == "vault")
+            .expect("profile vault");
+        assert_eq!(vault.initial_path.as_deref(), Some("/enc"));
+        let mut options = vault.options.clone().unwrap_or_default();
+        options
+            .as_object_mut()
+            .unwrap()
+            .insert("initial_path".into(), serde_json::json!("/enc"));
+        let servers = vec![RcloneExportServer {
+            name: vault.name.clone(),
+            host: vault.host.clone(),
+            port: vault.port,
+            username: vault.username.clone(),
+            protocol: vault.protocol.clone(),
+            options: Some(options),
+            provider_id: vault.provider_id.clone(),
+        }];
+        let tmp = std::env::temp_dir().join(format!(
+            "aeroftp-test-export-crypt-subfolder-{}.conf",
+            std::process::id()
+        ));
+        let outcome = export_rclone(&servers, &HashMap::new(), &tmp).expect("export");
+        let exported = std::fs::read_to_string(&tmp).expect("read");
+        std::fs::remove_file(&tmp).ok();
+        assert!(
+            outcome.skipped.is_empty(),
+            "the crypt section must be written, not refused: {:?}\n{exported}",
+            outcome.skipped
+        );
+        assert!(
+            exported.contains("type = crypt"),
+            "crypt section:\n{exported}"
+        );
+        assert!(
+            exported.contains("[vault-path]"),
+            "start-folder alias:\n{exported}"
+        );
+        assert!(
+            exported.contains("remote = vault-path:\n"),
+            "crypt must wrap the alias at its root, not at vault-path:/enc, which is \
+             vault:/enc/enc:\n{exported}"
+        );
+        let crypt_header = exported
+            .lines()
+            .find(|line| line.starts_with('[') && line.contains("crypt"))
+            .unwrap_or("");
+        assert_ne!(
+            crypt_header, "[vault]",
+            "crypt must not take the clear name"
+        );
+        // L8 of the 4.2.1 closeout: the note is a warning, with the real
+        // names, that the name the operator knew as the crypt is the clear
+        // remote in this file.
+        let crypt_name = crypt_header.trim_matches(['[', ']']);
+        assert!(
+            exported.contains("`vault:` in this file is NOT encrypted"),
+            "the note must warn that the clear name is not encrypted:\n{exported}"
+        );
+        assert!(
+            exported.contains(&format!("use `{crypt_name}:`")),
+            "the note must name the crypt section to use instead:\n{exported}"
+        );
+
+        // The round trip: importing this export gives back the crypt profile
+        // on the same server, starting in the same folder, with the same key.
+        let reimport = std::env::temp_dir().join(format!(
+            "aeroftp-test-reimport-crypt-subfolder-{}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&reimport, &exported).expect("write");
+        let again = import_rclone(&reimport).expect("re-import");
+        std::fs::remove_file(&reimport).ok();
+        let crypt = again
+            .servers
+            .iter()
+            .find(|s| {
+                s.options
+                    .as_ref()
+                    .and_then(|o| o.get("rcloneCryptEnabled"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the crypt remote must come back as a crypt profile, skipped: {:?}\n{exported}",
+                    again
+                        .skipped
+                        .iter()
+                        .map(|s| format!("{}: {}", s.name, s.reason))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(crypt.name, crypt_name);
+        assert_eq!(crypt.host, "sftp.example.com");
+        assert_eq!(crypt.username, "demo");
+        assert_eq!(
+            crypt.initial_path.as_deref(),
+            Some("/enc"),
+            "the crypt must open in the folder it was exported from:\n{exported}"
+        );
+        assert_eq!(
+            crypt
+                .options
+                .as_ref()
+                .and_then(|o| o.get("rcloneCryptPassword"))
+                .and_then(|v| v.as_str()),
+            Some("topsecret")
+        );
+    }
+
+    /// The imported crypt path is from the clear remote's root, the alias
+    /// base already points into it: the path is taken relative to the
+    /// alias's folder, and one outside it wraps the clear remote.
+    #[test]
+    fn crypt_export_remote_target_is_relative_to_the_alias_folder() {
+        let imported = |target: &str| serde_json::json!({ "rcloneCryptRemote": target });
+        let at = |target: &str| {
+            crypt_export_remote_target("nas-path", "nas", Some("/team"), &imported(target))
+        };
+        assert_eq!(at("x:/team"), "nas-path:");
+        assert_eq!(at("x:team/vault"), "nas-path:/vault");
+        assert_eq!(at("x:/other"), "nas:/other");
+        assert_eq!(
+            at("x:/teamwork"),
+            "nas:/teamwork",
+            "a prefix is not a folder"
+        );
+        assert_eq!(
+            crypt_export_remote_target("nas", "nas", None, &imported("x:/enc")),
+            "nas:/enc"
+        );
+        assert_eq!(
+            crypt_export_remote_target(
+                "nas-path",
+                "nas",
+                Some("/team"),
+                &serde_json::json!({ "rcloneCryptOverlayScope": "/vault" })
+            ),
+            "nas-path:/vault",
+            "the overlay scope is already relative to the start folder"
+        );
+    }
+
+    /// A crypt over an alias imports onto what the alias points at; a chain
+    /// is followed, and one that loops is refused instead of spinning.
+    #[test]
+    fn a_crypt_over_an_alias_resolves_to_the_aliased_remote() {
+        let section = |pairs: &[(&str, &str)]| -> RcloneRemote {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let sections: HashMap<String, RcloneRemote> = HashMap::from([
+            ("nas".to_string(), section(&[("type", "sftp")])),
+            (
+                "nas-path".to_string(),
+                section(&[("type", "alias"), ("remote", "nas:/team")]),
+            ),
+            (
+                "deeper".to_string(),
+                section(&[("type", "alias"), ("remote", "nas-path:docs")]),
+            ),
+            (
+                "loop".to_string(),
+                section(&[("type", "alias"), ("remote", "loop:x")]),
+            ),
+        ]);
+        assert_eq!(
+            resolve_alias_target("nas-path:", &sections).unwrap(),
+            "nas:/team"
+        );
+        assert_eq!(
+            resolve_alias_target("nas-path:/vault", &sections).unwrap(),
+            "nas:/team/vault"
+        );
+        assert_eq!(
+            resolve_alias_target("deeper:v", &sections).unwrap(),
+            "nas:/team/docs/v"
+        );
+        assert_eq!(
+            resolve_alias_target("nas:/enc", &sections).unwrap(),
+            "nas:/enc"
+        );
+        assert!(resolve_alias_target("loop:", &sections).is_err());
     }
 
     #[test]
