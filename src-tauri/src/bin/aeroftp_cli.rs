@@ -63567,7 +63567,7 @@ struct CliRunnerAdapter<'a> {
 }
 
 #[cfg(test)]
-#[path = "cli_tests/runner.rs"]
+#[path = "../cli_runner_tests.rs"]
 mod cli_runner_tests;
 
 #[async_trait::async_trait]
