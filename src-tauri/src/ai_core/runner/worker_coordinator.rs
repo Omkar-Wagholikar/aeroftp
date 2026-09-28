@@ -386,3 +386,6 @@ fn valid_remote_root(root: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+mod worker_run;
+pub use worker_run::{LiveWorkerTransport, WorkerResult, WorkerTransport};

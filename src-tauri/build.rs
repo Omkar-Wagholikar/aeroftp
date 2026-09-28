@@ -78,7 +78,7 @@ const DEPENDENCY_CATEGORIES: &[(&str, &[&str])] = &[
             "argon2",
             "base64",
             "blake3",
-            "cap-std",
+            "cap-std", // The 4.2.2 worker's confined file-handle boundary.
             "cbc",
             "chacha20poly1305",
             "crypto_secretbox",

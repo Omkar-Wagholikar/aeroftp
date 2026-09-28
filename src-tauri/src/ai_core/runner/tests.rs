@@ -125,6 +125,7 @@ async fn invoke(
         RunnerOptions {
             max_steps,
             plan_only,
+            fail_on_step_limit: false,
         },
         cancel,
     )

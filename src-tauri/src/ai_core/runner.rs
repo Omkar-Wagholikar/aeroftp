@@ -53,6 +53,8 @@ pub trait RunnerAdapter: Sync {
 pub struct RunnerOptions {
     pub max_steps: u32,
     pub plan_only: bool,
+    /// Workers fail closed when they reach the tool-step ceiling.
+    pub fail_on_step_limit: bool,
 }
 
 fn message(role: &str, content: String) -> ChatMessage {
@@ -141,6 +143,9 @@ pub async fn run(
         }
         steps += 1;
         if steps > options.max_steps {
+            if options.fail_on_step_limit {
+                return Err("Agent tool-step limit reached".into());
+            }
             if !response.content.is_empty() {
                 messages.push(message("assistant", response.content.clone()));
             }
