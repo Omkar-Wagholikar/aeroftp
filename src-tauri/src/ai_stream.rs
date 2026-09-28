@@ -21,6 +21,91 @@ use crate::ai_core::EventSink;
 static ACTIVE_STREAMS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Async transport may be dropped before returning (runner cancellation/abort).
+// Keep registry cleanup synchronous and tied to the future's lifetime.
+struct StreamRegistration<'a> {
+    id: &'a str,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for StreamRegistration<'_> {
+    fn drop(&mut self) {
+        let mut streams = ACTIVE_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+        if streams
+            .get(self.id)
+            .is_some_and(|flag| Arc::ptr_eq(flag, &self.cancel))
+        {
+            streams.remove(self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_registration_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct Sink;
+    impl EventSink for Sink {
+        fn emit_stream_chunk(&self, _: &str, _: &StreamChunk) {}
+        fn emit_tool_progress(&self, _: &crate::ai_core::ToolProgress) {}
+        fn emit_app_control(&self, _: &str, _: &serde_json::Value) {}
+    }
+
+    #[tokio::test]
+    async fn dropping_transport_while_waiting_for_headers_removes_registration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request: AIRequest = serde_json::from_value(serde_json::json!({
+            "provider_type": "ollama", "model": "fixture", "messages": [],
+            "base_url": format!("http://{address}")
+        }))
+        .unwrap();
+        let id = format!("registration-test-{}", uuid::Uuid::new_v4());
+        {
+            let stream = ai_chat_stream_with_sink(&Sink, request, &id);
+            tokio::pin!(stream);
+            let connected = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                socket
+            };
+            let _socket = tokio::select! {
+                result = &mut stream => panic!("transport finished unexpectedly: {result:?}"),
+                socket = tokio::time::timeout(std::time::Duration::from_secs(5), connected) => socket.unwrap(),
+            };
+            assert!(ACTIVE_STREAMS.lock().unwrap().contains_key(&id));
+            // Leave the scope with the request still awaiting HTTP headers.
+        }
+        assert!(!ACTIVE_STREAMS.lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn old_registration_cannot_remove_a_replacement_with_the_same_id() {
+        let id = format!("registration-test-{}", uuid::Uuid::new_v4());
+        let old = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+        ACTIVE_STREAMS
+            .lock()
+            .unwrap()
+            .insert(id.clone(), replacement.clone());
+        drop(StreamRegistration {
+            id: &id,
+            cancel: old,
+        });
+        assert!(Arc::ptr_eq(
+            ACTIVE_STREAMS.lock().unwrap().get(&id).unwrap(),
+            &replacement
+        ));
+        drop(StreamRegistration {
+            id: &id,
+            cancel: replacement,
+        });
+        assert!(!ACTIVE_STREAMS.lock().unwrap().contains_key(&id));
+    }
+}
+
 /// Maximum SSE buffer size (50 MB) to prevent unbounded memory growth
 const MAX_BUFFER_SIZE: usize = 50 * 1024 * 1024;
 
@@ -90,6 +175,10 @@ pub async fn ai_chat_stream_with_sink(
         .lock()
         .unwrap()
         .insert(stream_id.to_string(), Arc::clone(&cancel));
+    let registration = StreamRegistration {
+        id: stream_id,
+        cancel: Arc::clone(&cancel),
+    };
 
     // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
     let request = AIRequest {
@@ -125,7 +214,7 @@ pub async fn ai_chat_stream_with_sink(
     };
 
     // Deregister stream
-    ACTIVE_STREAMS.lock().unwrap().remove(stream_id);
+    drop(registration);
 
     match result {
         Ok(()) => Ok(()),

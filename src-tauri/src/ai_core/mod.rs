@@ -16,6 +16,7 @@ pub mod local_tools;
 pub mod mcp_impl;
 pub mod remote_backend;
 pub mod remote_tools;
+pub mod runner;
 pub mod system_tools;
 pub mod tauri_impl;
 pub mod tools;
