@@ -70,6 +70,57 @@ impl WorkerCredentialSource for FakeSource {
         }
         Ok(state.server.clone())
     }
+    fn server_snapshot(&self, id: &str) -> Result<PinnedServerSnapshot, String> {
+        let state = self.0.lock().unwrap();
+        if state.locked || id != state.server.profile_id {
+            return Err("locked or unknown".into());
+        }
+        let mut snapshot = snapshot_from_record(
+            id,
+            &serde_json::json!({
+                "id": id, "protocol": "s3", "server": "s3.example.test",
+                "options": {"bucket": "test-bucket"}
+            }),
+            Zeroizing::new("test-secret".into()),
+        )?;
+        snapshot.pin = state.server.clone();
+        Ok(snapshot)
+    }
+}
+
+#[test]
+fn snapshot_is_exact_and_rejects_unsupported_authority() {
+    let profile = serde_json::json!({
+        "id": "server-1", "protocol": "s3", "server": "s3.example.test",
+        "username": "access-key", "options": {"bucket": "test-bucket"}
+    });
+    let snapshot =
+        snapshot_from_record("server-1", &profile, Zeroizing::new("secret".into())).unwrap();
+    assert_eq!(snapshot.config.host, "s3.example.test");
+    assert_eq!(snapshot.config.password, None);
+    assert_ne!(
+        snapshot.pin.revision,
+        snapshot_from_record("server-1", &profile, Zeroizing::new("rotated".into()))
+            .unwrap()
+            .pin
+            .revision
+    );
+    assert!(snapshot_from_record("Active", &profile, Zeroizing::new("secret".into())).is_err());
+    for mutation in [
+        serde_json::json!({"aeroCryptOverlay": {"enabled": true}}),
+        serde_json::json!({"protocol": "sftp"}),
+        serde_json::json!({"options": {"bucket": "test-bucket", "sessionToken": "token"}}),
+        serde_json::json!({"options": {"bucket": "test-bucket", "roleArn": "arn"}}),
+    ] {
+        let mut changed = profile.clone();
+        changed
+            .as_object_mut()
+            .unwrap()
+            .extend(mutation.as_object().unwrap().clone());
+        assert!(
+            snapshot_from_record("server-1", &changed, Zeroizing::new("secret".into())).is_err()
+        );
+    }
 }
 
 fn ledger() -> Ledger {
@@ -139,10 +190,19 @@ fn profile_edit_key_rotation_vault_lock_and_cancel_fail_closed() {
     let expires = Instant::now() + Duration::from_secs(5);
     let model = broker.issue_model(&child, "provider-1", expires).unwrap();
     let server = broker.issue_server(&child, "server-1", expires).unwrap();
+    assert_eq!(
+        broker
+            .resolve_server_snapshot(&child, &server)
+            .unwrap()
+            .pin
+            .profile_id,
+        "server-1"
+    );
     source.0.lock().unwrap().model.revision = "rotated-key-rev".into();
     assert!(broker.resolve_model(&child, &model).is_err());
     source.0.lock().unwrap().server.revision = "edited-profile-rev".into();
     assert!(broker.resolve_server(&child, &server).is_err());
+    assert!(broker.resolve_server_snapshot(&child, &server).is_err());
     source.0.lock().unwrap().locked = true;
     assert!(broker.issue_model(&child, "provider-1", expires).is_err());
     assert!(broker.resolve_model(&child, &model).is_err());

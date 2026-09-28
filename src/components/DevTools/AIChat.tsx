@@ -17,6 +17,7 @@ import { ToolApproval } from './ToolApproval';
 import { BatchToolApproval } from './BatchToolApproval';
 import { type Conversation, cleanupHistory, loadSession } from '../../utils/chatHistory';
 import { secureGetWithFallback } from '../../utils/secureStorage';
+import { loadSavedServerProfiles } from '../../utils/serverProfileStore';
 import { useTranslation } from '../../i18n';
 import { logger } from '../../utils/logger';
 import { Message, AIChatProps, SelectedModel, MAX_IMAGES, MUTATION_TOOLS, AgentMode, AGENT_MODE_MAX_STEPS, TransferPlan, TransferPlanOperation, TransferPlanResultData, CodingPatchResultData, CodingCheckpointRestoreResultData, CodingGitResultData, CodingRunCheckResultData, CodingGitHistoryResultData, CodingVerifyResultData, CodingDiagnosticsResultData, CodingSearchResultData } from './aiChatTypes';
@@ -114,7 +115,8 @@ type DelegationEvent = {
     status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'budget_exhausted';
 };
 
-type DelegationWorker = { runId: string; childId: string; summary: string };
+type DelegationWorker = { runId: string; childId: string; profileId?: string | null; summary: string };
+type DelegatedRemoteProfile = { id: string; name: string; root: string };
 type DelegationResult = {
     answer: string;
     workers: DelegationWorker[];
@@ -126,6 +128,7 @@ type DelegationResult = {
 type DelegationView = {
     requestId: string;
     root: string;
+    remoteProfiles: DelegatedRemoteProfile[];
     status: 'running' | 'completed' | 'failed' | 'cancelled';
     events: DelegationEvent[];
     workers: DelegationWorker[];
@@ -725,6 +728,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     const [isLoading, setIsLoading] = useState(false);
     const [delegateLocal, setDelegateLocal] = useState(false);
     const [delegationView, setDelegationView] = useState<DelegationView | null>(null);
+    const [remoteWorkerProfiles, setRemoteWorkerProfiles] = useState<DelegatedRemoteProfile[]>([]);
+    const [selectedRemoteWorkerIds, setSelectedRemoteWorkerIds] = useState<string[]>([]);
     const { text: thinkingMessage, isTyping: thinkingIsTyping } = useThinkingMessage(isLoading, t);
     const [isListening, setIsListening] = useState(false);
     const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
@@ -2206,9 +2211,12 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     const handleDelegateSend = async () => {
         const goal = input.trim();
         if (!goal || !localPath || isLoading || attachedImages.length > 0) return;
+        const remoteProfiles = selectedRemoteWorkerIds
+            .map(id => remoteWorkerProfiles.find(profile => profile.id === id))
+            .filter((profile): profile is DelegatedRemoteProfile => Boolean(profile));
         const requestId = crypto.randomUUID();
         activeDelegationIdRef.current = requestId;
-        setDelegationView({ requestId, root: localPath, status: 'running', events: [], workers: [] });
+        setDelegationView({ requestId, root: localPath, remoteProfiles, status: 'running', events: [], workers: [] });
         setMessages(previous => [...previous, {
             id: crypto.randomUUID(), role: 'user', content: goal, timestamp: new Date(),
         }]);
@@ -2229,6 +2237,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                 modelName: activeModel.modelName,
                 root: localPath,
                 goal,
+                remoteProfiles: remoteProfiles.map(profile => ({ profileId: profile.id, root: profile.root })),
             });
             if (activeDelegationIdRef.current !== requestId) return;
             setDelegationView(previous => previous?.requestId === requestId
@@ -2267,6 +2276,27 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     useEffect(() => {
         if (!localPath) setDelegateLocal(false);
     }, [localPath]);
+
+    useEffect(() => {
+        if (!delegateLocal) {
+            setSelectedRemoteWorkerIds([]);
+            return;
+        }
+        let current = true;
+        void loadSavedServerProfiles().then(profiles => {
+            if (!current) return;
+            const eligible = profiles.filter(profile => profile.protocol === 's3'
+                && !profile.aeroCryptOverlay && !profile.password).map(profile => ({
+                id: profile.id,
+                name: profile.name,
+                root: profile.initialPath?.trim()
+                    ? `/${profile.initialPath.trim().replace(/^\/+|\/+$/g, '')}` : '/',
+            })).filter(profile => profile.id && profile.root.split('/').every(part => part !== '.' && part !== '..'));
+            setRemoteWorkerProfiles(eligible);
+            setSelectedRemoteWorkerIds(previous => previous.filter(id => eligible.some(profile => profile.id === id)));
+        }).catch(() => { if (current) setRemoteWorkerProfiles([]); });
+        return () => { current = false; };
+    }, [delegateLocal]);
 
     const handleSend = async () => {
         if ((!input.trim() && attachedImages.length === 0) || isLoading) return;
@@ -3219,13 +3249,17 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                     <span className={ct.textMuted}>{delegationStatusLabel(delegationView.status)}</span>
                                 </div>
                                 <div className={`${ct.textMuted} break-all`}>{t('ai.delegateLocalHint', { path: delegationView.root })}</div>
+                                {delegationView.remoteProfiles.map(profile => (
+                                    <div key={profile.id} className={`${ct.textMuted} break-all`}>{profile.name}: {profile.root}</div>
+                                ))}
                                 {Array.from(new Set(delegationView.events.flatMap(event => event.childId ? [event.childId] : []))).map((childId, index) => {
                                     const status = delegationView.events.filter(event => event.childId === childId).slice(-1)[0]?.status ?? 'queued';
                                     const worker = delegationView.workers.find(item => item.childId === childId);
                                     return (
                                         <div key={childId} className={`rounded border ${ct.border} px-2 py-1.5`}>
                                             <div className="flex justify-between gap-2">
-                                                <span>{t('ai.worker')} {index + 1}</span>
+                                                <span>{t('ai.worker')} {index + 1}{worker?.profileId
+                                                    ? ` · ${delegationView.remoteProfiles.find(profile => profile.id === worker.profileId)?.name ?? worker.profileId}` : ''}</span>
                                                 <span className={ct.textMuted}>{delegationStatusLabel(status)}</span>
                                             </div>
                                             {worker && <p className="mt-1 whitespace-pre-wrap break-words">{worker.summary}</p>}
@@ -3485,8 +3519,21 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     </div>
 
                     {delegateLocal && localPath && (
-                        <div className={`px-3 pb-2 text-[11px] ${ct.textMuted} break-all`}>
-                            {t('ai.delegateLocalHint', { path: localPath })}
+                        <div className={`px-3 pb-2 text-[11px] ${ct.textMuted} break-all space-y-1`}>
+                            <div>{t('ai.delegateLocalHint', { path: localPath })}</div>
+                            <div>{t('ai.delegateRemoteProfiles')}</div>
+                            {remoteWorkerProfiles.length === 0 && <div>{t('ai.delegateRemoteEmpty')}</div>}
+                            <div className="flex flex-wrap gap-2">
+                                {remoteWorkerProfiles.map(profile => (
+                                    <label key={profile.id} className={`flex items-center gap-1 rounded border ${ct.border} px-2 py-1`}>
+                                        <input type="checkbox" checked={selectedRemoteWorkerIds.includes(profile.id)}
+                                            disabled={isLoading || (!selectedRemoteWorkerIds.includes(profile.id) && selectedRemoteWorkerIds.length >= 2)}
+                                            onChange={() => setSelectedRemoteWorkerIds(previous => previous.includes(profile.id)
+                                                ? previous.filter(id => id !== profile.id) : [...previous, profile.id].slice(0, 2))} />
+                                        <span>{profile.name} · {profile.root}</span>
+                                    </label>
+                                ))}
+                            </div>
                         </div>
                     )}
 

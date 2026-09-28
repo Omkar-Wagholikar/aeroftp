@@ -14967,6 +14967,7 @@ async fn ai_delegate_local(
     model_name: String,
     root: String,
     goal: String,
+    remote_profiles: Option<Vec<ai_core::runner::delegation::RemoteProfileScope>>,
 ) -> Result<serde_json::Value, String> {
     if uuid::Uuid::parse_str(&request_id).is_err() || !std::path::Path::new(&root).is_absolute() {
         return Err("Delegated request ID or local root is invalid".into());
@@ -14995,6 +14996,7 @@ async fn ai_delegate_local(
             model_name,
             root: root.into(),
             goal,
+            remote_profiles: remote_profiles.unwrap_or_default(),
         },
         std::sync::Arc::new(ai_core::runner::worker_credentials::VaultWorkerCredentialSource),
         transport.clone(),
@@ -15008,6 +15010,7 @@ async fn ai_delegate_local(
         "workers": result.workers.iter().map(|worker| serde_json::json!({
             "runId": worker.run_id,
             "childId": worker.child_id,
+            "profileId": worker.profile_id,
             "summary": worker.summary,
         })).collect::<Vec<_>>(),
         "inputTokens": result.usage.input_tokens,

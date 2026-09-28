@@ -41,6 +41,7 @@ impl WorkerTransport for LiveWorkerTransport {
 pub struct WorkerResult {
     pub run_id: String,
     pub child_id: String,
+    pub profile_id: Option<String>,
     pub summary: String,
 }
 
@@ -65,9 +66,10 @@ fn template(child: &PreparedWorker) -> Result<AIRequest, String> {
             "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
         )
         && child.model.endpoint.trim_end_matches('/') == "https://api.openai.com/v1";
-    let tools = if child.tools.contains("local_read") {
+    let mut definitions = Vec::new();
+    if child.tools.contains("local_read") {
         let roots: Vec<_> = child.local_roots.keys().cloned().collect();
-        Some(vec![AIToolDefinition {
+        definitions.push(AIToolDefinition {
             name: "local_read".into(),
             description: "Read a bounded text file within an explicitly granted root".into(),
             parameters: json!({
@@ -79,9 +81,35 @@ fn template(child: &PreparedWorker) -> Result<AIRequest, String> {
                 "required": ["root_id", "path"],
                 "additionalProperties": false
             }),
-        }])
-    } else {
+        });
+    }
+    for (name, description) in [
+        ("remote_stat", "Read bounded object metadata"),
+        ("remote_read", "Read a bounded text prefix"),
+        ("remote_list", "List a bounded page of object names"),
+    ] {
+        if !child.tools.contains(name) {
+            continue;
+        }
+        let profiles: Vec<_> = child.remote.keys().cloned().collect();
+        definitions.push(AIToolDefinition {
+            name: name.into(),
+            description: format!("{description} under one explicitly granted S3 profile and root"),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "profile_id": {"type": "string", "enum": profiles},
+                    "path": {"type": "string", "description": "Relative object path within the granted root"}
+                },
+                "required": ["profile_id", "path"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    let tools = if definitions.is_empty() {
         None
+    } else {
+        Some(definitions)
     };
     Ok(AIRequest {
         turn_scope: None,
@@ -147,15 +175,34 @@ impl RunnerAdapter for WorkerAdapter<'_> {
         if cancel.is_cancelled() {
             return Err(crate::ai_core::runner::CANCELLED.into());
         }
-        let root_id = call
-            .arguments
-            .get("root_id")
-            .and_then(Value::as_str)
-            .ok_or("Worker tool call requires an exact root ID")?;
-        let result = self
-            .coordinator
-            .local_tool(self.child, root_id, &call.name, &call.arguments)
-            .await?;
+        let result = match call.name.as_str() {
+            "local_read" => {
+                let root_id = call
+                    .arguments
+                    .get("root_id")
+                    .and_then(Value::as_str)
+                    .ok_or("Worker tool call requires an exact root ID")?;
+                self.coordinator
+                    .local_tool(self.child, root_id, &call.name, &call.arguments)
+                    .await?
+            }
+            "remote_stat" | "remote_read" | "remote_list" => {
+                let profile_id = call
+                    .arguments
+                    .get("profile_id")
+                    .and_then(Value::as_str)
+                    .ok_or("Worker tool call requires an exact profile ID")?;
+                let path = call
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or("Worker remote tool requires a relative path")?;
+                self.coordinator
+                    .remote_tool(self.child, profile_id, path, &call.name)
+                    .await?
+            }
+            _ => return Err("Tool is not in the worker allowlist".into()),
+        };
         serde_json::to_string(&result).map_err(|_| "Worker tool result is invalid".into())
     }
 }
@@ -187,9 +234,6 @@ impl WorkerCoordinator {
         transport: &dyn WorkerTransport,
     ) -> Result<WorkerResult, String> {
         self.ensure_prepared(child)?;
-        if !child.remote.is_empty() {
-            return Err("Remote worker I/O has not been audited".into());
-        }
         let request = template(child)?;
         let adapter = WorkerAdapter {
             coordinator: self,
@@ -221,6 +265,11 @@ impl WorkerCoordinator {
         Ok(WorkerResult {
             run_id: child.run_id.clone(),
             child_id: child.child_id.clone(),
+            profile_id: if child.remote.len() == 1 {
+                child.remote.keys().next().cloned()
+            } else {
+                None
+            },
             summary,
         })
     }

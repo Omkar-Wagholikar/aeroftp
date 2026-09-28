@@ -2975,7 +2975,9 @@
             "workerCompleted": "[NEEDS TRANSLATION] Completed",
             "workerFailed": "[NEEDS TRANSLATION] Failed",
             "workerQueued": "[NEEDS TRANSLATION] Queued",
-            "workerRunning": "[NEEDS TRANSLATION] Running"
+            "workerRunning": "[NEEDS TRANSLATION] Running",
+            "delegateRemoteProfiles": "[NEEDS TRANSLATION] Optional saved S3 profiles (up to two), each limited to the shown root:",
+            "delegateRemoteEmpty": "[NEEDS TRANSLATION] No eligible saved S3 profiles are available."
         },
         "archive": {
             "passwordRequired": "Ang archive na ito ay protektado ng password",

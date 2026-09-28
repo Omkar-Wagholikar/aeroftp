@@ -11,6 +11,7 @@ use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use serde_json::Value;
 use sha2::Sha256;
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use super::ledger::Ledger;
@@ -29,12 +30,32 @@ pub struct ServerPin {
     pub revision: String,
 }
 
+/// Backend-only, single-use connection input. It is never serialized or sent
+/// to the model. In particular, the network factory must not reload the vault.
+pub struct PinnedServerSnapshot {
+    pub(crate) pin: ServerPin,
+    pub(crate) config: crate::providers::ProviderConfig,
+    pub(crate) secret: Zeroizing<String>,
+}
+
+impl Drop for PinnedServerSnapshot {
+    fn drop(&mut self) {
+        self.config.zeroize_password();
+        for value in self.config.extra.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 /// All methods are privileged backend operations. The model sees only tool
 /// schemas and bounded evidence, never this trait or its returned secrets.
 pub trait WorkerCredentialSource: Send + Sync {
     fn model_pin(&self, provider_id: &str) -> Result<ModelPin, String>;
     fn model_key(&self, provider_id: &str) -> Result<Zeroizing<String>, String>;
     fn server_pin(&self, profile_id: &str) -> Result<ServerPin, String>;
+    fn server_snapshot(&self, _profile_id: &str) -> Result<PinnedServerSnapshot, String> {
+        Err("Worker remote profile snapshots are unavailable".into())
+    }
 }
 
 pub struct VaultWorkerCredentialSource;
@@ -123,6 +144,81 @@ fn active_secret(
         .ok_or_else(|| "Credential unavailable".into())
 }
 
+fn snapshot_from_record(
+    profile_id: &str,
+    profile: &Value,
+    secret: Zeroizing<String>,
+) -> Result<PinnedServerSnapshot, String> {
+    if profile.get("id").and_then(Value::as_str) != Some(profile_id)
+        || profile.get("protocol").and_then(Value::as_str) != Some("s3")
+        || profile
+            .get("aeroCryptOverlay")
+            .is_some_and(|value| !value.is_null())
+        || profile
+            .get("password")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    {
+        return Err("Worker remote profile requires plain S3 and a separate credential".into());
+    }
+    let mut extra = HashMap::new();
+    crate::profile_loader::apply_profile_options(&mut extra, profile);
+    // STS and provider-specific bridges add external credentials or mutable
+    // authority; they need their own reviewed snapshot boundary.
+    if extra
+        .keys()
+        .any(|key| key == "session_token" || key.starts_with("role_"))
+        || extra
+            .get("provider_id")
+            .is_some_and(|id| id.contains("filen"))
+        || extra.get("bucket").is_none_or(String::is_empty)
+    {
+        return Err("S3 worker profile uses an unsupported credential mode".into());
+    }
+    let encoded = serde_json::to_vec(profile).map_err(|_| "Invalid server profile")?;
+    let pin = ServerPin {
+        profile_id: profile_id.into(),
+        revision: digest(&[&encoded, secret.as_bytes()]),
+    };
+    let host = profile
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| profile.get("host").and_then(Value::as_str))
+        .ok_or("S3 worker endpoint missing")?;
+    let (host, embedded_port) = crate::cloud_provider_factory::parse_server_field(host);
+    let port = profile
+        .get("port")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=u16::MAX as u64).contains(value))
+        .map(|value| value as u16);
+    let config = crate::providers::ProviderConfig {
+        name: profile
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("S3")
+            .into(),
+        provider_type: crate::providers::ProviderType::S3,
+        host,
+        port: embedded_port.or(port),
+        username: profile
+            .get("username")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        password: None,
+        initial_path: profile
+            .get("initialPath")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        extra,
+    };
+    Ok(PinnedServerSnapshot {
+        pin,
+        config,
+        secret,
+    })
+}
+
 impl WorkerCredentialSource for VaultWorkerCredentialSource {
     fn model_pin(&self, provider_id: &str) -> Result<ModelPin, String> {
         let store = vault()?;
@@ -167,6 +263,13 @@ impl WorkerCredentialSource for VaultWorkerCredentialSource {
             profile_id: profile_id.into(),
             revision: digest(&[&encoded, secret_bytes]),
         })
+    }
+
+    fn server_snapshot(&self, profile_id: &str) -> Result<PinnedServerSnapshot, String> {
+        let store = vault()?;
+        let profile = server_record(&store, profile_id)?;
+        let secret = active_secret(&store, &format!("server_{profile_id}"))?;
+        snapshot_from_record(profile_id, &profile, secret)
     }
 }
 
@@ -308,6 +411,24 @@ impl WorkerCredentialBroker {
             return Err("Server profile changed since worker preparation".into());
         }
         Ok(pin)
+    }
+
+    pub fn resolve_server_snapshot(
+        &self,
+        child_id: &str,
+        handle_id: &str,
+    ) -> Result<PinnedServerSnapshot, String> {
+        let HandleKind::Server(pin) = self.entry(child_id, handle_id)?.kind else {
+            return Err("Credential handle type mismatch".into());
+        };
+        let snapshot = self.source.server_snapshot(&pin.profile_id)?;
+        if snapshot.pin != pin
+            || self.source.server_pin(&pin.profile_id)? != pin
+            || self.entry(child_id, handle_id).is_err()
+        {
+            return Err("Server profile changed before worker dispatch".into());
+        }
+        Ok(snapshot)
     }
 
     pub fn revoke_child(&self, child_id: &str) -> Result<(), String> {

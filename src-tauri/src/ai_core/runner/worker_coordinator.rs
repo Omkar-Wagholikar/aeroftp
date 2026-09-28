@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use super::ledger::{Ledger, Usage};
 use super::worker_credentials::{
-    ModelPin, ServerPin, WorkerCredentialBroker, WorkerCredentialSource,
+    ModelPin, PinnedServerSnapshot, ServerPin, WorkerCredentialBroker, WorkerCredentialSource,
 };
 use super::worker_local::WorkerLocalRead;
 use crate::ai::{AIRequest, AIResponse, ChatMessage};
@@ -115,7 +115,14 @@ impl WorkerCoordinator {
         source: Arc<dyn WorkerCredentialSource>,
         parent: ParentScope,
     ) -> Result<Self, String> {
-        if parent.model_name.is_empty() || !parent.tools.iter().all(|tool| tool == "local_read") {
+        if parent.model_name.is_empty()
+            || !parent.tools.iter().all(|tool| {
+                matches!(
+                    tool.as_str(),
+                    "local_read" | "remote_stat" | "remote_read" | "remote_list"
+                )
+            })
+        {
             return Err("Parent scope contains an unaudited worker tool".into());
         }
         if parent
@@ -153,7 +160,11 @@ impl WorkerCoordinator {
             || remote_ids
                 .iter()
                 .any(|id| !self.parent.remote_roots.contains_key(id))
-            || (!tools.is_empty() && local_ids.is_empty())
+            || (tools.contains("local_read") && local_ids.is_empty())
+            || ((tools.contains("remote_stat")
+                || tools.contains("remote_read")
+                || tools.contains("remote_list"))
+                && remote_ids.is_empty())
         {
             return Err("Worker requested an undelegated grant".into());
         }
@@ -327,8 +338,23 @@ impl WorkerCoordinator {
         Ok((pin, grant.root.clone()))
     }
 
-    /// Only one audited local operation is available. Remote grants are
-    /// preparation metadata until a provider-specific confined backend exists.
+    pub fn resolve_remote_snapshot(
+        &self,
+        child: &PreparedWorker,
+        profile_id: &str,
+    ) -> Result<(PinnedServerSnapshot, String), String> {
+        self.ensure_prepared(child)?;
+        let grant = child
+            .remote
+            .get(profile_id)
+            .ok_or("Remote profile was not delegated")?;
+        let snapshot = self
+            .broker
+            .resolve_server_snapshot(&child.child_id, &grant.credential_handle)?;
+        Ok((snapshot, grant.root.clone()))
+    }
+
+    /// Audited local operation against an opened root handle.
     pub async fn local_tool(
         &self,
         child: &PreparedWorker,
@@ -346,6 +372,57 @@ impl WorkerCoordinator {
             .ok_or("Local root is not delegated")?;
         root.dispatch(&self.ledger, &child.child_id, tool, args)
             .await
+    }
+
+    pub async fn remote_tool(
+        &self,
+        child: &PreparedWorker,
+        profile_id: &str,
+        relative_path: &str,
+        tool: &str,
+    ) -> Result<Value, String> {
+        self.ensure_prepared(child)?;
+        if !matches!(tool, "remote_stat" | "remote_read" | "remote_list")
+            || !child.tools.contains(tool)
+        {
+            return Err("Remote tool is not delegated".into());
+        }
+        let step_id = self.ledger.reserve_tool_step(&child.child_id)?;
+        let result = async {
+            let (snapshot, root) =
+                super::worker_remote::validate_exact_profile(self, child, profile_id)?;
+            let path = if tool == "remote_list" {
+                super::worker_remote::confined_s3_list_path(&root, relative_path)?
+            } else {
+                super::worker_remote::confined_s3_path(&root, relative_path)?
+            };
+            let operation = async {
+                match tool {
+                    "remote_stat" => super::worker_remote::stat_s3(snapshot, &path).await,
+                    "remote_read" => super::worker_remote::read_s3(snapshot, &path).await,
+                    "remote_list" => super::worker_remote::list_s3(snapshot, &path).await,
+                    _ => unreachable!(),
+                }
+            };
+            let cancellation = self.ledger.cancellation();
+            let value = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err("Worker run cancelled".to_string()),
+                result = operation => result,
+            }?;
+            let encoded =
+                serde_json::to_vec(&value).map_err(|_| "Worker remote result is invalid")?;
+            if encoded.len() > MAX_RESPONSE_BYTES {
+                return Err("Worker remote result exceeds publication cap".into());
+            }
+            self.ledger
+                .reserve_result_bytes(&child.child_id, encoded.len() as u64)?;
+            Ok(value)
+        }
+        .await;
+        self.ledger.finish_tool_step(&step_id)?;
+        self.ensure_prepared(child)?;
+        result
     }
 
     pub fn finish_child(&self, child: &PreparedWorker) -> Result<(), String> {
@@ -385,8 +462,12 @@ impl WorkerCoordinator {
 
 fn valid_remote_root(root: &str) -> bool {
     root.starts_with('/')
+        && root.len() <= 4096
+        && !root.contains("//")
+        && !root.contains('%')
         && !root.contains('\\')
         && !root.contains('\0')
+        && !root.chars().any(char::is_control)
         && root
             .split('/')
             .all(|segment| segment != "." && segment != "..")
