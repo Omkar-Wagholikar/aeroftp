@@ -29,7 +29,9 @@ pub struct LiveWorkerTransport;
 #[async_trait]
 impl WorkerTransport for LiveWorkerTransport {
     async fn complete(&self, request: AIRequest) -> Result<AIResponse, String> {
-        crate::ai::call_ai(request).await.map_err(|e| e.to_string())
+        crate::ai::call_ai(request)
+            .await
+            .map_err(|_| "Delegated provider request failed".into())
     }
 }
 
@@ -57,6 +59,12 @@ fn template(child: &PreparedWorker) -> Result<AIRequest, String> {
     let provider_type: AIProviderType =
         serde_json::from_value(Value::String(child.model.provider_type.clone()))
             .map_err(|_| "Worker provider type is invalid")?;
+    let use_responses_api = provider_type == AIProviderType::OpenAI
+        && matches!(
+            child.model_name.as_str(),
+            "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+        )
+        && child.model.endpoint.trim_end_matches('/') == "https://api.openai.com/v1";
     let tools = if child.tools.contains("local_read") {
         let roots: Vec<_> = child.local_roots.keys().cloned().collect();
         Some(vec![AIToolDefinition {
@@ -95,7 +103,7 @@ fn template(child: &PreparedWorker) -> Result<AIRequest, String> {
         top_k: None,
         cached_content: None,
         web_search: Some(false),
-        use_responses_api: None,
+        use_responses_api: Some(use_responses_api),
     })
 }
 
@@ -284,7 +292,7 @@ impl WorkerCoordinator {
         if cancel.is_cancelled() {
             return Err("Worker run cancelled".into());
         }
-        let response = result?;
+        let response = result.map_err(|e| crate::ai::sanitize_error_message(&e))?;
         if serde_json::to_vec(&response)
             .map_err(|_| "Invalid worker response")?
             .len()

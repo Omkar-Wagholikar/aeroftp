@@ -14841,6 +14841,128 @@ static AI_CHAT_CANCEL_TOKENS: std::sync::LazyLock<
     tokio::sync::Mutex<std::collections::HashMap<String, CancellationToken>>,
 > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+static AI_DELEGATION_TOKENS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<CancellationToken>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+struct DelegationRegistration {
+    id: String,
+    token: std::sync::Arc<CancellationToken>,
+}
+
+impl Drop for DelegationRegistration {
+    fn drop(&mut self) {
+        let mut active = AI_DELEGATION_TOKENS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active
+            .get(&self.id)
+            .is_some_and(|token| std::sync::Arc::ptr_eq(token, &self.token))
+        {
+            active.remove(&self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod delegation_registration_tests {
+    use super::*;
+
+    #[test]
+    fn old_registration_cannot_remove_a_replacement_run() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let old = std::sync::Arc::new(CancellationToken::new());
+        let replacement = std::sync::Arc::new(CancellationToken::new());
+        AI_DELEGATION_TOKENS
+            .lock()
+            .unwrap()
+            .insert(id.clone(), old.clone());
+        AI_DELEGATION_TOKENS
+            .lock()
+            .unwrap()
+            .insert(id.clone(), replacement.clone());
+        drop(DelegationRegistration {
+            id: id.clone(),
+            token: old,
+        });
+        assert!(std::sync::Arc::ptr_eq(
+            AI_DELEGATION_TOKENS.lock().unwrap().get(&id).unwrap(),
+            &replacement
+        ));
+        drop(DelegationRegistration {
+            id,
+            token: replacement,
+        });
+    }
+}
+
+/// Explicit read-only parent/worker run. Its separate request ID makes Stop
+/// address the complete shared ledger rather than one provider stream.
+#[tauri::command]
+async fn ai_delegate_local(
+    request_id: String,
+    provider_id: String,
+    model_name: String,
+    root: String,
+    goal: String,
+) -> Result<serde_json::Value, String> {
+    if uuid::Uuid::parse_str(&request_id).is_err() || !std::path::Path::new(&root).is_absolute() {
+        return Err("Delegated request ID or local root is invalid".into());
+    }
+    let token = std::sync::Arc::new(CancellationToken::new());
+    {
+        let mut active = AI_DELEGATION_TOKENS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.contains_key(&request_id) {
+            return Err("Delegated request ID is already active".into());
+        }
+        active.insert(request_id.clone(), token.clone());
+    }
+    let _registration = DelegationRegistration {
+        id: request_id,
+        token: token.clone(),
+    };
+    let transport = std::sync::Arc::new(ai_core::runner::worker_coordinator::LiveWorkerTransport);
+    let result = ai_core::runner::delegation::run_local_delegation(
+        ai_core::runner::delegation::DelegationRequest {
+            provider_id,
+            model_name,
+            root: root.into(),
+            goal,
+        },
+        std::sync::Arc::new(ai_core::runner::worker_credentials::VaultWorkerCredentialSource),
+        transport.clone(),
+        transport,
+        (*token).clone(),
+    )
+    .await?;
+    Ok(serde_json::json!({
+        "answer": result.answer,
+        "workers": result.workers.iter().map(|worker| serde_json::json!({
+            "runId": worker.run_id,
+            "childId": worker.child_id,
+            "summary": worker.summary,
+        })).collect::<Vec<_>>(),
+        "inputTokens": result.usage.input_tokens,
+        "outputTokens": result.usage.output_tokens,
+        "terminal": "completed",
+    }))
+}
+
+#[tauri::command]
+async fn ai_cancel_delegation(request_id: String) -> Result<(), String> {
+    let token = AI_DELEGATION_TOKENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&request_id)
+        .cloned();
+    if let Some(token) = token {
+        token.cancel();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn ai_chat(
     request: ai::AIRequest,
@@ -20000,6 +20122,8 @@ pub fn run() {
             // AI commands
             ai_chat,
             ai_cancel_chat,
+            ai_delegate_local,
+            ai_cancel_delegation,
             ai_test_provider,
             ai_list_models,
             ai_execute_tool,

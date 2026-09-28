@@ -217,7 +217,9 @@ impl WorkerCoordinator {
         cap: Usage,
     ) -> Result<AIResponse, String> {
         self.complete_with(child, request, cap, |request| async move {
-            crate::ai::call_ai(request).await.map_err(|e| e.to_string())
+            crate::ai::call_ai(request)
+                .await
+                .map_err(|_| "Delegated provider request failed".into())
         })
         .await
     }
