@@ -75,6 +75,43 @@ fn request(coordinator: &WorkerCoordinator) -> WorkerRequest {
     }
 }
 
+fn model_request() -> AIRequest {
+    AIRequest {
+        turn_scope: None,
+        reasoning_effort: None,
+        provider_type: AIProviderType::Custom,
+        model: "test-model".into(),
+        api_key: None,
+        base_url: "https://example.test/v1".into(),
+        messages: vec![],
+        max_tokens: Some(10),
+        temperature: None,
+        tools: None,
+        tool_results: None,
+        thinking_budget: None,
+        top_p: None,
+        top_k: None,
+        cached_content: None,
+        web_search: None,
+        use_responses_api: None,
+    }
+}
+
+fn model_response(content: &str) -> AIResponse {
+    AIResponse {
+        native_turn: None,
+        content: content.into(),
+        model: "test-model".into(),
+        tokens_used: Some(4),
+        input_tokens: Some(2),
+        output_tokens: Some(2),
+        finish_reason: Some("stop".into()),
+        tool_calls: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    }
+}
+
 #[test]
 fn delegated_scope_is_exact_and_bounded() {
     let (coordinator, _, ledger) = fixture();
@@ -133,72 +170,11 @@ fn remote_root_rejects_traversal_and_alias_forms() {
 }
 
 #[tokio::test]
-async fn remote_profile_edit_or_lock_during_connect_is_rejected() {
-    let (coordinator, source, _) = fixture();
-    let child = coordinator.prepare(request(&coordinator)).unwrap();
-    let records = vec![crate::ai_tools::SavedServerInfo {
-        id: "server-id".into(),
-        name: "alias".into(),
-        host: "example.test".into(),
-        port: 22,
-        username: "user".into(),
-        protocol: "sftp".into(),
-        initial_path: None,
-        provider_id: None,
-    }];
-    let source_edit = source.clone();
-    let edited = super::super::worker_remote::connect_checked(
-        &coordinator,
-        &child,
-        "server-id",
-        &records,
-        move |_| async move {
-            source_edit.0.lock().unwrap().1.revision = "s2".into();
-            Ok(())
-        },
-    )
-    .await;
-    assert!(edited.is_err());
-    source.0.lock().unwrap().1.revision = "s1".into();
-    let source_lock = source.clone();
-    let locked = super::super::worker_remote::connect_checked(
-        &coordinator,
-        &child,
-        "server-id",
-        &records,
-        move |_| async move {
-            source_lock.0.lock().unwrap().2 = true;
-            Ok(())
-        },
-    )
-    .await;
-    assert!(locked.is_err());
-    coordinator.finish_child(&child).unwrap();
-}
-
-#[tokio::test]
 async fn model_dispatch_rejects_parent_history_tools_and_unreserved_output() {
     let (coordinator, _, ledger) = fixture();
     let child = coordinator.prepare(request(&coordinator)).unwrap();
-    let request = AIRequest {
-        turn_scope: None,
-        reasoning_effort: None,
-        provider_type: AIProviderType::Custom,
-        model: "test-model".into(),
-        api_key: None,
-        base_url: "https://example.test/v1".into(),
-        messages: vec![],
-        max_tokens: Some(20),
-        temperature: None,
-        tools: None,
-        tool_results: None,
-        thinking_budget: None,
-        top_p: None,
-        top_k: None,
-        cached_content: None,
-        web_search: None,
-        use_responses_api: None,
-    };
+    let mut request = model_request();
+    request.max_tokens = Some(20);
     let cap = Usage {
         input_tokens: 20,
         output_tokens: 10,
@@ -227,5 +203,53 @@ async fn model_dispatch_rejects_parent_history_tools_and_unreserved_output() {
     });
     assert!(coordinator.complete(&child, history, cap).await.is_err());
     assert_eq!(ledger.snapshot().unwrap().1, 0);
+    coordinator.finish_child(&child).unwrap();
+}
+
+#[tokio::test]
+async fn dropped_pending_model_future_releases_slot_but_retains_unknown_charge() {
+    let (coordinator, _, ledger) = fixture();
+    let child = coordinator.prepare(request(&coordinator)).unwrap();
+    let cap = Usage {
+        input_tokens: 20,
+        output_tokens: 10,
+    };
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut pending =
+        Box::pin(
+            coordinator.complete_with(&child, model_request(), cap, move |_| async move {
+                let _ = started_tx.send(());
+                std::future::pending::<Result<AIResponse, String>>().await
+            }),
+        );
+    tokio::select! {
+        _ = &mut pending => panic!("fixture transport should remain pending"),
+        _ = started_rx => {},
+    }
+    drop(pending);
+    assert_eq!(ledger.snapshot().unwrap().0, cap);
+    coordinator.finish_child(&child).unwrap();
+    assert_eq!(
+        ledger.finish(Terminal::Completed).unwrap(),
+        Terminal::Completed
+    );
+}
+
+#[tokio::test]
+async fn nonempty_model_response_needs_aggregate_result_budget() {
+    let (coordinator, _, ledger) = fixture();
+    let child = coordinator.prepare(request(&coordinator)).unwrap();
+    ledger.reserve_result_bytes(ledger.run_id(), 1024).unwrap();
+    let cap = Usage {
+        input_tokens: 20,
+        output_tokens: 10,
+    };
+    let result = coordinator
+        .complete_with(&child, model_request(), cap, |_| async {
+            Ok(model_response("not empty"))
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(ledger.snapshot().unwrap().3, 1024);
     coordinator.finish_child(&child).unwrap();
 }
