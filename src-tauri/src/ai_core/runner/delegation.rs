@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ledger::{JoinState, Ledger, Limits, Terminal, Usage};
 use super::worker_coordinator::{
-    ParentScope, WorkerCoordinator, WorkerRequest, WorkerResult, WorkerTransport,
+    ParentScope, PreparedWorker, WorkerCoordinator, WorkerRequest, WorkerResult, WorkerTransport,
 };
 use super::worker_credentials::{ModelPin, WorkerCredentialSource};
 use super::worker_local::WorkerLocalRead;
@@ -95,6 +95,29 @@ fn parent_template(pin: &ModelPin, model_name: &str, goal: &str) -> Result<AIReq
                 "required":["root_id","goal"],
                 "additionalProperties":false
             }),
+        }, AIToolDefinition {
+            name: "delegate_local_reads".into(),
+            description: "Run two independent read-only workers concurrently within the selected workspace root".into(),
+            parameters: json!({
+                "type":"object",
+                "properties": {
+                    "tasks": {
+                        "type":"array", "minItems":2, "maxItems":2,
+                        "items": {
+                            "type":"object",
+                            "properties": {
+                                "root_id": {"type":"string", "enum":[ROOT_ID]},
+                                "goal": {"type":"string", "maxLength":MAX_GOAL_BYTES},
+                                "evidence": {"type":"string", "maxLength":MAX_EVIDENCE_BYTES}
+                            },
+                            "required":["root_id","goal"],
+                            "additionalProperties":false
+                        }
+                    }
+                },
+                "required":["tasks"],
+                "additionalProperties":false
+            }),
         }]),
         tool_results: None,
         thinking_budget: None,
@@ -115,6 +138,42 @@ struct ParentAdapter {
     child_transport: Arc<dyn WorkerTransport>,
     deadline: Instant,
     results: Mutex<Vec<WorkerResult>>,
+}
+
+impl ParentAdapter {
+    fn prepare_local(&self, args: &Value) -> Result<PreparedWorker, String> {
+        let fields = args
+            .as_object()
+            .ok_or("Delegation task must be an object")?;
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "root_id" | "goal" | "evidence"))
+            || fields.get("root_id").and_then(Value::as_str) != Some(ROOT_ID)
+        {
+            return Err("Delegation task exceeds its granted scope".into());
+        }
+        let goal = fields
+            .get("goal")
+            .and_then(Value::as_str)
+            .ok_or("Delegation goal is missing")?;
+        let evidence = match fields.get("evidence") {
+            None => "",
+            Some(value) => value.as_str().ok_or("Delegation evidence must be text")?,
+        };
+        if goal.is_empty() || goal.len() > MAX_GOAL_BYTES || evidence.len() > MAX_EVIDENCE_BYTES {
+            return Err("Delegation input exceeds its cap".into());
+        }
+        self.coordinator.prepare(WorkerRequest {
+            goal: goal.into(),
+            evidence: evidence.into(),
+            model: self.pin.clone(),
+            model_name: self.model_name.clone(),
+            local_root_ids: vec![ROOT_ID.into()],
+            remote_profile_ids: vec![],
+            tools: vec!["local_read".into()],
+            expires: self.deadline,
+        })
+    }
 }
 
 #[async_trait]
@@ -161,48 +220,65 @@ impl RunnerAdapter for ParentAdapter {
         if cancel.is_cancelled() {
             return Err(CANCELLED.into());
         }
-        if call.name != "delegate_local_read"
-            || call.arguments.get("root_id").and_then(Value::as_str) != Some(ROOT_ID)
-        {
-            return Err("Delegation tool or root was not granted".into());
-        }
-        let goal = call
-            .arguments
-            .get("goal")
-            .and_then(Value::as_str)
-            .ok_or("Delegation goal is missing")?;
-        let evidence = call
-            .arguments
-            .get("evidence")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if goal.is_empty() || goal.len() > MAX_GOAL_BYTES || evidence.len() > MAX_EVIDENCE_BYTES {
-            return Err("Delegation input exceeds its cap".into());
-        }
-        let child = self.coordinator.prepare(WorkerRequest {
-            goal: goal.into(),
-            evidence: evidence.into(),
-            model: self.pin.clone(),
-            model_name: self.model_name.clone(),
-            local_root_ids: vec![ROOT_ID.into()],
-            remote_profile_ids: vec![],
-            tools: vec!["local_read".into()],
-            expires: self.deadline,
-        })?;
-        let result = self
-            .coordinator
-            .clone()
-            .spawn_local_worker(child, self.child_transport.clone())
-            .await
-            .map_err(|_| "Delegated worker task interrupted")??;
+        let results = match call.name.as_str() {
+            "delegate_local_read" => {
+                let child = self.prepare_local(&call.arguments)?;
+                vec![self
+                    .coordinator
+                    .clone()
+                    .spawn_local_worker(child, self.child_transport.clone())
+                    .await
+                    .map_err(|_| "Delegated worker task interrupted")??]
+            }
+            "delegate_local_reads" => {
+                let fields = call
+                    .arguments
+                    .as_object()
+                    .ok_or("Delegation batch must be an object")?;
+                if fields.len() != 1 {
+                    return Err("Delegation batch contains unknown fields".into());
+                }
+                let tasks = fields
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .ok_or("Delegation batch requires tasks")?;
+                if tasks.len() != 2 {
+                    return Err("Delegation batch requires exactly two tasks".into());
+                }
+                let first = self.prepare_local(&tasks[0])?;
+                let second = match self.prepare_local(&tasks[1]) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        self.coordinator.finish_child(&first)?;
+                        return Err(error);
+                    }
+                };
+                let left = self
+                    .coordinator
+                    .clone()
+                    .spawn_local_worker(first, self.child_transport.clone());
+                let right = self
+                    .coordinator
+                    .clone()
+                    .spawn_local_worker(second, self.child_transport.clone());
+                // Join both even when one fails: no child slot or in-flight I/O is abandoned.
+                let (left, right) = tokio::join!(left, right);
+                let left = left.map_err(|_| "Delegated worker task interrupted")?;
+                let right = right.map_err(|_| "Delegated worker task interrupted")?;
+                vec![left?, right?]
+            }
+            _ => return Err("Delegation tool was not granted".into()),
+        };
         if cancel.is_cancelled() {
             return Err(CANCELLED.into());
         }
-        let projection = json!({"child_id":&result.child_id,"summary":&result.summary});
+        let projection = json!({"children":results.iter().map(|result| json!({
+            "child_id":&result.child_id,"summary":&result.summary
+        })).collect::<Vec<_>>()});
         self.results
             .lock()
             .map_err(|_| "Delegation result lock poisoned")?
-            .push(result);
+            .extend(results);
         serde_json::to_string(&projection).map_err(|_| "Delegation result is invalid".into())
     }
 }

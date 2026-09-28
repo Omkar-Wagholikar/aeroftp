@@ -1,6 +1,7 @@
 use super::*;
 use crate::ai_core::runner::worker_credentials::ServerPin;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zeroize::Zeroizing;
 
 struct Credentials(ModelPin);
@@ -36,6 +37,28 @@ impl WorkerTransport for Script {
             .unwrap()
             .pop_front()
             .ok_or("No scripted response".into())
+    }
+}
+
+struct ConcurrentChildren {
+    barrier: tokio::sync::Barrier,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[async_trait]
+impl WorkerTransport for ConcurrentChildren {
+    async fn complete(&self, request: AIRequest) -> Result<AIResponse, String> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        self.barrier.wait().await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        let goal = request.messages[1]
+            .content
+            .lines()
+            .nth(1)
+            .unwrap_or("unknown");
+        Ok(response(&format!("Summary for {goal}"), None))
     }
 }
 
@@ -167,5 +190,103 @@ async fn delegated_run_denies_ungranted_parent_tool_before_child_dispatch() {
     )
     .await;
     assert!(result.is_err());
+    assert!(child.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn two_children_run_concurrently_and_return_distinct_results() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = Arc::new(Script {
+        replies: Mutex::new(VecDeque::from([
+            response(
+                "",
+                Some((
+                    "delegate-2",
+                    "delegate_local_reads",
+                    json!({"tasks":[
+                        {"root_id":"workspace","goal":"first"},
+                        {"root_id":"workspace","goal":"second"}
+                    ]}),
+                )),
+            ),
+            response("Combined summary.", None),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let children = Arc::new(ConcurrentChildren {
+        barrier: tokio::sync::Barrier::new(2),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_local_delegation(
+            DelegationRequest {
+                provider_id: "provider-1".into(),
+                model_name: "fixture-model".into(),
+                root: root.path().into(),
+                goal: "Run two read-only checks".into(),
+            },
+            source(),
+            parent.clone(),
+            children.clone(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("both workers should reach the barrier")
+    .unwrap();
+    assert_eq!(children.peak.load(Ordering::SeqCst), 2);
+    assert_eq!(children.active.load(Ordering::SeqCst), 0);
+    assert_eq!(result.workers.len(), 2);
+    assert_ne!(result.workers[0].child_id, result.workers[1].child_id);
+    assert_eq!(result.workers[0].run_id, result.workers[1].run_id);
+    assert_eq!(result.workers[0].summary, "Summary for first");
+    assert_eq!(result.workers[1].summary, "Summary for second");
+    let continuation = &parent.requests.lock().unwrap()[1];
+    assert!(continuation.messages.iter().any(|message| {
+        message.role == "tool"
+            && message.content.contains("Summary for first")
+            && message.content.contains("Summary for second")
+    }));
+}
+
+#[tokio::test]
+async fn invalid_second_task_releases_prepared_first_child_without_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = Arc::new(Script {
+        replies: Mutex::new(VecDeque::from([response(
+            "",
+            Some((
+                "delegate-invalid",
+                "delegate_local_reads",
+                json!({"tasks":[
+                    {"root_id":"workspace","goal":"first"},
+                    {"root_id":"outside","goal":"second"}
+                ]}),
+            )),
+        )])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let child = Arc::new(Script {
+        replies: Mutex::new(VecDeque::new()),
+        requests: Mutex::new(Vec::new()),
+    });
+    let error = run_local_delegation(
+        DelegationRequest {
+            provider_id: "provider-1".into(),
+            model_name: "fixture-model".into(),
+            root: root.path().into(),
+            goal: "Try a batch".into(),
+        },
+        source(),
+        parent,
+        child.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .err()
+    .expect("invalid second task must fail");
+    assert!(error.contains("granted scope"), "{error}");
     assert!(child.requests.lock().unwrap().is_empty());
 }
