@@ -227,7 +227,7 @@ fn provider_test_path(provider_type: &AIProviderType) -> &'static str {
 }
 
 // AI Request from frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AIRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_scope: Option<String>,
@@ -265,6 +265,25 @@ pub struct AIRequest {
     /// own Chat Completions transports until they have dedicated adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_responses_api: Option<bool>,
+}
+
+impl std::fmt::Debug for AIRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AIRequest")
+            .field("provider_type", &self.provider_type)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AIRequest {
+    fn drop(&mut self) {
+        if let Some(key) = &mut self.api_key {
+            use zeroize::Zeroize;
+            key.zeroize();
+        }
+    }
 }
 
 // AI Response to frontend
@@ -1383,14 +1402,11 @@ mod anthropic {
 }
 
 // Main AI call function
-pub async fn call_ai(request: AIRequest) -> Result<AIResponse, AIError> {
+pub async fn call_ai(mut request: AIRequest) -> Result<AIResponse, AIError> {
     // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
-    let request = AIRequest {
-        top_p: request.top_p.map(|v| v.clamp(0.0, 1.0)),
-        top_k: request.top_k.map(|v| v.clamp(1, 500)),
-        thinking_budget: request.thinking_budget.map(|v| v.clamp(0, 128_000)),
-        ..request
-    };
+    request.top_p = request.top_p.map(|v| v.clamp(0.0, 1.0));
+    request.top_k = request.top_k.map(|v| v.clamp(1, 500));
+    request.thinking_budget = request.thinking_budget.map(|v| v.clamp(0, 128_000));
 
     crate::ai_native::validate_history(&request)?;
     let client = &*AI_HTTP_CLIENT;
@@ -2025,6 +2041,7 @@ mod api_key_tests {
         let json = r#"{"provider_type":"openrouter","model":"m","api_key":" sk-or-v1-abc ","base_url":"https://openrouter.ai/api/v1","messages":[],"max_tokens":null,"temperature":null}"#;
         let req: AIRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.api_key.as_deref(), Some("sk-or-v1-abc"));
+        assert!(!format!("{req:?}").contains("sk-or-v1-abc"));
     }
 
     #[test]
