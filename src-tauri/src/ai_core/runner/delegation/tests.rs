@@ -69,6 +69,128 @@ struct ConcurrentChildren {
     peak: AtomicUsize,
 }
 
+struct RemoteTestCredentials {
+    model: ModelPin,
+    endpoints: [String; 2],
+}
+
+impl WorkerCredentialSource for RemoteTestCredentials {
+    fn model_pin(&self, id: &str) -> Result<ModelPin, String> {
+        if id == self.model.provider_id {
+            Ok(self.model.clone())
+        } else {
+            Err("Unknown provider".into())
+        }
+    }
+    fn model_key(&self, id: &str) -> Result<Zeroizing<String>, String> {
+        self.model_pin(id)?;
+        Ok(Zeroizing::new("fixture-model-key".into()))
+    }
+    fn server_pin(&self, id: &str) -> Result<ServerPin, String> {
+        if !matches!(id, "server-one" | "server-two") {
+            return Err("Unknown server".into());
+        }
+        Ok(ServerPin {
+            profile_id: id.into(),
+            revision: format!("pin-{id}"),
+        })
+    }
+    fn server_snapshot(&self, id: &str) -> Result<PinnedServerSnapshot, String> {
+        let index = if id == "server-one" {
+            0
+        } else if id == "server-two" {
+            1
+        } else {
+            return Err("Unknown server".into());
+        };
+        Ok(PinnedServerSnapshot {
+            pin: self.server_pin(id)?,
+            config: ProviderConfig {
+                name: id.into(),
+                provider_type: ProviderType::S3,
+                host: self.endpoints[index].clone(),
+                port: None,
+                username: Some(id.into()),
+                password: None,
+                initial_path: Some(if index == 0 { "/one" } else { "/two" }.into()),
+                extra: std::collections::HashMap::from([("bucket".into(), "fixture".into())]),
+            },
+            secret: Zeroizing::new(format!("secret-{id}")),
+        })
+    }
+}
+
+struct RemoteReadingChildren;
+
+#[async_trait]
+impl WorkerTransport for RemoteReadingChildren {
+    async fn complete(&self, request: AIRequest) -> Result<AIResponse, String> {
+        let goal = request
+            .messages
+            .get(1)
+            .map(|message| message.content.as_str())
+            .unwrap_or("");
+        let (profile_id, label) = if goal.contains("first") {
+            ("server-one", "first")
+        } else {
+            ("server-two", "second")
+        };
+        if let Some(tool) = request
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+        {
+            let value: Value =
+                serde_json::from_str(&tool.content).map_err(|_| "Invalid fixture tool result")?;
+            return Ok(response(
+                &format!(
+                    "{label}: {}",
+                    value["content"].as_str().unwrap_or("missing")
+                ),
+                None,
+            ));
+        }
+        Ok(response(
+            "",
+            Some((
+                &format!("call-{label}"),
+                "remote_read",
+                json!({
+                    "profile_id": profile_id, "path": "note.txt"
+                }),
+            )),
+        ))
+    }
+}
+
+async fn fixture_s3_endpoint(body: &'static str) -> String {
+    let app = axum::Router::new().fallback(axum::routing::any(
+        move |request: axum::extract::Request| async move {
+            if request.method() == axum::http::Method::HEAD {
+                return axum::response::Response::builder()
+                    .status(200)
+                    .header("content-length", body.len().to_string())
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+            axum::response::Response::builder()
+                .status(206)
+                .header(
+                    "content-range",
+                    format!("bytes 0-{}/{}", body.len() - 1, body.len()),
+                )
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    endpoint
+}
+
 #[async_trait]
 impl WorkerTransport for ConcurrentChildren {
     async fn complete(&self, request: AIRequest) -> Result<AIResponse, String> {
@@ -370,6 +492,77 @@ async fn two_remote_profiles_keep_distinct_child_identities_and_one_budget() {
     assert!(tool_result.content.contains("server-one"));
     assert!(tool_result.content.contains("server-two"));
     assert!(!tool_result.content.contains("key-server"));
+}
+
+#[tokio::test]
+async fn two_remote_children_read_only_their_pinned_s3_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let first = fixture_s3_endpoint("alpha").await;
+    let second = fixture_s3_endpoint("bravo").await;
+    let model = source().model_pin("provider-1").unwrap();
+    let credentials = Arc::new(RemoteTestCredentials {
+        model,
+        endpoints: [first, second],
+    });
+    let parent = Arc::new(Script {
+        replies: Mutex::new(VecDeque::from([
+            response(
+                "",
+                Some((
+                    "remote-read",
+                    "delegate_remote_reads",
+                    json!({"tasks": [
+                        {"profile_id": "server-one", "goal": "first"},
+                        {"profile_id": "server-two", "goal": "second"}
+                    ]}),
+                )),
+            ),
+            response("Compared selected profiles.", None),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        run_local_delegation(
+            DelegationRequest {
+                provider_id: "provider-1".into(),
+                model_name: "fixture-model".into(),
+                root: root.path().into(),
+                goal: "Compare two selected S3 profiles".into(),
+                remote_profiles: vec![
+                    RemoteProfileScope {
+                        profile_id: "server-one".into(),
+                        root: "/one".into(),
+                    },
+                    RemoteProfileScope {
+                        profile_id: "server-two".into(),
+                        root: "/two".into(),
+                    },
+                ],
+            },
+            credentials,
+            parent.clone(),
+            Arc::new(RemoteReadingChildren),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("fixture must finish")
+    .unwrap();
+    assert_eq!(result.workers[0].profile_id.as_deref(), Some("server-one"));
+    assert_eq!(result.workers[1].profile_id.as_deref(), Some("server-two"));
+    assert_eq!(result.workers[0].summary, "first: alpha");
+    assert_eq!(result.workers[1].summary, "second: bravo");
+    assert_eq!(result.workers[0].observations[0].path, "/one/note.txt");
+    assert_eq!(result.workers[1].observations[0].path, "/two/note.txt");
+    let projection = &parent.requests.lock().unwrap()[1];
+    let tool = projection
+        .messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .unwrap();
+    assert!(!tool.content.contains("secret-server"));
+    assert!(!tool.content.contains("fixture-model-key"));
 }
 
 #[tokio::test]
