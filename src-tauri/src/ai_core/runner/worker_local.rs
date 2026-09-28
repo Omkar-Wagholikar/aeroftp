@@ -6,6 +6,8 @@
 
 use std::io::Read;
 use std::path::{Component, Path};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
@@ -23,6 +25,8 @@ const MAX_RESULT_BYTES: usize = 5_120;
 pub struct WorkerLocalRead {
     root: Arc<Dir>,
     max_result_bytes: usize,
+    #[cfg(test)]
+    open_attempts: Arc<AtomicUsize>,
 }
 
 impl WorkerLocalRead {
@@ -37,6 +41,8 @@ impl WorkerLocalRead {
         Ok(Self {
             root: Arc::new(root),
             max_result_bytes,
+            #[cfg(test)]
+            open_attempts: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -61,6 +67,8 @@ impl WorkerLocalRead {
         options.read(true);
         #[cfg(unix)]
         options.custom_flags(libc::O_NONBLOCK);
+        #[cfg(test)]
+        self.open_attempts.fetch_add(1, Ordering::SeqCst);
         // cap-std resolves against the open directory handle. Never replace
         // this with canonicalize + std::fs::File::open(path): that reopens an
         // attacker-controlled name after validation.
@@ -114,7 +122,12 @@ impl WorkerLocalRead {
         let run = ledger.clone();
         let owner = child_id.to_string();
         let result = tokio::task::spawn_blocking(move || {
-            let result = scope.read_bounded(&raw).and_then(|value| {
+            let result = if run.cancellation().is_cancelled() {
+                Err("Worker run cancelled before file dispatch".into())
+            } else {
+                scope.read_bounded(&raw)
+            }
+            .and_then(|value| {
                 let bytes = serde_json::to_vec(&value)
                     .map_err(|e| format!("Worker result serialization failed: {e}"))?;
                 run.reserve_result_bytes(&owner, bytes.len() as u64)?;
