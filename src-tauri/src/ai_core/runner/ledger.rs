@@ -71,7 +71,7 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn new(limits: Limits) -> Self {
-        Self {
+        let ledger = Self {
             run_id: uuid::Uuid::new_v4().to_string(),
             limits,
             state: Arc::new(Mutex::new(State {
@@ -88,7 +88,23 @@ impl Ledger {
             })),
             notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
+        };
+        // The deadline must interrupt work already in flight, even when no
+        // later reservation occurs. Runtime callers get a lightweight timer;
+        // synchronous harnesses retain the same lifecycle with a thread.
+        let watchdog = ledger.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(limits.deadline)).await;
+                watchdog.expire();
+            });
+        } else {
+            std::thread::spawn(move || {
+                std::thread::sleep(limits.deadline.saturating_duration_since(Instant::now()));
+                watchdog.expire();
+            });
         }
+        ledger
     }
 
     pub fn run_id(&self) -> &str {
@@ -131,6 +147,14 @@ impl Ledger {
         self.cancel.cancel();
         self.notify.notify_waiters();
         "Run budget exhausted".into()
+    }
+
+    fn expire(&self) {
+        if let Ok(mut state) = self.lock() {
+            if state.terminal.is_none() && Instant::now() >= self.limits.deadline {
+                self.exhaust(&mut state);
+            }
+        }
     }
 
     /// Reserve both token ceilings before every parent/child request, retry or
@@ -324,6 +348,9 @@ impl Ledger {
         }
         if !matches!(requested, Terminal::Completed | Terminal::Failed) {
             return Err("Terminal status is derived from run state".into());
+        }
+        if Instant::now() >= self.limits.deadline {
+            self.exhaust(&mut state);
         }
         if !state.children.is_empty()
             || !state.pending_requests.is_empty()

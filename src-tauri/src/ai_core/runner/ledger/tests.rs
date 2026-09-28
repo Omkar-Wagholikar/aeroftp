@@ -110,6 +110,38 @@ fn deadline_denies_and_cancels_before_dispatch_with_fake_time() {
 }
 
 #[test]
+fn expired_run_cannot_finish_successfully_without_another_reservation() {
+    let mut l = limits();
+    l.deadline = Instant::now() - Duration::from_millis(1);
+    let ledger = Ledger::new(l);
+    assert_eq!(
+        ledger.finish(Terminal::Completed).unwrap(),
+        Terminal::BudgetExhausted
+    );
+}
+
+#[tokio::test]
+async fn deadline_cancels_pending_request_and_waits_for_quiescence() {
+    let mut l = limits();
+    l.deadline = Instant::now() + Duration::from_millis(20);
+    let ledger = Ledger::new(l);
+    let child = ledger.acquire_child(ledger.run_id()).unwrap();
+    let request = ledger.reserve_request(&child, cap(1, 1)).unwrap();
+    let cancel = ledger.cancellation();
+    tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+        .await
+        .expect("deadline did not cancel pending request");
+    assert!(ledger.finish_child(&child).is_err());
+    assert!(ledger.finish(Terminal::Completed).is_err());
+    ledger.finish_request(&request, None).unwrap();
+    ledger.finish_child(&child).unwrap();
+    assert_eq!(
+        ledger.finish(Terminal::Completed).unwrap(),
+        Terminal::BudgetExhausted
+    );
+}
+
+#[test]
 fn external_token_cancellation_cannot_finish_as_success() {
     let ledger = Ledger::new(limits());
     ledger.cancellation().cancel();
