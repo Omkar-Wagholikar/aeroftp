@@ -14036,47 +14036,6 @@ async fn detect_renames_cmd(
 }
 
 // =============================
-// Delta Sync Commands (#155)
-// =============================
-
-/// Analyze a file pair and return delta sync stats (preview, no actual transfer)
-#[cfg(feature = "aerorsync")]
-#[tauri::command]
-async fn delta_sync_analyze(
-    local_path: String,
-    remote_path: String,
-) -> Result<aerorsync::delta_engine::DeltaResult, String> {
-    validate_path(&local_path)?;
-    validate_path(&remote_path)?;
-
-    // Read local file
-    let local_data = tokio::fs::read(&local_path)
-        .await
-        .map_err(|e| format!("Failed to read local file: {}", e))?;
-
-    if (local_data.len() as u64) < aerorsync::delta_engine::DELTA_MIN_FILE_SIZE {
-        return Err(format!(
-            "File too small for delta sync ({}B < {}B minimum)",
-            local_data.len(),
-            aerorsync::delta_engine::DELTA_MIN_FILE_SIZE
-        ));
-    }
-
-    // For analysis, we use the local file as both source and simulate
-    // In real usage, remote_data would come from provider.read_range()
-    let block_size = aerorsync::delta_engine::compute_block_size(local_data.len() as u64);
-    let sigs = aerorsync::delta_engine::compute_signatures(&local_data, block_size);
-
-    // Read remote (local copy for now: real impl would use provider)
-    let remote_data = tokio::fs::read(&remote_path)
-        .await
-        .map_err(|e| format!("Failed to read remote file: {}", e))?;
-
-    let (_, result) = aerorsync::delta_engine::compute_delta(&remote_data, &sigs);
-    Ok(result)
-}
-
-// =============================
 // Canary Sync Commands
 // =============================
 
@@ -19785,8 +19744,6 @@ pub fn run() {
             restore_sync_snapshot_cmd,
             detect_renames_cmd,
             delete_sync_snapshot_cmd,
-            #[cfg(feature = "aerorsync")]
-            delta_sync_analyze,
             sync_canary_run,
             sync_canary_approve,
             get_journal_signing_key,
