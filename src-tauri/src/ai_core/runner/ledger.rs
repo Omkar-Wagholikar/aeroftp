@@ -114,6 +114,11 @@ impl Ledger {
         self.cancel.clone()
     }
 
+    pub fn child_active(&self, child_id: &str) -> Result<bool, String> {
+        let state = self.lock()?;
+        Ok(state.terminal.is_none() && state.children.contains(child_id))
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, String> {
         self.state
             .lock()
