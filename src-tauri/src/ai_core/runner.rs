@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ai::{AIRequest, AIResponse, AIToolCall, ChatMessage, ToolCallEcho};
 
+pub mod ledger;
+
 pub const CANCELLED: &str = "Agent run cancelled";
 
 pub fn check_cancelled(cancel: &CancellationToken) -> Result<(), String> {
