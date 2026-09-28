@@ -489,7 +489,8 @@ impl RunnerAdapter for ParentAdapter {
             return Err(CANCELLED.into());
         }
         let projection = json!({"children":results.iter().map(|result| json!({
-            "child_id":&result.child_id,"profile_id":&result.profile_id,"summary":&result.summary
+            "child_id":&result.child_id,"profile_id":&result.profile_id,
+            "summary":&result.summary,"observations":&result.observations
         })).collect::<Vec<_>>()});
         self.results
             .lock()

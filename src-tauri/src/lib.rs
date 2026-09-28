@@ -15012,6 +15012,7 @@ async fn ai_delegate_local(
             "childId": worker.child_id,
             "profileId": worker.profile_id,
             "summary": worker.summary,
+            "observations": worker.observations,
         })).collect::<Vec<_>>(),
         "inputTokens": result.usage.input_tokens,
         "outputTokens": result.usage.output_tokens,

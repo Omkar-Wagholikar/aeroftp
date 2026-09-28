@@ -115,7 +115,8 @@ type DelegationEvent = {
     status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'budget_exhausted';
 };
 
-type DelegationWorker = { runId: string; childId: string; profileId?: string | null; summary: string };
+type DelegationObservation = { tool: string; root_id?: string | null; profile_id?: string | null; path: string; size?: number | null; truncated?: boolean | null };
+type DelegationWorker = { runId: string; childId: string; profileId?: string | null; summary: string; observations?: DelegationObservation[] };
 type DelegatedRemoteProfile = { id: string; name: string; root: string };
 type DelegationResult = {
     answer: string;
@@ -3263,6 +3264,12 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                                 <span className={ct.textMuted}>{delegationStatusLabel(status)}</span>
                                             </div>
                                             {worker && <p className="mt-1 whitespace-pre-wrap break-words">{worker.summary}</p>}
+                                            {worker?.observations?.map((observation, observationIndex) => (
+                                                <div key={`${observation.tool}-${observationIndex}`} className={`${ct.textMuted} mt-1 break-all`}>
+                                                    {observation.root_id ? `${observation.root_id}/` : ''}{observation.path}
+                                                    {observation.size !== null && observation.size !== undefined ? ` · ${observation.size} B` : ''}
+                                                </div>
+                                            ))}
                                         </div>
                                     );
                                 })}

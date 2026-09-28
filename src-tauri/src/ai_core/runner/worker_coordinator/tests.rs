@@ -1,9 +1,10 @@
 use super::*;
 use crate::ai::{AIProviderType, AIToolDefinition};
 use crate::ai_core::runner::ledger::{Limits, Terminal};
+use crate::providers::{ProviderConfig, ProviderType};
 use std::time::Duration;
 
-struct FakeSource(Mutex<(ModelPin, ServerPin, bool)>);
+struct FakeSource(Mutex<(ModelPin, ServerPin, bool, String)>);
 
 impl WorkerCredentialSource for FakeSource {
     fn model_pin(&self, id: &str) -> Result<ModelPin, String> {
@@ -23,6 +24,26 @@ impl WorkerCredentialSource for FakeSource {
             return Err("server unavailable".into());
         }
         Ok(state.1.clone())
+    }
+    fn server_snapshot(&self, id: &str) -> Result<PinnedServerSnapshot, String> {
+        let state = self.0.lock().unwrap();
+        if state.2 || state.1.profile_id != id {
+            return Err("server unavailable".into());
+        }
+        Ok(PinnedServerSnapshot {
+            pin: state.1.clone(),
+            config: ProviderConfig {
+                name: id.into(),
+                provider_type: ProviderType::S3,
+                host: state.3.clone(),
+                port: None,
+                username: Some("test".into()),
+                password: None,
+                initial_path: None,
+                extra: std::collections::HashMap::from([("bucket".into(), "fixture".into())]),
+            },
+            secret: Zeroizing::new("server-secret".into()),
+        })
     }
 }
 
@@ -50,6 +71,7 @@ fn fixture() -> (WorkerCoordinator, Arc<FakeSource>, Ledger) {
         model.clone(),
         server.clone(),
         false,
+        String::new(),
     ))));
     let parent = ParentScope {
         model,
@@ -167,6 +189,64 @@ fn remote_root_rejects_traversal_and_alias_forms() {
         assert!(!valid_remote_root(root));
     }
     assert!(valid_remote_root("/safe/sub"));
+}
+
+#[tokio::test]
+async fn cancelling_a_pending_s3_head_releases_the_remote_step_before_child_finish() {
+    use std::sync::Arc;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let seen = entered.clone();
+    let blocked = release.clone();
+    let app = axum::Router::new().fallback(axum::routing::any(
+        move |_request: axum::extract::Request| {
+            let seen = seen.clone();
+            let blocked = blocked.clone();
+            async move {
+                seen.notify_one();
+                blocked.notified().await;
+                axum::response::Response::builder()
+                    .status(200)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let (mut coordinator, source, ledger) = fixture();
+    source.0.lock().unwrap().3 = endpoint;
+    coordinator.parent.tools.insert("remote_stat".into());
+    let mut request = request(&coordinator);
+    request.tools = vec!["remote_stat".into()];
+    let child = coordinator.prepare(request).unwrap();
+    let coordinator = Arc::new(coordinator);
+    let active = coordinator.clone();
+    let task = tokio::spawn(async move {
+        let result = active
+            .remote_tool(&child, "server-id", "file", "remote_stat")
+            .await;
+        let finished = active.finish_child(&child);
+        (result, finished)
+    });
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    ledger.cancel().unwrap();
+    let (result, finished) = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err());
+    assert!(
+        finished.is_ok(),
+        "remote step must quiesce before child finish: {finished:?}"
+    );
+    release.notify_waiters();
 }
 
 #[tokio::test]

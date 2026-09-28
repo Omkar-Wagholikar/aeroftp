@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -37,12 +37,23 @@ impl WorkerTransport for LiveWorkerTransport {
 
 /// Data-only child output. Native state, model keys and full tool transcripts
 /// stay inside the task and are never included in this projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct WorkerResult {
     pub run_id: String,
     pub child_id: String,
     pub profile_id: Option<String>,
     pub summary: String,
+    pub observations: Vec<WorkerObservation>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct WorkerObservation {
+    pub tool: String,
+    pub root_id: Option<String>,
+    pub profile_id: Option<String>,
+    pub path: String,
+    pub size: Option<u64>,
+    pub truncated: Option<bool>,
 }
 
 fn text_message(role: &str, content: String) -> ChatMessage {
@@ -141,6 +152,7 @@ struct WorkerAdapter<'a> {
     transport: &'a dyn WorkerTransport,
     trusted_prefix: &'a [ChatMessage],
     trusted_tools: Option<&'a [AIToolDefinition]>,
+    observations: Mutex<Vec<WorkerObservation>>,
 }
 
 #[async_trait]
@@ -203,6 +215,32 @@ impl RunnerAdapter for WorkerAdapter<'_> {
             }
             _ => return Err("Tool is not in the worker allowlist".into()),
         };
+        let path = result
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| call.arguments.get("path").and_then(Value::as_str))
+            .ok_or("Worker tool result lacks its source path")?;
+        let profile_id = call
+            .arguments
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let root_id = call
+            .arguments
+            .get("root_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.observations
+            .lock()
+            .map_err(|_| "Worker observation lock poisoned")?
+            .push(WorkerObservation {
+                tool: call.name.clone(),
+                root_id,
+                profile_id,
+                path: path.into(),
+                size: result.get("size").and_then(Value::as_u64),
+                truncated: result.get("truncated").and_then(Value::as_bool),
+            });
         serde_json::to_string(&result).map_err(|_| "Worker tool result is invalid".into())
     }
 }
@@ -241,6 +279,7 @@ impl WorkerCoordinator {
             transport,
             trusted_prefix: &request.messages,
             trusted_tools: request.tools.as_deref(),
+            observations: Mutex::new(Vec::new()),
         };
         let mut messages = Vec::new();
         let cancel = self.ledger.cancellation();
@@ -259,10 +298,7 @@ impl WorkerCoordinator {
         if summary.len() > MAX_RESPONSE_BYTES {
             return Err("Worker summary exceeds publication cap".into());
         }
-        self.ledger
-            .reserve_result_bytes(&child.child_id, summary.len() as u64)?;
-        self.ensure_prepared(child)?;
-        Ok(WorkerResult {
+        let result = WorkerResult {
             run_id: child.run_id.clone(),
             child_id: child.child_id.clone(),
             profile_id: if child.remote.len() == 1 {
@@ -271,7 +307,16 @@ impl WorkerCoordinator {
                 None
             },
             summary,
-        })
+            observations: adapter
+                .observations
+                .into_inner()
+                .map_err(|_| "Worker observation lock poisoned")?,
+        };
+        let encoded = serde_json::to_vec(&result).map_err(|_| "Worker result is invalid")?;
+        self.ledger
+            .reserve_result_bytes(&child.child_id, encoded.len() as u64)?;
+        self.ensure_prepared(child)?;
+        Ok(result)
     }
 
     async fn complete_worker_request(

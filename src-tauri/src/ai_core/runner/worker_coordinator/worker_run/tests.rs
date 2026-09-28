@@ -133,6 +133,10 @@ async fn local_worker_reads_only_its_granted_root_and_returns_bounded_data() {
         .unwrap()
         .unwrap();
     assert_eq!(result.summary, "The note contains trusted fixture text.");
+    assert_eq!(result.observations.len(), 1);
+    assert_eq!(result.observations[0].root_id.as_deref(), Some("root-1"));
+    assert_eq!(result.observations[0].path, "note.txt");
+    assert!(!format!("{:?}", result.observations).contains("trusted fixture text"));
     let requests = script.requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].turn_scope, requests[1].turn_scope);
