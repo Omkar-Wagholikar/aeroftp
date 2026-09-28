@@ -2966,7 +2966,16 @@
             "routing": {
                 "fallbackUsed": "বিকল্প",
                 "fallbackUsedTooltip": "{model} ব্যর্থ হয়েছে, তাই বিকল্প মডেল উত্তর দিয়েছে"
-            }
+            },
+            "delegateLocal": "[NEEDS TRANSLATION] Read-only workers",
+            "delegateLocalHint": "[NEEDS TRANSLATION] Separate run. Workers may read files under {path}.",
+            "worker": "[NEEDS TRANSLATION] Worker",
+            "workerBudgetExhausted": "[NEEDS TRANSLATION] Budget exhausted",
+            "workerCancelled": "[NEEDS TRANSLATION] Cancelled",
+            "workerCompleted": "[NEEDS TRANSLATION] Completed",
+            "workerFailed": "[NEEDS TRANSLATION] Failed",
+            "workerQueued": "[NEEDS TRANSLATION] Queued",
+            "workerRunning": "[NEEDS TRANSLATION] Running"
         },
         "archive": {
             "passwordRequired": "এই আর্কাইভটি পাসওয়ার্ড দ্বারা সুরক্ষিত",

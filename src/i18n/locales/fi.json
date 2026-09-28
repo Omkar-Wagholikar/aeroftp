@@ -2966,7 +2966,16 @@
             "routing": {
                 "fallbackUsed": "varamalli",
                 "fallbackUsedTooltip": "{model} epäonnistui, joten varamalli vastasi"
-            }
+            },
+            "delegateLocal": "[NEEDS TRANSLATION] Read-only workers",
+            "delegateLocalHint": "[NEEDS TRANSLATION] Separate run. Workers may read files under {path}.",
+            "worker": "[NEEDS TRANSLATION] Worker",
+            "workerBudgetExhausted": "[NEEDS TRANSLATION] Budget exhausted",
+            "workerCancelled": "[NEEDS TRANSLATION] Cancelled",
+            "workerCompleted": "[NEEDS TRANSLATION] Completed",
+            "workerFailed": "[NEEDS TRANSLATION] Failed",
+            "workerQueued": "[NEEDS TRANSLATION] Queued",
+            "workerRunning": "[NEEDS TRANSLATION] Running"
         },
         "archive": {
             "passwordRequired": "Tämä arkisto on salasanasuojattu",

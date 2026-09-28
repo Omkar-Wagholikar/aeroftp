@@ -96,6 +96,12 @@ pub struct PreparedWorker {
     tools: BTreeSet<String>,
 }
 
+impl PreparedWorker {
+    pub fn child_id(&self) -> &str {
+        &self.child_id
+    }
+}
+
 pub struct WorkerCoordinator {
     ledger: Ledger,
     broker: WorkerCredentialBroker,

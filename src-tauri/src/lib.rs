@@ -14844,6 +14844,58 @@ static AI_CHAT_CANCEL_TOKENS: std::sync::LazyLock<
 static AI_DELEGATION_TOKENS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<CancellationToken>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static AI_DELEGATION_EARLY_CANCELS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn register_delegation_token(
+    id: &str,
+    token: std::sync::Arc<CancellationToken>,
+) -> Result<(), String> {
+    let mut active = AI_DELEGATION_TOKENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if active.contains_key(id) {
+        return Err("Delegated request ID is already active".into());
+    }
+    if AI_DELEGATION_EARLY_CANCELS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(id)
+        .is_some()
+    {
+        return Err("Delegated request cancelled before dispatch".into());
+    }
+    active.insert(id.into(), token);
+    Ok(())
+}
+
+fn cancel_delegation_token(id: &str) {
+    let active = AI_DELEGATION_TOKENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(token) = active.get(id) {
+        token.cancel();
+    } else {
+        // Stop may overtake the asynchronous invoke. Keep a bounded tombstone
+        // so registration cannot dispatch a run the user already cancelled.
+        let mut early = AI_DELEGATION_EARLY_CANCELS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = std::time::Instant::now();
+        early.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(120));
+        if early.len() >= 256 {
+            if let Some(oldest) = early
+                .iter()
+                .min_by_key(|(_, at)| *at)
+                .map(|(id, _)| id.clone())
+            {
+                early.remove(&oldest);
+            }
+        }
+        early.insert(id.into(), now);
+    }
+}
 
 struct DelegationRegistration {
     id: String,
@@ -14894,12 +14946,22 @@ mod delegation_registration_tests {
             token: replacement,
         });
     }
+
+    #[test]
+    fn stop_before_registration_prevents_delegated_dispatch() {
+        let id = uuid::Uuid::new_v4().to_string();
+        cancel_delegation_token(&id);
+        let token = std::sync::Arc::new(CancellationToken::new());
+        assert!(register_delegation_token(&id, token).is_err());
+        assert!(!AI_DELEGATION_TOKENS.lock().unwrap().contains_key(&id));
+    }
 }
 
 /// Explicit read-only parent/worker run. Its separate request ID makes Stop
 /// address the complete shared ledger rather than one provider stream.
 #[tauri::command]
 async fn ai_delegate_local(
+    app: tauri::AppHandle,
     request_id: String,
     provider_id: String,
     model_name: String,
@@ -14910,21 +14972,24 @@ async fn ai_delegate_local(
         return Err("Delegated request ID or local root is invalid".into());
     }
     let token = std::sync::Arc::new(CancellationToken::new());
-    {
-        let mut active = AI_DELEGATION_TOKENS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if active.contains_key(&request_id) {
-            return Err("Delegated request ID is already active".into());
-        }
-        active.insert(request_id.clone(), token.clone());
-    }
+    register_delegation_token(&request_id, token.clone())?;
     let _registration = DelegationRegistration {
-        id: request_id,
+        id: request_id.clone(),
         token: token.clone(),
     };
+    let event_request_id = request_id;
+    let event_sink: ai_core::runner::delegation::DelegationEventSink =
+        std::sync::Arc::new(move |event| {
+            let _ = app.emit(
+                "ai-delegation-event",
+                serde_json::json!({
+                    "requestId": &event_request_id,
+                    "event": event,
+                }),
+            );
+        });
     let transport = std::sync::Arc::new(ai_core::runner::worker_coordinator::LiveWorkerTransport);
-    let result = ai_core::runner::delegation::run_local_delegation(
+    let result = ai_core::runner::delegation::run_local_delegation_with_events(
         ai_core::runner::delegation::DelegationRequest {
             provider_id,
             model_name,
@@ -14935,6 +15000,7 @@ async fn ai_delegate_local(
         transport.clone(),
         transport,
         (*token).clone(),
+        Some(event_sink),
     )
     .await?;
     Ok(serde_json::json!({
@@ -14952,14 +15018,10 @@ async fn ai_delegate_local(
 
 #[tauri::command]
 async fn ai_cancel_delegation(request_id: String) -> Result<(), String> {
-    let token = AI_DELEGATION_TOKENS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&request_id)
-        .cloned();
-    if let Some(token) = token {
-        token.cancel();
+    if uuid::Uuid::parse_str(&request_id).is_err() {
+        return Err("Delegated request ID is invalid".into());
     }
+    cancel_delegation_token(&request_id);
     Ok(())
 }
 

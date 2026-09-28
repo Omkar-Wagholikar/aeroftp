@@ -3160,7 +3160,16 @@
             "routing": {
                 "fallbackUsed": "riserva",
                 "fallbackUsedTooltip": "{model} non ha risposto, ha risposto il modello di riserva"
-            }
+            },
+            "delegateLocal": "[NEEDS TRANSLATION] Read-only workers",
+            "delegateLocalHint": "[NEEDS TRANSLATION] Separate run. Workers may read files under {path}.",
+            "worker": "[NEEDS TRANSLATION] Worker",
+            "workerBudgetExhausted": "[NEEDS TRANSLATION] Budget exhausted",
+            "workerCancelled": "[NEEDS TRANSLATION] Cancelled",
+            "workerCompleted": "[NEEDS TRANSLATION] Completed",
+            "workerFailed": "[NEEDS TRANSLATION] Failed",
+            "workerQueued": "[NEEDS TRANSLATION] Queued",
+            "workerRunning": "[NEEDS TRANSLATION] Running"
         },
         "archive": {
             "passwordRequired": "Questo archivio è protetto da password",

@@ -218,9 +218,11 @@ async fn two_children_run_concurrently_and_return_distinct_results() {
         active: AtomicUsize::new(0),
         peak: AtomicUsize::new(0),
     });
+    let events = Arc::new(Mutex::new(Vec::<DelegationEvent>::new()));
+    let recorded = events.clone();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        run_local_delegation(
+        run_local_delegation_with_events(
             DelegationRequest {
                 provider_id: "provider-1".into(),
                 model_name: "fixture-model".into(),
@@ -231,6 +233,7 @@ async fn two_children_run_concurrently_and_return_distinct_results() {
             parent.clone(),
             children.clone(),
             CancellationToken::new(),
+            Some(Arc::new(move |event| recorded.lock().unwrap().push(event))),
         ),
     )
     .await
@@ -249,6 +252,25 @@ async fn two_children_run_concurrently_and_return_distinct_results() {
             && message.content.contains("Summary for first")
             && message.content.contains("Summary for second")
     }));
+    let events = events.lock().unwrap();
+    assert_eq!(events.first().unwrap().status, "running");
+    assert_eq!(events.last().unwrap().status, "completed");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.status == "completed" && event.child_id.is_some())
+            .count(),
+        2
+    );
+    assert!(events
+        .iter()
+        .enumerate()
+        .all(|(index, event)| event.sequence == index as u64 + 1));
+    let payload = serde_json::to_string(&*events).unwrap();
+    assert!(!payload.contains("fixture-secret"));
+    assert!(!payload.contains("Summary for"));
+    let root_path = root.path().to_string_lossy().into_owned();
+    assert!(!payload.contains(root_path.as_str()));
 }
 
 #[tokio::test]

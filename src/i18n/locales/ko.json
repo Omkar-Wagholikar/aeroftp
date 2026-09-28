@@ -2966,7 +2966,16 @@
             "routing": {
                 "fallbackUsed": "대체",
                 "fallbackUsedTooltip": "{model}이(가) 실패하여 대체 모델이 대신 응답했습니다"
-            }
+            },
+            "delegateLocal": "[NEEDS TRANSLATION] Read-only workers",
+            "delegateLocalHint": "[NEEDS TRANSLATION] Separate run. Workers may read files under {path}.",
+            "worker": "[NEEDS TRANSLATION] Worker",
+            "workerBudgetExhausted": "[NEEDS TRANSLATION] Budget exhausted",
+            "workerCancelled": "[NEEDS TRANSLATION] Cancelled",
+            "workerCompleted": "[NEEDS TRANSLATION] Completed",
+            "workerFailed": "[NEEDS TRANSLATION] Failed",
+            "workerQueued": "[NEEDS TRANSLATION] Queued",
+            "workerRunning": "[NEEDS TRANSLATION] Running"
         },
         "archive": {
             "passwordRequired": "이 압축 파일은 비밀번호로 보호되어 있습니다",

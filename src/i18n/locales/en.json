@@ -238,6 +238,8 @@
         },
         "ai": {
             "addContext": "Add context (@path)",
+            "delegateLocal": "Read-only workers",
+            "delegateLocalHint": "Separate run. Workers may read files under {path}.",
             "aeroAgent": "AeroAgent",
             "aiSettings": "AI Settings",
             "analyzeThisImage": "Analyze this image",
@@ -404,6 +406,13 @@
             "insertPath": "Insert path",
             "listFiles": "List files & folders",
             "localPath": "Local Path",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Budget exhausted",
+            "workerCancelled": "Cancelled",
+            "workerCompleted": "Completed",
+            "workerFailed": "Failed",
+            "workerQueued": "Queued",
+            "workerRunning": "Running",
             "marketplace": {
                 "add": "Add",
                 "added": "Added",

@@ -4,7 +4,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Send, Bot, Sparkles, Mic, MicOff, ChevronDown, Trash2, MessageSquare, ImageIcon, X, ShieldAlert, AlertTriangle, FolderOpen, FileCode, Search, Archive, Terminal, Shield, RefreshCw, Brain, Eye, Key, Settings, Upload, Download, Square } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { createTauriListener } from '../../hooks/useTauriListener';
+import { createTauriListener, useTauriListener } from '../../hooks/useTauriListener';
 import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from './AIIcons';
 import { AISettingsPanel } from '../AISettings';
 import { AISettings, AIProviderType } from '../../types/ai';
@@ -105,6 +105,30 @@ type BackendApprovalPreparation = {
 type BackendApprovalGrant = {
     approved: boolean;
     grantId?: string | null;
+};
+
+type DelegationEvent = {
+    runId: string;
+    childId?: string | null;
+    sequence: number;
+    status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'budget_exhausted';
+};
+
+type DelegationWorker = { runId: string; childId: string; summary: string };
+type DelegationResult = {
+    answer: string;
+    workers: DelegationWorker[];
+    inputTokens: number;
+    outputTokens: number;
+    terminal: 'completed';
+};
+
+type DelegationView = {
+    requestId: string;
+    root: string;
+    status: 'running' | 'completed' | 'failed' | 'cancelled';
+    events: DelegationEvent[];
+    workers: DelegationWorker[];
 };
 
 type ExecuteToolOptions = {
@@ -699,6 +723,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     const [showContextMenu, setShowContextMenu] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
+    const [delegateLocal, setDelegateLocal] = useState(false);
+    const [delegationView, setDelegationView] = useState<DelegationView | null>(null);
     const { text: thinkingMessage, isTyping: thinkingIsTyping } = useThinkingMessage(isLoading, t);
     const [isListening, setIsListening] = useState(false);
     const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
@@ -732,6 +758,13 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
     // Cancel the active backend stream and clean up frontend state
     const cancelActiveStream = useCallback(() => {
+        if (activeDelegationIdRef.current) {
+            const requestId = activeDelegationIdRef.current;
+            activeDelegationIdRef.current = null;
+            invoke('ai_cancel_delegation', { requestId }).catch(() => {});
+            setDelegationView(previous => previous?.requestId === requestId
+                ? { ...previous, status: 'cancelled' } : previous);
+        }
         if (activeStreamIdRef.current) {
             invoke('ai_cancel_stream', { streamId: activeStreamIdRef.current }).catch(() => {});
             activeStreamIdRef.current = null;
@@ -752,6 +785,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     // Wrap startNewChat to also clear pending tool calls, token budget, and cost
     const startNewChat = useCallback(() => {
         cancelActiveStream();
+        setDelegationView(null);
         startNewChatBase();
         setPendingToolCalls([]);
         setTokenBudgetData(null);
@@ -771,6 +805,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     // A6-06: Abort any ongoing streaming before switching conversation
     const switchConversation = useCallback(async (conv: Conversation) => {
         cancelActiveStream();
+        setDelegationView(null);
         setIsLoading(false);
         setPendingToolCalls([]);
         await switchConversationBase(conv);
@@ -847,7 +882,19 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     } | null>(null);
     const streamingMsgIdRef = useRef<string | null>(null);
     const activeStreamIdRef = useRef<string | null>(null);
+    const activeDelegationIdRef = useRef<string | null>(null);
     const streamUnlistenRef = useRef<(() => void) | null>(null);
+    useTauriListener<{ requestId: string; event: DelegationEvent }>('ai-delegation-event', ({ payload }) => {
+        if (!payload?.event || typeof payload.event.sequence !== 'number') return;
+        setDelegationView(previous => {
+            if (!previous || previous.requestId !== payload.requestId || previous.status !== 'running') return previous;
+            if (previous.events.some(event => event.sequence === payload.event.sequence)) return previous;
+            return {
+                ...previous,
+                events: [...previous.events, payload.event].sort((a, b) => a.sequence - b.sequence).slice(-16),
+            };
+        });
+    });
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const voiceCaptureRef = useRef<VoiceCaptureRefs>({
@@ -2145,6 +2192,82 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         window.dispatchEvent(new CustomEvent('ai-status-changed', { detail: status }));
     };
 
+    const delegationStatusLabel = (status: DelegationEvent['status'] | DelegationView['status']) => {
+        switch (status) {
+            case 'queued': return t('ai.workerQueued');
+            case 'running': return t('ai.workerRunning');
+            case 'completed': return t('ai.workerCompleted');
+            case 'cancelled': return t('ai.workerCancelled');
+            case 'budget_exhausted': return t('ai.workerBudgetExhausted');
+            case 'failed': return t('ai.workerFailed');
+        }
+    };
+
+    const handleDelegateSend = async () => {
+        const goal = input.trim();
+        if (!goal || !localPath || isLoading || attachedImages.length > 0) return;
+        const requestId = crypto.randomUUID();
+        activeDelegationIdRef.current = requestId;
+        setDelegationView({ requestId, root: localPath, status: 'running', events: [], workers: [] });
+        setMessages(previous => [...previous, {
+            id: crypto.randomUUID(), role: 'user', content: goal, timestamp: new Date(),
+        }]);
+        setInput('');
+        if (inputRef.current) inputRef.current.style.height = 'auto';
+        setIsLoading(true);
+        dispatchAIStatus('streaming');
+        try {
+            const settings = await secureGetWithFallback<AISettings>('ai_settings', 'aeroftp_ai_settings');
+            if (!settings) throw new Error(t('ai.noModelsConfigured'));
+            settings.models = reconcileProviderModels(settings.models, settings.providers);
+            const activeModel = resolveRoutedModels(selectedModel, settings, goal).primary;
+            if (!activeModel) throw new Error(t('ai.noModelsConfigured'));
+            if (activeDelegationIdRef.current !== requestId) return;
+            const result = await invoke<DelegationResult>('ai_delegate_local', {
+                requestId,
+                providerId: activeModel.providerId,
+                modelName: activeModel.modelName,
+                root: localPath,
+                goal,
+            });
+            if (activeDelegationIdRef.current !== requestId) return;
+            setDelegationView(previous => previous?.requestId === requestId
+                ? { ...previous, status: 'completed', workers: result.workers.slice(0, 2) } : previous);
+            setMessages(previous => [...previous, {
+                id: crypto.randomUUID(), role: 'assistant', content: result.answer, timestamp: new Date(),
+                modelInfo: {
+                    modelName: activeModel.displayName,
+                    providerName: activeModel.providerName,
+                    providerType: activeModel.providerType,
+                },
+                tokenInfo: {
+                    inputTokens: result.inputTokens,
+                    outputTokens: result.outputTokens,
+                    totalTokens: result.inputTokens + result.outputTokens,
+                },
+            }]);
+        } catch (error) {
+            if (activeDelegationIdRef.current !== requestId) return;
+            setDelegationView(previous => previous?.requestId === requestId
+                ? { ...previous, status: 'failed' } : previous);
+            setMessages(previous => [...previous, {
+                id: crypto.randomUUID(), role: 'assistant',
+                content: `${t('ai.workerFailed')}: ${String(error)}`, timestamp: new Date(),
+            }]);
+            dispatchAIStatus('error');
+        } finally {
+            if (activeDelegationIdRef.current === requestId) {
+                activeDelegationIdRef.current = null;
+                setIsLoading(false);
+                dispatchAIStatus('idle');
+            }
+        }
+    };
+
+    useEffect(() => {
+        if (!localPath) setDelegateLocal(false);
+    }, [localPath]);
+
     const handleSend = async () => {
         if ((!input.trim() && attachedImages.length === 0) || isLoading) return;
 
@@ -3089,6 +3212,28 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                 TransferPlanReview={TransferPlanReview}
                             />
                         ))}
+                        {delegationView && (
+                            <div className={`${ct.assistantMsg} rounded-lg border ${ct.border} px-4 py-3 text-xs space-y-2`}>
+                                <div className="flex items-center justify-between gap-2">
+                                    <span className="font-medium text-purple-400">{t('ai.delegateLocal')}</span>
+                                    <span className={ct.textMuted}>{delegationStatusLabel(delegationView.status)}</span>
+                                </div>
+                                <div className={`${ct.textMuted} break-all`}>{t('ai.delegateLocalHint', { path: delegationView.root })}</div>
+                                {Array.from(new Set(delegationView.events.flatMap(event => event.childId ? [event.childId] : []))).map((childId, index) => {
+                                    const status = delegationView.events.filter(event => event.childId === childId).slice(-1)[0]?.status ?? 'queued';
+                                    const worker = delegationView.workers.find(item => item.childId === childId);
+                                    return (
+                                        <div key={childId} className={`rounded border ${ct.border} px-2 py-1.5`}>
+                                            <div className="flex justify-between gap-2">
+                                                <span>{t('ai.worker')} {index + 1}</span>
+                                                <span className={ct.textMuted}>{delegationStatusLabel(status)}</span>
+                                            </div>
+                                            {worker && <p className="mt-1 whitespace-pre-wrap break-words">{worker.summary}</p>}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
                         {isLoading && !pendingToolCalls.some(tc => tc.status === 'pending') && (
                             <div className="flex gap-3">
                                 <div className={`${ct.bgHalf} rounded-lg px-4 py-2 ${ct.textSecondary} text-sm flex items-center gap-3`}>
@@ -3287,7 +3432,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             onKeyDown={(e) => {
                                 if (e.key === 'Enter' && !e.shiftKey) {
                                     e.preventDefault();
-                                    handleSend();
+                                    if (delegateLocal) void handleDelegateSend();
+                                    else void handleSend();
                                 }
                             }}
                             onPaste={handlePaste}
@@ -3297,7 +3443,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                         />
                         <button
                             onClick={handleImagePick}
-                            disabled={attachedImages.length >= MAX_IMAGES}
+                            disabled={delegateLocal || attachedImages.length >= MAX_IMAGES}
                             className={`p-1.5 rounded transition-colors ${
                                 attachedImages.length >= MAX_IMAGES
                                     ? 'text-gray-600 cursor-not-allowed'
@@ -3326,8 +3472,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             {isTranscribingAudio ? <RefreshCw size={16} className="animate-spin" /> : isListening ? <MicOff size={16} /> : <Mic size={16} />}
                         </button>
                         <button
-                            onClick={isLoading ? cancelActiveStream : handleSend}
-                            disabled={!isLoading && !input.trim() && attachedImages.length === 0}
+                            onClick={isLoading ? cancelActiveStream : delegateLocal ? handleDelegateSend : handleSend}
+                            disabled={!isLoading && ((!input.trim() && attachedImages.length === 0) || (delegateLocal && (!localPath || attachedImages.length > 0)))}
                             title={isLoading ? t('ai.stopGeneration') : undefined}
                             aria-label={isLoading ? t('ai.stopGeneration') : undefined}
                             className={`p-1.5 rounded transition-colors ${isLoading
@@ -3337,6 +3483,12 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             {isLoading ? <Square size={16} fill="currentColor" /> : <Send size={16} />}
                         </button>
                     </div>
+
+                    {delegateLocal && localPath && (
+                        <div className={`px-3 pb-2 text-[11px] ${ct.textMuted} break-all`}>
+                            {t('ai.delegateLocalHint', { path: localPath })}
+                        </div>
+                    )}
 
                     {voiceStatus && (
                         <div className={`px-3 pb-2 text-[11px] ${ct.textMuted}`}>
@@ -3476,6 +3628,19 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                     </div>
                                 )}
                             </div>
+
+                            {localPath && (
+                                <button
+                                    type="button"
+                                    onClick={() => setDelegateLocal(previous => !previous)}
+                                    disabled={isLoading || attachedImages.length > 0}
+                                    aria-pressed={delegateLocal}
+                                    title={t('ai.delegateLocalHint', { path: localPath })}
+                                    className={`flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors ${delegateLocal ? 'bg-purple-500/20 text-purple-300' : ct.textMuted} disabled:opacity-40`}
+                                >
+                                    <Bot size={12} />{t('ai.delegateLocal')}
+                                </button>
+                            )}
                         </div>
 
                         {/* Phase 4: Cost budget indicator (#77) */}

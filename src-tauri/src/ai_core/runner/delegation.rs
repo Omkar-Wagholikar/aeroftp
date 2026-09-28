@@ -5,10 +5,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +39,38 @@ pub struct DelegationResult {
     pub workers: Vec<WorkerResult>,
     pub usage: Usage,
     pub terminal: Terminal,
+}
+
+/// Event payloads contain only coordinator-minted IDs and lifecycle state.
+/// Model text, paths, credentials and native continuation state stay private.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationEvent {
+    pub run_id: String,
+    pub child_id: Option<String>,
+    pub sequence: u64,
+    pub status: String,
+}
+
+pub type DelegationEventSink = Arc<dyn Fn(DelegationEvent) + Send + Sync>;
+
+struct EventRecorder {
+    run_id: String,
+    next: AtomicU64,
+    sink: Option<DelegationEventSink>,
+}
+
+impl EventRecorder {
+    fn emit(&self, child_id: Option<&str>, status: &str) {
+        if let Some(sink) = &self.sink {
+            sink(DelegationEvent {
+                run_id: self.run_id.clone(),
+                child_id: child_id.map(str::to_owned),
+                sequence: self.next.fetch_add(1, Ordering::Relaxed),
+                status: status.into(),
+            });
+        }
+    }
 }
 
 fn message(role: &str, content: String) -> ChatMessage {
@@ -138,6 +172,7 @@ struct ParentAdapter {
     child_transport: Arc<dyn WorkerTransport>,
     deadline: Instant,
     results: Mutex<Vec<WorkerResult>>,
+    events: Arc<EventRecorder>,
 }
 
 impl ParentAdapter {
@@ -223,12 +258,26 @@ impl RunnerAdapter for ParentAdapter {
         let results = match call.name.as_str() {
             "delegate_local_read" => {
                 let child = self.prepare_local(&call.arguments)?;
-                vec![self
+                let child_id = child.child_id().to_owned();
+                self.events.emit(Some(&child_id), "queued");
+                let task = self
                     .coordinator
                     .clone()
-                    .spawn_local_worker(child, self.child_transport.clone())
-                    .await
-                    .map_err(|_| "Delegated worker task interrupted")??]
+                    .spawn_local_worker(child, self.child_transport.clone());
+                self.events.emit(Some(&child_id), "running");
+                let joined = task.await;
+                self.events.emit(
+                    Some(&child_id),
+                    if cancel.is_cancelled() {
+                        "cancelled"
+                    } else if joined.as_ref().is_ok_and(Result::is_ok) {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                );
+                let result = joined.map_err(|_| "Delegated worker task interrupted")?;
+                vec![result?]
             }
             "delegate_local_reads" => {
                 let fields = call
@@ -246,13 +295,18 @@ impl RunnerAdapter for ParentAdapter {
                     return Err("Delegation batch requires exactly two tasks".into());
                 }
                 let first = self.prepare_local(&tasks[0])?;
+                let first_id = first.child_id().to_owned();
+                self.events.emit(Some(&first_id), "queued");
                 let second = match self.prepare_local(&tasks[1]) {
                     Ok(child) => child,
                     Err(error) => {
                         self.coordinator.finish_child(&first)?;
+                        self.events.emit(Some(&first_id), "cancelled");
                         return Err(error);
                     }
                 };
+                let second_id = second.child_id().to_owned();
+                self.events.emit(Some(&second_id), "queued");
                 let left = self
                     .coordinator
                     .clone()
@@ -261,8 +315,22 @@ impl RunnerAdapter for ParentAdapter {
                     .coordinator
                     .clone()
                     .spawn_local_worker(second, self.child_transport.clone());
+                self.events.emit(Some(&first_id), "running");
+                self.events.emit(Some(&second_id), "running");
                 // Join both even when one fails: no child slot or in-flight I/O is abandoned.
                 let (left, right) = tokio::join!(left, right);
+                for (id, joined) in [(&first_id, &left), (&second_id, &right)] {
+                    self.events.emit(
+                        Some(id),
+                        if cancel.is_cancelled() {
+                            "cancelled"
+                        } else if joined.as_ref().is_ok_and(|result| result.is_ok()) {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                    );
+                }
                 let left = left.map_err(|_| "Delegated worker task interrupted")?;
                 let right = right.map_err(|_| "Delegated worker task interrupted")?;
                 vec![left?, right?]
@@ -292,6 +360,21 @@ pub async fn run_local_delegation(
     child_transport: Arc<dyn WorkerTransport>,
     cancel: CancellationToken,
 ) -> Result<DelegationResult, String> {
+    run_local_delegation_with_events(request, source, transport, child_transport, cancel, None)
+        .await
+}
+
+pub async fn run_local_delegation_with_events(
+    request: DelegationRequest,
+    source: Arc<dyn WorkerCredentialSource>,
+    transport: Arc<dyn WorkerTransport>,
+    child_transport: Arc<dyn WorkerTransport>,
+    cancel: CancellationToken,
+    event_sink: Option<DelegationEventSink>,
+) -> Result<DelegationResult, String> {
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
     if request.goal.is_empty() || request.goal.len() > MAX_GOAL_BYTES {
         return Err("Delegation goal exceeds its cap".into());
     }
@@ -299,6 +382,11 @@ pub async fn run_local_delegation(
     let pin = source.model_pin(&request.provider_id)?;
     let limits = limits();
     let ledger = Ledger::new(limits);
+    let events = Arc::new(EventRecorder {
+        run_id: ledger.run_id().into(),
+        next: AtomicU64::new(1),
+        sink: event_sink,
+    });
     let coordinator = Arc::new(WorkerCoordinator::new(
         ledger.clone(),
         source.clone(),
@@ -320,8 +408,10 @@ pub async fn run_local_delegation(
         child_transport,
         deadline: limits.deadline,
         results: Mutex::new(Vec::new()),
+        events: events.clone(),
     };
     let mut history = Vec::new();
+    events.emit(None, "running");
     let answer = run_with_ledger(
         &adapter,
         &template,
@@ -337,6 +427,7 @@ pub async fn run_local_delegation(
     .await;
     match ledger.snapshot()?.4 {
         JoinState::Pending { child_ids } if !child_ids.is_empty() => {
+            events.emit(None, "failed");
             return Err(format!(
                 "Delegated workers still active: {}",
                 child_ids.len()
@@ -349,6 +440,15 @@ pub async fn run_local_delegation(
     } else {
         Terminal::Failed
     })?;
+    events.emit(
+        None,
+        match terminal {
+            Terminal::Completed => "completed",
+            Terminal::Cancelled => "cancelled",
+            Terminal::BudgetExhausted => "budget_exhausted",
+            Terminal::Failed => "failed",
+        },
+    );
     let usage = ledger.snapshot()?.0;
     let answer = answer?;
     if terminal != Terminal::Completed {
