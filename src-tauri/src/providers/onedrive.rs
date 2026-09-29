@@ -1672,7 +1672,88 @@ impl StorageProvider for OneDriveProvider {
     }
 
     async fn rmdir(&mut self, path: &str) -> Result<(), ProviderError> {
-        self.delete(path).await
+        // Round 2 of the 4.2.1 review: Graph's DELETE sends a folder to the
+        // recycle bin with everything in it. The folder is read first
+        // (`folder.childCount`, its cTag and eTag): one that holds anything
+        // is refused, and the DELETE carries `If-Match` with the tag read
+        // ([`rmdir_condition`]). The cTag changes with the folder's content,
+        // so a child added in between is refused with 412 instead of taken.
+        // OneDrive for Business returns no cTag on folders: there the eTag is
+        // the condition, which a new child may leave unchanged, so the
+        // `childCount` read is the check and one round trip is the window, as
+        // on the backends that check with a listing.
+        let full_path = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", self.current_path.trim_end_matches('/'), path)
+        };
+        let item_id = self.resolve_path(&full_path).await?;
+        let url = format!("{}?$select=id,eTag,cTag,folder", self.api_item(&item_id));
+        let response = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, self.auth_header().await?)
+            .send()
+            .await
+            .map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
+        if response.status().as_u16() == 404 {
+            return Err(ProviderError::NotFound(path.to_string()));
+        }
+        if !response.status().is_success() {
+            return Err(ProviderError::Other(format!(
+                "Reading the folder failed: {}",
+                response.status()
+            )));
+        }
+        let item: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| ProviderError::ParseError(e.to_string()))?;
+        let Some(folder) = item.get("folder") else {
+            return Err(ProviderError::InvalidPath(format!(
+                "{path} is not a folder"
+            )));
+        };
+        match folder.get("childCount").and_then(|c| c.as_u64()) {
+            Some(0) => {}
+            Some(count) => return Err(super::directory_not_empty(path, count as usize)),
+            // A folder facet without a count: the listing decides.
+            None => self.refuse_non_empty_dir(path).await?,
+        }
+        // The DELETE is sent only on the condition of the eTag read: without
+        // one, Graph would take a child added after the read along with the
+        // folder (CodeRabbit on #979).
+        let Some(etag) = rmdir_condition(&item) else {
+            return Err(ProviderError::Other(format!(
+                "{path} was not removed: Graph gave no eTag to delete it on condition"
+            )));
+        };
+        let response = self
+            .client
+            .delete(self.api_item(&item_id))
+            .header(AUTHORIZATION, self.auth_header().await?)
+            .header(reqwest::header::IF_MATCH, etag)
+            .send()
+            .await
+            .map_err(|e| ProviderError::ConnectionFailed(e.to_string()))?;
+        match response.status().as_u16() {
+            412 => {
+                return Err(ProviderError::DirectoryNotEmpty(format!(
+                    "{path} changed between the check and the delete; it stays"
+                )))
+            }
+            404 => {}
+            status if !response.status().is_success() => {
+                return Err(ProviderError::Other(format!("Delete failed: {status}")))
+            }
+            _ => {}
+        }
+        super::forget_cached_subtree_ignoring_case(
+            &mut self.path_cache,
+            full_path.trim_matches('/'),
+        );
+        info!("Removed empty folder: {}", path);
+        Ok(())
     }
 
     async fn rmdir_recursive(&mut self, path: &str) -> Result<(), ProviderError> {
@@ -2703,6 +2784,18 @@ fn copy_destination(current_path: &str, to: &str) -> (String, String) {
     (parent_of_absolute(&absolute), name)
 }
 
+/// The tag an `rmdir` DELETE is sent on (`If-Match`): the folder's cTag,
+/// which Graph changes with its content, or, where Graph gives none (folders
+/// on OneDrive for Business), its eTag. None when the read carried neither:
+/// no condition, no DELETE.
+fn rmdir_condition(item: &serde_json::Value) -> Option<&str> {
+    ["cTag", "eTag"].iter().find_map(|key| {
+        item.get(*key)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+    })
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3129,6 +3222,11 @@ mod tests {
                 let method = request.method().clone();
                 let path = request.uri().path().to_string();
                 seen.lock().unwrap().push(format!("{method} {path}"));
+                // Read the whole request before answering: a reply sent
+                // while an upload body is still arriving closes the
+                // connection under it, and on Windows the client then fails
+                // with "error sending request" instead of reading the reply.
+                let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await;
                 let (status, body) = answer(&method, &path);
                 let body: serde_json::Value =
                     serde_json::from_str(&body.to_string().replace("{base}", &base)).unwrap();
@@ -3145,6 +3243,123 @@ mod tests {
         p.api_origin_override = Some(format!("http://{addr}"));
         p.test_access_token = Some("fixture".into());
         (p, requests, server)
+    }
+
+    /// Round 2 of the 4.2.1 review: `rmdir` was `delete`, and Graph's DELETE
+    /// sends a folder to the recycle bin with everything in it. The folder is
+    /// read first: `folder.childCount` above zero refuses it, with no DELETE
+    /// sent; an empty one is deleted.
+    #[tokio::test]
+    async fn rmdir_reads_the_folder_and_refuses_one_that_holds_anything() {
+        fn full(
+            method: &axum::http::Method,
+            path: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            graph_folder_answer(method, path, 2)
+        }
+        fn empty(
+            method: &axum::http::Method,
+            path: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            graph_folder_answer(method, path, 0)
+        }
+        let (mut p, requests, server) = graph_fixture(full).await;
+        let refused = p.rmdir("/d").await;
+        assert!(
+            matches!(refused, Err(ProviderError::DirectoryNotEmpty(_))),
+            "{refused:?}"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("DELETE ")),
+            "{:?}",
+            requests.lock().unwrap()
+        );
+        server.abort();
+
+        let (mut p, requests, server) = graph_fixture(empty).await;
+        p.rmdir("/d").await.expect("an empty folder goes");
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "DELETE /v1.0/me/drive/items/D"),
+            "{:?}",
+            requests.lock().unwrap()
+        );
+        server.abort();
+    }
+
+    /// CodeRabbit on #979: an empty folder whose read carried no eTag was
+    /// deleted without `If-Match`, so a child added after the read went with
+    /// it. No eTag, no DELETE.
+    #[tokio::test]
+    async fn rmdir_sends_no_delete_without_an_etag() {
+        fn no_etag(
+            method: &axum::http::Method,
+            path: &str,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            let (status, mut body) = graph_folder_answer(method, path, 0);
+            if let Some(map) = body.as_object_mut() {
+                map.remove("eTag");
+            }
+            (status, body)
+        }
+        let (mut p, requests, server) = graph_fixture(no_etag).await;
+        assert!(p.rmdir("/d").await.is_err());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("DELETE ")),
+            "{:?}",
+            requests.lock().unwrap()
+        );
+        server.abort();
+    }
+
+    /// CodeRabbit on #979: a folder's eTag need not change when a child is
+    /// added, its cTag does. The DELETE is conditioned on the cTag when Graph
+    /// gives one, on the eTag only where it gives none.
+    #[test]
+    fn rmdir_conditions_the_delete_on_the_ctag_first() {
+        let both = serde_json::json!({ "eTag": "\"e\"", "cTag": "\"c\"" });
+        assert_eq!(rmdir_condition(&both), Some("\"c\""));
+        let business = serde_json::json!({ "eTag": "\"e\"" });
+        assert_eq!(rmdir_condition(&business), Some("\"e\""));
+        let neither = serde_json::json!({ "eTag": "" });
+        assert_eq!(rmdir_condition(&neither), None);
+    }
+
+    /// Graph for a folder `d` (id `D`) with `children` children.
+    fn graph_folder_answer(
+        method: &axum::http::Method,
+        path: &str,
+        children: u64,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use axum::http::StatusCode;
+        match (method.as_str(), path) {
+            ("GET", "/v1.0/me/drive/root:/d") | ("GET", "/v1.0/me/drive/items/D") => (
+                StatusCode::OK,
+                serde_json::json!({
+                    "id": "D", "name": "d", "eTag": "\"etag-1\"",
+                    "folder": { "childCount": children },
+                    "parentReference": { "path": "/drive/root:" },
+                }),
+            ),
+            ("DELETE", "/v1.0/me/drive/items/D") => {
+                (StatusCode::NO_CONTENT, serde_json::Value::Null)
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"error":{"code":"itemNotFound"}}),
+            ),
+        }
     }
 
     // Pre-existing, found by the #960 review: delete dropped only the exact
