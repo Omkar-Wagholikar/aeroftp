@@ -438,8 +438,9 @@ impl RunnerAdapter for ParentAdapter {
                 if tasks.len() != 2 {
                     return Err("Remote delegation batch requires exactly two tasks".into());
                 }
-                let profile = |value: &Value| value.get("profile_id").and_then(Value::as_str);
-                if profile(&tasks[0]).is_none() || profile(&tasks[0]) == profile(&tasks[1]) {
+                let first_profile = tasks[0].get("profile_id").and_then(Value::as_str);
+                let second_profile = tasks[1].get("profile_id").and_then(Value::as_str);
+                if first_profile.is_none() || first_profile == second_profile {
                     return Err("Remote delegation requires two distinct exact profiles".into());
                 }
                 let first = self.prepare_remote(&tasks[0])?;
