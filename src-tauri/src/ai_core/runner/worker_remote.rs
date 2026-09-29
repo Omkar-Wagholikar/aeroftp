@@ -89,11 +89,14 @@ fn provider_from_snapshot(
     let mut provider = created.map_err(|_| "Worker S3 provider creation failed")?;
     // The normal S3 connect probe parses an unbounded error body on 403.
     // Worker reads perform their own bounded requests, so skip that probe.
-    provider
+    let s3 = provider
         .as_any_mut()
         .downcast_mut::<crate::providers::S3Provider>()
-        .ok_or("Worker provider is not S3")?
-        .set_no_check_bucket(true);
+        .ok_or("Worker provider is not S3")?;
+    if s3.worker_endpoint_may_reconcile_bridge() {
+        return Err("Worker S3 endpoint can change after its grant is pinned".into());
+    }
+    s3.set_no_check_bucket(true);
     Ok(provider)
 }
 
@@ -323,5 +326,19 @@ mod tests {
         assert_eq!(b["content"], "bravo");
         assert!(!a.to_string().contains("secret-a"));
         assert!(!b.to_string().contains("secret-b"));
+    }
+
+    #[test]
+    fn reconcilable_bridge_endpoints_are_rejected_before_connect() {
+        for endpoint in [
+            "https://[::1]:1800",
+            "https://localhost:1800",
+            "http://127.0.0.1:1800",
+        ] {
+            assert!(
+                provider_from_snapshot(snapshot("custom-s3", endpoint.into(), "secret")).is_err(),
+                "{endpoint}"
+            );
+        }
     }
 }

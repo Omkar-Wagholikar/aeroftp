@@ -3,6 +3,13 @@ use crate::ai_core::runner::ledger::{Limits, Terminal};
 use std::time::Duration;
 
 #[test]
+fn ollama_uses_foreground_sentinel_without_a_saved_api_key() {
+    let key = model_auth_key("ollama", || panic!("Ollama must not load an API key")).unwrap();
+    assert_eq!(key.as_str(), "ollama");
+    assert!(model_auth_key("custom", || Err("Credential unavailable".into())).is_err());
+}
+
+#[test]
 fn revisions_are_stable_within_a_run_but_not_offline_password_hashes() {
     use sha2::Digest;
 

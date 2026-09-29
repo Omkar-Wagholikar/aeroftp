@@ -415,6 +415,7 @@
             "workerFailed": "Failed",
             "workerQueued": "Queued",
             "workerRunning": "Running",
+            "workerStopping": "Stopping...",
             "marketplace": {
                 "add": "Add",
                 "added": "Added",

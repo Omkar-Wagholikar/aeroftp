@@ -2977,7 +2977,8 @@
             "workerQueued": "[NEEDS TRANSLATION] Queued",
             "workerRunning": "[NEEDS TRANSLATION] Running",
             "delegateRemoteProfiles": "[NEEDS TRANSLATION] Optional saved S3 profiles (up to two), each limited to the shown root:",
-            "delegateRemoteEmpty": "[NEEDS TRANSLATION] No eligible saved S3 profiles are available."
+            "delegateRemoteEmpty": "[NEEDS TRANSLATION] No eligible saved S3 profiles are available.",
+            "workerStopping": "[NEEDS TRANSLATION] Stopping..."
         },
         "archive": {
             "passwordRequired": "Mae'r archif hwn wedi'i ddiogelu â chyfrinair",

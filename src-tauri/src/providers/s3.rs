@@ -890,6 +890,21 @@ impl S3Provider {
         self.no_check_bucket = enabled;
     }
 
+    /// Workers pin one exact saved endpoint. A local bridge can rewrite its
+    /// scheme and even replace IPv6 loopback with IPv4 during `connect()`, so
+    /// it cannot be used behind that immutable worker grant.
+    pub(crate) fn worker_endpoint_may_reconcile_bridge(&self) -> bool {
+        let Ok(url) = url::Url::parse(&self.endpoint()) else {
+            return true;
+        };
+        let Some(host) = url.host_str() else {
+            return true;
+        };
+        url.port().is_some_and(|port| {
+            crate::local_bridge::is_local_bridge_authority(host.trim_matches(['[', ']']), port)
+        })
+    }
+
     /// KE-B1.3: Suppress payload SHA-256 hashing in signed requests by
     /// using the SigV4 `UNSIGNED-PAYLOAD` placeholder. Big win on CPU when
     /// uploading multipart parts (~500 MiB+ each). Matches rclone's

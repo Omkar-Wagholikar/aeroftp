@@ -422,6 +422,64 @@ async fn two_children_run_concurrently_and_return_distinct_results() {
 }
 
 #[tokio::test]
+async fn two_sequential_batches_publish_all_four_worker_results() {
+    let root = tempfile::tempdir().unwrap();
+    let batch = |id: &str, first: &str, second: &str| {
+        response(
+            "",
+            Some((
+                id,
+                "delegate_local_reads",
+                json!({"tasks":[
+                    {"root_id":"workspace","goal":first},
+                    {"root_id":"workspace","goal":second}
+                ]}),
+            )),
+        )
+    };
+    let parent = Arc::new(Script {
+        replies: Mutex::new(VecDeque::from([
+            batch("batch-one", "first-a", "second-a"),
+            batch("batch-two", "first-b", "second-b"),
+            response("Four checks complete.", None),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let children = Arc::new(ConcurrentChildren {
+        barrier: tokio::sync::Barrier::new(2),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_local_delegation(
+            DelegationRequest {
+                provider_id: "provider-1".into(),
+                model_name: "fixture-model".into(),
+                root: root.path().into(),
+                goal: "Run four bounded checks in two batches".into(),
+                remote_profiles: vec![],
+            },
+            source(),
+            parent,
+            children.clone(),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("both batches should finish")
+    .unwrap();
+    assert_eq!(children.peak.load(Ordering::SeqCst), 2);
+    assert_eq!(result.workers.len(), 4);
+    for goal in ["first-a", "second-a", "first-b", "second-b"] {
+        assert!(result
+            .workers
+            .iter()
+            .any(|worker| worker.summary == format!("Summary for {goal}")));
+    }
+}
+
+#[tokio::test]
 async fn two_remote_profiles_keep_distinct_child_identities_and_one_budget() {
     let root = tempfile::tempdir().unwrap();
     let parent = Arc::new(Script {

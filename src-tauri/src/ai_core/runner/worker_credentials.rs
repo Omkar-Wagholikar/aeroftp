@@ -144,6 +144,20 @@ fn active_secret(
         .ok_or_else(|| "Credential unavailable".into())
 }
 
+fn model_auth_key(
+    provider_type: &str,
+    load_secret: impl FnOnce() -> Result<Zeroizing<String>, String>,
+) -> Result<Zeroizing<String>, String> {
+    // The foreground Ollama adapter uses this non-secret sentinel and has no
+    // API-key field. Still require the enabled provider record and unlocked
+    // vault before reaching this helper.
+    if provider_type == "ollama" {
+        Ok(Zeroizing::new("ollama".into()))
+    } else {
+        load_secret()
+    }
+}
+
 fn snapshot_from_record(
     profile_id: &str,
     profile: &Value,
@@ -234,7 +248,9 @@ impl WorkerCredentialSource for VaultWorkerCredentialSource {
         if endpoint.is_empty() {
             return Err("AI provider endpoint missing".into());
         }
-        let secret = active_secret(&store, &format!("ai_apikey_{provider_id}"))?;
+        let secret = model_auth_key(provider_type, || {
+            active_secret(&store, &format!("ai_apikey_{provider_id}"))
+        })?;
         let encoded = serde_json::to_vec(&record).map_err(|_| "Invalid AI provider record")?;
         Ok(ModelPin {
             provider_id: provider_id.into(),
@@ -246,8 +262,14 @@ impl WorkerCredentialSource for VaultWorkerCredentialSource {
 
     fn model_key(&self, provider_id: &str) -> Result<Zeroizing<String>, String> {
         let store = vault()?;
-        model_record(&store, provider_id)?;
-        active_secret(&store, &format!("ai_apikey_{provider_id}"))
+        let record = model_record(&store, provider_id)?;
+        let provider_type = record
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or("AI provider type missing")?;
+        model_auth_key(provider_type, || {
+            active_secret(&store, &format!("ai_apikey_{provider_id}"))
+        })
     }
 
     fn server_pin(&self, profile_id: &str) -> Result<ServerPin, String> {

@@ -130,7 +130,7 @@ type DelegationView = {
     requestId: string;
     root: string;
     remoteProfiles: DelegatedRemoteProfile[];
-    status: 'running' | 'completed' | 'failed' | 'cancelled';
+    status: 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
     events: DelegationEvent[];
     workers: DelegationWorker[];
 };
@@ -767,9 +767,10 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         if (activeDelegationIdRef.current) {
             const requestId = activeDelegationIdRef.current;
             activeDelegationIdRef.current = null;
+            cancelRequestedDelegationIdRef.current = null;
             invoke('ai_cancel_delegation', { requestId }).catch(() => {});
             setDelegationView(previous => previous?.requestId === requestId
-                ? { ...previous, status: 'cancelled' } : previous);
+                ? null : previous);
         }
         if (activeStreamIdRef.current) {
             invoke('ai_cancel_stream', { streamId: activeStreamIdRef.current }).catch(() => {});
@@ -787,6 +788,26 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         multiStepContextRef.current = null;
         streamingMsgIdRef.current = null;
     }, []);
+
+    // Stop is a request until the backend has joined all workers. Keep the
+    // active identity and event subscription until that terminal response.
+    const requestStopGeneration = useCallback(() => {
+        const requestId = activeDelegationIdRef.current;
+        if (!requestId) {
+            cancelActiveStream();
+            return;
+        }
+        if (cancelRequestedDelegationIdRef.current === requestId) return;
+        cancelRequestedDelegationIdRef.current = requestId;
+        setDelegationView(previous => previous?.requestId === requestId
+            ? { ...previous, status: 'cancelling' } : previous);
+        invoke('ai_cancel_delegation', { requestId }).catch(() => {
+            if (cancelRequestedDelegationIdRef.current !== requestId) return;
+            cancelRequestedDelegationIdRef.current = null;
+            setDelegationView(previous => previous?.requestId === requestId
+                ? { ...previous, status: 'running' } : previous);
+        });
+    }, [cancelActiveStream]);
 
     // Wrap startNewChat to also clear pending tool calls, token budget, and cost
     const startNewChat = useCallback(() => {
@@ -889,11 +910,12 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     const streamingMsgIdRef = useRef<string | null>(null);
     const activeStreamIdRef = useRef<string | null>(null);
     const activeDelegationIdRef = useRef<string | null>(null);
+    const cancelRequestedDelegationIdRef = useRef<string | null>(null);
     const streamUnlistenRef = useRef<(() => void) | null>(null);
     useTauriListener<{ requestId: string; event: DelegationEvent }>('ai-delegation-event', ({ payload }) => {
         if (!payload?.event || typeof payload.event.sequence !== 'number') return;
         setDelegationView(previous => {
-            if (!previous || previous.requestId !== payload.requestId || previous.status !== 'running') return previous;
+            if (!previous || previous.requestId !== payload.requestId || !['running', 'cancelling'].includes(previous.status)) return previous;
             if (previous.events.some(event => event.sequence === payload.event.sequence)) return previous;
             return {
                 ...previous,
@@ -2200,6 +2222,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
     const delegationStatusLabel = (status: DelegationEvent['status'] | DelegationView['status']) => {
         switch (status) {
+            case 'cancelling': return t('ai.workerStopping');
             case 'queued': return t('ai.workerQueued');
             case 'running': return t('ai.workerRunning');
             case 'completed': return t('ai.workerCompleted');
@@ -2217,6 +2240,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             .filter((profile): profile is DelegatedRemoteProfile => Boolean(profile));
         const requestId = crypto.randomUUID();
         activeDelegationIdRef.current = requestId;
+        cancelRequestedDelegationIdRef.current = null;
         setDelegationView({ requestId, root: localPath, remoteProfiles, status: 'running', events: [], workers: [] });
         setMessages(previous => [...previous, {
             id: crypto.randomUUID(), role: 'user', content: goal, timestamp: new Date(),
@@ -2241,8 +2265,13 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                 remoteProfiles: remoteProfiles.map(profile => ({ profileId: profile.id, root: profile.root })),
             });
             if (activeDelegationIdRef.current !== requestId) return;
+            if (cancelRequestedDelegationIdRef.current === requestId) {
+                setDelegationView(previous => previous?.requestId === requestId
+                    ? { ...previous, status: 'cancelled' } : previous);
+                return;
+            }
             setDelegationView(previous => previous?.requestId === requestId
-                ? { ...previous, status: 'completed', workers: result.workers.slice(0, 2) } : previous);
+                ? { ...previous, status: 'completed', workers: result.workers } : previous);
             setMessages(previous => [...previous, {
                 id: crypto.randomUUID(), role: 'assistant', content: result.answer, timestamp: new Date(),
                 modelInfo: {
@@ -2258,6 +2287,11 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             }]);
         } catch (error) {
             if (activeDelegationIdRef.current !== requestId) return;
+            if (cancelRequestedDelegationIdRef.current === requestId) {
+                setDelegationView(previous => previous?.requestId === requestId
+                    ? { ...previous, status: 'cancelled' } : previous);
+                return;
+            }
             setDelegationView(previous => previous?.requestId === requestId
                 ? { ...previous, status: 'failed' } : previous);
             setMessages(previous => [...previous, {
@@ -2268,6 +2302,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         } finally {
             if (activeDelegationIdRef.current === requestId) {
                 activeDelegationIdRef.current = null;
+                cancelRequestedDelegationIdRef.current = null;
                 setIsLoading(false);
                 dispatchAIStatus('idle');
             }
@@ -3287,7 +3322,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                             <span>Step {autoStepCount}</span>
                                             <span className="mx-1">-</span>
                                             <button
-                                                onClick={() => { cancelActiveStream(); setIsLoading(false); }}
+                                                onClick={requestStopGeneration}
+                                                disabled={delegationView?.status === 'cancelling'}
                                                 className="text-red-400 hover:text-red-300 text-xs underline"
                                             >
                                                 {t('ai.stopGeneration')}
@@ -3305,7 +3341,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                     {/* Stop button: visible during any streaming or loading */}
                                     {!isAutoExecuting && (
                                         <button
-                                            onClick={() => { cancelActiveStream(); setIsLoading(false); }}
+                                            onClick={requestStopGeneration}
+                                            disabled={delegationView?.status === 'cancelling'}
                                             className="ml-1 p-1 rounded hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
                                             title={t('ai.stopGeneration')}
                                         >
@@ -3515,8 +3552,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                             {isTranscribingAudio ? <RefreshCw size={16} className="animate-spin" /> : isListening ? <MicOff size={16} /> : <Mic size={16} />}
                         </button>
                         <button
-                            onClick={isLoading ? cancelActiveStream : delegateLocal ? handleDelegateSend : handleSend}
-                            disabled={!isLoading && ((!input.trim() && attachedImages.length === 0) || (delegateLocal && (!localPath || attachedImages.length > 0)))}
+                            onClick={isLoading ? requestStopGeneration : delegateLocal ? handleDelegateSend : handleSend}
+                            disabled={(isLoading && delegationView?.status === 'cancelling') || (!isLoading && ((!input.trim() && attachedImages.length === 0) || (delegateLocal && (!localPath || attachedImages.length > 0))))}
                             title={isLoading ? t('ai.stopGeneration') : undefined}
                             aria-label={isLoading ? t('ai.stopGeneration') : undefined}
                             className={`p-1.5 rounded transition-colors ${isLoading
