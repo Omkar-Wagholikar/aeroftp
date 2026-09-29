@@ -7,7 +7,23 @@ import type { ToolMacro } from './aiChatToolMacros';
 
 type Source = { kind: 'builtin' | 'discovery' }
     | { kind: 'plugin'; ownerId: string; toolName: string; version: string }
-    | { kind: 'macro'; ownerId: string; macro: ToolMacro };
+    | { kind: 'macro'; ownerId: string; macro: ToolMacro }
+    | { kind: 'mcp'; ownerId: string; toolName: string };
+/** Untrusted discovery data. Process configuration and credentials belong in the backend. */
+export interface McpToolSnapshot {
+    name: string;
+    description?: string;
+    inputSchema: unknown;
+    enabled: boolean;
+    /** Server claims cannot lower the local approval floor. */
+    dangerLevel?: 'safe' | 'medium' | 'high';
+}
+export interface McpServerSnapshot {
+    id: string;
+    revision: string;
+    enabled: boolean;
+    tools: McpToolSnapshot[];
+}
 export interface RegisteredTool {
     identity: string;
     revision: string;
@@ -45,13 +61,70 @@ function uniqueOwners<T extends { id: string }>(values: T[]): T[] {
     return values.filter(v => v.id && values.filter(other => other.id === v.id).length === 1);
 }
 
+const MCP_MAX_SERVERS = 32;
+const MCP_MAX_TOOLS = 64;
+const MCP_MAX_SCHEMA_BYTES = 8192;
+const MCP_MAX_PARAMETERS = 16;
+const MCP_MAX_DEPTH = 3;
+const MCP_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+const MCP_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.\/-]{0,127}$/;
+const PARAM_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+const object = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+const keysOnly = (value: Record<string, unknown>, allowed: string[]) => Object.keys(value).every(key => allowed.includes(key));
+const shortText = (value: unknown, max: number): value is string => typeof value === 'string'
+    && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+
+/** The current AITool contract supports flat primitive parameters and string arrays only.
+ *  Reject other JSON Schema features instead of silently weakening validation. */
+function mcpParameters(input: unknown): AITool['parameters'] | undefined {
+    if (!object(input)) return undefined;
+    let nodes = 0;
+    const withinDepth = (value: unknown, depth: number): boolean => {
+        if (depth > MCP_MAX_DEPTH || ++nodes > 128) return false;
+        if (Array.isArray(value)) return value.every(item => withinDepth(item, depth + 1));
+        if (object(value)) return Object.entries(value).every(([key, item]) => key.length <= 128 && withinDepth(item, depth + 1));
+        return value === null || typeof value === 'string' && value.length <= MCP_MAX_SCHEMA_BYTES
+            || typeof value === 'number' && Number.isFinite(value) || typeof value === 'boolean';
+    };
+    if (!withinDepth(input, 0)) return undefined;
+    let json: string;
+    try { json = JSON.stringify(input); } catch { return undefined; }
+    if (!json || new TextEncoder().encode(json).length > MCP_MAX_SCHEMA_BYTES
+        || !keysOnly(input, ['type', 'properties', 'required', 'additionalProperties', 'description'])
+        || input.type !== 'object' || !object(input.properties)
+        || input.additionalProperties !== false && input.additionalProperties !== undefined
+        || input.description !== undefined && !shortText(input.description, 512)) return undefined;
+    const names = Object.keys(input.properties);
+    if (names.length > MCP_MAX_PARAMETERS || !names.every(name => PARAM_NAME.test(name))) return undefined;
+    if (!Array.isArray(input.required) && input.required !== undefined) return undefined;
+    const required = (input.required ?? []) as unknown[];
+    if (required.some(name => typeof name !== 'string' || !names.includes(name)) || new Set(required).size !== required.length) return undefined;
+    const parameters: AITool['parameters'] = [];
+    for (const name of names) {
+        const property = input.properties[name];
+        if (!object(property) || !keysOnly(property, ['type', 'description', 'items'])
+            || property.description !== undefined && !shortText(property.description, 512)) return undefined;
+        const type = property.type;
+        if (!['string', 'number', 'boolean', 'array'].includes(type as string)) return undefined;
+        if (type === 'array') {
+            if (!object(property.items) || !keysOnly(property.items, ['type']) || property.items.type !== 'string') return undefined;
+        } else if (property.items !== undefined) return undefined;
+        parameters.push({ name, type: type as AITool['parameters'][number]['type'],
+            description: (property.description as string | undefined) ?? '', required: required.includes(name) });
+    }
+    return parameters;
+}
+
 /** Snapshot only. No credentials, commands or approval grants are exposed to the model. */
-export function buildToolRegistry(plugins: PluginManifest[], macros: ToolMacro[]): ToolRegistry {
+export function buildToolRegistry(plugins: PluginManifest[], macros: ToolMacro[], mcpServers: McpServerSnapshot[] = []): ToolRegistry {
     const entries: RegisteredTool[] = [];
     function add(tool: AITool, source: Source, rawName = tool.name, implementation: unknown = null) {
         const identity = JSON.stringify([source.kind, 'ownerId' in source ? source.ownerId : 'aeroftp', rawName]);
         const revision = JSON.stringify([identity, tool, implementation]);
-        const wireName = source.kind === 'plugin' || source.kind === 'macro'
+        const wireName = source.kind === 'mcp'
+            ? `mcp_${rawName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30)}_${hash(identity)}`
+            : source.kind === 'plugin' || source.kind === 'macro'
             ? `${source.kind}_${rawName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 30)}_${hash(revision)}`
             : rawName;
         // Clone before freezing so React settings and source constants remain editable.
@@ -72,6 +145,22 @@ export function buildToolRegistry(plugins: PluginManifest[], macros: ToolMacro[]
             return !builtin || builtin.dangerLevel === 'high';
         }) ? 'high' : 'medium' },
             { kind: 'macro', ownerId: macro.id, macro }, macro.name, macro);
+    }
+    if (mcpServers.length <= MCP_MAX_SERVERS) for (const server of uniqueOwners(mcpServers.filter(object) as McpServerSnapshot[])) {
+        if (typeof server.id !== 'string' || !MCP_ID.test(server.id) || !shortText(server.revision, 128) || !server.revision
+            || server.enabled !== true || !Array.isArray(server.tools) || server.tools.length > MCP_MAX_TOOLS) continue;
+        const names = server.tools.map(tool => object(tool) ? tool.name : undefined);
+        for (const tool of server.tools) {
+            if (!object(tool) || tool.enabled !== true || typeof tool.name !== 'string' || !MCP_NAME.test(tool.name)
+                || names.filter(name => name === tool.name).length !== 1
+                || !shortText(tool.description ?? '', 512)) continue;
+            const parameters = mcpParameters(tool.inputSchema);
+            if (!parameters) continue;
+            // Server-declared read-only/safe annotations are untrusted. Backend approval is still required.
+            add({ name: tool.name, description: `[MCP: ${server.id}] ${tool.description ?? ''}`,
+                parameters, dangerLevel: 'high' },
+            { kind: 'mcp', ownerId: server.id, toolName: tool.name }, tool.name, server.revision);
+        }
     }
     // Fail closed on duplicate identities or wire collisions, independently of input order.
     return Object.freeze(entries.filter(e => entries.filter(x => x.identity === e.identity).length === 1
