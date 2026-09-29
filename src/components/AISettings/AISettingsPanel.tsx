@@ -17,6 +17,7 @@ import './AISettingsPanel.css';
 import { secureGetWithFallback, secureStoreAndClean } from '../../utils/secureStorage';
 import { ProviderMarketplace } from './ProviderMarketplace';
 import { PluginBrowser } from './PluginBrowser';
+import { McpServersPanel } from './McpServersPanel';
 import { applyDiscoveredModelDefaults, buildSavedModelRecord, getModelCapabilitySource, lookupModelSpec } from '../../types/aiModelRegistry';
 import { CAPABILITY_KEYS, DiscoveredModelInfo, normalizeModelCatalog, providerModelSnapshot, reconcileProviderModels, reconcileProviderNames, resolveProviderModel, withProviderEdit } from '../../types/aiModelDiscovery';
 import { useTranslation } from '../../i18n';
@@ -241,7 +242,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
     const [settingsLoaded, setSettingsLoaded] = useState(false);
     const settingsRef = useRef(settings);
     settingsRef.current = settings;
-    const [activeTab, setActiveTab] = useState<'providers' | 'models' | 'advanced' | 'prompt' | 'plugins' | 'macros'>('providers');
+    const [activeTab, setActiveTab] = useState<'providers' | 'models' | 'advanced' | 'prompt' | 'plugins' | 'macros' | 'mcp'>('providers');
     const [showMarketplace, setShowMarketplace] = useState(false);
     const [showPluginBrowser, setShowPluginBrowser] = useState(false);
     const [plugins, setPlugins] = useState<PluginManifest[]>([]);
@@ -778,7 +779,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
         <div className="fixed inset-0 z-50 flex items-start justify-center pt-4">
             <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
 
-            <div {...modalDrag.panelProps} className="ai-settings-panel relative bg-gray-900 text-gray-100 rounded-lg shadow-2xl w-full max-w-3xl max-h-[95vh] overflow-hidden flex flex-col animate-scale-in">
+            <div {...modalDrag.panelProps} className="ai-settings-panel relative bg-gray-900 text-gray-100 rounded-lg shadow-2xl w-full max-w-5xl max-h-[95vh] overflow-hidden flex flex-col animate-scale-in">
                 {/* Header (drag handle: move the modal like the other draggable modals) */}
                 <div {...modalDrag.dragHandleProps} className="flex items-center justify-between px-6 py-4 border-b border-gray-700 cursor-grab active:cursor-grabbing select-none">
                     <div className="flex items-center gap-3">
@@ -791,7 +792,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                 </div>
 
                 {/* Tabs */}
-                <div className="flex border-b border-gray-700">
+                <div className="flex overflow-x-auto border-b border-gray-700">
                     {[
                         {
                             id: 'providers',
@@ -819,12 +820,17 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                             icon: <Puzzle size={14} />,
                         },
                         {
+                            id: 'mcp',
+                            label: 'MCP',
+                            icon: <Server size={14} />,
+                        },
+                        {
                             id: 'macros',
                             label: t('ai.settings.macros'),
                             icon: <Layers size={14} />,
                         },
                     ].map((tab) => (
-                        <button key={tab.id} onClick={() => setActiveTab(tab.id as typeof activeTab)} className={`flex items-center gap-2 px-6 py-3 text-sm font-medium transition-colors ${activeTab === tab.id ? 'text-purple-400 border-b-2 border-purple-400 bg-gray-800/50' : 'text-gray-400 hover:text-white hover:bg-gray-800/30'}`}>
+                        <button key={tab.id} onClick={() => setActiveTab(tab.id as typeof activeTab)} className={`flex shrink-0 items-center gap-2 px-6 py-3 text-sm font-medium transition-colors ${activeTab === tab.id ? 'text-purple-400 border-b-2 border-purple-400 bg-gray-800/50' : 'text-gray-400 hover:text-white hover:bg-gray-800/30'}`}>
                             {tab.icon}
                             {tab.label}
                         </button>
@@ -1758,6 +1764,8 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                             </div>
                         </div>
                     )}
+
+                    {activeTab === 'mcp' && <McpServersPanel />}
 
                     {activeTab === 'plugins' && (
                         <div className="space-y-4">
