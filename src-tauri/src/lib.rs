@@ -59,6 +59,7 @@ pub mod app_events;
 mod archive_browse;
 #[cfg(target_os = "linux")]
 mod localhost_security;
+pub mod mcp_client_config;
 mod openai_responses;
 #[cfg(target_os = "linux")]
 mod ui_server;
