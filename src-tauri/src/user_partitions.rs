@@ -5107,6 +5107,9 @@ pub async fn user_partitions_get_user_credential(
     app: AppHandle,
     credential_id: String,
 ) -> Result<Option<String>, String> {
+    if credential_id.starts_with("mcp_env_") {
+        return Err("MCP_CREDENTIAL_PRIVATE".to_string());
+    }
     init_or_migrate(&app)?;
     let store = CredentialStore::from_cache().ok_or_else(|| "STORE_NOT_READY".to_string())?;
     let mut root_key = store.derive_user_partition_wrapping_key();
@@ -5124,6 +5127,10 @@ pub async fn user_partitions_set_user_credential(
     credential_type: String,
     mut secret: String,
 ) -> Result<(), String> {
+    if credential_id.starts_with("mcp_env_") {
+        secret.zeroize();
+        return Err("MCP_CREDENTIAL_PRIVATE".to_string());
+    }
     init_or_migrate(&app)?;
     let store = CredentialStore::from_cache().ok_or_else(|| "STORE_NOT_READY".to_string())?;
     let mut root_key = store.derive_user_partition_wrapping_key();
@@ -5141,6 +5148,9 @@ pub async fn user_partitions_delete_user_credential(
     app: AppHandle,
     credential_id: String,
 ) -> Result<(), String> {
+    if credential_id.starts_with("mcp_env_") {
+        return Err("MCP_CREDENTIAL_PRIVATE".to_string());
+    }
     init_or_migrate(&app)?;
     let conn = open_or_init(&app)?;
     delete_active_user_credential(&conn, &credential_id)

@@ -59,6 +59,7 @@ pub mod app_events;
 mod archive_browse;
 #[cfg(target_os = "linux")]
 mod localhost_security;
+mod mcp_client_commands;
 pub mod mcp_client_config;
 mod openai_responses;
 #[cfg(target_os = "linux")]
@@ -19916,6 +19917,10 @@ pub fn run() {
             user_partitions::user_partitions_get_user_credential,
             user_partitions::user_partitions_set_user_credential,
             user_partitions::user_partitions_delete_user_credential,
+            mcp_client_commands::mcp_client_list_servers,
+            mcp_client_commands::mcp_client_upsert_server,
+            mcp_client_commands::mcp_client_remove_server,
+            mcp_client_commands::mcp_client_set_secret,
             user_partitions::user_partitions_find_cross_user_dedup,
             // AeroShare P1 (task 4/5): the peer handshake + inventory surface
             peer_commands::peer_identity_get,
