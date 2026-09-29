@@ -21,13 +21,98 @@ use crate::ai_core::EventSink;
 static ACTIVE_STREAMS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// Async transport may be dropped before returning (runner cancellation/abort).
+// Keep registry cleanup synchronous and tied to the future's lifetime.
+struct StreamRegistration<'a> {
+    id: &'a str,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for StreamRegistration<'_> {
+    fn drop(&mut self) {
+        let mut streams = ACTIVE_STREAMS.lock().unwrap_or_else(|e| e.into_inner());
+        if streams
+            .get(self.id)
+            .is_some_and(|flag| Arc::ptr_eq(flag, &self.cancel))
+        {
+            streams.remove(self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_registration_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct Sink;
+    impl EventSink for Sink {
+        fn emit_stream_chunk(&self, _: &str, _: &StreamChunk) {}
+        fn emit_tool_progress(&self, _: &crate::ai_core::ToolProgress) {}
+        fn emit_app_control(&self, _: &str, _: &serde_json::Value) {}
+    }
+
+    #[tokio::test]
+    async fn dropping_transport_while_waiting_for_headers_removes_registration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request: AIRequest = serde_json::from_value(serde_json::json!({
+            "provider_type": "ollama", "model": "fixture", "messages": [],
+            "base_url": format!("http://{address}")
+        }))
+        .unwrap();
+        let id = format!("registration-test-{}", uuid::Uuid::new_v4());
+        {
+            let stream = ai_chat_stream_with_sink(&Sink, request, &id);
+            tokio::pin!(stream);
+            let connected = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                socket
+            };
+            let _socket = tokio::select! {
+                result = &mut stream => panic!("transport finished unexpectedly: {result:?}"),
+                socket = tokio::time::timeout(std::time::Duration::from_secs(5), connected) => socket.unwrap(),
+            };
+            assert!(ACTIVE_STREAMS.lock().unwrap().contains_key(&id));
+            // Leave the scope with the request still awaiting HTTP headers.
+        }
+        assert!(!ACTIVE_STREAMS.lock().unwrap().contains_key(&id));
+    }
+
+    #[test]
+    fn old_registration_cannot_remove_a_replacement_with_the_same_id() {
+        let id = format!("registration-test-{}", uuid::Uuid::new_v4());
+        let old = Arc::new(AtomicBool::new(false));
+        let replacement = Arc::new(AtomicBool::new(false));
+        ACTIVE_STREAMS
+            .lock()
+            .unwrap()
+            .insert(id.clone(), replacement.clone());
+        drop(StreamRegistration {
+            id: &id,
+            cancel: old,
+        });
+        assert!(Arc::ptr_eq(
+            ACTIVE_STREAMS.lock().unwrap().get(&id).unwrap(),
+            &replacement
+        ));
+        drop(StreamRegistration {
+            id: &id,
+            cancel: replacement,
+        });
+        assert!(!ACTIVE_STREAMS.lock().unwrap().contains_key(&id));
+    }
+}
+
 /// Maximum SSE buffer size (50 MB) to prevent unbounded memory growth
 const MAX_BUFFER_SIZE: usize = 50 * 1024 * 1024;
 
 /// Polls the cancel flag every 200ms. Resolves when cancellation is requested.
 /// Used inside `tokio::select!` so that a stuck `stream.next().await` does not
 /// block cancellation indefinitely (the exact Ollama-hangs scenario).
-async fn wait_for_cancel(cancel: &AtomicBool) {
+pub(crate) async fn wait_for_cancel(cancel: &AtomicBool) {
     while !cancel.load(Ordering::Relaxed) {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -36,6 +121,8 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
 /// Stream chunk emitted to frontend
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_turn: Option<crate::ai_native::NativeTurn>,
     pub content: String,
     pub done: bool,
     pub tool_calls: Option<Vec<AIToolCall>>,
@@ -81,12 +168,17 @@ pub async fn ai_chat_stream_with_sink(
     request: AIRequest,
     stream_id: &str,
 ) -> Result<(), String> {
+    crate::ai_native::validate_history(&request).map_err(|e| e.to_string())?;
     // Register a cancellation flag for this stream
     let cancel = Arc::new(AtomicBool::new(false));
     ACTIVE_STREAMS
         .lock()
         .unwrap()
         .insert(stream_id.to_string(), Arc::clone(&cancel));
+    let registration = StreamRegistration {
+        id: stream_id,
+        cancel: Arc::clone(&cancel),
+    };
 
     // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
     let request = AIRequest {
@@ -98,21 +190,31 @@ pub async fn ai_chat_stream_with_sink(
 
     let client = &*AI_STREAM_CLIENT;
 
-    let result = match request.provider_type {
-        AIProviderType::Google => stream_gemini(client, &request, sink, stream_id, &cancel).await,
-        AIProviderType::Anthropic => {
-            stream_anthropic(client, &request, sink, stream_id, &cancel).await
+    let result = if crate::ai_native::modern_anthropic(&request)
+        || crate::ai_native::modern_chat(&request)
+    {
+        crate::ai_native::stream(client, &request, sink, stream_id, &cancel).await
+    } else {
+        match request.provider_type {
+            AIProviderType::Google => {
+                stream_gemini(client, &request, sink, stream_id, &cancel).await
+            }
+            AIProviderType::Anthropic => {
+                stream_anthropic(client, &request, sink, stream_id, &cancel).await
+            }
+            AIProviderType::OpenAI if request.use_responses_api.unwrap_or(false) => {
+                stream_openai_responses(client, &request, sink, stream_id, &cancel).await
+            }
+            AIProviderType::Ollama => {
+                stream_ollama(client, &request, sink, stream_id, &cancel).await
+            }
+            // OpenAI, xAI, OpenRouter, Custom all use OpenAI-compatible SSE
+            _ => stream_openai(client, &request, sink, stream_id, &cancel).await,
         }
-        AIProviderType::OpenAI if request.use_responses_api.unwrap_or(false) => {
-            stream_openai_responses(client, &request, sink, stream_id, &cancel).await
-        }
-        AIProviderType::Ollama => stream_ollama(client, &request, sink, stream_id, &cancel).await,
-        // OpenAI, xAI, OpenRouter, Custom all use OpenAI-compatible SSE
-        _ => stream_openai(client, &request, sink, stream_id, &cancel).await,
     };
 
     // Deregister stream
-    ACTIVE_STREAMS.lock().unwrap().remove(stream_id);
+    drop(registration);
 
     match result {
         Ok(()) => Ok(()),
@@ -122,6 +224,7 @@ pub async fn ai_chat_stream_with_sink(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: format!("Error: {}", safe_msg),
                     done: true,
                     tool_calls: None,
@@ -142,10 +245,14 @@ fn emit_responses_update(
     sink: &dyn EventSink,
     stream_id: &str,
     update: crate::openai_responses::ResponsesStreamUpdate,
+    request: &AIRequest,
 ) {
     sink.emit_stream_chunk(
         stream_id,
         &StreamChunk {
+            native_turn: update
+                .output
+                .and_then(|output| crate::ai_native::capture(request, output)),
             content: update.content.unwrap_or_default(),
             done: update.done,
             tool_calls: update.tool_calls,
@@ -172,12 +279,11 @@ async fn stream_openai_responses(
     let api_key = request.api_key.as_ref().ok_or("Missing API key")?;
     let url = format!("{}/responses", request.base_url.trim_end_matches('/'));
     let body = crate::openai_responses::build_request_body(request, true)?;
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await?;
+    let response = tokio::select! {
+        biased;
+        _ = wait_for_cancel(cancel) => return Ok(()),
+        response = client.post(url).bearer_auth(api_key).json(&body).send() => response?,
+    };
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -202,11 +308,11 @@ async fn stream_openai_responses(
     loop {
         let chunk = tokio::select! {
             biased;
-            chunk = stream.next() => chunk,
             _ = wait_for_cancel(cancel) => {
                 cancelled = true;
                 break;
             }
+            chunk = stream.next() => chunk,
         };
         let Some(chunk) = chunk else { break };
         let bytes = chunk?;
@@ -239,7 +345,10 @@ async fn stream_openai_responses(
                 continue;
             };
             if let Some(update) = state.ingest(&event)? {
-                emit_responses_update(sink, stream_id, update);
+                emit_responses_update(sink, stream_id, update, request);
+                if state.completed() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -249,14 +358,17 @@ async fn stream_openai_responses(
         if !data.is_empty() && data != "[DONE]" {
             if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(update) = state.ingest(&event)? {
-                    emit_responses_update(sink, stream_id, update);
+                    emit_responses_update(sink, stream_id, update, request);
+                    if state.completed() {
+                        return Ok(());
+                    }
                 }
             }
         }
     }
 
     if cancelled && !state.completed() {
-        emit_responses_update(sink, stream_id, state.finish());
+        emit_responses_update(sink, stream_id, state.finish(), request);
     }
     crate::openai_responses::responses_stream_end(cancelled, state.completed()).map_err(Into::into)
 }
@@ -489,6 +601,7 @@ async fn stream_openai(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: "\n\n[Error: Stream buffer exceeded 50MB limit]".to_string(),
                     done: true,
                     tool_calls: None,
@@ -514,6 +627,7 @@ async fn stream_openai(
                         sink.emit_stream_chunk(
                             stream_id,
                             &StreamChunk {
+                                native_turn: None,
                                 content: String::new(),
                                 done: false,
                                 tool_calls: None,
@@ -544,6 +658,7 @@ async fn stream_openai(
                     sink.emit_stream_chunk(
                         stream_id,
                         &StreamChunk {
+                            native_turn: None,
                             content: String::new(),
                             done: true,
                             tool_calls,
@@ -579,6 +694,7 @@ async fn stream_openai(
                             sink.emit_stream_chunk(
                                 stream_id,
                                 &StreamChunk {
+                                    native_turn: None,
                                     content: content.to_string(),
                                     done: false,
                                     tool_calls: None,
@@ -602,6 +718,7 @@ async fn stream_openai(
                                 sink.emit_stream_chunk(
                                     stream_id,
                                     &StreamChunk {
+                                        native_turn: None,
                                         content: String::new(),
                                         done: false,
                                         tool_calls: None,
@@ -651,6 +768,7 @@ async fn stream_openai(
                         sink.emit_stream_chunk(
                             stream_id,
                             &StreamChunk {
+                                native_turn: None,
                                 content: content.to_string(),
                                 done: false,
                                 tool_calls: None,
@@ -675,6 +793,7 @@ async fn stream_openai(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: String::new(),
                     done: false,
                     tool_calls: None,
@@ -690,6 +809,7 @@ async fn stream_openai(
         sink.emit_stream_chunk(
             stream_id,
             &StreamChunk {
+                native_turn: None,
                 content: String::new(),
                 done: true,
                 tool_calls: if accumulated_tool_calls.is_empty() {
@@ -729,7 +849,7 @@ async fn stream_anthropic(
     cancel: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let api_key = request.api_key.as_ref().ok_or("Missing API key")?;
-    let url = format!("{}/messages", request.base_url);
+    let url = crate::ai::anthropic_messages_url(&request.base_url);
 
     let tools: Option<Vec<serde_json::Value>> = request.tools.as_ref().map(|defs| {
         let len = defs.len();
@@ -878,6 +998,7 @@ async fn stream_anthropic(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: "\n\n[Error: Stream buffer exceeded 50MB limit]".to_string(),
                     done: true,
                     tool_calls: None,
@@ -924,6 +1045,7 @@ async fn stream_anthropic(
                                         sink.emit_stream_chunk(
                                             stream_id,
                                             &StreamChunk {
+                                                native_turn: None,
                                                 content: String::new(),
                                                 done: false,
                                                 tool_calls: None,
@@ -948,6 +1070,7 @@ async fn stream_anthropic(
                                         sink.emit_stream_chunk(
                                             stream_id,
                                             &StreamChunk {
+                                                native_turn: None,
                                                 content: text.to_string(),
                                                 done: false,
                                                 tool_calls: None,
@@ -966,6 +1089,7 @@ async fn stream_anthropic(
                                         sink.emit_stream_chunk(
                                             stream_id,
                                             &StreamChunk {
+                                                native_turn: None,
                                                 content: String::new(),
                                                 done: false,
                                                 tool_calls: None,
@@ -996,6 +1120,7 @@ async fn stream_anthropic(
                                 sink.emit_stream_chunk(
                                     stream_id,
                                     &StreamChunk {
+                                        native_turn: None,
                                         content: String::new(),
                                         done: false,
                                         tool_calls: None,
@@ -1055,6 +1180,7 @@ async fn stream_anthropic(
                             sink.emit_stream_chunk(
                                 stream_id,
                                 &StreamChunk {
+                                    native_turn: None,
                                     content: String::new(),
                                     done: true,
                                     tool_calls: tc,
@@ -1090,6 +1216,7 @@ async fn stream_anthropic(
                         sink.emit_stream_chunk(
                             stream_id,
                             &StreamChunk {
+                                native_turn: None,
                                 content: text.to_string(),
                                 done: false,
                                 tool_calls: None,
@@ -1114,6 +1241,7 @@ async fn stream_anthropic(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: String::new(),
                     done: false,
                     tool_calls: None,
@@ -1144,6 +1272,7 @@ async fn stream_anthropic(
         sink.emit_stream_chunk(
             stream_id,
             &StreamChunk {
+                native_turn: None,
                 content: String::new(),
                 done: true,
                 tool_calls: tc,
@@ -1290,6 +1419,7 @@ async fn stream_gemini(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: "\n\n[Error: Stream buffer exceeded 50MB limit]".to_string(),
                     done: true,
                     tool_calls: None,
@@ -1328,6 +1458,7 @@ async fn stream_gemini(
                                     sink.emit_stream_chunk(
                                         stream_id,
                                         &StreamChunk {
+                                            native_turn: None,
                                             content: String::new(),
                                             done: false,
                                             tool_calls: None,
@@ -1347,6 +1478,7 @@ async fn stream_gemini(
                                 sink.emit_stream_chunk(
                                     stream_id,
                                     &StreamChunk {
+                                        native_turn: None,
                                         content: String::new(),
                                         done: false,
                                         tool_calls: None,
@@ -1363,6 +1495,7 @@ async fn stream_gemini(
                                 sink.emit_stream_chunk(
                                     stream_id,
                                     &StreamChunk {
+                                        native_turn: None,
                                         content: text.to_string(),
                                         done: false,
                                         tool_calls: None,
@@ -1386,6 +1519,7 @@ async fn stream_gemini(
                                 sink.emit_stream_chunk(
                                     stream_id,
                                     &StreamChunk {
+                                        native_turn: None,
                                         content: formatted,
                                         done: false,
                                         tool_calls: None,
@@ -1410,6 +1544,7 @@ async fn stream_gemini(
                                 sink.emit_stream_chunk(
                                     stream_id,
                                     &StreamChunk {
+                                        native_turn: None,
                                         content: formatted,
                                         done: false,
                                         tool_calls: None,
@@ -1460,6 +1595,7 @@ async fn stream_gemini(
                                     sink.emit_stream_chunk(
                                         stream_id,
                                         &StreamChunk {
+                                            native_turn: None,
                                             content: String::new(),
                                             done: false,
                                             tool_calls: None,
@@ -1479,6 +1615,7 @@ async fn stream_gemini(
                             sink.emit_stream_chunk(
                                 stream_id,
                                 &StreamChunk {
+                                    native_turn: None,
                                     content: text.to_string(),
                                     done: false,
                                     tool_calls: None,
@@ -1502,6 +1639,7 @@ async fn stream_gemini(
                             sink.emit_stream_chunk(
                                 stream_id,
                                 &StreamChunk {
+                                    native_turn: None,
                                     content: formatted,
                                     done: false,
                                     tool_calls: None,
@@ -1526,6 +1664,7 @@ async fn stream_gemini(
                             sink.emit_stream_chunk(
                                 stream_id,
                                 &StreamChunk {
+                                    native_turn: None,
                                     content: formatted,
                                     done: false,
                                     tool_calls: None,
@@ -1563,6 +1702,7 @@ async fn stream_gemini(
     sink.emit_stream_chunk(
         stream_id,
         &StreamChunk {
+            native_turn: None,
             content: String::new(),
             done: true,
             tool_calls: if final_tool_calls.is_empty() {
@@ -1645,6 +1785,7 @@ async fn stream_ollama(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content: "\n\n[Error: Stream buffer exceeded 50MB limit]".to_string(),
                     done: true,
                     tool_calls: None,
@@ -1677,6 +1818,7 @@ async fn stream_ollama(
                 sink.emit_stream_chunk(
                     stream_id,
                     &StreamChunk {
+                        native_turn: None,
                         content,
                         done,
                         tool_calls: None,
@@ -1716,6 +1858,7 @@ async fn stream_ollama(
             sink.emit_stream_chunk(
                 stream_id,
                 &StreamChunk {
+                    native_turn: None,
                     content,
                     done,
                     tool_calls: None,
@@ -1746,6 +1889,7 @@ async fn stream_ollama(
         sink.emit_stream_chunk(
             stream_id,
             &StreamChunk {
+                native_turn: None,
                 content: String::new(),
                 done: true,
                 tool_calls: None,

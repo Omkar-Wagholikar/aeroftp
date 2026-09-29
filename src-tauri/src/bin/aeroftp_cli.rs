@@ -66791,7 +66791,7 @@ fn detect_ai_provider() -> Option<(String, String, String)> {
         (
             "anthropic",
             "ANTHROPIC_API_KEY",
-            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
         ),
         ("openai", "OPENAI_API_KEY", "https://api.openai.com/v1"),
         (
@@ -66891,7 +66891,7 @@ fn resolve_vault_ai_provider(
 
     let base_url_for = |ptype: &str| -> &str {
         match ptype {
-            "anthropic" => "https://api.anthropic.com",
+            "anthropic" => "https://api.anthropic.com/v1",
             "openai" => "https://api.openai.com/v1",
             "google" => "https://generativelanguage.googleapis.com",
             "xai" => "https://api.x.ai/v1",
@@ -68350,11 +68350,15 @@ fn is_auto_approved(tool_name: &str, approve_level: u8) -> bool {
 /// previous synchronous `call_ai()` path with token-by-token streaming.
 struct CollectingCliSink {
     print_live: bool,
+    cancel: tokio_util::sync::CancellationToken,
     inner: std::sync::Mutex<CollectingSinkState>,
+    /// Text streamed so far, readable after the run is interrupted.
+    streamed: Arc<Mutex<String>>,
 }
 
 #[derive(Default)]
 struct CollectingSinkState {
+    native_turn: Option<ftp_client_gui_lib::ai_native::NativeTurn>,
     content: String,
     thinking: String,
     tool_calls: Option<Vec<ftp_client_gui_lib::ai::AIToolCall>>,
@@ -68367,10 +68371,16 @@ struct CollectingSinkState {
 }
 
 impl CollectingCliSink {
-    fn new(print_live: bool) -> Self {
+    fn new(
+        print_live: bool,
+        cancel: tokio_util::sync::CancellationToken,
+        streamed: Arc<Mutex<String>>,
+    ) -> Self {
         Self {
             print_live,
+            cancel,
             inner: std::sync::Mutex::new(CollectingSinkState::default()),
+            streamed,
         }
     }
 
@@ -68378,6 +68388,7 @@ impl CollectingCliSink {
     fn into_response(self, model: &str) -> ftp_client_gui_lib::ai::AIResponse {
         let state = self.inner.into_inner().unwrap_or_else(|e| e.into_inner());
         ftp_client_gui_lib::ai::AIResponse {
+            native_turn: state.native_turn,
             content: state.content,
             model: model.to_string(),
             tokens_used: state.tokens_used.or_else(|| {
@@ -68402,6 +68413,9 @@ impl ftp_client_gui_lib::ai_core::EventSink for CollectingCliSink {
         _stream_id: &str,
         chunk: &ftp_client_gui_lib::ai_stream::StreamChunk,
     ) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         // Live output to stdout when enabled. We only print content deltas here;
         // thinking text (Anthropic extended thinking) goes to stderr dimmed.
         if self.print_live {
@@ -68425,11 +68439,17 @@ impl ftp_client_gui_lib::ai_core::EventSink for CollectingCliSink {
                 state.error_seen = true;
             }
             state.content.push_str(&chunk.content);
+            if let Ok(mut streamed) = self.streamed.lock() {
+                streamed.push_str(&chunk.content);
+            }
             if let Some(ref t) = chunk.thinking {
                 state.thinking.push_str(t);
             }
             if chunk.tool_calls.is_some() {
                 state.tool_calls = chunk.tool_calls.clone();
+            }
+            if chunk.native_turn.is_some() {
+                state.native_turn = chunk.native_turn.clone();
             }
             if let Some(v) = chunk.input_tokens {
                 state.input_tokens = Some(v);
@@ -68463,80 +68483,57 @@ impl ftp_client_gui_lib::ai_core::EventSink for CollectingCliSink {
     }
 }
 
-/// Multi-step agent tool execution loop.
-/// Sends tool definitions to the model, processes tool_calls, executes tools,
-/// re-injects results, and loops until the model responds with text only.
-async fn agent_tool_loop(
-    cfg: &AgentConfig,
-    messages: &mut Vec<ftp_client_gui_lib::ai::ChatMessage>,
+/// CLI policy/UI adapter for the shared foreground runner.
+struct CliRunnerAdapter<'a> {
+    cfg: &'a AgentConfig,
     is_tty: bool,
-) -> Result<String, String> {
-    use ftp_client_gui_lib::ai::{AIRequest, AIResponse, ChatMessage};
+    /// Text of the model step being streamed; what an interrupted run had.
+    streamed: Arc<Mutex<String>>,
+}
 
-    let tools = cli_tool_definitions();
-    let mut steps = 0u32;
+/// Why an agent run returned without an answer.
+#[derive(Debug)]
+enum AgentRunError {
+    /// Ctrl-C. Carries the text the interrupted step had already streamed.
+    Interrupted(String),
+    Failed(String),
+}
 
-    loop {
-        // Build request with tool definitions
-        let mut all_messages = vec![ChatMessage {
-            role: "system".to_string(),
-            content: cfg.system.clone(),
-            images: None,
-            tool_calls_echo: None,
-            tool_call_id: None,
-        }];
-        all_messages.extend_from_slice(messages);
+impl std::fmt::Display for AgentRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted(_) => f.write_str(ftp_client_gui_lib::ai_core::runner::CANCELLED),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
 
-        let request = AIRequest {
-            provider_type: cfg.provider_type.clone(),
-            model: cfg.model.clone(),
-            api_key: Some(cfg.api_key.clone()),
-            base_url: cfg.base_url.clone(),
-            messages: all_messages,
-            max_tokens: Some(4096),
-            temperature: Some(0.3),
-            tools: Some(tools.clone()),
-            tool_results: None, // Tool results are embedded in conversation messages
-            thinking_budget: None,
-            top_p: None,
-            top_k: None,
-            cached_content: None,
-            web_search: None,
-            use_responses_api: None,
-        };
+#[cfg(test)]
+#[path = "../cli_runner_tests.rs"]
+mod cli_runner_tests;
 
-        // T4: stream the assistant response token-by-token via ai_chat_stream_with_sink.
-        // Ctrl+C during the stream triggers ai_cancel_stream for graceful cancellation.
-        let stream_id = format!(
-            "cli-agent-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+#[async_trait::async_trait]
+impl ftp_client_gui_lib::ai_core::runner::RunnerAdapter for CliRunnerAdapter<'_> {
+    async fn complete(
+        &self,
+        request: ftp_client_gui_lib::ai::AIRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ftp_client_gui_lib::ai::AIResponse, String> {
+        let stream_id = format!("cli-agent-{}", uuid::Uuid::new_v4());
+        if let Ok(mut streamed) = self.streamed.lock() {
+            streamed.clear();
+        }
+        let sink = CollectingCliSink::new(
+            self.is_tty && !self.cfg.plan_only,
+            cancel.clone(),
+            self.streamed.clone(),
         );
+        ftp_client_gui_lib::ai_stream::ai_chat_stream_with_sink(&sink, request, &stream_id).await?;
+        Ok(sink.into_response(&self.cfg.model))
+    }
 
-        // Only stream live to stdout when attached to a TTY and plan_only is off.
-        // plan_only should produce deterministic output, not interleaved tokens.
-        let print_live = is_tty && !cfg.plan_only;
-        let sink = CollectingCliSink::new(print_live);
-
-        let sid_for_signal = stream_id.clone();
-        let cancel_task = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = ftp_client_gui_lib::ai_stream::ai_cancel_stream(sid_for_signal).await;
-            }
-        });
-
-        let stream_outcome =
-            ftp_client_gui_lib::ai_stream::ai_chat_stream_with_sink(&sink, request, &stream_id)
-                .await;
-
-        cancel_task.abort();
-        stream_outcome?;
-
-        let response: AIResponse = sink.into_response(&cfg.model);
-
+    fn account(&self, response: &ftp_client_gui_lib::ai::AIResponse) -> Result<(), String> {
+        let cfg = self.cfg;
         {
             let mut usage = cfg
                 .usage
@@ -68564,160 +68561,211 @@ async fn agent_tool_loop(
             }
         }
 
-        // Check if model wants to call tools
-        let tool_calls = response.tool_calls.as_ref().filter(|tc| !tc.is_empty());
+        Ok(())
+    }
 
-        match tool_calls {
-            None => {
-                // No tool calls - return the text response
-                return Ok(response.content);
+    async fn execute(
+        &self,
+        tc: &ftp_client_gui_lib::ai::AIToolCall,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, String> {
+        let cfg = self.cfg;
+        let is_tty = self.is_tty;
+        ftp_client_gui_lib::ai_core::runner::check_cancelled(cancel)?;
+        // Check approval
+        let approved = if is_auto_approved(&tc.name, cfg.approve_level) {
+            if is_tty {
+                eprintln!(
+                    "  \x1b[32m✓\x1b[0m Auto-approved: {} ({} · egress: {})",
+                    tc.name,
+                    tool_exposure_category(&tc.name),
+                    tool_data_egress(&tc.name)
+                );
             }
-            Some(calls) => {
-                if cfg.plan_only {
-                    let plan_lines: Vec<String> = calls
-                        .iter()
-                        .map(|tc| {
-                            format!(
-                                "- {} {}",
-                                tc.name,
-                                serde_json::to_string(&tc.arguments)
-                                    .unwrap_or_else(|_| "{}".to_string())
-                            )
-                        })
-                        .collect();
-                    let mut output = response.content.clone();
-                    if !output.is_empty() {
-                        output.push_str("\n\n");
+            true
+        } else if is_tty && io::stdin().is_terminal() {
+            prompt_tool_approval(&tc.name, &tc.arguments)
+        } else {
+            cfg.approve_level >= 3
+        };
+
+        ftp_client_gui_lib::ai_core::runner::check_cancelled(cancel)?;
+        let result_content = if approved {
+            if is_tty {
+                eprint!("  \x1b[2m⠙ Executing {}...\x1b[0m", tc.name);
+                io::stderr().flush().ok();
+            }
+            let outcome = execute_cli_tool(&tc.name, &tc.arguments).await;
+            match outcome {
+                Ok(val) => {
+                    if is_tty && !cancel.is_cancelled() {
+                        eprint!("\r                                        \r");
+                        eprintln!("  \x1b[32m✓\x1b[0m {} completed", tc.name);
                     }
-                    output.push_str("Planned tool calls:\n");
-                    output.push_str(&plan_lines.join("\n"));
-                    return Ok(output);
+                    cap_tool_result(val.to_string())
                 }
-
-                steps += 1;
-                if steps > cfg.max_steps {
-                    if !response.content.is_empty() {
-                        messages.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: response.content.clone(),
-                            images: None,
-                            tool_calls_echo: None,
-                            tool_call_id: None,
-                        });
+                Err(e) => {
+                    if is_tty && !cancel.is_cancelled() {
+                        eprint!("\r                                        \r");
+                        eprintln!("  \x1b[31m✗\x1b[0m {} failed: {}", tc.name, e);
                     }
-                    return Ok(format!(
-                        "{}\n\n[Reached max steps limit ({}).]",
-                        response.content, cfg.max_steps
-                    ));
-                }
-
-                // Show assistant text if any.
-                // T4: when print_live is true the sink has already streamed
-                // response.content to stdout: printing it again here would
-                // duplicate the visible output, so we only fall back to the
-                // stderr echo when streaming to stdout is disabled.
-                if !response.content.is_empty() && is_tty && !print_live {
-                    eprintln!("\n{}", response.content);
-                }
-
-                // Add assistant message with tool_calls echo (required by OpenAI/Cohere format)
-                let tool_calls_echo: Vec<ftp_client_gui_lib::ai::ToolCallEcho> = calls
-                    .iter()
-                    .map(|tc| ftp_client_gui_lib::ai::ToolCallEcho {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                    })
-                    .collect();
-
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: response.content.clone(),
-                    images: None,
-                    tool_calls_echo: Some(tool_calls_echo),
-                    tool_call_id: None,
-                });
-
-                // Execute each tool call
-                for tc in calls {
-                    // Check approval
-                    let approved = if is_auto_approved(&tc.name, cfg.approve_level) {
-                        if is_tty {
-                            eprintln!(
-                                "  \x1b[32m✓\x1b[0m Auto-approved: {} ({} · egress: {})",
-                                tc.name,
-                                tool_exposure_category(&tc.name),
-                                tool_data_egress(&tc.name)
-                            );
-                        }
-                        true
-                    } else if is_tty && io::stdin().is_terminal() {
-                        prompt_tool_approval(&tc.name, &tc.arguments)
-                    } else {
-                        cfg.approve_level >= 3
-                    };
-
-                    let result_content = if approved {
-                        if is_tty {
-                            eprint!("  \x1b[2m⠙ Executing {}...\x1b[0m", tc.name);
-                            io::stderr().flush().ok();
-                        }
-                        match execute_cli_tool(&tc.name, &tc.arguments).await {
-                            Ok(val) => {
-                                if is_tty {
-                                    eprint!("\r                                        \r");
-                                    eprintln!("  \x1b[32m✓\x1b[0m {} completed", tc.name);
-                                }
-                                let s = val.to_string();
-                                if s.len() > 8192 {
-                                    format!(
-                                        "{}... [truncated, {} bytes total]",
-                                        s.get(..8192).unwrap_or(&s),
-                                        s.len()
-                                    )
-                                } else {
-                                    s
-                                }
-                            }
-                            Err(e) => {
-                                if is_tty {
-                                    eprint!("\r                                        \r");
-                                    eprintln!("  \x1b[31m✗\x1b[0m {} failed: {}", tc.name, e);
-                                }
-                                // MCP-02: scrub token-bearing provider/tool error
-                                // strings before they enter the model conversation.
-                                format!(
-                                    "Error: {}",
-                                    ftp_client_gui_lib::ai::sanitize_error_message(&e.to_string())
-                                )
-                            }
-                        }
-                    } else {
-                        if is_tty {
-                            eprintln!("  \x1b[33m⊘\x1b[0m {} denied by user", tc.name);
-                        }
-                        "Tool call denied by user.".to_string()
-                    };
-
-                    // Add tool result as conversation message with tool_call_id
-                    messages.push(ChatMessage {
-                        role: "tool".to_string(),
-                        content: result_content,
-                        images: None,
-                        tool_calls_echo: None,
-                        tool_call_id: Some(tc.id.clone()),
-                    });
-                }
-
-                // Tool results are now in conversation history (no separate tool_results field needed)
-
-                if is_tty {
-                    eprint!("\n  \x1b[2m⠙ Thinking...\x1b[0m");
-                    io::stderr().flush().ok();
+                    // MCP-02: scrub token-bearing provider/tool error
+                    // strings before they enter the model conversation.
+                    format!(
+                        "Error: {}",
+                        ftp_client_gui_lib::ai::sanitize_error_message(&e.to_string())
+                    )
                 }
             }
+        } else {
+            if is_tty {
+                eprintln!("  \x1b[33m⊘\x1b[0m {} denied by user", tc.name);
+            }
+            "Tool call denied by user.".to_string()
+        };
+
+        Ok(result_content)
+    }
+
+    fn assistant_tools(&self, response: &ftp_client_gui_lib::ai::AIResponse) {
+        if !response.content.is_empty() && self.is_tty && self.cfg.plan_only {
+            eprintln!("\n{}", response.content);
         }
     }
+
+    fn continuing(&self) {
+        if self.is_tty {
+            eprint!("\n  \x1b[2m⠙ Thinking...\x1b[0m");
+            io::stderr().flush().ok();
+        }
+    }
+}
+
+/// Bound a tool result before it enters the model conversation. The cut falls
+/// on the nearest char boundary at or below the limit, so a multi-byte
+/// character there cannot let the whole result through.
+fn cap_tool_result(s: String) -> String {
+    const LIMIT: usize = 8192;
+    if s.len() > LIMIT {
+        format!(
+            "{}... [truncated, {} bytes total]",
+            &s[..s.floor_char_boundary(LIMIT)],
+            s.len()
+        )
+    } else {
+        s
+    }
+}
+
+/// Abort the signal listener also when the owning future is dropped.
+struct AgentSignalTask(tokio::task::JoinHandle<()>);
+impl Drop for AgentSignalTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Only remove a failed prompt if the run added no execution evidence.
+fn agent_failed_turn(history: &mut Vec<ftp_client_gui_lib::ai::ChatMessage>, prompt_index: usize) {
+    if history.len() == prompt_index + 1 && history[prompt_index].role == "user" {
+        history.pop();
+    }
+}
+
+/// Trim at a user boundary, never through an assistant/tool-result group. When
+/// one turn with many tool steps fills the whole window, keep from the latest
+/// user message, so history stays bounded to that turn.
+fn agent_trim_history(history: &mut Vec<ftp_client_gui_lib::ai::ChatMessage>, max: usize) {
+    if history.len() > max {
+        let is_user = |i: &usize| history[*i].role == "user";
+        if let Some(index) = (history.len() - max..history.len())
+            .find(is_user)
+            .or_else(|| (0..history.len()).rev().find(is_user))
+        {
+            history.drain(..index);
+        }
+    }
+}
+
+/// One agent run that Ctrl-C cancels.
+async fn agent_tool_loop(
+    cfg: &AgentConfig,
+    messages: &mut Vec<ftp_client_gui_lib::ai::ChatMessage>,
+    is_tty: bool,
+) -> Result<String, AgentRunError> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let signal_cancel = cancel.clone();
+    let _signal_task = AgentSignalTask(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal_cancel.cancel();
+        }
+    }));
+    let adapter = CliRunnerAdapter {
+        cfg,
+        is_tty,
+        streamed: Arc::default(),
+    };
+    agent_run(&adapter, messages, &cancel).await
+}
+
+/// One agent run under a caller-owned cancellation token, through an adapter
+/// whose streamed text the caller can watch.
+async fn agent_run(
+    adapter: &CliRunnerAdapter<'_>,
+    messages: &mut Vec<ftp_client_gui_lib::ai::ChatMessage>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<String, AgentRunError> {
+    use ftp_client_gui_lib::ai::{AIRequest, ChatMessage};
+    use ftp_client_gui_lib::ai_core::runner::{run, RunnerOptions};
+    let cfg = adapter.cfg;
+    let request = AIRequest {
+        turn_scope: None,
+        reasoning_effort: None,
+        provider_type: cfg.provider_type.clone(),
+        model: cfg.model.clone(),
+        api_key: Some(cfg.api_key.clone()),
+        base_url: cfg.base_url.clone(),
+        messages: vec![ChatMessage {
+            native_turn: None,
+            role: "system".to_string(),
+            content: cfg.system.clone(),
+            images: None,
+            tool_calls_echo: None,
+            tool_call_id: None,
+        }],
+        max_tokens: Some(4096),
+        temperature: Some(0.3),
+        tools: Some(cli_tool_definitions()),
+        tool_results: None, // Tool results are embedded in conversation messages
+        thinking_budget: None,
+        top_p: None,
+        top_k: None,
+        cached_content: None,
+        web_search: None,
+        use_responses_api: Some(
+            cfg.provider_type == ftp_client_gui_lib::ai::AIProviderType::OpenAI
+                && matches!(
+                    cfg.model.as_str(),
+                    "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+                )
+                && cfg.base_url.trim_end_matches('/') == "https://api.openai.com/v1",
+        ),
+    };
+
+    let options = RunnerOptions {
+        max_steps: cfg.max_steps,
+        plan_only: cfg.plan_only,
+    };
+    run(adapter, &request, messages, options, cancel)
+        .await
+        .map_err(|error| {
+            if cancel.is_cancelled() {
+                let streamed = adapter.streamed.lock().map(|s| s.clone());
+                AgentRunError::Interrupted(streamed.unwrap_or_default())
+            } else {
+                AgentRunError::Failed(error)
+            }
+        })
 }
 
 /// Run the agent in interactive REPL, one-shot, or orchestration mode
@@ -68744,7 +68792,7 @@ async fn cmd_agent(
         let env_key = format!("{}_API_KEY", name.to_uppercase());
         let key = std::env::var(&env_key).unwrap_or_default();
         let url = match name.as_str() {
-            "anthropic" => "https://api.anthropic.com",
+            "anthropic" => "https://api.anthropic.com/v1",
             "openai" => "https://api.openai.com/v1",
             "gemini" | "google" => "https://generativelanguage.googleapis.com",
             "ollama" => "http://localhost:11434",
@@ -68927,6 +68975,7 @@ async fn cmd_agent_oneshot(message: &str, cfg: &AgentConfig, format: OutputForma
     use ftp_client_gui_lib::ai::ChatMessage;
 
     let mut messages = vec![ChatMessage {
+        native_turn: None,
         role: "user".to_string(),
         content: message.to_string(),
         images: None,
@@ -68935,12 +68984,26 @@ async fn cmd_agent_oneshot(message: &str, cfg: &AgentConfig, format: OutputForma
     }];
 
     let is_tty = io::stdin().is_terminal();
+    let outcome = agent_tool_loop(cfg, &mut messages, is_tty).await;
+    // T4: when is_tty the final response was already streamed to stdout
+    // token-by-token by the sink, so it is printed again only otherwise.
+    report_agent_oneshot(&mut io::stdout(), outcome, format, !is_tty || cfg.plan_only)
+}
 
-    match agent_tool_loop(cfg, &mut messages, is_tty).await {
+/// Print a one-shot agent outcome and return its exit code. `print_text` is
+/// false when the answer was already streamed to the terminal.
+fn report_agent_oneshot(
+    out: &mut dyn IoWrite,
+    outcome: Result<String, AgentRunError>,
+    format: OutputFormat,
+    print_text: bool,
+) -> i32 {
+    match outcome {
         Ok(response) => {
             match format {
                 OutputFormat::Json => {
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "{}",
                         serde_json::json!({
                             "status": "ok",
@@ -68949,20 +69012,40 @@ async fn cmd_agent_oneshot(message: &str, cfg: &AgentConfig, format: OutputForma
                     );
                 }
                 OutputFormat::Text => {
-                    // T4: when is_tty the final response was already streamed to
-                    // stdout token-by-token by the sink, so avoid duplicating it.
-                    // Ensure there is a trailing newline for non-streamed paths.
-                    if !is_tty || cfg.plan_only {
-                        println!("{}", response);
+                    if print_text {
+                        let _ = writeln!(out, "{}", response);
                     }
                 }
             }
             0
         }
-        Err(e) => {
+        // Ctrl-C keeps what the model had written, as before the shared
+        // runner, and exits with the documented code 130 (Interrupted).
+        Err(AgentRunError::Interrupted(partial)) => {
             match format {
                 OutputFormat::Json => {
-                    println!(
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        serde_json::json!({
+                            "status": "interrupted",
+                            "response": partial,
+                        })
+                    );
+                }
+                OutputFormat::Text => {
+                    if print_text && !partial.is_empty() {
+                        let _ = writeln!(out, "{}", partial);
+                    }
+                }
+            }
+            130
+        }
+        Err(AgentRunError::Failed(e)) => {
+            match format {
+                OutputFormat::Json => {
+                    let _ = writeln!(
+                        out,
                         "{}",
                         serde_json::json!({
                             "status": "error",
@@ -69109,7 +69192,9 @@ async fn cmd_agent_repl(cfg: &AgentConfig) -> i32 {
         }
 
         // Add user message
+        let prompt_index = conversation.len();
         conversation.push(ChatMessage {
+            native_turn: None,
             role: "user".to_string(),
             content: input,
             images: None,
@@ -69136,6 +69221,7 @@ async fn cmd_agent_repl(cfg: &AgentConfig) -> i32 {
                     println!("\n{}\n", response);
                 }
                 conversation.push(ChatMessage {
+                    native_turn: None,
                     role: "assistant".to_string(),
                     content: response,
                     images: None,
@@ -69144,18 +69230,24 @@ async fn cmd_agent_repl(cfg: &AgentConfig) -> i32 {
                 });
                 // Sliding window: keep last 40 messages to avoid context overflow
                 const MAX_CONVERSATION_MESSAGES: usize = 40;
-                if conversation.len() > MAX_CONVERSATION_MESSAGES {
-                    let drain_count = conversation.len() - MAX_CONVERSATION_MESSAGES;
-                    conversation.drain(..drain_count);
-                }
+                agent_trim_history(&mut conversation, MAX_CONVERSATION_MESSAGES);
             }
-            Err(e) => {
+            Err(AgentRunError::Interrupted(partial)) => {
+                if is_tty {
+                    // The partial answer is already on screen.
+                    eprint!("\r                    \r");
+                } else if !partial.is_empty() {
+                    println!("\n{}\n", partial);
+                }
+                eprintln!("\n  Interrupted.\n");
+                agent_failed_turn(&mut conversation, prompt_index);
+            }
+            Err(AgentRunError::Failed(e)) => {
                 if is_tty {
                     eprint!("\r                    \r");
                 }
                 eprintln!("\n  \x1b[1;31mError:\x1b[0m {}\n", e);
-                // Remove the failed user message
-                conversation.pop();
+                agent_failed_turn(&mut conversation, prompt_index);
             }
         }
     }
@@ -69290,7 +69382,9 @@ async fn cmd_agent_orchestrate(cfg: &AgentConfig) -> i32 {
                     continue;
                 }
 
+                let prompt_index = conversation.len();
                 conversation.push(ChatMessage {
+                    native_turn: None,
                     role: "user".to_string(),
                     content: msg.to_string(),
                     images: None,
@@ -69311,6 +69405,7 @@ async fn cmd_agent_orchestrate(cfg: &AgentConfig) -> i32 {
                 match agent_tool_loop(cfg, &mut conversation, false).await {
                     Ok(response) => {
                         conversation.push(ChatMessage {
+                            native_turn: None,
                             role: "assistant".to_string(),
                             content: response.clone(),
                             images: None,
@@ -69318,9 +69413,7 @@ async fn cmd_agent_orchestrate(cfg: &AgentConfig) -> i32 {
                             tool_call_id: None,
                         });
                         // Sliding window: keep last 40 messages
-                        if conversation.len() > 40 {
-                            conversation.drain(..conversation.len() - 40);
-                        }
+                        agent_trim_history(&mut conversation, 40);
                         println!(
                             "{}",
                             serde_json::json!({
@@ -69334,12 +69427,12 @@ async fn cmd_agent_orchestrate(cfg: &AgentConfig) -> i32 {
                         );
                     }
                     Err(e) => {
-                        conversation.pop(); // Remove failed user message
+                        agent_failed_turn(&mut conversation, prompt_index);
                         println!(
                             "{}",
                             serde_json::json!({
                                 "jsonrpc": "2.0", "id": id,
-                                "error": { "code": -32000, "message": e }
+                                "error": { "code": -32000, "message": e.to_string() }
                             })
                         );
                     }

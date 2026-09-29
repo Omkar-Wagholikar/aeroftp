@@ -58,6 +58,8 @@ pub fn sanitize_error_message(msg: &str) -> String {
             r"[?&]key=[^&\s\)]*",                    // Google key= query parameter
             r"sk-ant-[A-Za-z0-9_\-]{20,}", // Anthropic API keys (check before generic sk-)
             r"sk-[A-Za-z0-9_\-]{20,}",     // OpenAI API keys
+            r"nvapi-[A-Za-z0-9_\-]{20,}",  // NVIDIA API keys
+            r"xai-[A-Za-z0-9_\-]{20,}",    // xAI API keys
             r"(?i)Bearer\s+[A-Za-z0-9._\-/+=]{20,}", // Bearer tokens in error bodies
             r"(?i)x-api-key:\s*\S+",       // x-api-key header reflections
         ]
@@ -71,6 +73,61 @@ pub fn sanitize_error_message(msg: &str) -> String {
         result = re.replace_all(&result, "[REDACTED]").to_string();
     }
     result
+}
+
+/// The Messages endpoint for an Anthropic base URL. The default base ends in
+/// `/v1`; a profile saved with the bare host (`https://api.anthropic.com`, the
+/// CLI default before) gets the `/v1` it needs. A base with any other path,
+/// such as a gateway prefix, is used as configured.
+pub(crate) fn anthropic_messages_url(base_url: &str) -> String {
+    let base = base_url.trim();
+    let Ok(mut url) = reqwest::Url::parse(base) else {
+        return format!("{}/messages", base.trim_end_matches('/'));
+    };
+    // The endpoint goes on the path, so a query string (a gateway's region or
+    // key parameter) stays after it; a fragment is never sent and is dropped.
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/');
+    let endpoint = if path.is_empty() {
+        "/v1/messages".to_string()
+    } else {
+        format!("{path}/messages")
+    };
+    url.set_path(&endpoint);
+    url.to_string()
+}
+
+#[cfg(test)]
+mod anthropic_messages_url_tests {
+    use super::anthropic_messages_url;
+
+    /// The endpoint is appended to the URL path, not to the raw string, so a
+    /// query string stays after it: `.../v1?region=eu` became
+    /// `.../v1?region=eu/messages`, which still targeted `/v1`.
+    #[test]
+    fn the_endpoint_goes_on_the_path_and_keeps_the_query() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1/"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://gateway.example/v1?region=eu"),
+            "https://gateway.example/v1/messages?region=eu"
+        );
+        // Only the path loses its trailing slash: a query value keeps its own.
+        assert_eq!(
+            anthropic_messages_url("https://gateway.example/v1?key=abc/"),
+            "https://gateway.example/v1/messages?key=abc/"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://gateway.example/proxy/anthropic#frag"),
+            "https://gateway.example/proxy/anthropic/messages"
+        );
+    }
 }
 
 // Provider types
@@ -127,6 +184,9 @@ pub struct ToolCallEcho {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Opaque provider output, scoped to one foreground turn. Never persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn: Option<crate::ai_native::NativeTurn>,
     pub role: String,
     pub content: String,
     /// Optional image attachments for vision-capable models
@@ -169,6 +229,10 @@ fn provider_test_path(provider_type: &AIProviderType) -> &'static str {
 // AI Request from frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AIRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub provider_type: AIProviderType,
     pub model: String,
     #[serde(default, deserialize_with = "deserialize_api_key")]
@@ -206,6 +270,8 @@ pub struct AIRequest {
 // AI Response to frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AIResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_turn: Option<crate::ai_native::NativeTurn>,
     pub content: String,
     pub model: String,
     pub tokens_used: Option<u32>,
@@ -651,6 +717,7 @@ mod gemini {
         };
 
         Ok(AIResponse {
+            native_turn: None,
             content: if content.is_empty() {
                 String::new()
             } else {
@@ -1021,6 +1088,7 @@ mod openai_compat {
         });
 
         Ok(AIResponse {
+            native_turn: None,
             content: choice.message.content.unwrap_or_default(),
             model: request.model.clone(),
             tokens_used: openai_response.usage.as_ref().and_then(|u| u.total_tokens),
@@ -1101,7 +1169,7 @@ mod anthropic {
     pub async fn call(client: &Client, request: &AIRequest) -> Result<AIResponse, AIError> {
         let api_key = request.api_key.as_ref().ok_or(AIError::MissingApiKey)?;
 
-        let url = format!("{}/messages", request.base_url);
+        let url = crate::ai::anthropic_messages_url(&request.base_url);
 
         // Convert tool definitions for Anthropic format
         let tools = request.tools.as_ref().map(|defs| {
@@ -1300,6 +1368,7 @@ mod anthropic {
         };
 
         Ok(AIResponse {
+            native_turn: None,
             content,
             model: request.model.clone(),
             tokens_used: total,
@@ -1323,7 +1392,11 @@ pub async fn call_ai(request: AIRequest) -> Result<AIResponse, AIError> {
         ..request
     };
 
+    crate::ai_native::validate_history(&request)?;
     let client = &*AI_HTTP_CLIENT;
+    if crate::ai_native::modern_anthropic(&request) || crate::ai_native::modern_chat(&request) {
+        return crate::ai_native::call(client, &request).await;
+    }
 
     match request.provider_type {
         AIProviderType::Google => gemini::call(client, &request).await,
@@ -1922,6 +1995,20 @@ pub async fn deepseek_fim_complete(
 #[cfg(test)]
 mod api_key_tests {
     use super::*;
+
+    #[test]
+    fn bare_nvidia_and_xai_keys_are_redacted_from_error_text() {
+        for key in [
+            "nvapi-Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z_-Ab3dEf6hIj9kLm2nOp5",
+            "xai-Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z",
+        ] {
+            let message = sanitize_error_message(&format!("401: invalid key {key} for this model"));
+            assert_eq!(message, "401: invalid key [REDACTED] for this model");
+        }
+        // Model names that merely start the same way are not keys.
+        let names = "model xai-grok-4.7 on nvapi-docs";
+        assert_eq!(sanitize_error_message(names), names);
+    }
 
     #[test]
     fn a_pasted_key_loses_the_whitespace_around_it() {

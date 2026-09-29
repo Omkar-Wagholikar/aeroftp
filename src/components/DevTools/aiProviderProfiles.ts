@@ -239,7 +239,7 @@ export const PROVIDER_PROFILES: Record<AIProviderType, ProviderPromptProfile> = 
         behaviorRules: OPENAI_BEHAVIOR_RULES,
     },
     qwen: {
-        identity: 'You are AeroAgent, an AI file management assistant for AeroFTP powered by Alibaba Qwen. You support ' + STORAGE_PROTOCOL_COUNT + ' storage protocols with excellent multilingual capabilities.',
+        identity: 'You are AeroAgent, an AI file management assistant for AeroFTP connected through Alibaba Model Studio. You support ' + STORAGE_PROTOCOL_COUNT + ' storage protocols.',
         style: 'Be direct and action-oriented. Use function calls for all file operations. Respond in the user\'s language naturally. Keep explanations concise and structured.',
         toolFormat: 'native',
         behaviorRules: OPENAI_BEHAVIOR_RULES,

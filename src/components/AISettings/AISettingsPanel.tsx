@@ -10,15 +10,17 @@ import type { PluginManifest } from '../../types/plugins';
 import { DEFAULT_MACROS } from '../DevTools/aiChatToolMacros';
 import { detectOllamaModelFamily } from '../DevTools/aiProviderProfiles';
 import { OllamaGpuMonitor } from '../DevTools/OllamaGpuMonitor';
-import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, QwenIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from '../DevTools/AIIcons';
+import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from '../DevTools/AIIcons';
 import { AIProvider, AIModel, AISettings, AIProviderType, PROVIDER_PRESETS, DEFAULT_MODELS, generateId, getDefaultAISettings } from '../../types/ai';
 import { logger } from '../../utils/logger';
 import './AISettingsPanel.css';
 import { secureGetWithFallback, secureStoreAndClean } from '../../utils/secureStorage';
 import { ProviderMarketplace } from './ProviderMarketplace';
 import { PluginBrowser } from './PluginBrowser';
-import { applyDiscoveredModelDefaults, buildSavedModelRecord, getModelCapabilitySource, lookupModelSpec, reconcilePersistedModels } from '../../types/aiModelRegistry';
+import { applyDiscoveredModelDefaults, buildSavedModelRecord, getModelCapabilitySource, lookupModelSpec } from '../../types/aiModelRegistry';
+import { CAPABILITY_KEYS, DiscoveredModelInfo, normalizeModelCatalog, providerModelSnapshot, reconcileProviderModels, reconcileProviderNames, resolveProviderModel, withProviderEdit } from '../../types/aiModelDiscovery';
 import { useTranslation } from '../../i18n';
+import { AEROAGENT_VERSION } from '../../utils/aeroagentVersion';
 import { createTauriListener } from '../../hooks/useTauriListener';
 import { useDraggableModal } from '../../hooks/useDraggableModal';
 
@@ -45,7 +47,7 @@ const getProviderIcon = (type: AIProviderType): React.ReactNode => {
         case 'kimi':
             return <KimiIcon size={16} />;
         case 'qwen':
-            return <QwenIcon size={16} />;
+            return <AlibabaModelStudioIcon size={16} />;
         case 'deepseek':
             return <DeepSeekIcon size={16} />;
         case 'mistral':
@@ -92,12 +94,13 @@ const AI_SETTINGS_KEY = 'aeroftp_ai_settings';
 interface ModelEditModalProps {
     model: AIModel | null;
     providerId: string;
+    provider?: AIProvider;
     isNew: boolean;
     onSave: (model: AIModel) => void;
     onClose: () => void;
 }
 
-const ModelEditModal: React.FC<ModelEditModalProps> = ({ model, providerId, isNew, onSave, onClose }) => {
+const ModelEditModal: React.FC<ModelEditModalProps> = ({ model, providerId, provider, isNew, onSave, onClose }) => {
     const t = useTranslation();
     const modalDrag = useDraggableModal();
     const [formData, setFormData] = useState({
@@ -115,6 +118,10 @@ const ModelEditModal: React.FC<ModelEditModalProps> = ({ model, providerId, isNe
     const handleNameChange = (name: string) => {
         setFormData((prev) => {
             const spec = lookupModelSpec(name);
+            const discovered = provider && providerModelSnapshot(provider, name);
+            if (discovered) return { ...prev, name, maxContextTokens: discovered.maxContextTokens || 0,
+                supportsStreaming: discovered.supportsStreaming ?? true, supportsTools: discovered.supportsTools ?? false,
+                supportsVision: discovered.supportsVision ?? false, supportsThinking: discovered.supportsThinking ?? false };
             if (!spec) return { ...prev, name };
             return {
                 ...prev,
@@ -231,6 +238,7 @@ const ModelEditModal: React.FC<ModelEditModalProps> = ({ model, providerId, isNe
 export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClose }) => {
     const modalDrag = useDraggableModal();
     const [settings, setSettings] = useState<AISettings>(getDefaultAISettings());
+    const [settingsLoaded, setSettingsLoaded] = useState(false);
     const settingsRef = useRef(settings);
     settingsRef.current = settings;
     const [activeTab, setActiveTab] = useState<'providers' | 'models' | 'advanced' | 'prompt' | 'plugins' | 'macros'>('providers');
@@ -264,10 +272,12 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
     const [availableModels, setAvailableModels] = useState<{
         providerId: string;
         models: string[];
+        metadata?: DiscoveredModelInfo[];
     } | null>(null);
     const [addedModels, setAddedModels] = useState<Set<string>>(new Set());
     const [showApiKey, setShowApiKey] = useState<Record<string, boolean>>({});
     const [modelFilter, setModelFilter] = useState('');
+    const refreshedCatalogs = useRef(new Set<string>());
 
     // Ollama pull model state
     const [pullModelName, setPullModelName] = useState('');
@@ -361,7 +371,8 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
             if (saved) {
                 try {
                     const parsed = JSON.parse(saved) as AISettings;
-                    parsed.models = reconcilePersistedModels(parsed.models);
+                    parsed.providers = reconcileProviderNames(parsed.providers);
+                    parsed.models = reconcileProviderModels(parsed.models, parsed.providers);
                     const { settings: hydrated, migrated } = await hydrateApiKeys(parsed);
                     setSettings(hydrated);
 
@@ -386,13 +397,15 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
             try {
                 const vaultData = await secureGetWithFallback<AISettings>('ai_settings', AI_SETTINGS_KEY);
                 if (vaultData && vaultData.providers && vaultData.providers.length > 0) {
-                    vaultData.models = reconcilePersistedModels(vaultData.models);
+                    vaultData.providers = reconcileProviderNames(vaultData.providers);
+                    vaultData.models = reconcileProviderModels(vaultData.models, vaultData.providers);
                     const { settings: vaultHydrated } = await hydrateApiKeys(vaultData);
                     setSettings(vaultHydrated);
                 }
             } catch {
                 // Vault unavailable, localStorage data already loaded above
             }
+            setSettingsLoaded(true);
         };
         loadSettings();
     }, []);
@@ -400,6 +413,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
     // Save settings: API keys go to OS Keyring, rest to localStorage + vault (debounced)
     // B14: async persistence with error logging instead of fire-and-forget
     const saveSettings = useCallback((newSettings: AISettings) => {
+        settingsRef.current = newSettings;
         setSettings(newSettings);
 
         if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
@@ -471,11 +485,8 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
     };
 
     // Update provider
-    const updateProvider = (provider: AIProvider) => {
-        saveSettings({
-            ...settings,
-            providers: settings.providers.map((p) => (p.id === provider.id ? { ...provider, updatedAt: new Date() } : p)),
-        });
+    const updateProvider = (provider: AIProvider, commit = true) => {
+        saveSettings(withProviderEdit(settingsRef.current, provider, commit));
         setEditingProvider(null);
     };
 
@@ -647,12 +658,20 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
         setFetchingModels(provider.id);
         setAddedModels(new Set());
         try {
-            const models = await invoke<string[]>('ai_list_models', {
+            const catalog = await invoke<DiscoveredModelInfo[]>('ai_list_models', {
                 providerType: provider.type,
                 baseUrl: provider.baseUrl,
                 apiKey: provider.apiKey || null,
+                includeMetadata: true,
             });
-            setAvailableModels({ providerId: provider.id, models });
+            const metadata = normalizeModelCatalog(catalog);
+            const current = settingsRef.current;
+            const live = current.providers.find(p => p.id === provider.id && p.type === provider.type && p.baseUrl === provider.baseUrl);
+            if (!live) return;
+            setAvailableModels({ providerId: provider.id, models: metadata.map(m => m.id), metadata });
+            const models = current.models.map(model => model.providerId === provider.id
+                ? resolveProviderModel(model, live, metadata.find(m => m.id === model.name)) as AIModel : model);
+            if (JSON.stringify(models) !== JSON.stringify(current.models)) saveSettings({ ...current, models });
         } catch (error: any) {
             const msg = typeof error === 'string' ? error : error?.message || 'Failed to fetch models';
             setTestResults((prev) => ({
@@ -674,7 +693,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
             return;
         }
         const noExisting = existingNames.length === 0;
-        const newModel = applyDiscoveredModelDefaults({
+        const newModel = resolveProviderModel(applyDiscoveredModelDefaults({
             id: generateId(),
             providerId: provider.id,
             name: modelName,
@@ -687,7 +706,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                     .replace(/\b\w/g, (c) => c.toUpperCase()) || modelName,
             isEnabled: true,
             isDefault: noExisting,
-        }) as AIModel;
+        }) as AIModel, provider, availableModels?.metadata?.find(m => m.id === modelName)) as AIModel;
         saveSettings({
             ...current,
             models: [...current.models, newModel],
@@ -697,6 +716,15 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
 
     // Save model (create or update)
     const saveModel = (model: AIModel) => {
+        const previous = settings.models.find(m => m.id === model.id);
+        const provider = settings.providers.find(p => p.id === model.providerId);
+        const automatic = resolveProviderModel({ ...model, capabilityOverrides: undefined }, provider);
+        const overrides = { ...(previous?.name === model.name ? previous.capabilityOverrides : {}) };
+        for (const key of CAPABILITY_KEYS) {
+            if (model[key] !== automatic[key]) overrides[key] = model[key];
+            else delete overrides[key];
+        }
+        model = resolveProviderModel({ ...model, capabilityOverrides: overrides }, provider) as AIModel;
         const existingIndex = settings.models.findIndex((m) => m.id === model.id);
         if (existingIndex >= 0) {
             // Update
@@ -718,7 +746,31 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
     const getProviderModels = (providerId: string) => settings.models.filter((m) => m.providerId === providerId);
 
     // Get unused presets
-    const unusedPresets = PROVIDER_PRESETS.filter((preset) => !settings.providers.some((p) => p.type === preset.type));
+    const unusedPresets = PROVIDER_PRESETS.filter((preset) => preset.type === 'custom' || !settings.providers.some((p) => p.type === preset.type));
+
+    // Refresh saved router models too, without opening the catalog or sending a
+    // generation request. Results are scoped to the still-current endpoint.
+    useEffect(() => {
+        if (!isOpen) { refreshedCatalogs.current.clear(); return; }
+        if (!settingsLoaded) return;
+        for (const provider of settings.providers) {
+            if (provider.type !== 'openrouter' || provider.baseUrl.replace(/\/+$/, '') !== 'https://openrouter.ai/api/v1'
+                || !settings.models.some(m => m.providerId === provider.id)) continue;
+            const scope = `${provider.id}:${provider.baseUrl}`;
+            if (refreshedCatalogs.current.has(scope)) continue;
+            refreshedCatalogs.current.add(scope);
+            invoke<DiscoveredModelInfo[]>('ai_list_models', { providerType: provider.type, baseUrl: provider.baseUrl, includeMetadata: true })
+                .then(catalog => {
+                    const metadata = normalizeModelCatalog(catalog);
+                    const current = settingsRef.current;
+                    const live = current.providers.find(p => p.id === provider.id && p.type === provider.type && p.baseUrl === provider.baseUrl);
+                    if (!live || !Array.isArray(catalog)) return;
+                    const models = current.models.map(m => m.providerId === provider.id
+                        ? resolveProviderModel(m, live, metadata.find(info => info.id === m.name)) as AIModel : m);
+                    if (JSON.stringify(models) !== JSON.stringify(current.models)) saveSettings({ ...current, models });
+                }).catch(() => { /* Keep cached/unknown capabilities while offline. */ });
+        }
+    }, [isOpen, settingsLoaded, settings.providers, settings.models]);
 
     if (!isOpen) return null;
 
@@ -969,6 +1021,21 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                                                         )}
                                                     </div>
 
+                                                    {provider.type === 'custom' && (
+                                                        <div>
+                                                            <label htmlFor={`provider-name-${provider.id}`} className="block text-sm text-gray-400 mb-1">{t('ai.settings.displayName')}</label>
+                                                            <input
+                                                                id={`provider-name-${provider.id}`}
+                                                                type="text"
+                                                                value={provider.name}
+                                                                maxLength={120}
+                                                                onChange={(e) => updateProvider({ ...provider, name: e.target.value })}
+                                                                onBlur={(e) => updateProvider({ ...provider, name: e.target.value.trim() || PROVIDER_PRESETS.find(p => p.type === 'custom')!.name })}
+                                                                className="w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                                                            />
+                                                        </div>
+                                                    )}
+
                                                     {/* Base URL */}
                                                     <div>
                                                         <label className="block text-sm text-gray-400 mb-1">
@@ -979,6 +1046,12 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                                                             type="text"
                                                             value={provider.baseUrl}
                                                             onChange={(e) =>
+                                                                updateProvider({
+                                                                    ...provider,
+                                                                    baseUrl: e.target.value,
+                                                                }, false)
+                                                            }
+                                                            onBlur={(e) =>
                                                                 updateProvider({
                                                                     ...provider,
                                                                     baseUrl: e.target.value,
@@ -1914,10 +1987,14 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
 
                 {/* Footer */}
                 <div className="px-6 py-4 border-t border-gray-700 flex justify-between items-center">
-                    <div className="text-sm text-gray-500">
-                        {t('ai.settings.providersEnabled', {
-                            count: settings.providers.filter((p) => p.isEnabled).length,
-                        })}
+                    <div className="flex items-center gap-2 text-xs text-gray-500">
+                        <span>{t('ai.aeroAgent')} {AEROAGENT_VERSION}</span>
+                        <span aria-hidden="true">|</span>
+                        <span>
+                            {t('ai.settings.providersEnabled', {
+                                count: settings.providers.filter((p) => p.isEnabled).length,
+                            })}
+                        </span>
                     </div>
                     <button onClick={onClose} className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg text-sm transition-colors">
                         {t('ai.settings.done')}
@@ -1926,7 +2003,7 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
             </div>
 
             {/* Model Edit Modal */}
-            {editingModel && <ModelEditModal model={editingModel.model} providerId={editingModel.providerId} isNew={editingModel.isNew} onSave={saveModel} onClose={() => setEditingModel(null)} />}
+            {editingModel && <ModelEditModal model={editingModel.model} providerId={editingModel.providerId} provider={settings.providers.find(p => p.id === editingModel.providerId)} isNew={editingModel.isNew} onSave={saveModel} onClose={() => setEditingModel(null)} />}
 
             {/* Available Models Modal */}
             {availableModels &&

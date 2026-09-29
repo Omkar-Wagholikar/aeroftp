@@ -33,7 +33,9 @@ export interface AIModel {
     supportsParallelTools?: boolean;   // Multiple tool calls in single response
     toolCallQuality?: 1 | 2 | 3 | 4 | 5;   // Tool call accuracy rating
     bestFor?: string[];                        // Capability tags
-    capabilitySource?: 'registry' | 'user' | 'unknown';
+    capabilitySource?: 'registry' | 'provider' | 'user' | 'unknown';
+    providerCapabilities?: import('./aiModelDiscovery').ProviderCapabilitySnapshot;
+    capabilityOverrides?: Partial<import('./aiModelDiscovery').CapabilityFlags>;
     capabilitiesVerifiedAt?: string;           // ISO date for provider-doc verification
     capabilitiesSourceUrl?: string;            // Public provider documentation, never a secret URL
     nativeCapabilities?: AIModelNativeCapabilities;
@@ -46,6 +48,10 @@ export type AIReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | '
 
 /** Provider-native features. Availability here does not mean AeroAgent has wired the feature yet. */
 export interface AIModelNativeCapabilities {
+    /** Provider contract only; the current adapter may not implement it. */
+    toolCallingTransport?: 'responses' | 'responses-or-chat-without-reasoning';
+    thinkingAlwaysOn?: boolean;
+    forcedToolChoice?: boolean;
     responses?: boolean;
     hostedTools?: boolean;
     toolSearch?: boolean;
@@ -155,7 +161,7 @@ export const PROVIDER_PRESETS: Omit<AIProvider, 'id' | 'apiKey' | 'createdAt' | 
         isDefault: false,
     },
     {
-        name: 'Qwen (Alibaba)',
+        name: 'Alibaba Model Studio',
         type: 'qwen',
         baseUrl: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
         isEnabled: false,
