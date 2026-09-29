@@ -30,6 +30,7 @@ import { ToolMacro, resolveMacroSteps, DEFAULT_MACROS, MAX_TOTAL_MACRO_STEPS, cr
 import { buildToolRegistry, resolveRegisteredTool, resolveMacroStep, ToolExposure, TOOL_EXPOSURE_GUIDE, assertToolExecutionCurrent, recordToolDispatch } from './aiChatToolRegistry';
 import { validateToolArgs } from './aiChatToolValidation';
 import { computeTokenInfo } from './aiChatTokenInfo';
+import { delegationCardEntries } from './aiChatDelegationCards';
 import { useAIChatImages } from './useAIChatImages';
 import { useAIChatConversations } from './useAIChatConversations';
 import { Checkbox } from '../ui/Checkbox';
@@ -3288,11 +3289,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                 {delegationView.remoteProfiles.map(profile => (
                                     <div key={profile.id} className={`${ct.textMuted} break-all`}>{profile.name}: {profile.root}</div>
                                 ))}
-                                {Array.from(new Set(delegationView.events.flatMap(event => event.childId ? [event.childId] : []))).map((childId, index) => {
-                                    const lastStatus = delegationView.events.filter(event => event.childId === childId).slice(-1)[0]?.status ?? 'queued';
-                                    const status = delegationView.status === 'cancelled' && (lastStatus === 'queued' || lastStatus === 'running')
-                                        ? 'cancelled' : lastStatus;
-                                    const worker = delegationView.workers.find(item => item.childId === childId);
+                                {delegationCardEntries(delegationView.workers, delegationView.events, delegationView.status === 'cancelled').map(({ childId, worker, status }, index) => {
                                     return (
                                         <div key={childId} className={`rounded border ${ct.border} px-2 py-1.5`}>
                                             <div className="flex justify-between gap-2">
@@ -3331,8 +3328,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                         </>
                                     ) : (
                                         <span className="transition-opacity duration-300 flex items-center gap-2">
-                                            {thinkingMessage}
-                                            {thinkingIsTyping && (
+                                            {delegationView?.status === 'cancelling' ? t('ai.workerStopping') : thinkingMessage}
+                                            {delegationView?.status !== 'cancelling' && thinkingIsTyping && (
                                                 <span className="inline-block w-[3px] h-3.5 ml-0.5 bg-purple-400 rounded-[1px] animate-[blink_0.5s_infinite] align-middle"
                                                     style={{ animationTimingFunction: 'steps(1)' }} />
                                             )}
@@ -3554,8 +3551,8 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                         <button
                             onClick={isLoading ? requestStopGeneration : delegateLocal ? handleDelegateSend : handleSend}
                             disabled={(isLoading && delegationView?.status === 'cancelling') || (!isLoading && ((!input.trim() && attachedImages.length === 0) || (delegateLocal && (!localPath || attachedImages.length > 0))))}
-                            title={isLoading ? t('ai.stopGeneration') : undefined}
-                            aria-label={isLoading ? t('ai.stopGeneration') : undefined}
+                            title={isLoading ? t(delegationView?.status === 'cancelling' ? 'ai.workerStopping' : 'ai.stopGeneration') : undefined}
+                            aria-label={isLoading ? t(delegationView?.status === 'cancelling' ? 'ai.workerStopping' : 'ai.stopGeneration') : undefined}
                             className={`p-1.5 rounded transition-colors ${isLoading
                                 ? 'text-red-400 hover:text-red-300 hover:bg-red-500/20'
                                 : 'text-purple-400 hover:text-purple-300 disabled:text-gray-600 disabled:cursor-not-allowed'}`}
