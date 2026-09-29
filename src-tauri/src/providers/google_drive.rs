@@ -476,7 +476,12 @@ impl GoogleDriveProvider {
             .map_err(|e| ProviderError::Other(format!("Parse error: {}", e)))
     }
 
-    /// Find file/folder by name in parent
+    /// The file or folder named exactly `name` in `parent_id`. Drive's
+    /// `name='x'` search ignores letter case while Drive keeps `A.txt` and
+    /// `a.txt` as two items, so the search can answer the other one, alone
+    /// or listed first: `a.txt` resolved to `A.txt`, and an upload of
+    /// `a.txt` overwrote it. Only a hit of the exact name counts (as in
+    /// rclone's Drive backend).
     async fn find_by_name(
         &self,
         name: &str,
@@ -507,7 +512,7 @@ impl GoogleDriveProvider {
             .await
             .map_err(|e| ProviderError::Other(format!("Parse error: {}", e)))?;
 
-        Ok(list.files.into_iter().next())
+        Ok(list.files.into_iter().find(|file| file.name == name))
     }
 
     /// P2-6: LRU eviction: remove least-recently-accessed half when cache exceeds max
@@ -543,12 +548,15 @@ impl GoogleDriveProvider {
     /// Drop the cached ids of the folder at `path` and of every folder under
     /// it. A rename, move or delete leaves them pointing at a folder that is
     /// no longer there: after `/a` moved to `/b`, a new `/a` still resolved to
-    /// the moved folder, and deleting `/a/x` deleted `/b/x`.
+    /// the moved folder, and deleting `/a/x` deleted `/b/x`. Under every
+    /// capitalization: a folder is cached under the spelling of each lookup,
+    /// so one whose case another client changed (or that the case-blind
+    /// lookup found under another spelling) sat there twice, and the other
+    /// spelling outlived the move. The keys keep their case: `A` and `a` are
+    /// two items, and forgetting both costs one lookup.
     fn forget_folder(&mut self, path: &str) {
         let path = self.absolute_path(path);
-        let below = format!("{}/", path.trim_end_matches('/'));
-        self.folder_cache
-            .retain(|cached, _| *cached != path && !cached.starts_with(&below));
+        super::forget_cached_subtree_ignoring_case(&mut self.folder_cache, &path);
     }
 
     /// The id of `parent`, the folder part of a path already stripped of
@@ -1236,17 +1244,25 @@ impl GoogleDriveProvider {
         Ok(())
     }
 
-    /// Look up a file in the trash by basename. Returns the id of the most
-    /// recently trashed match, or None if no trashed file with that name
-    /// exists. Used by `delete_permanent` to resolve the path the caller
-    /// just passed to `delete()` (which trashed it).
-    async fn find_trashed_by_basename(
+    /// Look up a file in the trash by its name in the folder `parent_id`.
+    /// Returns the id of the most recently modified match, or None if that
+    /// folder has no trashed item of that name. Used by `delete_permanent` to
+    /// resolve the path the caller just passed to `delete()` (which trashed
+    /// it). The folder matters: the search went by name alone, so with
+    /// `/old/a.txt` and `/new/a.txt` both in the trash a purge of
+    /// `/new/a.txt` could delete `/old/a.txt` for good (the crypt overlay
+    /// gives the same names in many folders).
+    async fn find_trashed_in(
         &mut self,
-        basename: &str,
+        name: &str,
+        parent_id: &str,
     ) -> Result<Option<String>, ProviderError> {
         // Escape single quotes per Drive query syntax (\').
-        let escaped = basename.replace('\\', "\\\\").replace('\'', "\\'");
-        let q = format!("name='{}' and trashed=true", escaped);
+        let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
+        let q = format!(
+            "name='{}' and '{}' in parents and trashed=true",
+            escaped, parent_id
+        );
         let url = format!(
             "{}/files?q={}&orderBy=modifiedTime+desc&fields=files(id,name,mimeType,modifiedTime),nextPageToken&pageSize=10",
             self.drive_api(),
@@ -1266,7 +1282,14 @@ impl GoogleDriveProvider {
             .json()
             .await
             .map_err(|e| ProviderError::Other(format!("Trash search parse error: {}", e)))?;
-        Ok(list.files.into_iter().next().map(|f| f.id))
+        // The search ignores letter case (see `find_by_name`): a trashed
+        // `A.txt` is not the `a.txt` the caller trashed, and this id is
+        // deleted for good.
+        Ok(list
+            .files
+            .into_iter()
+            .find(|f| f.name == name)
+            .map(|f| f.id))
     }
 
     /// Permanently delete a file by file ID (bypasses trash)
@@ -1924,6 +1947,8 @@ impl StorageProvider for GoogleDriveProvider {
         // check the HTTP status and would surface a deserialize error) must not
         // fail the create, which historically went straight to the POST, so on
         // any lookup error we fall through and let the create proceed.
+        // The name exactly: Drive keeps `photos` beside `Photos` as two
+        // folders, so `mkdir /photos` there creates it.
         if let Ok(Some(existing)) = self.find_by_name(folder_name, &parent_id).await {
             if is_drive_folder(&existing) {
                 return Err(ProviderError::AlreadyExists(path.to_string()));
@@ -1977,18 +2002,26 @@ impl StorageProvider for GoogleDriveProvider {
 
     async fn delete_permanent(&mut self, path: &str) -> Result<bool, ProviderError> {
         // After `delete()` the item lives in trash with no usable path; look
-        // it up by basename in the trash listing and call `permanent_delete`
-        // by file id. If nothing matches the path is treated as already
-        // purged (Ok(false)) rather than an error so the caller can continue.
-        let basename = path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(path);
+        // it up by its name in the trash, among the items of its folder,
+        // and call `permanent_delete` by file id. If nothing matches the path
+        // is treated as already purged (Ok(false)) rather than an error so
+        // the caller can continue; so is a folder that is no longer there,
+        // since nothing in the trash can then be told to be this path.
+        let path_is_absolute = path.starts_with('/');
+        let trimmed = path.trim_matches('/');
+        let (parent_path, basename) = match trimmed.rfind('/') {
+            Some(pos) => (&trimmed[..pos], &trimmed[pos + 1..]),
+            None => ("", trimmed),
+        };
         if basename.is_empty() {
             return Ok(false);
         }
-        match self.find_trashed_by_basename(basename).await? {
+        let parent_id = match self.parent_folder_id(path_is_absolute, parent_path).await {
+            Ok(id) => id,
+            Err(ProviderError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        match self.find_trashed_in(basename, &parent_id).await? {
             Some(id) => {
                 self.permanent_delete(&id).await?;
                 Ok(true)
@@ -3226,10 +3259,14 @@ mod tests {
     }
 
     /// A Drive API double holding `tree` as `(id, name, parent id)`, a name
-    /// without a dot being a folder. It answers the `name='..' and '..' in
-    /// parents` searches of `find_by_name`, a download (`alt=media`) of `id`
-    /// with `content of id`, and accepts every PATCH, uploads included.
-    /// Returns a provider pointed at it and every PATCH as `id body`.
+    /// without a dot being a folder and the parent `trash:P` standing for an
+    /// item trashed from the folder `P`. It answers the `name='..' and '..'
+    /// in parents` searches, of the live items or, with `trashed=true`, of
+    /// the trash (the folder part optional there), ignoring letter case as
+    /// Drive's do, a download (`alt=media`) of
+    /// `id` with `content of id`, and accepts every PATCH, POST and DELETE,
+    /// uploads included. Returns a provider pointed at it and every PATCH as
+    /// `id body`, POST as `POST path` and DELETE as `DELETE id`.
     async fn provider_on_drive(
         tree: &'static [(&'static str, &'static str, &'static str)],
     ) -> (
@@ -3256,6 +3293,15 @@ mod tests {
                             .push(format!("{id} {}", String::from_utf8_lossy(&body)));
                         return axum::Json(serde_json::json!({ "id": id })).into_response();
                     }
+                    if method == "POST" {
+                        seen.lock().unwrap().push(format!("POST {}", url.path()));
+                        return axum::Json(serde_json::json!({ "id": "CREATED" })).into_response();
+                    }
+                    if method == "DELETE" {
+                        let id = url.path().rsplit('/').next().unwrap_or("").to_string();
+                        seen.lock().unwrap().push(format!("DELETE {id}"));
+                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                    }
                     if url.query_pairs().any(|(k, v)| k == "alt" && v == "media") {
                         let id = url.path().rsplit('/').next().unwrap_or("").to_string();
                         return format!("content of {id}").into_response();
@@ -3265,27 +3311,41 @@ mod tests {
                         .find(|(k, _)| k == "q")
                         .map(|(_, v)| v.to_string())
                         .unwrap_or_default();
-                    let name = q
-                        .strip_prefix("name='")
-                        .and_then(|rest| rest.split_once("' and '"))
-                        .map(|(name, rest)| (name.to_string(), rest.to_string()));
+                    // `name='N' and 'P' in parents and trashed=B`, the folder
+                    // part optional: an item trashed from `P` has the parent
+                    // `trash:P`.
+                    let trashed = q.ends_with("trashed=true");
+                    let name = q.strip_prefix("name='").and_then(|rest| {
+                        let (name, rest) = rest.split_once("' and ")?;
+                        let parent = rest
+                            .strip_prefix('\'')
+                            .and_then(|r| r.split_once("' in parents"))
+                            .map(|(p, _)| p.to_string());
+                        Some((name.to_string(), parent))
+                    });
                     let files: Vec<serde_json::Value> = match name {
-                        Some((name, rest)) => {
-                            let parent = rest.split_once("' in parents").map_or("", |(p, _)| p);
-                            tree.iter()
-                                .filter(|(_, n, p)| *n == name && *p == parent)
-                                .map(|(id, n, p)| {
-                                    let mime = if n.contains('.') {
-                                        "text/plain"
-                                    } else {
-                                        "application/vnd.google-apps.folder"
-                                    };
-                                    serde_json::json!({
-                                        "id": id, "name": n, "mimeType": mime, "parents": [p],
-                                    })
+                        Some((name, parent)) => tree
+                            .iter()
+                            .filter(|(_, n, p)| {
+                                let in_parent = match (&parent, p.strip_prefix("trash:")) {
+                                    (Some(want), Some(from)) => trashed && from == want,
+                                    (None, Some(_)) => trashed,
+                                    (Some(want), None) => !trashed && p == want,
+                                    (None, None) => false,
+                                };
+                                n.eq_ignore_ascii_case(&name) && in_parent
+                            })
+                            .map(|(id, n, p)| {
+                                let mime = if n.contains('.') {
+                                    "text/plain"
+                                } else {
+                                    "application/vnd.google-apps.folder"
+                                };
+                                serde_json::json!({
+                                    "id": id, "name": n, "mimeType": mime, "parents": [p],
                                 })
-                                .collect()
-                        }
+                            })
+                            .collect(),
                         None => Vec::new(),
                     };
                     axum::Json(serde_json::json!({ "files": files })).into_response()
@@ -3329,6 +3389,107 @@ mod tests {
         p.rmdir("/a").await.expect("rmdir");
         assert!(!p.folder_cache.contains_key("/a"));
         assert!(!p.folder_cache.contains_key("/a/sub"));
+    }
+
+    /// A small local file to upload.
+    fn local_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"new").unwrap();
+        file
+    }
+
+    /// Drive's name search ignores letter case and Drive keeps `A.txt` and
+    /// `a.txt` as two files: an upload of `a.txt` beside `A.txt` found
+    /// `A.txt` and sent the content as a new revision of it. It creates
+    /// `a.txt` and leaves `A.txt` alone.
+    #[tokio::test]
+    async fn an_upload_does_not_overwrite_a_file_of_another_case() {
+        let (mut p, changes) = provider_on_drive(&[("UP", "A.txt", "root")]).await;
+        let file = local_file();
+        p.upload(file.path().to_str().unwrap(), "/a.txt", None)
+            .await
+            .expect("upload");
+        assert_eq!(*changes.lock().unwrap(), ["POST /upload/drive/v3/files"]);
+    }
+
+    /// A replace onto `a.txt` took `A.txt` for the file to replace: the new
+    /// content became a revision of `A.txt`. With no `a.txt` there, the
+    /// replace is the rename.
+    #[tokio::test]
+    async fn a_replace_does_not_take_a_file_of_another_case_for_the_old_one() {
+        let (mut p, changes) =
+            provider_on_drive(&[("UP", "A.txt", "root"), ("NEW", "x.txt", "root")]).await;
+        p.replace("/x.txt", "/a.txt").await.expect("replace");
+        let changes = changes.lock().unwrap().clone();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(
+            changes[0].starts_with(r#"NEW {"name":"a.txt""#),
+            "{changes:?}"
+        );
+    }
+
+    /// Drive keeps `photos` beside `Photos` as two folders, and the exact
+    /// name decides: `mkdir /photos` there creates it, where it answered
+    /// AlreadyExists for `Photos`.
+    #[tokio::test]
+    async fn mkdir_beside_a_folder_of_another_case_creates_the_folder() {
+        let (mut p, changes) = provider_on_drive(&[("PH", "Photos", "root")]).await;
+        p.mkdir("/photos").await.expect("mkdir");
+        assert_eq!(*changes.lock().unwrap(), ["POST /drive/v3/files"]);
+    }
+
+    /// The trash search ignores letter case too: after `rm /a.txt`, a
+    /// permanent delete of `/a.txt` with only an `A.txt` in the trash deleted
+    /// `A.txt` for good. Nothing of that exact name is there, so nothing is
+    /// deleted.
+    #[tokio::test]
+    async fn a_permanent_delete_does_not_take_a_trashed_file_of_another_case() {
+        let (mut p, changes) = provider_on_drive(&[("TA", "A.txt", "trash:root")]).await;
+        assert!(!p.delete_permanent("/a.txt").await.expect("delete"));
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+    }
+
+    /// The trash search went by name alone: with `/old/a.txt` and
+    /// `/new/a.txt` both in the trash, a purge of `/new/a.txt` deleted
+    /// `/old/a.txt` for good. It looks among the items trashed from the
+    /// folder of the path.
+    #[tokio::test]
+    async fn a_permanent_delete_takes_the_trashed_file_of_its_own_folder() {
+        let (mut p, changes) = provider_on_drive(&[
+            ("O", "old", "root"),
+            ("N", "new", "root"),
+            ("TO", "a.txt", "trash:O"),
+            ("TN", "a.txt", "trash:N"),
+        ])
+        .await;
+        assert!(p.delete_permanent("/new/a.txt").await.expect("purge"));
+        assert_eq!(*changes.lock().unwrap(), ["DELETE TN"]);
+    }
+
+    /// The folder cache keeps each spelling a lookup used, so a folder whose
+    /// case changed sat there as `/Projects` and `/projects`. A move of
+    /// `/Projects` forgot only that spelling, and `put /projects/sub/x` went
+    /// on into the moved folder. Every capitalization is forgotten; a
+    /// sibling sharing the prefix stays.
+    #[tokio::test]
+    async fn a_move_forgets_the_folder_under_every_capitalization() {
+        let (mut p, _) = provider_on_drive(&[("P", "Projects", "root")]).await;
+        for (path, id) in [
+            ("/Projects", "P"),
+            ("/projects", "P"),
+            ("/projects/sub", "SUB"),
+            ("/projectsx", "X"),
+        ] {
+            p.folder_cache.insert(path.to_string(), (id.to_string(), 0));
+        }
+        p.rename("/Projects", "/Archive").await.expect("rename");
+        let mut cached: Vec<&str> = p.folder_cache.keys().map(String::as_str).collect();
+        cached.sort();
+        assert_eq!(cached, ["/projectsx"]);
     }
 
     /// `replace` is the verb for "put this over that" (CLI `edit`, MCP

@@ -802,8 +802,39 @@ impl InternxtProvider {
 
     // ─── Path Resolution ───────────────────────────────────────────────
 
-    /// Resolve a virtual path to a folder UUID, navigating from root
+    /// The uuid of the folder at `path`, for a read: each name matched
+    /// exactly first, and in another letter case as the fallback.
     async fn resolve_folder_uuid(&mut self, path: &str) -> Result<String, ProviderError> {
+        self.resolve_folder(path, true).await
+    }
+
+    /// The uuid of the folder at `path` with every name matched exactly, for
+    /// a step that changes or destroys what it finds: `rmdir /docs` beside
+    /// only `Docs` removed `Docs`, and `rm /docs/x` deleted `Docs/x`. The
+    /// cache is trusted, because only exact matches are ever written to it.
+    async fn resolve_folder_uuid_exact(&mut self, path: &str) -> Result<String, ProviderError> {
+        self.resolve_folder(path, false).await
+    }
+
+    /// Whether the folder at `resolved` is cached, that is, was resolved
+    /// with every name matched exactly: a folder under it may be cached
+    /// under its path. A listing, mkdir or rename under a path resolved
+    /// through the fallback caches nothing, or the path of another folder
+    /// would hold its children's ids.
+    fn is_cached_exactly(&self, resolved: &str) -> bool {
+        resolved == "/" || self.dir_cache.contains_key(resolved)
+    }
+
+    /// Resolve a virtual path to a folder UUID, navigating from root. Only
+    /// exact matches are cached, and nothing below a name matched in another
+    /// case: a spelling the fallback resolved (`cd /docs` beside only `Docs`)
+    /// kept the uuid of `Docs` after another client made a real `docs`, and
+    /// `rm -r /docs` emptied `Docs`.
+    async fn resolve_folder(
+        &mut self,
+        path: &str,
+        other_case: bool,
+    ) -> Result<String, ProviderError> {
         let normalized = Self::normalize_path(path);
 
         // Check cache
@@ -819,6 +850,7 @@ impl InternxtProvider {
         // Walk path segments from root
         let mut current_uuid = self.root_folder_id.clone();
         let mut current_path = String::from("/");
+        let mut exact_so_far = true;
 
         for segment in normalized.trim_matches('/').split('/') {
             if segment.is_empty() {
@@ -839,10 +871,15 @@ impl InternxtProvider {
             }
 
             // List folders in current_uuid to find segment
-            let found = self.find_subfolder(&current_uuid, segment).await?;
+            let found = self
+                .find_subfolder(&current_uuid, segment, other_case)
+                .await?;
             match found {
-                Some(uuid) => {
-                    self.dir_cache_insert(check_path.clone(), DirInfo { uuid: uuid.clone() });
+                Some((uuid, exact)) => {
+                    exact_so_far &= exact;
+                    if exact_so_far {
+                        self.dir_cache_insert(check_path.clone(), DirInfo { uuid: uuid.clone() });
+                    }
                     current_uuid = uuid;
                     current_path = check_path;
                 }
@@ -855,14 +892,21 @@ impl InternxtProvider {
         Ok(current_uuid)
     }
 
-    /// Find a subfolder by name within a parent folder
+    /// Find a subfolder by name within a parent folder: the name as spelled
+    /// first, on every page, and when `other_case`, another letter case as
+    /// the fallback. Internxt is taken to keep `Docs` and `docs` as two
+    /// folders (as rclone lists it), and the first match ignoring the case
+    /// walked `/docs` into `Docs` when it was listed first. Returns the uuid
+    /// and whether the name matched exactly.
     async fn find_subfolder(
         &mut self,
         parent_uuid: &str,
         name: &str,
-    ) -> Result<Option<String>, ProviderError> {
+        other_case: bool,
+    ) -> Result<Option<(String, bool)>, ProviderError> {
         let mut trail = CursorTrail::default();
         let mut cursor: Option<String> = None;
+        let mut fallback = None;
         loop {
             let (folders, next) = self
                 .content_page::<InternxtFolder>(parent_uuid, "folders", cursor.as_deref())
@@ -874,16 +918,124 @@ impl InternxtProvider {
                     .as_deref()
                     .or(folder.name.as_deref())
                     .unwrap_or("");
-                if folder_name.eq_ignore_ascii_case(name) {
-                    return Ok(Some(folder.uuid.clone()));
+                if folder_name == name {
+                    return Ok(Some((folder.uuid.clone(), true)));
+                }
+                if other_case && fallback.is_none() && folder_name.eq_ignore_ascii_case(name) {
+                    fallback = Some((folder.uuid.clone(), false));
                 }
             }
 
             match trail.follow("folders", next)? {
                 Some(next) => cursor = Some(next),
-                None => return Ok(None),
+                None => return Ok(fallback),
             }
         }
+    }
+
+    /// Delete the file `uuid`.
+    async fn delete_file_by_uuid(&mut self, uuid: &str) -> Result<(), ProviderError> {
+        let resp = self
+            .send_with_reauth(|this| {
+                this.drive_request(reqwest::Method::DELETE, &format!("/files/{}", uuid))
+            })
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::ServerError(format!(
+                "Delete failed ({}): {}",
+                status,
+                super::sanitize_api_error(&body)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete the folder `uuid`, found at `resolved`.
+    async fn delete_folder_by_uuid(
+        &mut self,
+        uuid: &str,
+        resolved: &str,
+    ) -> Result<(), ProviderError> {
+        let sent = self
+            .send_with_reauth(|this| {
+                this.drive_request(reqwest::Method::DELETE, &format!("/folders/{}", uuid))
+            })
+            .await;
+        // Whatever the answer, not only the folder's own id: every folder
+        // cached under it is gone with it, under every capitalization.
+        super::forget_cached_subtree_ignoring_case(&mut self.dir_cache, resolved);
+        let resp = sent?;
+
+        if !resp.status().is_success() && resp.status().as_u16() != 204 {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::ServerError(format!(
+                "Delete folder failed ({}): {}",
+                status,
+                super::sanitize_api_error(&body)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Delete the folder `uuid`, found at `resolved`, after everything in it,
+    /// each item by the uuid its folder's listing gives. By path, the
+    /// listing and the deletes resolved `resolved` again through the cache,
+    /// and a spelling the fallback had cached there emptied another folder.
+    async fn remove_folder_tree(
+        &mut self,
+        uuid: &str,
+        resolved: &str,
+    ) -> Result<(), ProviderError> {
+        let mut files = Vec::new();
+        let mut trail = CursorTrail::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, next) = self
+                .content_page::<InternxtFile>(uuid, "files", cursor.as_deref())
+                .await?;
+            files.extend(
+                page.into_iter()
+                    .filter(|f| !matches!(f.status.as_deref(), Some("TRASHED" | "DELETED")))
+                    .map(|f| f.uuid),
+            );
+            match trail.follow("files", next)? {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let mut folders = Vec::new();
+        let mut trail = CursorTrail::default();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, next) = self
+                .content_page::<InternxtFolder>(uuid, "folders", cursor.as_deref())
+                .await?;
+            folders.extend(
+                page.into_iter()
+                    .filter(|f| !matches!(f.status.as_deref(), Some("TRASHED" | "DELETED")))
+                    .map(|f| {
+                        let name = f.plain_name.or(f.name).unwrap_or_default();
+                        (f.uuid, name)
+                    }),
+            );
+            match trail.follow("folders", next)? {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        for file in files {
+            self.delete_file_by_uuid(&file).await?;
+        }
+        for (folder, name) in folders {
+            let path = format!("{}/{name}", resolved.trim_end_matches('/'));
+            Box::pin(self.remove_folder_tree(&folder, &path)).await?;
+        }
+        self.delete_folder_by_uuid(uuid, resolved).await
     }
 
     /// Read one page of `GET /folders/v2/content/{folder_uuid}/{kind}`, `kind`
@@ -1022,14 +1174,40 @@ impl InternxtProvider {
         }
     }
 
-    /// Find a file by name in a folder, returns (uuid, file_id, bucket)
+    /// Find a file by name in a folder, returns (uuid, file_id, bucket): the
+    /// name as spelled first, on every page, and another letter case as the
+    /// fallback. The first match ignoring the case resolved `report.pdf` to
+    /// a `Report.pdf` listed before it.
     async fn find_file_in_folder(
         &mut self,
         folder_uuid: &str,
         filename: &str,
     ) -> Result<Option<(String, String, String)>, ProviderError> {
+        self.find_file_matching(folder_uuid, filename, true).await
+    }
+
+    /// [`Self::find_file_in_folder`] without the fallback to another letter
+    /// case, for a step that destroys what it finds: an upload of `a.txt`
+    /// beside only `A.txt` deleted `A.txt` first, and `rm /a.txt` deleted it.
+    async fn find_exact_file_in_folder(
+        &mut self,
+        folder_uuid: &str,
+        filename: &str,
+    ) -> Result<Option<(String, String, String)>, ProviderError> {
+        self.find_file_matching(folder_uuid, filename, false).await
+    }
+
+    /// The file named `filename` in `folder_uuid`: the exact name first, and
+    /// when `other_case`, another letter case as the fallback.
+    async fn find_file_matching(
+        &mut self,
+        folder_uuid: &str,
+        filename: &str,
+        other_case: bool,
+    ) -> Result<Option<(String, String, String)>, ProviderError> {
         let mut trail = CursorTrail::default();
         let mut cursor: Option<String> = None;
+        let mut fallback = None;
         loop {
             let (files, next) = self
                 .content_page::<InternxtFile>(folder_uuid, "files", cursor.as_deref())
@@ -1037,18 +1215,25 @@ impl InternxtProvider {
 
             for file in &files {
                 let fname = Self::get_filename(file);
-                if fname.eq_ignore_ascii_case(filename) {
-                    return Ok(Some((
+                let exact = fname == filename;
+                if exact
+                    || (other_case && fallback.is_none() && fname.eq_ignore_ascii_case(filename))
+                {
+                    let found = (
                         file.uuid.clone(),
                         file.file_id.clone().unwrap_or_default(),
                         file.bucket.clone().unwrap_or_else(|| self.bucket.clone()),
-                    )));
+                    );
+                    if exact {
+                        return Ok(Some(found));
+                    }
+                    fallback = Some(found);
                 }
             }
 
             match trail.follow("files", next)? {
                 Some(next) => cursor = Some(next),
-                None => return Ok(None),
+                None => return Ok(fallback),
             }
         }
     }
@@ -1480,6 +1665,7 @@ impl StorageProvider for InternxtProvider {
     async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
         let resolved = self.resolve_path(path);
         let folder_uuid = self.resolve_folder_uuid(&resolved).await?;
+        let cache_children = self.is_cached_exactly(&resolved);
 
         internxt_log(&format!(
             "[LIST] path={} uuid={} api_base={}",
@@ -1516,12 +1702,14 @@ impl StorageProvider for InternxtProvider {
                     format!("{}/{}", resolved, name)
                 };
                 let folder_path_clone = folder_path.clone();
-                self.dir_cache_insert(
-                    folder_path,
-                    DirInfo {
-                        uuid: folder.uuid.clone(),
-                    },
-                );
+                if cache_children {
+                    self.dir_cache_insert(
+                        folder_path,
+                        DirInfo {
+                            uuid: folder.uuid.clone(),
+                        },
+                    );
+                }
 
                 entries.push(RemoteEntry {
                     name: name.clone(),
@@ -1771,7 +1959,7 @@ impl StorageProvider for InternxtProvider {
         let (parent_path, filename) = Self::split_path(&resolved);
         let parent_path = parent_path.to_string();
         let filename = filename.to_string();
-        let parent_uuid = self.resolve_folder_uuid(&parent_path).await?;
+        let parent_uuid = self.resolve_folder_uuid_exact(&parent_path).await?;
 
         // M9: Full file read into memory for client-side AES-256-CTR encryption before upload.
         // Internxt requires encrypted content + HMAC, which needs buffering the entire plaintext.
@@ -1788,9 +1976,11 @@ impl StorageProvider for InternxtProvider {
 
         // Preemptive delete: if file already exists, remove it before uploading.
         // This avoids 409 Conflict and gives the server time to process the delete
-        // during the upload/encryption phase.
-        if let Some((existing_uuid, _, _)) =
-            self.find_file_in_folder(&parent_uuid, &filename).await?
+        // during the upload/encryption phase. The file of this exact name,
+        // never one of another letter case.
+        if let Some((existing_uuid, _, _)) = self
+            .find_exact_file_in_folder(&parent_uuid, &filename)
+            .await?
         {
             internxt_log(&format!(
                 "[UPLOAD] File {} exists, deleting before overwrite...",
@@ -2043,6 +2233,7 @@ impl StorageProvider for InternxtProvider {
         let parent_path = parent_path.to_string();
         let folder_name = folder_name.to_string();
         let parent_uuid = self.resolve_folder_uuid(&parent_path).await?;
+        let cache_new = self.is_cached_exactly(&parent_path);
 
         internxt_log(&format!(
             "Creating folder: {} in {}",
@@ -2079,13 +2270,15 @@ impl StorageProvider for InternxtProvider {
             ProviderError::ServerError(format!("Failed to parse create folder response: {}", e))
         })?;
 
-        // Cache new folder
-        self.dir_cache_insert(
-            resolved,
-            DirInfo {
-                uuid: folder_data.uuid,
-            },
-        );
+        // Cache new folder, when its parent was resolved exactly.
+        if cache_new {
+            self.dir_cache_insert(
+                resolved,
+                DirInfo {
+                    uuid: folder_data.uuid,
+                },
+            );
+        }
 
         Ok(())
     }
@@ -2095,81 +2288,28 @@ impl StorageProvider for InternxtProvider {
         let (parent_path, filename) = Self::split_path(&resolved);
         let parent_path = parent_path.to_string();
         let filename = filename.to_string();
-        let parent_uuid = self.resolve_folder_uuid(&parent_path).await?;
+        let parent_uuid = self.resolve_folder_uuid_exact(&parent_path).await?;
 
         let file_info = self
-            .find_file_in_folder(&parent_uuid, &filename)
+            .find_exact_file_in_folder(&parent_uuid, &filename)
             .await?
             .ok_or_else(|| ProviderError::NotFound(resolved.to_string()))?;
 
-        let resp = self
-            .send_with_reauth(|this| {
-                this.drive_request(reqwest::Method::DELETE, &format!("/files/{}", file_info.0))
-            })
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::ServerError(format!(
-                "Delete failed ({}): {}",
-                status,
-                super::sanitize_api_error(&body)
-            )));
-        }
-
-        Ok(())
+        self.delete_file_by_uuid(&file_info.0).await
     }
 
     async fn rmdir(&mut self, path: &str) -> Result<(), ProviderError> {
         let resolved = self.resolve_path(path);
-        let uuid = self.resolve_folder_uuid(&resolved).await?;
-
-        let resp = self
-            .send_with_reauth(|this| {
-                this.drive_request(reqwest::Method::DELETE, &format!("/folders/{}", uuid))
-            })
-            .await?;
-
-        if !resp.status().is_success() && resp.status().as_u16() != 204 {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::ServerError(format!(
-                "Delete folder failed ({}): {}",
-                status,
-                super::sanitize_api_error(&body)
-            )));
-        }
-
-        // Remove from cache
-        self.dir_cache.remove(&resolved);
-
-        Ok(())
+        let uuid = self.resolve_folder_uuid_exact(&resolved).await?;
+        self.delete_folder_by_uuid(&uuid, &resolved).await
     }
 
     async fn rmdir_recursive(&mut self, path: &str) -> Result<(), ProviderError> {
         let resolved = self.resolve_path(path);
-        let _uuid = self.resolve_folder_uuid(&resolved).await?;
-
-        // List and delete all contents first
-        let entries = self.list(&resolved).await?;
-        for entry in entries {
-            let child_path = if resolved == "/" {
-                format!("/{}", entry.name)
-            } else {
-                format!("{}/{}", resolved, entry.name)
-            };
-
-            if entry.is_walkable_dir() {
-                // Box the recursive future to avoid infinite type
-                Box::pin(self.rmdir_recursive(&child_path)).await?;
-            } else {
-                self.delete(&child_path).await?;
-            }
-        }
-
-        // Now delete the empty folder
-        self.rmdir(&resolved).await
+        // The folder by its exact path, and then everything in it by the
+        // uuids of its listings, never by path again.
+        let uuid = self.resolve_folder_uuid_exact(&resolved).await?;
+        self.remove_folder_tree(&uuid, &resolved).await
     }
 
     async fn delete_permanent(&mut self, path: &str) -> Result<bool, ProviderError> {
@@ -2183,25 +2323,38 @@ impl StorageProvider for InternxtProvider {
         // hard (the trash listing remains empty after the call) so this
         // override mostly returns Ok(false). It is wired anyway because
         // other Internxt deployments and workspace plans do route through
-        // a recoverable trash, in which case the basename match + DELETE
+        // a recoverable trash, in which case the name match + DELETE
         // /storage/trash flow works correctly.
-        let basename = path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(path);
+        //
+        // The match is by exact name among the items trashed from the
+        // path's folder (resolved by exact names): by name alone, a purge of
+        // `/new/a.txt` could take a trashed `/old/a.txt`. Ok(false) when
+        // the folder is no longer there to tell which item is this path.
+        let resolved = self.resolve_path(path);
+        let (parent_path, basename) = Self::split_path(&resolved);
+        let (parent_path, basename) = (parent_path.to_string(), basename.to_string());
         if basename.is_empty() {
             return Ok(false);
         }
+        let parent_uuid = match self.resolve_folder_uuid_exact(&parent_path).await {
+            Ok(uuid) => uuid,
+            Err(ProviderError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         let trashed = self.list_trash().await?;
-        let target = trashed.iter().find(|e| e.name == basename).and_then(|e| {
-            let uuid = e.path.strip_prefix("[Trash]/")?.to_string();
-            if uuid.is_empty() {
-                None
-            } else {
-                Some((uuid, e.is_dir))
-            }
-        });
+        let from_parent = |e: &&RemoteEntry| e.metadata.get("parent_uuid") == Some(&parent_uuid);
+        let target = trashed
+            .iter()
+            .filter(from_parent)
+            .find(|e| e.name == basename)
+            .and_then(|e| {
+                let uuid = e.path.strip_prefix("[Trash]/")?.to_string();
+                if uuid.is_empty() {
+                    None
+                } else {
+                    Some((uuid, e.is_dir))
+                }
+            });
         let (uuid, is_dir) = match target {
             Some(t) => t,
             None => return Ok(false),
@@ -2322,10 +2475,11 @@ impl StorageProvider for InternxtProvider {
         .await;
 
         // Whatever happened, the ids cached for either path, and for
-        // everything under them, may now point at a moved folder.
-        super::forget_cached_subtree(&mut self.dir_cache, &from_resolved);
-        super::forget_cached_subtree(&mut self.dir_cache, &to_resolved);
-        if outcome.is_ok() && kind == "folders" {
+        // everything under them, may now point at a moved folder. Under every
+        // capitalization, as in `rmdir`.
+        super::forget_cached_subtree_ignoring_case(&mut self.dir_cache, &from_resolved);
+        super::forget_cached_subtree_ignoring_case(&mut self.dir_cache, &to_resolved);
+        if outcome.is_ok() && kind == "folders" && self.is_cached_exactly(&to_parent) {
             self.dir_cache_insert(to_resolved, DirInfo { uuid });
         }
         outcome
@@ -2729,6 +2883,16 @@ impl InternxtProvider {
                     .get("updatedAt")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                // The folder the item was trashed from: `folderUuid` on a
+                // file, `parentUuid` on a folder.
+                let mut metadata = HashMap::new();
+                if let Some(parent) = item
+                    .get("folderUuid")
+                    .or_else(|| item.get("parentUuid"))
+                    .and_then(|v| v.as_str())
+                {
+                    metadata.insert("parent_uuid".to_string(), parent.to_string());
+                }
                 if kind == "folders" {
                     let name = item
                         .get("plainName")
@@ -2748,7 +2912,7 @@ impl InternxtProvider {
                         is_symlink: false,
                         link_target: None,
                         mime_type: None,
-                        metadata: Default::default(),
+                        metadata,
                     });
                 } else {
                     let plain_name = item
@@ -2775,7 +2939,7 @@ impl InternxtProvider {
                         is_symlink: false,
                         link_target: None,
                         mime_type: None,
-                        metadata: Default::default(),
+                        metadata,
                     });
                 }
             }
@@ -2846,11 +3010,14 @@ mod tests {
     /// `src` (`S`) and `dst` (`D`), and `files` (uuid, name, folder) kept in
     /// memory. A move (PATCH) or a rename (PUT `/meta`) onto a name its
     /// folder holds answers 409, as Internxt does; a rename to a name
-    /// starting with `fail`, and any change to a folder, answers 403. A
-    /// rename to a name starting with `failsquat` also puts another `a.txt`
-    /// (`SQ`) in `src`, as a second client taking the name meanwhile.
-    /// Returns a provider on it, the files,
-    /// and every change as `METHOD path`.
+    /// starting with `fail`, and any change to a folder but a delete,
+    /// answers 403. A rename to a name starting with `failsquat` also puts
+    /// another `a.txt` (`SQ`) in `src`, as a second client taking the name
+    /// meanwhile. A delete removes, and `POST /files` (the metadata of an
+    /// upload) adds the file `NEW`. A file held in the folder `trash:F` is in
+    /// the trash, trashed from `F`, and a purge from the trash removes it.
+    /// Returns a provider on it, the files, and every change as `METHOD
+    /// path`, a purge as `PURGE uuid`.
     #[allow(clippy::type_complexity)]
     async fn provider_on_drive(
         files: &[(&str, &str, &str)],
@@ -2859,8 +3026,47 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        provider_on_drive_with(&[("S", "src", "R"), ("D", "dst", "R")], files).await
+    }
+
+    /// [`provider_on_drive`] over the folders `folders` (uuid, name, parent)
+    /// in place of `src` and `dst`.
+    #[allow(clippy::type_complexity)]
+    async fn provider_on_drive_with(
+        folders: &[(&str, &str, &str)],
+        files: &[(&str, &str, &str)],
+    ) -> (
+        InternxtProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (provider, _, store, changes) = provider_on_drive_tree(folders, files).await;
+        (provider, store, changes)
+    }
+
+    /// [`provider_on_drive_with`], also returning the folders, which a test
+    /// may change as another client would.
+    #[allow(clippy::type_complexity)]
+    async fn provider_on_drive_tree(
+        folders: &[(&str, &str, &str)],
+        files: &[(&str, &str, &str)],
+    ) -> (
+        InternxtProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         use axum::response::IntoResponse;
         use std::sync::{Arc, Mutex};
+        let folders: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(
+            folders
+                .iter()
+                .map(|(uuid, name, parent)| {
+                    (uuid.to_string(), name.to_string(), parent.to_string())
+                })
+                .collect(),
+        ));
+        let tree = Arc::clone(&folders);
         let store: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(
             files
                 .iter()
@@ -2873,10 +3079,12 @@ mod tests {
         let (items, seen) = (Arc::clone(&store), Arc::clone(&changes));
         let app = axum::Router::new().fallback(axum::routing::any(
             move |req: axum::extract::Request| {
-                let (items, seen) = (Arc::clone(&items), Arc::clone(&seen));
+                let (items, seen, folders) =
+                    (Arc::clone(&items), Arc::clone(&seen), Arc::clone(&tree));
                 async move {
                     let method = req.method().clone();
                     let path = req.uri().path().to_string();
+                    let query = req.uri().query().unwrap_or("").to_string();
                     let body = axum::body::to_bytes(req.into_body(), 1 << 16).await.unwrap();
                     let args: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     let mut items = items.lock().unwrap();
@@ -2889,13 +3097,36 @@ mod tests {
                     };
                     if method == axum::http::Method::GET {
                         let body = match path.as_str() {
-                            "/drive/folders/v2/content/R/folders" => serde_json::json!({
-                                "folders": [
-                                    { "uuid": "S", "plainName": "src" },
-                                    { "uuid": "D", "plainName": "dst" },
-                                ]
-                            }),
-                            p if p.ends_with("/folders") => serde_json::json!({ "folders": [] }),
+                            // The trash, files only: a file trashed from the
+                            // folder `F` is held with the folder `trash:F`.
+                            "/drive/storage/trash/paginated" => {
+                                let files: Vec<serde_json::Value> = items
+                                    .iter()
+                                    .filter(|_| query.contains("type=files"))
+                                    .filter_map(|f| {
+                                        let from = f.2.strip_prefix("trash:")?;
+                                        let (stem, ext) = f.1.rsplit_once('.').unwrap();
+                                        Some(serde_json::json!({
+                                            "uuid": f.0, "plainName": stem, "type": ext,
+                                            "folderUuid": from,
+                                        }))
+                                    })
+                                    .collect();
+                                serde_json::json!({ "result": files })
+                            }
+                            p if p.ends_with("/folders") => {
+                                let parent = p
+                                    .trim_start_matches("/drive/folders/v2/content/")
+                                    .trim_end_matches("/folders");
+                                let listed: Vec<serde_json::Value> = folders
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .filter(|f| f.2 == parent)
+                                    .map(|f| serde_json::json!({ "uuid": f.0, "plainName": f.1 }))
+                                    .collect();
+                                serde_json::json!({ "folders": listed })
+                            }
                             p => {
                                 let folder = p
                                     .trim_start_matches("/drive/folders/v2/content/")
@@ -2913,9 +3144,30 @@ mod tests {
                         };
                         return axum::Json(body).into_response();
                     }
+                    if path == "/drive/storage/trash" {
+                        let uuid = args["items"][0]["uuid"].as_str().unwrap_or("").to_string();
+                        seen.lock().unwrap().push(format!("PURGE {uuid}"));
+                        items.retain(|f| f.0 != uuid);
+                        return axum::Json(serde_json::json!({})).into_response();
+                    }
                     seen.lock().unwrap().push(format!("{method} {path}"));
+                    if method == axum::http::Method::DELETE {
+                        let uuid = path.rsplit('/').next().unwrap_or("");
+                        items.retain(|f| f.0 != uuid);
+                        return axum::Json(serde_json::json!({})).into_response();
+                    }
                     if path.starts_with("/drive/folders/") {
                         return axum::http::StatusCode::FORBIDDEN.into_response();
+                    }
+                    if method == axum::http::Method::POST && path == "/drive/files" {
+                        let name = format!(
+                            "{}.{}",
+                            args["plainName"].as_str().unwrap_or(""),
+                            args["type"].as_str().unwrap_or("")
+                        );
+                        let folder = args["folderUuid"].as_str().unwrap_or("").to_string();
+                        items.push(("NEW".into(), name, folder));
+                        return axum::Json(serde_json::json!({ "uuid": "NEW" })).into_response();
                     }
                     let uuid = path
                         .trim_start_matches("/drive/files/")
@@ -2954,7 +3206,7 @@ mod tests {
         provider.connected = true;
         provider.root_folder_id = "R".to_string();
         provider.api_base = format!("http://{addr}");
-        (provider, store, changes)
+        (provider, folders, store, changes)
     }
 
     /// A move to another folder onto a taken name moved the source there and
@@ -3020,6 +3272,247 @@ mod tests {
         assert!(!provider.dir_cache.contains_key("/src/sub"));
         assert!(!provider.dir_cache.contains_key("/src/sub/deep"));
         assert!(provider.dir_cache.contains_key("/src/keep"));
+    }
+
+    fn insert_folders(provider: &mut InternxtProvider, folders: &[(&str, &str)]) {
+        for (path, uuid) in folders {
+            provider.dir_cache_insert(
+                path.to_string(),
+                DirInfo {
+                    uuid: uuid.to_string(),
+                },
+            );
+        }
+    }
+
+    /// A folder lookup falls back to another letter case and caches the
+    /// spelling it was given, so `/SRC/Sub` can hold the id of `src/sub`. A
+    /// rename forgot only its own spelling; an rmdir only its exact key,
+    /// not even the folders under it. Every capitalization of the subtree
+    /// goes; a sibling sharing the prefix stays.
+    #[tokio::test]
+    async fn a_rename_or_rmdir_forgets_the_ids_cached_under_any_case() {
+        let (mut provider, _, _) = provider_on_drive(&[]).await;
+        insert_folders(
+            &mut provider,
+            &[
+                ("/src/sub", "SUB"),
+                ("/SRC/Sub/deep", "DEEP"),
+                ("/Src/keep", "K"),
+            ],
+        );
+        let outcome = provider.rename("/src/sub", "/dst/sub2").await;
+        assert!(outcome.is_err(), "{outcome:?}");
+        let mut cached: Vec<&str> = provider.dir_cache.keys().map(String::as_str).collect();
+        cached.sort();
+        // `/src` and `/dst` were resolved on the way, and stay.
+        assert_eq!(cached, ["/Src/keep", "/dst", "/src"]);
+
+        let (mut provider, _, _) = provider_on_drive_with(&[("D", "docs", "R")], &[]).await;
+        insert_folders(
+            &mut provider,
+            &[
+                ("/docs", "D"),
+                ("/Docs/sub", "SUB"),
+                ("/docs/sub/deep", "DEEP"),
+                ("/docsx", "X"),
+            ],
+        );
+        provider.rmdir("/docs").await.expect("rmdir");
+        let mut cached: Vec<&str> = provider.dir_cache.keys().map(String::as_str).collect();
+        cached.sort();
+        assert_eq!(cached, ["/docsx"]);
+    }
+
+    /// The purge after a delete looked the trash up by name alone: with
+    /// `/src/a.txt` and `/dst/a.txt` both trashed, `delete_permanent` of
+    /// `/dst/a.txt` purged `/src/a.txt`, listed first. It takes the item
+    /// trashed from the path's folder, found by exact names; with no such
+    /// folder nothing is purged.
+    #[tokio::test]
+    async fn a_permanent_delete_takes_the_trashed_item_of_its_own_folder() {
+        let (mut provider, _, changes) = provider_on_drive(&[
+            ("TS", "a.txt", "trash:S"),
+            ("TD", "a.txt", "trash:D"),
+            ("TB", "b.txt", "trash:D"),
+        ])
+        .await;
+        assert!(provider
+            .delete_permanent("/dst/a.txt")
+            .await
+            .expect("purge"));
+        assert_eq!(*changes.lock().unwrap(), ["PURGE TD"]);
+        assert!(!provider
+            .delete_permanent("/DST/b.txt")
+            .await
+            .expect("no folder of that case"));
+        assert_eq!(changes.lock().unwrap().len(), 1);
+    }
+
+    /// `cd /docs` beside only `Docs` resolved to `Docs` through the case
+    /// fallback and cached it as `/docs`. After another client made a real
+    /// `docs`, `rm -r /docs` found `docs` exactly and then listed and
+    /// deleted by path, which the cache still gave as `Docs`: it emptied
+    /// `Docs`. A fallback caches nothing now, not even what a listing under
+    /// it finds, and the tree goes by the uuid resolved exactly.
+    #[tokio::test]
+    async fn rm_r_after_a_fallback_cd_empties_only_the_folder_named() {
+        let (mut provider, folders, store, changes) = provider_on_drive_tree(
+            &[("X", "Docs", "R"), ("XS", "sub", "X")],
+            &[("F1", "keep.txt", "X")],
+        )
+        .await;
+        provider.cd("/docs").await.expect("cd through the fallback");
+        provider
+            .list("/docs")
+            .await
+            .expect("ls through the fallback");
+        let spelled: Vec<String> = provider
+            .dir_cache
+            .keys()
+            .filter(|k| k.starts_with("/docs"))
+            .cloned()
+            .collect();
+        assert!(
+            spelled.is_empty(),
+            "cached through the fallback: {spelled:?}"
+        );
+        folders
+            .lock()
+            .unwrap()
+            .push(("D".into(), "docs".into(), "R".into()));
+        store
+            .lock()
+            .unwrap()
+            .push(("F2".into(), "old.txt".into(), "D".into()));
+        provider.rmdir_recursive("/docs").await.expect("rm -r");
+        assert_eq!(
+            *changes.lock().unwrap(),
+            ["DELETE /drive/files/F2", "DELETE /drive/folders/D"]
+        );
+        assert!(store.lock().unwrap().iter().any(|f| f.0 == "F1"));
+    }
+
+    /// With only `Docs` there, `rm /docs/keep.txt` and `put /docs/keep.txt`
+    /// resolved `/docs` to `Docs` through the fallback: the delete, and the
+    /// delete before the upload, deleted `Docs/keep.txt`. A step that
+    /// deletes resolves every folder on the path exactly.
+    #[tokio::test]
+    async fn a_delete_under_a_folder_of_another_case_is_refused() {
+        let (mut provider, store, changes) =
+            provider_on_drive_with(&[("X", "Docs", "R")], &[("F1", "keep.txt", "X")]).await;
+        let outcome = provider.delete("/docs/keep.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotFound(_))),
+            "{outcome:?}"
+        );
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let outcome = provider
+            .upload(empty.path().to_str().unwrap(), "/docs/keep.txt", None)
+            .await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotFound(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+        assert_eq!(store.lock().unwrap().len(), 1);
+    }
+
+    /// Internxt is taken to keep `Docs` and `docs` as two folders: `rmdir
+    /// /docs` beside only `Docs` found `Docs` ignoring the case and removed
+    /// it. The folder removed is the one of the exact name.
+    #[tokio::test]
+    async fn rmdir_does_not_take_a_folder_of_another_case() {
+        let (mut provider, _, changes) = provider_on_drive_with(&[("X", "Docs", "R")], &[]).await;
+        for outcome in [
+            provider.rmdir("/docs").await,
+            provider.rmdir_recursive("/docs").await,
+        ] {
+            assert!(
+                matches!(outcome, Err(ProviderError::NotFound(_))),
+                "{outcome:?}"
+            );
+        }
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+    }
+
+    /// An upload deletes the file it replaces first, and found it ignoring
+    /// the case: an upload of `a.txt` beside only `A.txt` deleted `A.txt`.
+    /// `rm /src/A.TXT` deleted it too. Both take the exact name only.
+    #[tokio::test]
+    async fn an_upload_or_delete_does_not_take_a_file_of_another_case() {
+        let (mut provider, store, changes) = provider_on_drive(&[("FA", "A.txt", "S")]).await;
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        provider
+            .upload(empty.path().to_str().unwrap(), "/src/a.txt", None)
+            .await
+            .expect("upload");
+        let outcome = provider.delete("/src/A.TXT").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotFound(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(*changes.lock().unwrap(), ["POST /drive/files"]);
+        let names: Vec<String> = store.lock().unwrap().iter().map(|f| f.1.clone()).collect();
+        assert_eq!(names, ["A.txt", "a.txt"]);
+    }
+
+    /// With `Docs` listed before `docs` and `Report.pdf` before
+    /// `report.pdf`, the lookups took the first match ignoring the case:
+    /// `/docs` walked into `Docs`, and `report.pdf` was `Report.pdf`. The
+    /// name as spelled comes first, on whatever page it is.
+    #[tokio::test]
+    async fn lookups_take_the_name_as_spelled_before_another_case() {
+        let (mut provider, _) = provider_on_paged_drive(vec![
+            (
+                ("R", "folders"),
+                vec![
+                    content_page(
+                        "folders",
+                        serde_json::json!([{ "uuid": "X", "plainName": "Docs" }]),
+                        Some("cm9vdA=="),
+                    ),
+                    content_page(
+                        "folders",
+                        serde_json::json!([{ "uuid": "D", "plainName": "docs" }]),
+                        None,
+                    ),
+                ],
+            ),
+            (
+                ("D", "files"),
+                vec![
+                    content_page(
+                        "files",
+                        serde_json::json!([{ "uuid": "O", "plainName": "Report", "type": "pdf" }]),
+                        Some("ZG9jcw+="),
+                    ),
+                    content_page(
+                        "files",
+                        serde_json::json!([{ "uuid": "F", "plainName": "report", "type": "pdf" }]),
+                        None,
+                    ),
+                ],
+            ),
+        ])
+        .await;
+        assert_eq!(
+            provider.resolve_folder_uuid("/docs").await.expect("docs"),
+            "D"
+        );
+        let found = provider
+            .find_file_in_folder("D", "report.pdf")
+            .await
+            .expect("lookup");
+        assert_eq!(found.map(|(uuid, _, _)| uuid), Some("F".to_string()));
     }
 
     /// When the rename after the move failed, the file stayed in the new

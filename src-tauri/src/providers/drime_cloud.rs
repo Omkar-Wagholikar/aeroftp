@@ -423,7 +423,40 @@ impl DrimeCloudProvider {
 
     // ─── Folder Resolution ───────────────────────────────────────────────
 
+    /// The id of the folder at `path`, for a read: each name matched
+    /// exactly first, and in another letter case as the fallback.
     async fn resolve_folder_id(&mut self, path: &str) -> Result<String, ProviderError> {
+        self.resolve_folder(path, true).await
+    }
+
+    /// The id of the folder at `path` with every name matched exactly, for a
+    /// step that changes or destroys what it finds under it: `rm /docs/x`
+    /// beside only `Docs` deleted `Docs/x`. The cache is trusted, because
+    /// only exact matches are ever written to it.
+    async fn resolve_folder_id_exact(&mut self, path: &str) -> Result<String, ProviderError> {
+        self.resolve_folder(path, false).await
+    }
+
+    /// Whether the folder at `resolved` is cached, that is, was resolved
+    /// with every name matched exactly: a folder under it may be cached
+    /// under its path. A listing or a mkdir under a path resolved through
+    /// the fallback caches nothing, or the path of another folder would
+    /// hold its children's ids.
+    fn is_cached_exactly(&self, resolved: &str) -> bool {
+        resolved == "/" || self.dir_cache.contains_key(resolved)
+    }
+
+    /// The walk behind [`Self::resolve_folder_id`] and
+    /// [`Self::resolve_folder_id_exact`]. Only exact matches are cached, and
+    /// nothing below a name matched in another case: a spelling the fallback
+    /// resolved (`cd /docs` beside only `Docs`) kept the id of `Docs` after
+    /// another client made a real `docs`, and a later `rm` under `/docs`
+    /// acted inside `Docs`.
+    async fn resolve_folder(
+        &mut self,
+        path: &str,
+        other_case: bool,
+    ) -> Result<String, ProviderError> {
         let normalized = Self::normalize_path(path);
 
         if normalized == "/" {
@@ -439,6 +472,7 @@ impl DrimeCloudProvider {
         let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
         let mut current_id = String::new(); // root
         let mut current_path = String::new();
+        let mut exact_so_far = true;
 
         for part in &parts {
             current_path = format!("{}/{}", current_path, part);
@@ -506,7 +540,7 @@ impl DrimeCloudProvider {
                                 exact = Some(id);
                                 break;
                             }
-                            if fallback.is_none() && name.eq_ignore_ascii_case(part) {
+                            if other_case && fallback.is_none() && name.eq_ignore_ascii_case(part) {
                                 fallback = Some(id);
                             }
                         }
@@ -519,13 +553,17 @@ impl DrimeCloudProvider {
                 page += 1;
             }
 
+            exact_so_far &= exact.is_some();
             let Some(id) = exact.or(fallback) else {
                 return Err(ProviderError::NotFound(format!(
                     "Folder '{}' not found in {}",
                     part, current_path
                 )));
             };
-            self.dir_cache_insert(current_path.clone(), DirInfo { id: id.clone() });
+            // Only an exact match, with every name above it exact too.
+            if exact_so_far {
+                self.dir_cache_insert(current_path.clone(), DirInfo { id: id.clone() });
+            }
             current_id = id;
         }
 
@@ -655,6 +693,21 @@ impl DrimeCloudProvider {
             }
         })
         .await
+    }
+
+    /// [`Self::find_file_in_folder`] without the fallback to another letter
+    /// case, for a step that destroys or publishes what it finds. Drime keeps
+    /// `A.txt` and `a.txt` side by side, so the fallback answers an item
+    /// other than the one named: an upload of `a.txt` beside only `A.txt`
+    /// deleted `A.txt` first, and a share link asked for `a.txt` published
+    /// `A.txt` (or removed its link, whose URL cannot be made again).
+    async fn find_exact_in_folder(
+        &self,
+        folder_id: &str,
+        filename: &str,
+    ) -> Result<Option<(String, bool, Option<String>)>, ProviderError> {
+        self.find_entry_in_folder(folder_id, |name, _| (name == filename).then_some(true))
+            .await
     }
 
     /// The entry of the folder `folder_id` that `wanted` picks, read page by
@@ -1216,6 +1269,7 @@ impl StorageProvider for DrimeCloudProvider {
     async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
         let resolved = self.resolve_path(path);
         let folder_id = self.resolve_folder_id(&resolved).await?;
+        let cache_children = self.is_cached_exactly(&resolved);
 
         let mut entries = Vec::new();
         let mut page = 1u32;
@@ -1279,7 +1333,9 @@ impl StorageProvider for DrimeCloudProvider {
                         } else {
                             format!("{}/{}", resolved, name)
                         };
-                        self.dir_cache_insert(dir_path, DirInfo { id });
+                        if cache_children {
+                            self.dir_cache_insert(dir_path, DirInfo { id });
+                        }
                     }
                 }
 
@@ -1431,7 +1487,7 @@ impl StorageProvider for DrimeCloudProvider {
 
         let resolved = self.resolve_path(remote_path);
         let (parent_path, filename) = Self::split_path(&resolved);
-        let parent_id = self.resolve_folder_id(parent_path).await?;
+        let parent_id = self.resolve_folder_id_exact(parent_path).await?;
 
         // M9: Full file read into memory: no streaming upload API available for Drime Cloud.
         // This limits practical upload size to available RAM. For files >500MB, users should
@@ -1446,8 +1502,19 @@ impl StorageProvider for DrimeCloudProvider {
             filename, file_size, parent_id
         ));
 
-        // Delete existing file before overwrite
-        if let Some((existing_id, _, _)) = self.find_file_in_folder(&parent_id, filename).await? {
+        // Delete existing file before overwrite: the one of this exact
+        // name, never one of another letter case, and never a folder: a
+        // folder of that name went to the trash with everything in it.
+        let existing = match self.find_exact_in_folder(&parent_id, filename).await? {
+            Some((_, true, _)) => {
+                return Err(ProviderError::InvalidPath(format!(
+                    "{resolved} is a folder: an upload replaces a file, never a folder"
+                )))
+            }
+            Some((id, false, _)) => Some(id),
+            None => None,
+        };
+        if let Some(existing_id) = existing {
             drime_log(&format!(
                 "File {} exists (id={}), deleting before overwrite",
                 filename, existing_id
@@ -1520,6 +1587,7 @@ impl StorageProvider for DrimeCloudProvider {
         let resolved = self.resolve_path(path);
         let (parent_path, dir_name) = Self::split_path(&resolved);
         let parent_id = self.resolve_folder_id(parent_path).await?;
+        let cache_new = self.is_cached_exactly(parent_path);
 
         drime_log(&format!(
             "Creating directory '{}' in folder '{}'",
@@ -1566,7 +1634,7 @@ impl StorageProvider for DrimeCloudProvider {
 
         // Cache the new dir
         if let Ok(folder_resp) = resp.json::<DrimeFolderResponse>().await {
-            if let Some(id) = folder_resp.id_str() {
+            if let (true, Some(id)) = (cache_new, folder_resp.id_str()) {
                 self.dir_cache_insert(resolved, DirInfo { id });
             }
         }
@@ -1577,10 +1645,10 @@ impl StorageProvider for DrimeCloudProvider {
     async fn delete(&mut self, path: &str) -> Result<(), ProviderError> {
         let resolved = self.resolve_path(path);
         let (parent_path, filename) = Self::split_path(&resolved);
-        let parent_id = self.resolve_folder_id(parent_path).await?;
+        let parent_id = self.resolve_folder_id_exact(parent_path).await?;
 
         let (file_id, _, _) = self
-            .find_file_in_folder(&parent_id, filename)
+            .find_exact_in_folder(&parent_id, filename)
             .await?
             .ok_or_else(|| ProviderError::NotFound(format!("'{}' not found", filename)))?;
 
@@ -1588,15 +1656,23 @@ impl StorageProvider for DrimeCloudProvider {
 
         // Batch delete endpoint (moves to trash by default)
         let body = serde_json::json!({ "entryIds": [file_id.parse::<i64>().unwrap_or(0)] });
-        let resp = self
+        let sent = self
             .client
             .post(Self::api_url("/file-entries/delete"))
             .header(AUTHORIZATION, self.auth_header()?)
             .header(CONTENT_TYPE, "application/json")
             .body(body.to_string())
             .send()
-            .await
-            .map_err(|e| ProviderError::ConnectionFailed(format!("Delete failed: {}", e)))?;
+            .await;
+        // Whatever the answer, even none (a delete Drime applied whose
+        // answer was lost or came back as an error), the ids cached for the
+        // item and for everything under it may point into the trash: forgot
+        // only after a success, they outlived a failed answer. Under every
+        // capitalization: a folder lookup falls back to another case, so one
+        // folder can be cached under two spellings.
+        super::forget_cached_subtree_ignoring_case(&mut self.dir_cache, &resolved);
+        let resp =
+            sent.map_err(|e| ProviderError::ConnectionFailed(format!("Delete failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1608,8 +1684,6 @@ impl StorageProvider for DrimeCloudProvider {
             )));
         }
 
-        // The ids cached for the item and for everything under it are gone.
-        super::forget_cached_subtree(&mut self.dir_cache, &resolved);
         Ok(())
     }
 
@@ -1719,17 +1793,33 @@ impl StorageProvider for DrimeCloudProvider {
         .await;
 
         // Whatever happened, the ids cached for either path, and for
-        // everything under them, may now point at moved items.
-        super::forget_cached_subtree(&mut self.dir_cache, &resolved_from);
-        super::forget_cached_subtree(&mut self.dir_cache, &resolved_to);
+        // everything under them, may now point at moved items. Under every
+        // capitalization, as in `delete`.
+        super::forget_cached_subtree_ignoring_case(&mut self.dir_cache, &resolved_from);
+        super::forget_cached_subtree_ignoring_case(&mut self.dir_cache, &resolved_to);
         outcome
     }
 
     /// Drime's rename and move never overwrite, so a replace sets the item at
     /// `to` aside, renames `from` in, and then deletes the one set aside, which
     /// Drime moves to its trash: see [`super::replace_by_setting_aside`].
+    ///
+    /// Only an item of exactly that name is set aside and deleted: the
+    /// lookups fall back to another letter case, and a replace onto `a.txt`
+    /// beside only `A.txt` set `A.txt` aside and deleted it. Without one it
+    /// is the rename, whose look before the move still refuses a name taken
+    /// in another case.
     async fn replace(&mut self, from: &str, to: &str) -> Result<(), ProviderError> {
         let (from, to) = (self.resolve_path(from), self.resolve_path(to));
+        let (to_parent, to_name) = Self::split_path(&to);
+        let to_parent_id = self.resolve_folder_id_exact(to_parent).await?;
+        if self
+            .find_exact_in_folder(&to_parent_id, to_name)
+            .await?
+            .is_none()
+        {
+            return self.rename(&from, &to).await;
+        }
         super::replace_by_setting_aside(self, &from, &to).await
     }
 
@@ -1761,7 +1851,25 @@ impl StorageProvider for DrimeCloudProvider {
         let (parent_path, filename) = Self::split_path(&resolved);
         let parent_id = self.resolve_folder_id(parent_path).await?;
 
-        // Search for the file in the parent folder
+        // Search for the file in the parent folder: the name as spelled
+        // first, whatever the order of the listing, and another case as the
+        // fallback (as `find_file_in_folder`). With `A.txt` listed before
+        // `a.txt`, a first match that ignored the case answered `A.txt`.
+        let entry = |file: &DrimeFile, name: &str| RemoteEntry {
+            name: name.to_string(),
+            path: resolved.clone(),
+            is_dir: file.file_type.as_deref() == Some("folder"),
+            size: file.size.unwrap_or(0),
+            modified: file.updated_at.as_deref().and_then(Self::parse_date),
+            permissions: None,
+            owner: None,
+            group: None,
+            is_symlink: false,
+            link_target: None,
+            metadata: HashMap::new(),
+            mime_type: file.mime_type.clone(),
+        };
+        let mut fallback = None;
         let mut page = 1u32;
 
         loop {
@@ -1813,25 +1921,11 @@ impl StorageProvider for DrimeCloudProvider {
 
             for file in &files {
                 if let Some(ref name) = file.name {
-                    if name.eq_ignore_ascii_case(filename) {
-                        let is_dir = file.file_type.as_deref() == Some("folder");
-                        let size = file.size.unwrap_or(0);
-                        let modified = file.updated_at.as_deref().and_then(Self::parse_date);
-
-                        return Ok(RemoteEntry {
-                            name: name.clone(),
-                            path: resolved,
-                            is_dir,
-                            size,
-                            modified,
-                            permissions: None,
-                            owner: None,
-                            group: None,
-                            is_symlink: false,
-                            link_target: None,
-                            metadata: HashMap::new(),
-                            mime_type: file.mime_type.clone(),
-                        });
+                    if name == filename {
+                        return Ok(entry(file, name));
+                    }
+                    if fallback.is_none() && name.eq_ignore_ascii_case(filename) {
+                        fallback = Some(entry(file, name));
                     }
                 }
             }
@@ -1842,7 +1936,7 @@ impl StorageProvider for DrimeCloudProvider {
             page += 1;
         }
 
-        Err(ProviderError::NotFound(format!("'{}' not found", filename)))
+        fallback.ok_or_else(|| ProviderError::NotFound(format!("'{}' not found", filename)))
     }
 
     async fn size(&mut self, path: &str) -> Result<u64, ProviderError> {
@@ -2172,10 +2266,10 @@ impl StorageProvider for DrimeCloudProvider {
     ) -> Result<ShareLinkResult, ProviderError> {
         let resolved = self.resolve_path(path);
         let (parent_path, filename) = Self::split_path(&resolved);
-        let parent_id = self.resolve_folder_id(parent_path).await?;
+        let parent_id = self.resolve_folder_id_exact(parent_path).await?;
 
         let (file_id, _, _) = self
-            .find_file_in_folder(&parent_id, filename)
+            .find_exact_in_folder(&parent_id, filename)
             .await?
             .ok_or_else(|| ProviderError::NotFound(format!("'{}' not found", filename)))?;
 
@@ -2241,10 +2335,10 @@ impl StorageProvider for DrimeCloudProvider {
     async fn remove_share_link(&mut self, path: &str) -> Result<(), ProviderError> {
         let resolved = self.resolve_path(path);
         let (parent_path, filename) = Self::split_path(&resolved);
-        let parent_id = self.resolve_folder_id(parent_path).await?;
+        let parent_id = self.resolve_folder_id_exact(parent_path).await?;
 
         let (file_id, _, _) = self
-            .find_file_in_folder(&parent_id, filename)
+            .find_exact_in_folder(&parent_id, filename)
             .await?
             .ok_or_else(|| ProviderError::NotFound(format!("'{}' not found", filename)))?;
 
@@ -2877,9 +2971,12 @@ mod tests {
     /// (`PUT /file-entries/{id}`, 400 onto a name taken in its folder; to a
     /// name starting with `fail` 500, and with `failrace` another `a.txt`
     /// appears in folder 1; to one starting with `ghost` 400 as a name taken
-    /// since the look), a move (403 into a folder named `nomove...`) and a
-    /// delete. Returns a provider on it, the entries, and every change as
-    /// `rename ID NAME`, `move ID PARENT` or `delete ID`.
+    /// since the look), a move (403 into a folder named `nomove...`), a
+    /// delete (500 for an entry whose name starts with `fail`), a small
+    /// upload (`POST /uploads`) and the creation or removal of a share link.
+    /// Returns a provider on it, the entries, and every change as `rename ID
+    /// NAME`, `move ID PARENT`, `delete ID`, `upload NAME PARENT`, `share ID`
+    /// or `unshare ID`.
     #[allow(clippy::type_complexity)]
     async fn provider_on_drime_entries(
         entries: &[(u64, &str, &str, &str)],
@@ -2990,9 +3087,41 @@ mod tests {
                         ("POST", "/file-entries/delete") => {
                             for id in args["entryIds"].as_array().unwrap() {
                                 let id = id.as_u64().unwrap();
+                                let refused =
+                                    items.iter().any(|e| e.0 == id && e.1.starts_with("fail"));
+                                if refused {
+                                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{}")
+                                        .into_response();
+                                }
                                 items.retain(|e| e.0 != id);
                                 seen.lock().unwrap().push(format!("delete {id}"));
                             }
+                            ok()
+                        }
+                        (method @ ("POST" | "DELETE"), p) if p.ends_with("/shareable-link") => {
+                            let id = p
+                                .trim_start_matches("/file-entries/")
+                                .trim_end_matches("/shareable-link");
+                            let what = if method == "POST" { "share" } else { "unshare" };
+                            seen.lock().unwrap().push(format!("{what} {id}"));
+                            axum::Json(serde_json::json!({ "link": { "hash": "H" } }))
+                                .into_response()
+                        }
+                        ("POST", "/uploads") => {
+                            // The form's `parentId` part and the file part's name.
+                            let form = String::from_utf8_lossy(&body);
+                            let part = |after: &str, until: &str| {
+                                form.split(after)
+                                    .nth(1)
+                                    .and_then(|rest| rest.split(until).next())
+                                    .unwrap_or("")
+                                    .to_string()
+                            };
+                            let name = part("filename=\"", "\"");
+                            let parent = part("name=\"parentId\"\r\n\r\n", "\r\n");
+                            let id = items.iter().map(|e| e.0).max().unwrap_or(0) + 1;
+                            seen.lock().unwrap().push(format!("upload {name} {parent}"));
+                            items.push((id, name, parent, "file".to_string()));
                             ok()
                         }
                         _ => (axum::http::StatusCode::BAD_REQUEST, "unexpected").into_response(),
@@ -3215,6 +3344,244 @@ mod tests {
         assert!(!provider.dir_cache.contains_key("/d/a.txt/x"));
         assert!(!provider.dir_cache.contains_key("/e/fail.txt/x"));
         assert!(provider.dir_cache.contains_key("/d/a.txtx"));
+    }
+
+    /// A folder lookup falls back to another letter case and caches the
+    /// spelling it was given, so `/D` can hold the id of `d`. A rename or
+    /// delete forgot only its own spelling: `/D/sub` kept the id of the
+    /// renamed folder and `/GONE/deep` that of the trashed one. Every
+    /// capitalization goes; a sibling sharing the prefix stays.
+    #[tokio::test]
+    async fn a_rename_or_delete_forgets_the_ids_cached_under_any_case() {
+        let (mut provider, _, _) =
+            provider_on_drime_entries(&[(1, "d", "", "folder"), (3, "gone", "", "folder")]).await;
+        for path in ["/D", "/D/sub", "/GONE/deep", "/Dx"] {
+            provider.dir_cache_insert(
+                path.to_string(),
+                DirInfo {
+                    id: "Z".to_string(),
+                },
+            );
+        }
+        provider.rename("/d", "/moved").await.expect("rename");
+        provider.delete("/gone").await.expect("delete");
+        let mut cached: Vec<&str> = provider.dir_cache.keys().map(String::as_str).collect();
+        cached.sort();
+        assert_eq!(cached, ["/Dx"], "a sibling sharing the prefix stays");
+    }
+
+    /// A small local file to upload.
+    fn local_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"new").unwrap();
+        file
+    }
+
+    /// Drime keeps `A.txt` and `a.txt` side by side, and the lookup falls
+    /// back to another case: an upload of `a.txt` beside only `A.txt`
+    /// deleted `A.txt` before it uploaded. Only a file of the exact name is
+    /// deleted first.
+    #[tokio::test]
+    async fn an_upload_does_not_delete_a_file_of_another_case() {
+        let (mut provider, store, changes) =
+            provider_on_drime_entries(&[(1, "d", "", "folder"), (10, "A.txt", "1", "file")]).await;
+        let file = local_file();
+        provider
+            .upload(file.path().to_str().unwrap(), "/d/a.txt", None)
+            .await
+            .expect("upload");
+        assert_eq!(*changes.lock().unwrap(), ["upload a.txt 1"]);
+        let names: Vec<String> = store.lock().unwrap().iter().map(|e| e.1.clone()).collect();
+        assert_eq!(names, ["d", "A.txt", "a.txt"]);
+    }
+
+    /// `rm /d/a.txt` beside only `A.txt` trashed `A.txt`. A delete takes
+    /// the exact name only.
+    #[tokio::test]
+    async fn a_delete_does_not_take_a_file_of_another_case() {
+        let (mut provider, _, changes) =
+            provider_on_drime_entries(&[(1, "d", "", "folder"), (10, "A.txt", "1", "file")]).await;
+        let outcome = provider.delete("/d/a.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotFound(_))),
+            "{outcome:?}"
+        );
+        assert!(changes.lock().unwrap().is_empty());
+    }
+
+    /// A replace onto `a.txt` beside only `A.txt` took `A.txt` for the file
+    /// to replace: it was set aside and deleted. Only an item of the exact
+    /// name is replaced; here the replace is the rename, whose look before
+    /// the move refuses the name taken in another case, and nothing changes.
+    #[tokio::test]
+    async fn a_replace_does_not_delete_a_file_of_another_case() {
+        let (mut provider, _, changes) = provider_on_drime_entries(&[
+            (1, "d", "", "folder"),
+            (10, "A.txt", "1", "file"),
+            (11, "x.txt", "1", "file"),
+        ])
+        .await;
+        let outcome = provider.replace("/d/x.txt", "/d/a.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::AlreadyExists(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+    }
+
+    /// An upload deletes the file it replaces first, and took a folder of
+    /// that name too: `put f /d/x` with `x` a folder sent the folder to the
+    /// trash with everything in it. Only a file is replaced; a folder there
+    /// is refused before any change.
+    #[tokio::test]
+    async fn an_upload_onto_a_folder_is_refused_before_any_change() {
+        let (mut provider, _, changes) = provider_on_drime_entries(&[
+            (1, "d", "", "folder"),
+            (5, "x", "1", "folder"),
+            (6, "inner.txt", "5", "file"),
+        ])
+        .await;
+        let file = local_file();
+        let outcome = provider
+            .upload(file.path().to_str().unwrap(), "/d/x", None)
+            .await;
+        assert!(
+            matches!(outcome, Err(ProviderError::InvalidPath(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+    }
+
+    /// A share link asked for `a.txt` beside only `A.txt` found `A.txt`
+    /// ignoring the case: creating one published `A.txt`, and removing one
+    /// removed `A.txt`'s link, whose URL cannot be made again. Both take the
+    /// exact name only.
+    #[tokio::test]
+    async fn share_links_do_not_take_a_file_of_another_case() {
+        let (mut provider, _, changes) =
+            provider_on_drime_entries(&[(1, "d", "", "folder"), (10, "A.txt", "1", "file")]).await;
+        let created = provider
+            .create_share_link("/d/a.txt", ShareLinkOptions::default())
+            .await;
+        assert!(
+            matches!(created, Err(ProviderError::NotFound(_))),
+            "{created:?}"
+        );
+        let removed = provider.remove_share_link("/d/a.txt").await;
+        assert!(
+            matches!(removed, Err(ProviderError::NotFound(_))),
+            "{removed:?}"
+        );
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+    }
+
+    /// A delete forgot the cached ids only after a success, so a delete
+    /// whose answer was an error (Drime may still have applied it) left
+    /// `/faildir/sub` pointing at what may be in the trash. They are
+    /// forgotten whatever the answer.
+    #[tokio::test]
+    async fn a_failed_delete_forgets_the_ids_cached_under_it() {
+        let (mut provider, _, _) = provider_on_drime_entries(&[(2, "faildir", "", "folder")]).await;
+        provider.dir_cache_insert(
+            "/faildir/sub".to_string(),
+            DirInfo {
+                id: "Z".to_string(),
+            },
+        );
+        let outcome = provider.delete("/faildir").await;
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(!provider.dir_cache.contains_key("/faildir/sub"));
+    }
+
+    /// `cd /docs` beside only `Docs` resolved to `Docs` through the case
+    /// fallback and cached it as `/docs` (a listing there cached its
+    /// subfolders too). After another client made a real `docs`, `rm
+    /// /docs/x.txt` took the parent from the cache and deleted `Docs/x.txt`.
+    /// A fallback caches nothing now.
+    #[tokio::test]
+    async fn a_delete_after_a_fallback_cd_takes_the_folder_named() {
+        let (mut provider, store, changes) = provider_on_drime_entries(&[
+            (3, "Docs", "", "folder"),
+            (5, "sub", "3", "folder"),
+            (31, "x.txt", "3", "file"),
+        ])
+        .await;
+        provider.cd("/docs").await.expect("cd through the fallback");
+        provider
+            .list("/docs")
+            .await
+            .expect("ls through the fallback");
+        let spelled: Vec<&String> = provider
+            .dir_cache
+            .keys()
+            .filter(|k| k.starts_with("/docs"))
+            .collect();
+        assert!(
+            spelled.is_empty(),
+            "cached through the fallback: {spelled:?}"
+        );
+        store.lock().unwrap().extend([
+            (4, "docs".to_string(), String::new(), "folder".to_string()),
+            (41, "x.txt".to_string(), "4".to_string(), "file".to_string()),
+        ]);
+        provider.delete("/docs/x.txt").await.expect("rm");
+        assert_eq!(*changes.lock().unwrap(), ["delete 41"]);
+    }
+
+    /// With only `Docs` there, `rm /docs/x.txt` and `put /docs/x.txt`
+    /// resolved `/docs` to `Docs` through the fallback: the delete, and the
+    /// delete before the upload, deleted `Docs/x.txt`. A step that deletes
+    /// resolves every folder on the path exactly.
+    #[tokio::test]
+    async fn a_delete_under_a_folder_of_another_case_is_refused() {
+        let (mut provider, _, changes) =
+            provider_on_drime_entries(&[(3, "Docs", "", "folder"), (31, "x.txt", "3", "file")])
+                .await;
+        let outcome = provider.delete("/docs/x.txt").await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotFound(_))),
+            "{outcome:?}"
+        );
+        let file = local_file();
+        let outcome = provider
+            .upload(file.path().to_str().unwrap(), "/docs/x.txt", None)
+            .await;
+        assert!(
+            matches!(outcome, Err(ProviderError::NotFound(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            changes.lock().unwrap().is_empty(),
+            "{:?}",
+            changes.lock().unwrap()
+        );
+    }
+
+    /// With `A.txt` listed before `a.txt`, `stat /d/a.txt` took the first
+    /// match ignoring the case and answered `A.txt`. The name as spelled
+    /// comes first.
+    #[tokio::test]
+    async fn stat_answers_the_name_as_spelled_first() {
+        let (mut provider, _, _) = provider_on_drime_entries(&[
+            (1, "d", "", "folder"),
+            (10, "A.txt", "1", "file"),
+            (11, "a.txt", "1", "file"),
+        ])
+        .await;
+        let found = provider.stat("/d/a.txt").await.expect("stat");
+        assert_eq!(found.name, "a.txt");
     }
 
     /// The replace sets the old item aside, so the name is empty for a

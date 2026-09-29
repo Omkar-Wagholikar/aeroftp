@@ -241,6 +241,15 @@ struct BoxTrashItem {
     size: Option<u64>,
     modified_at: Option<String>,
     trashed_at: Option<String>,
+    /// The folder the item was trashed from.
+    #[serde(default)]
+    parent: Option<BoxFolderRef>,
+}
+
+/// A folder named by its id, as Box nests it in an item (`parent`).
+#[derive(Debug, Deserialize)]
+struct BoxFolderRef {
+    id: String,
 }
 
 /// Box trash items collection
@@ -334,6 +343,9 @@ pub struct BoxProvider {
     /// Test-only upload API base. `None` keeps production `UPLOAD_BASE`.
     #[cfg(test)]
     upload_base_override: Option<String>,
+    /// Test-only API base. `None` keeps production `API_BASE`.
+    #[cfg(test)]
+    api_base_override: Option<String>,
     /// Test-only bearer token for local HTTP fixtures (bypasses vault).
     #[cfg(test)]
     test_access_token: Option<String>,
@@ -362,6 +374,8 @@ impl BoxProvider {
             profile_id: String::new(),
             #[cfg(test)]
             upload_base_override: None,
+            #[cfg(test)]
+            api_base_override: None,
             #[cfg(test)]
             test_access_token: None,
         }
@@ -398,6 +412,8 @@ impl BoxProvider {
             #[cfg(test)]
             upload_base_override: self.upload_base_override.clone(),
             #[cfg(test)]
+            api_base_override: self.api_base_override.clone(),
+            #[cfg(test)]
             test_access_token: self.test_access_token.clone(),
         }
     }
@@ -407,6 +423,15 @@ impl BoxProvider {
     pub fn with_profile_id(mut self, profile_id: impl Into<String>) -> Self {
         self.profile_id = profile_id.into();
         self
+    }
+
+    /// `API_BASE`, pointed at a local double in tests.
+    fn api_base(&self) -> &str {
+        #[cfg(test)]
+        if let Some(ref base) = self.api_base_override {
+            return base.as_str();
+        }
+        API_BASE
     }
 
     fn upload_api_base(&self) -> &str {
@@ -487,7 +512,8 @@ impl BoxProvider {
             let token = self.get_token().await?;
             let url = format!(
                 "{}/folders/{}/items?fields=name,type,id&limit=1000",
-                API_BASE, current_id
+                self.api_base(),
+                current_id
             );
             let resp = self
                 .client
@@ -541,7 +567,8 @@ impl BoxProvider {
 
         let url = format!(
             "{}/folders/{}/items?fields=name,type,id&limit=1000",
-            API_BASE, parent_id
+            self.api_base(),
+            parent_id
         );
         let resp = self
             .client
@@ -594,7 +621,8 @@ impl BoxProvider {
 
         let url = format!(
             "{}/folders/{}/items?fields=name,type,id&limit=1000",
-            API_BASE, parent_id
+            self.api_base(),
+            parent_id
         );
         let resp = self
             .client
@@ -633,8 +661,8 @@ impl BoxProvider {
         loop {
             let token = self.get_token().await?;
             let url = format!(
-                "{}/folders/trash/items?fields=name,type,id,size,modified_at,trashed_at&limit={}&offset={}",
-                API_BASE, PAGE_LIMIT, offset
+                "{}/folders/trash/items?fields=name,type,id,size,modified_at,trashed_at,parent&limit={}&offset={}",
+                self.api_base(), PAGE_LIMIT, offset
             );
             let resp = self
                 .client
@@ -659,6 +687,9 @@ impl BoxProvider {
                 metadata.insert("item_type".to_string(), item.item_type.clone());
                 if let Some(ref t) = item.trashed_at {
                     metadata.insert("trashed_at".to_string(), t.clone());
+                }
+                if let Some(ref parent) = item.parent {
+                    metadata.insert("parent_id".to_string(), parent.id.clone());
                 }
 
                 let name = crate::restricted_chars::decode_leaf(ProviderType::Box, &item.name);
@@ -703,15 +734,21 @@ impl BoxProvider {
             } else {
                 "files"
             };
-            let url = format!("{}/{}/{}", API_BASE, endpoint, item_id);
+            let url = format!("{}/{}/{}", self.api_base(), endpoint, item_id);
 
-            let resp = self
+            let sent = self
                 .client
                 .delete(&url)
                 .header(AUTHORIZATION, Self::bearer_header(&token)?)
                 .send()
-                .await
-                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+                .await;
+            // The folder ids cached for the item and everything under it,
+            // under any capitalization, may now point into the trash.
+            super::forget_cached_subtree_ignoring_case(
+                &mut self.id_cache,
+                &Self::normalize_path(path),
+            );
+            let resp = sent.map_err(|e| ProviderError::NetworkError(e.to_string()))?;
 
             if !resp.status().is_success() {
                 return Err(box_error_from_response(resp, "Trash failed:").await);
@@ -737,7 +774,7 @@ impl BoxProvider {
         } else {
             "files"
         };
-        let url = format!("{}/{}/{}", API_BASE, endpoint, item_id);
+        let url = format!("{}/{}/{}", self.api_base(), endpoint, item_id);
 
         let resp = self
             .client
@@ -772,7 +809,7 @@ impl BoxProvider {
         } else {
             "files"
         };
-        let url = format!("{}/{}/{}/trash", API_BASE, endpoint, item_id);
+        let url = format!("{}/{}/{}/trash", self.api_base(), endpoint, item_id);
 
         let resp = self
             .client
@@ -811,7 +848,7 @@ impl BoxProvider {
         } else {
             "files"
         };
-        let url = format!("{}/{}/{}", API_BASE, endpoint, item_id);
+        let url = format!("{}/{}/{}", self.api_base(), endpoint, item_id);
 
         let resp = self
             .client
@@ -841,7 +878,8 @@ impl BoxProvider {
 
         let url = format!(
             "{}/files/{}/comments?fields=message,created_at,created_by&limit=100",
-            API_BASE, file_id
+            self.api_base(),
+            file_id
         );
         let resp = self
             .client
@@ -872,7 +910,7 @@ impl BoxProvider {
         let file_id = self.resolve_file_id(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/comments", API_BASE);
+        let url = format!("{}/comments", self.api_base());
         let body = serde_json::json!({
             "item": { "id": file_id, "type": "file" },
             "message": message,
@@ -906,7 +944,7 @@ impl BoxProvider {
         }
 
         let token = self.get_token().await?;
-        let url = format!("{}/comments/{}", API_BASE, comment_id);
+        let url = format!("{}/comments/{}", self.api_base(), comment_id);
 
         let resp = self
             .client
@@ -944,7 +982,12 @@ impl BoxProvider {
         } else {
             "files"
         };
-        let url = format!("{}/{}/{}/collaborations", API_BASE, endpoint, item_id);
+        let url = format!(
+            "{}/{}/{}/collaborations",
+            self.api_base(),
+            endpoint,
+            item_id
+        );
 
         let resp = self
             .client
@@ -984,7 +1027,7 @@ impl BoxProvider {
         let (item_id, item_type) = self.resolve_item_id_and_type(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/collaborations", API_BASE);
+        let url = format!("{}/collaborations", self.api_base());
         let body = serde_json::json!({
             "item": { "id": item_id, "type": item_type },
             "accessible_by": { "type": "user", "login": email },
@@ -1019,7 +1062,7 @@ impl BoxProvider {
         }
 
         let token = self.get_token().await?;
-        let url = format!("{}/collaborations/{}", API_BASE, collab_id);
+        let url = format!("{}/collaborations/{}", self.api_base(), collab_id);
 
         let resp = self
             .client
@@ -1049,7 +1092,7 @@ impl BoxProvider {
         let file_id = self.resolve_file_id(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/files/{}/watermark", API_BASE, file_id);
+        let url = format!("{}/files/{}/watermark", self.api_base(), file_id);
         let body = r#"{"watermark":{"imprint":"default"}}"#;
 
         let resp = self
@@ -1082,7 +1125,7 @@ impl BoxProvider {
         let file_id = self.resolve_file_id(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/files/{}/watermark", API_BASE, file_id);
+        let url = format!("{}/files/{}/watermark", self.api_base(), file_id);
 
         let resp = self
             .client
@@ -1117,7 +1160,7 @@ impl BoxProvider {
         } else {
             "files"
         };
-        let url = format!("{}/{}/{}", API_BASE, endpoint, item_id);
+        let url = format!("{}/{}/{}", self.api_base(), endpoint, item_id);
         let body = serde_json::json!({ "tags": tags });
 
         let resp = self
@@ -1150,7 +1193,7 @@ impl BoxProvider {
         let folder_id = self.resolve_folder_id(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/folder_locks", API_BASE);
+        let url = format!("{}/folder_locks", self.api_base());
         let body = serde_json::json!({
             "folder": { "type": "folder", "id": folder_id },
             "locked_operations": { "move": true, "delete": true },
@@ -1184,7 +1227,7 @@ impl BoxProvider {
         }
 
         let token = self.get_token().await?;
-        let url = format!("{}/folder_locks/{}", API_BASE, lock_id);
+        let url = format!("{}/folder_locks/{}", self.api_base(), lock_id);
 
         let resp = self
             .client
@@ -1217,7 +1260,7 @@ impl BoxProvider {
         let folder_id = self.resolve_folder_id(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/folder_locks?folder_id={}", API_BASE, folder_id);
+        let url = format!("{}/folder_locks?folder_id={}", self.api_base(), folder_id);
 
         let resp = self
             .client
@@ -1406,7 +1449,13 @@ impl BoxProvider {
             .session_endpoints
             .as_ref()
             .and_then(|e| e.upload_part.clone())
-            .unwrap_or_else(|| format!("{}/files/upload_sessions/{}", UPLOAD_BASE, session.id));
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/files/upload_sessions/{}",
+                    self.upload_api_base(),
+                    session.id
+                )
+            });
         let commit_url = session
             .session_endpoints
             .as_ref()
@@ -1414,7 +1463,8 @@ impl BoxProvider {
             .unwrap_or_else(|| {
                 format!(
                     "{}/files/upload_sessions/{}/commit",
-                    UPLOAD_BASE, session.id
+                    self.upload_api_base(),
+                    session.id
                 )
             });
 
@@ -1538,7 +1588,7 @@ impl StorageProvider for BoxProvider {
 
         let resp = self
             .client
-            .get(format!("{}/users/me", API_BASE))
+            .get(format!("{}/users/me", self.api_base()))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .send()
             .await
@@ -1593,7 +1643,7 @@ impl StorageProvider for BoxProvider {
             let token = self.get_token().await?;
             let url = format!(
                 "{}/folders/{}/items?fields=name,type,id,size,modified_at,watermark_info,tags,sha1&limit={}&offset={}",
-                API_BASE, folder_id, PAGE_LIMIT, offset
+                self.api_base(), folder_id, PAGE_LIMIT, offset
             );
 
             let resp = self
@@ -1738,7 +1788,7 @@ impl StorageProvider for BoxProvider {
         let file_id = self.resolve_file_id(remote_path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/files/{}/content", API_BASE, file_id);
+        let url = format!("{}/files/{}/content", self.api_base(), file_id);
         let resp = self
             .client
             .get(&url)
@@ -1785,7 +1835,7 @@ impl StorageProvider for BoxProvider {
     ) -> Result<(), ProviderError> {
         let file_id = self.resolve_file_id(remote_path).await?;
         let token = self.get_token().await?;
-        let url = format!("{}/files/{}/content", API_BASE, file_id);
+        let url = format!("{}/files/{}/content", self.api_base(), file_id);
         let auth = Self::bearer_header(&token)?;
 
         super::http_resumable_download(
@@ -1806,7 +1856,7 @@ impl StorageProvider for BoxProvider {
         let file_id = self.resolve_file_id(remote_path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/files/{}/content", API_BASE, file_id);
+        let url = format!("{}/files/{}/content", self.api_base(), file_id);
         let resp = self
             .client
             .get(&url)
@@ -1862,7 +1912,7 @@ impl StorageProvider for BoxProvider {
                 "file_size": total_size
             });
 
-            let session_url = format!("{}/files/upload_sessions", UPLOAD_BASE);
+            let session_url = format!("{}/files/upload_sessions", self.upload_api_base());
             let session_resp = self
                 .client
                 .post(&session_url)
@@ -1880,7 +1930,11 @@ impl StorageProvider for BoxProvider {
                     let file_id = self.resolve_file_id(remote_path).await?;
                     let token2 = self.get_token().await?;
                     let ver_body = serde_json::json!({"file_size": total_size});
-                    let ver_url = format!("{}/files/{}/upload_sessions", UPLOAD_BASE, file_id);
+                    let ver_url = format!(
+                        "{}/files/{}/upload_sessions",
+                        self.upload_api_base(),
+                        file_id
+                    );
                     let ver_resp = self
                         .client
                         .post(&ver_url)
@@ -1931,7 +1985,7 @@ impl StorageProvider for BoxProvider {
                 reqwest::multipart::Part::bytes(data).file_name(file_name.to_string()),
             );
 
-        let url = format!("{}/files/content", UPLOAD_BASE);
+        let url = format!("{}/files/content", self.upload_api_base());
         let resp = self
             .client
             .post(&url)
@@ -1955,7 +2009,7 @@ impl StorageProvider for BoxProvider {
                     reqwest::multipart::Part::bytes(data2).file_name(file_name.to_string()),
                 );
 
-                let url2 = format!("{}/files/{}/content", UPLOAD_BASE, file_id);
+                let url2 = format!("{}/files/{}/content", self.upload_api_base(), file_id);
                 let resp2 = self
                     .client
                     .post(&url2)
@@ -2003,7 +2057,7 @@ impl StorageProvider for BoxProvider {
 
         let resp = self
             .client
-            .post(format!("{}/folders", API_BASE))
+            .post(format!("{}/folders", self.api_base()))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&body)
@@ -2028,7 +2082,7 @@ impl StorageProvider for BoxProvider {
 
         let resp = self
             .client
-            .delete(format!("{}/files/{}", API_BASE, file_id))
+            .delete(format!("{}/files/{}", self.api_base(), file_id))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .send()
             .await
@@ -2048,13 +2102,20 @@ impl StorageProvider for BoxProvider {
         let folder_id = self.resolve_folder_id(path).await?;
         let token = self.get_token().await?;
 
-        let resp = self
+        let sent = self
             .client
-            .delete(format!("{}/folders/{}?recursive=true", API_BASE, folder_id))
+            .delete(format!(
+                "{}/folders/{}?recursive=true",
+                self.api_base(),
+                folder_id
+            ))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .send()
-            .await
-            .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            .await;
+        // Not only the folder's own id: every folder cached under it, under
+        // any capitalization, is in the trash with it.
+        super::forget_cached_subtree_ignoring_case(&mut self.id_cache, &Self::normalize_path(path));
+        let resp = sent.map_err(|e| ProviderError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() && resp.status().as_u16() != 204 {
             return Err(ProviderError::Other(format!(
@@ -2062,10 +2123,6 @@ impl StorageProvider for BoxProvider {
                 resp.status()
             )));
         }
-
-        // Remove from cache
-        let normalized = Self::normalize_path(path);
-        self.id_cache.remove(&normalized);
 
         Ok(())
     }
@@ -2075,23 +2132,36 @@ impl StorageProvider for BoxProvider {
     }
 
     async fn delete_permanent(&mut self, path: &str) -> Result<bool, ProviderError> {
-        // Box trash listing carries id and item_type ("file"|"folder") in
-        // metadata. Match by basename and dispatch to the existing inherent
-        // helper. Ok(false) when the trash search returns no match.
-        let basename = path
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or(path);
+        // Box trash listing carries id, item_type ("file"|"folder") and the
+        // folder the item was trashed from in metadata. Match by name among
+        // the items trashed from the path's folder and dispatch to the
+        // existing inherent helper: by name alone, a purge of `/new/a.txt`
+        // could take a trashed `/old/a.txt`. Ok(false) when nothing matches,
+        // or the folder is no longer there to tell which item is this path.
+        let normalized = Self::normalize_path(path);
+        let (parent_path, basename) = match normalized.rfind('/') {
+            Some(pos) if pos > 0 => (&normalized[..pos], &normalized[pos + 1..]),
+            _ => ("/", normalized.trim_start_matches('/')),
+        };
         if basename.is_empty() {
             return Ok(false);
         }
+        let parent_id = match self.resolve_folder_id(parent_path).await {
+            Ok(id) => id,
+            Err(ProviderError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         let trashed = self.list_trash().await?;
-        let target = trashed.iter().find(|e| e.name == basename).and_then(|e| {
-            let id = e.metadata.get("id")?;
-            let kind = e.metadata.get("item_type")?;
-            Some((id.clone(), kind.clone()))
-        });
+        let from_parent = |e: &&RemoteEntry| e.metadata.get("parent_id") == Some(&parent_id);
+        let target = trashed
+            .iter()
+            .filter(from_parent)
+            .find(|e| e.name == basename)
+            .and_then(|e| {
+                let id = e.metadata.get("id")?;
+                let kind = e.metadata.get("item_type")?;
+                Some((id.clone(), kind.clone()))
+            });
         match target {
             Some((id, kind)) => {
                 self.permanent_delete_from_trash(&id, &kind).await?;
@@ -2123,53 +2193,44 @@ impl StorageProvider for BoxProvider {
 
         let cross_folder = from_parent != to_parent;
 
-        if let Ok(file_id) = self.resolve_file_id(from).await {
-            let mut body = serde_json::json!({"name": new_name});
-            if cross_folder {
-                let dest_folder_id = if to_parent.is_empty() || to_parent == "/" {
-                    "0".to_string()
-                } else {
-                    self.resolve_folder_id(&to_parent).await?
-                };
-                body["parent"] = serde_json::json!({"id": dest_folder_id});
-            }
-            let resp = self
-                .client
-                .put(format!("{}/files/{}", API_BASE, file_id))
-                .header(AUTHORIZATION, Self::bearer_header(&token)?)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
-
-            if !resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(rename_refused(&text, to));
-            }
+        // By the item's own endpoint. The file lookup matches the name
+        // alone, so it found a folder too, and its id went to `/files`,
+        // where Box knows no file by that id: renaming or moving a folder
+        // failed.
+        let (item_id, item_type) = self.resolve_item_id_and_type(from).await?;
+        let endpoint = if item_type == "folder" {
+            "folders"
         } else {
-            let folder_id = self.resolve_folder_id(from).await?;
-            let mut body = serde_json::json!({"name": new_name});
-            if cross_folder {
-                let dest_folder_id = if to_parent.is_empty() || to_parent == "/" {
-                    "0".to_string()
-                } else {
-                    self.resolve_folder_id(&to_parent).await?
-                };
-                body["parent"] = serde_json::json!({"id": dest_folder_id});
-            }
-            let resp = self
-                .client
-                .put(format!("{}/folders/{}", API_BASE, folder_id))
-                .header(AUTHORIZATION, Self::bearer_header(&token)?)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
+            "files"
+        };
+        let mut body = serde_json::json!({"name": new_name});
+        if cross_folder {
+            let dest_folder_id = if to_parent.is_empty() || to_parent == "/" {
+                "0".to_string()
+            } else {
+                self.resolve_folder_id(&to_parent).await?
+            };
+            body["parent"] = serde_json::json!({"id": dest_folder_id});
+        }
+        let sent = self
+            .client
+            .put(format!("{}/{}/{}", self.api_base(), endpoint, item_id))
+            .header(AUTHORIZATION, Self::bearer_header(&token)?)
+            .json(&body)
+            .send()
+            .await;
+        // Whatever the answer, even none (a move Box applied whose answer
+        // was lost), the folder ids cached for either path and everything
+        // under them may point at the moved item: after `mv /A /B` and a new
+        // `mkdir /A`, a `put /A/f` landed in `/B`. Box names ignore letter
+        // case, so every capitalization of the paths goes.
+        super::forget_cached_subtree_ignoring_case(&mut self.id_cache, &Self::normalize_path(from));
+        super::forget_cached_subtree_ignoring_case(&mut self.id_cache, &Self::normalize_path(to));
+        let resp = sent.map_err(|e| ProviderError::NetworkError(e.to_string()))?;
 
-            if !resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(rename_refused(&text, to));
-            }
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(rename_refused(&text, to));
         }
 
         Ok(())
@@ -2183,53 +2244,30 @@ impl StorageProvider for BoxProvider {
     }
 
     async fn stat(&mut self, path: &str) -> Result<RemoteEntry, ProviderError> {
-        // Try file first
-        if let Ok(file_id) = self.resolve_file_id(path).await {
-            let token = self.get_token().await?;
-            let resp = self
-                .client
-                .get(format!(
-                    "{}/files/{}?fields=name,type,size,modified_at,sha1",
-                    API_BASE, file_id
-                ))
-                .header(AUTHORIZATION, Self::bearer_header(&token)?)
-                .send()
-                .await
-                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
-
-            let item: BoxItem = resp
-                .json()
-                .await
-                .map_err(|e| ProviderError::ParseError(e.to_string()))?;
-
-            let mut metadata = HashMap::new();
-            if let Some(ref s) = item.sha1 {
-                metadata.insert("sha1".to_string(), s.to_ascii_lowercase());
-            }
-            return Ok(RemoteEntry {
-                name: crate::restricted_chars::decode_leaf(ProviderType::Box, &item.name),
-                path: Self::normalize_path(path),
-                is_dir: false,
-                size: item.size.unwrap_or(0),
-                modified: item.modified_at,
-                permissions: None,
-                owner: None,
-                group: None,
-                is_symlink: false,
-                link_target: None,
-                mime_type: None,
-                metadata,
-            });
-        }
-
-        // Try folder
-        let folder_id = self.resolve_folder_id(path).await?;
+        // By the item's own endpoint, as in `rename`: the file lookup matches
+        // the name alone, so for a folder it sent the folder's id to
+        // `/files`, whose 404 did not parse as an item (ParseError).
+        let normalized = Self::normalize_path(path);
+        let (item_id, item_type) = if normalized == "/" {
+            ("0".to_string(), "folder".to_string())
+        } else {
+            self.resolve_item_id_and_type(path).await?
+        };
+        let is_dir = item_type == "folder";
+        let (endpoint, fields) = if is_dir {
+            ("folders", "name,type,size,modified_at")
+        } else {
+            ("files", "name,type,size,modified_at,sha1")
+        };
         let token = self.get_token().await?;
         let resp = self
             .client
             .get(format!(
-                "{}/folders/{}?fields=name,type,size,modified_at",
-                API_BASE, folder_id
+                "{}/{}/{}?fields={}",
+                self.api_base(),
+                endpoint,
+                item_id,
+                fields
             ))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .send()
@@ -2241,11 +2279,17 @@ impl StorageProvider for BoxProvider {
             .await
             .map_err(|e| ProviderError::ParseError(e.to_string()))?;
 
+        let mut metadata = HashMap::new();
+        if !is_dir {
+            if let Some(ref s) = item.sha1 {
+                metadata.insert("sha1".to_string(), s.to_ascii_lowercase());
+            }
+        }
         Ok(RemoteEntry {
             name: crate::restricted_chars::decode_leaf(ProviderType::Box, &item.name),
-            path: Self::normalize_path(path),
-            is_dir: true,
-            size: 0,
+            path: normalized,
+            is_dir,
+            size: if is_dir { 0 } else { item.size.unwrap_or(0) },
             modified: item.modified_at,
             permissions: None,
             owner: None,
@@ -2253,7 +2297,7 @@ impl StorageProvider for BoxProvider {
             is_symlink: false,
             link_target: None,
             mime_type: None,
-            metadata: Default::default(),
+            metadata,
         })
     }
 
@@ -2300,7 +2344,7 @@ impl StorageProvider for BoxProvider {
             .client
             .get(format!(
                 "{}/users/me?fields=space_amount,space_used",
-                API_BASE
+                self.api_base()
             ))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .send()
@@ -2342,7 +2386,11 @@ impl StorageProvider for BoxProvider {
 
         let resp = self
             .client
-            .get(format!("{}/files/{}?fields=shared_link", API_BASE, file_id))
+            .get(format!(
+                "{}/files/{}?fields=shared_link",
+                self.api_base(),
+                file_id
+            ))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .send()
             .await
@@ -2405,7 +2453,11 @@ impl StorageProvider for BoxProvider {
 
         let resp = self
             .client
-            .put(format!("{}/files/{}?fields=shared_link", API_BASE, file_id))
+            .put(format!(
+                "{}/files/{}?fields=shared_link",
+                self.api_base(),
+                file_id
+            ))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .json(&body)
             .send()
@@ -2436,7 +2488,7 @@ impl StorageProvider for BoxProvider {
         let body = serde_json::json!({"shared_link": null});
         let _resp = self
             .client
-            .put(format!("{}/files/{}", API_BASE, file_id))
+            .put(format!("{}/files/{}", self.api_base(), file_id))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .json(&body)
             .send()
@@ -2472,39 +2524,22 @@ impl StorageProvider for BoxProvider {
         let to_name = crate::restricted_chars::encode_leaf(ProviderType::Box, to_name);
         let to_parent_id = self.resolve_folder_id(to_parent).await?;
 
-        // Try file copy first
-        if let Ok(file_id) = self.resolve_file_id(from).await {
-            let body = serde_json::json!({
-                "parent": {"id": to_parent_id},
-                "name": to_name
-            });
-            let resp = self
-                .client
-                .post(format!("{}/files/{}/copy", API_BASE, file_id))
-                .header(AUTHORIZATION, Self::bearer_header(&token)?)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| ProviderError::NetworkError(e.to_string()))?;
-
-            if !resp.status().is_success() {
-                return Err(ProviderError::Other(format!(
-                    "Copy failed: {}",
-                    resp.status()
-                )));
-            }
-            return Ok(());
-        }
-
-        // Try folder copy
-        let folder_id = self.resolve_folder_id(from).await?;
+        // By the item's own endpoint, as in `rename`: the file lookup matches
+        // the name alone, so a folder went to `/files/{id}/copy`, which Box
+        // answers 404, and a folder could not be copied.
+        let (item_id, item_type) = self.resolve_item_id_and_type(from).await?;
+        let endpoint = if item_type == "folder" {
+            "folders"
+        } else {
+            "files"
+        };
         let body = serde_json::json!({
             "parent": {"id": to_parent_id},
             "name": to_name
         });
         let resp = self
             .client
-            .post(format!("{}/folders/{}/copy", API_BASE, folder_id))
+            .post(format!("{}/{}/{}/copy", self.api_base(), endpoint, item_id))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .json(&body)
             .send()
@@ -2530,7 +2565,8 @@ impl StorageProvider for BoxProvider {
 
         let url = format!(
             "{}/files/{}/thumbnail.png?min_height=256&min_width=256",
-            API_BASE, file_id
+            self.api_base(),
+            file_id
         );
         let resp = self
             .client
@@ -2563,7 +2599,7 @@ impl StorageProvider for BoxProvider {
         let file_id = self.resolve_file_id(path).await?;
         let token = self.get_token().await?;
 
-        let url = format!("{}/files/{}/versions", API_BASE, file_id);
+        let url = format!("{}/files/{}/versions", self.api_base(), file_id);
         let resp = self
             .client
             .get(&url)
@@ -2607,7 +2643,9 @@ impl StorageProvider for BoxProvider {
 
         let url = format!(
             "{}/files/{}/content?version={}",
-            API_BASE, file_id, version_id
+            self.api_base(),
+            file_id,
+            version_id
         );
         let resp = self
             .client
@@ -2643,7 +2681,11 @@ impl StorageProvider for BoxProvider {
         let body = serde_json::json!({"id": version_id});
         let resp = self
             .client
-            .post(format!("{}/files/{}/versions/current", API_BASE, file_id))
+            .post(format!(
+                "{}/files/{}/versions/current",
+                self.api_base(),
+                file_id
+            ))
             .header(AUTHORIZATION, Self::bearer_header(&token)?)
             .json(&body)
             .send()
@@ -2685,7 +2727,7 @@ impl StorageProvider for BoxProvider {
 
         let url = format!(
             "{}/search?query={}&limit=200",
-            API_BASE,
+            self.api_base(),
             urlencoding::encode(&server_query)
         );
         let resp = self
@@ -3252,6 +3294,401 @@ mod tests {
         let mut p = BoxProvider::connected_for_test(demo_cfg());
         p.test_access_token = Some("fixture-token".to_string());
         p
+    }
+
+    /// One item of [`provider_on_box`]: id, name, parent id, `file` or `folder`.
+    type BoxDoubleItem = (String, String, String, String);
+
+    /// A Box double keeping `items` (id, name, parent id, kind; the root is
+    /// `0`, and the parent `trash:P` stands for an item trashed from the
+    /// folder `P`) in memory: folder listings, an item's own GET and copy
+    /// (`/files/{id}` or `/folders/{id}`, 404 for an id that is not of that
+    /// kind), a folder create (`POST /folders`), a rename or move (`PUT
+    /// /folders/{id}` or `PUT /files/{id}`, the same 404), a delete (`DELETE
+    /// /folders/{id}` takes the folder and everything under it), the trash
+    /// listing with each item's `parent`, a purge from the trash (`DELETE
+    /// /{kind}s/{id}/trash`) and a small upload (`POST /files/content`, 404
+    /// into a folder that is gone). Box names ignore letter case, so a name
+    /// taken in another case answers 409 `item_name_in_use`. Returns a
+    /// provider pointed at it, the items, and every change as `create NAME in
+    /// PARENT as ID`, `put KIND ID NAME in PARENT`, `copy KIND ID NAME in
+    /// PARENT`, `delete KIND ID`, `purge KIND ID` or `upload NAME in PARENT`.
+    #[allow(clippy::type_complexity)]
+    async fn provider_on_box(
+        items: &[(&str, &str, &str, &str)],
+    ) -> (
+        BoxProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<BoxDoubleItem>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use axum::{http::StatusCode, response::IntoResponse};
+        use std::sync::{Arc, Mutex};
+        let store: Arc<Mutex<Vec<BoxDoubleItem>>> = Arc::new(Mutex::new(
+            items
+                .iter()
+                .map(|(id, name, parent, kind)| {
+                    (
+                        id.to_string(),
+                        name.to_string(),
+                        parent.to_string(),
+                        kind.to_string(),
+                    )
+                })
+                .collect(),
+        ));
+        let changes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let next_id = Arc::new(std::sync::atomic::AtomicUsize::new(100));
+        let (held, seen) = (Arc::clone(&store), Arc::clone(&changes));
+        let app =
+            axum::Router::new().fallback(axum::routing::any(move |req: axum::extract::Request| {
+                let (held, seen, next_id) =
+                    (Arc::clone(&held), Arc::clone(&seen), Arc::clone(&next_id));
+                async move {
+                    let method = req.method().as_str().to_string();
+                    let path = req.uri().path().to_string();
+                    let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let text = String::from_utf8_lossy(&body).to_string();
+                    let mut items = held.lock().unwrap();
+                    let error = |status: StatusCode, code: &str| {
+                        (
+                            status,
+                            axum::Json(serde_json::json!({
+                                "type": "error", "status": status.as_u16(), "code": code,
+                            })),
+                        )
+                            .into_response()
+                    };
+                    let is_folder = |items: &Vec<BoxDoubleItem>, id: &str| {
+                        id == "0" || items.iter().any(|i| i.0 == id && i.3 == "folder")
+                    };
+                    let taken = |items: &Vec<BoxDoubleItem>, parent: &str, name: &str, id: &str| {
+                        items
+                            .iter()
+                            .any(|i| i.2 == parent && i.1.eq_ignore_ascii_case(name) && i.0 != id)
+                    };
+                    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                    match (method.as_str(), segments.as_slice()) {
+                        ("GET", ["folders", "trash", "items"]) => {
+                            let entries: Vec<serde_json::Value> = items
+                                .iter()
+                                .filter_map(|i| {
+                                    let from = i.2.strip_prefix("trash:")?;
+                                    Some(serde_json::json!({
+                                        "type": i.3, "id": i.0, "name": i.1,
+                                        "parent": { "type": "folder", "id": from },
+                                    }))
+                                })
+                                .collect();
+                            axum::Json(serde_json::json!({
+                                "total_count": entries.len(),
+                                "entries": entries,
+                                "offset": 0,
+                                "limit": 1000,
+                            }))
+                            .into_response()
+                        }
+                        ("DELETE", [endpoint @ ("folders" | "files"), id, "trash"]) => {
+                            let kind = endpoint.trim_end_matches('s');
+                            seen.lock().unwrap().push(format!("purge {kind} {id}"));
+                            items.retain(|i| i.0 != *id);
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                        ("GET", [endpoint @ ("folders" | "files"), id]) => {
+                            let kind = endpoint.trim_end_matches('s');
+                            let item = if *id == "0" && kind == "folder" {
+                                Some(("0", "All Files"))
+                            } else {
+                                items
+                                    .iter()
+                                    .find(|i| i.0 == *id && i.3 == kind)
+                                    .map(|i| (i.0.as_str(), i.1.as_str()))
+                            };
+                            match item {
+                                Some((id, name)) => axum::Json(serde_json::json!({
+                                    "type": kind, "id": id, "name": name, "size": 1,
+                                }))
+                                .into_response(),
+                                None => error(StatusCode::NOT_FOUND, "not_found"),
+                            }
+                        }
+                        ("POST", [endpoint @ ("folders" | "files"), id, "copy"]) => {
+                            let kind = endpoint.trim_end_matches('s');
+                            if !items.iter().any(|i| i.0 == *id && i.3 == kind) {
+                                return error(StatusCode::NOT_FOUND, "not_found");
+                            }
+                            let args: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            let name = args["name"].as_str().unwrap().to_string();
+                            let parent = args["parent"]["id"].as_str().unwrap().to_string();
+                            if taken(&items, &parent, &name, "") {
+                                return error(StatusCode::CONFLICT, "item_name_in_use");
+                            }
+                            seen.lock()
+                                .unwrap()
+                                .push(format!("copy {kind} {id} {name} in {parent}"));
+                            let copy = next_id
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                .to_string();
+                            items.push((copy.clone(), name, parent, kind.to_string()));
+                            (
+                                StatusCode::CREATED,
+                                axum::Json(serde_json::json!({ "type": kind, "id": copy })),
+                            )
+                                .into_response()
+                        }
+                        ("GET", ["folders", id, "items"]) => {
+                            if !is_folder(&items, id) {
+                                return error(StatusCode::NOT_FOUND, "not_found");
+                            }
+                            let entries: Vec<serde_json::Value> = items
+                                .iter()
+                                .filter(|i| i.2 == *id)
+                                .map(|i| serde_json::json!({ "type": i.3, "id": i.0, "name": i.1 }))
+                                .collect();
+                            axum::Json(serde_json::json!({
+                                "total_count": entries.len(),
+                                "entries": entries,
+                                "offset": 0,
+                                "limit": 1000,
+                            }))
+                            .into_response()
+                        }
+                        ("POST", ["folders"]) => {
+                            let args: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            let name = args["name"].as_str().unwrap().to_string();
+                            let parent = args["parent"]["id"].as_str().unwrap().to_string();
+                            if !is_folder(&items, &parent) {
+                                return error(StatusCode::NOT_FOUND, "not_found");
+                            }
+                            if taken(&items, &parent, &name, "") {
+                                return error(StatusCode::CONFLICT, "item_name_in_use");
+                            }
+                            let id = next_id
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                .to_string();
+                            seen.lock()
+                                .unwrap()
+                                .push(format!("create {name} in {parent} as {id}"));
+                            items.push((id.clone(), name, parent, "folder".to_string()));
+                            (
+                                StatusCode::CREATED,
+                                axum::Json(serde_json::json!({ "type": "folder", "id": id })),
+                            )
+                                .into_response()
+                        }
+                        ("PUT", [endpoint @ ("folders" | "files"), id]) => {
+                            let kind = endpoint.trim_end_matches('s');
+                            let Some(at) = items.iter().position(|i| i.0 == *id && i.3 == kind)
+                            else {
+                                return error(StatusCode::NOT_FOUND, "not_found");
+                            };
+                            let args: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            let name = args["name"].as_str().unwrap().to_string();
+                            let parent = args["parent"]["id"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| items[at].2.clone());
+                            if taken(&items, &parent, &name, id) {
+                                return error(StatusCode::CONFLICT, "item_name_in_use");
+                            }
+                            seen.lock()
+                                .unwrap()
+                                .push(format!("put {kind} {id} {name} in {parent}"));
+                            items[at].1 = name;
+                            items[at].2 = parent;
+                            axum::Json(serde_json::json!({ "type": kind, "id": id }))
+                                .into_response()
+                        }
+                        ("DELETE", [endpoint @ ("folders" | "files"), id]) => {
+                            let kind = endpoint.trim_end_matches('s');
+                            seen.lock().unwrap().push(format!("delete {kind} {id}"));
+                            let mut gone = vec![id.to_string()];
+                            while let Some(at) = items.iter().position(|i| gone.contains(&i.2)) {
+                                gone.push(items.remove(at).0);
+                            }
+                            items.retain(|i| i.0 != *id);
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                        ("POST", ["files", "content"]) => {
+                            // The `attributes` part is the one JSON line.
+                            let attributes: serde_json::Value = text
+                                .lines()
+                                .find_map(|line| serde_json::from_str(line).ok())
+                                .unwrap();
+                            let name = attributes["name"].as_str().unwrap().to_string();
+                            let parent = attributes["parent"]["id"].as_str().unwrap().to_string();
+                            if !is_folder(&items, &parent) {
+                                return error(StatusCode::NOT_FOUND, "not_found");
+                            }
+                            if taken(&items, &parent, &name, "") {
+                                return error(StatusCode::CONFLICT, "item_name_in_use");
+                            }
+                            let id = next_id
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                .to_string();
+                            seen.lock()
+                                .unwrap()
+                                .push(format!("upload {name} in {parent}"));
+                            items.push((id.clone(), name, parent, "file".to_string()));
+                            (
+                                StatusCode::CREATED,
+                                axum::Json(serde_json::json!({ "entries": [{ "id": id }] })),
+                            )
+                                .into_response()
+                        }
+                        _ => (StatusCode::BAD_REQUEST, "unexpected").into_response(),
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let mut provider = fixture_connected();
+        provider.api_base_override = Some(format!("http://{addr}"));
+        provider.upload_base_override = Some(format!("http://{addr}"));
+        (provider, store, changes)
+    }
+
+    /// The file lookup matched the name alone, so for a folder it found the
+    /// folder and the rename went to `PUT /files/{folder id}`, which Box
+    /// answers 404: a folder could not be renamed or moved. It goes to
+    /// `/folders` now, and a file still to `/files`.
+    #[tokio::test]
+    async fn a_folder_is_renamed_through_the_folders_endpoint() {
+        let (mut p, _, changes) = provider_on_box(&[
+            ("1", "A", "0", "folder"),
+            ("2", "B", "0", "folder"),
+            ("11", "f.txt", "1", "file"),
+        ])
+        .await;
+        p.rename("/A", "/C").await.expect("folder rename");
+        p.rename("/C/f.txt", "/B/g.txt").await.expect("file move");
+        assert_eq!(
+            *changes.lock().unwrap(),
+            ["put folder 1 C in 0", "put file 11 g.txt in 2"]
+        );
+    }
+
+    /// The file lookup found folders too, so `stat` of a folder asked
+    /// `/files/{folder id}`, whose 404 did not parse (ParseError). It goes by
+    /// the item's type now; a file and the root still stat.
+    #[tokio::test]
+    async fn stat_of_a_folder_uses_the_folders_endpoint() {
+        let (mut p, _, _) =
+            provider_on_box(&[("1", "A", "0", "folder"), ("11", "f.txt", "1", "file")]).await;
+        let folder = p.stat("/A").await.expect("stat folder");
+        assert!(folder.is_dir && folder.name == "A", "{folder:?}");
+        let file = p.stat("/A/f.txt").await.expect("stat file");
+        assert!(!file.is_dir && file.name == "f.txt", "{file:?}");
+        let root = p.stat("/").await.expect("stat root");
+        assert!(root.is_dir, "{root:?}");
+    }
+
+    /// A server-side copy of a folder went to `/files/{id}/copy`, which Box
+    /// answers 404: a folder could not be copied. It goes by the item's
+    /// type now, and a file still to `/files`.
+    #[tokio::test]
+    async fn a_folder_copy_uses_the_folders_endpoint() {
+        let (mut p, _, changes) =
+            provider_on_box(&[("1", "A", "0", "folder"), ("11", "f.txt", "1", "file")]).await;
+        p.server_side_copy("/A", "/B").await.expect("folder copy");
+        p.server_side_copy("/A/f.txt", "/g.txt")
+            .await
+            .expect("file copy");
+        assert_eq!(
+            *changes.lock().unwrap(),
+            ["copy folder 1 B in 0", "copy file 11 g.txt in 0"]
+        );
+    }
+
+    /// The purge after a delete looked the trash up by name alone: with
+    /// `/old/a.txt` and `/new/a.txt` both trashed, `delete_permanent` of
+    /// `/new/a.txt` purged `/old/a.txt`, listed first. It takes the item
+    /// trashed from the path's folder.
+    #[tokio::test]
+    async fn a_permanent_delete_takes_the_trashed_item_of_its_own_folder() {
+        let (mut p, _, changes) = provider_on_box(&[
+            ("1", "old", "0", "folder"),
+            ("2", "new", "0", "folder"),
+            ("11", "a.txt", "trash:1", "file"),
+            ("12", "a.txt", "trash:2", "file"),
+        ])
+        .await;
+        assert!(p.delete_permanent("/new/a.txt").await.expect("purge"));
+        assert_eq!(*changes.lock().unwrap(), ["purge file 12"]);
+        // No folder to tell which trashed `a.txt` is this path: none.
+        assert!(!p.delete_permanent("/gone/a.txt").await.expect("no folder"));
+        assert_eq!(changes.lock().unwrap().len(), 1);
+    }
+
+    /// A one-byte local file to upload.
+    fn local_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"x").unwrap();
+        file
+    }
+
+    /// Box names ignore letter case, and the id cache keeps the spelling
+    /// each lookup used: after another client renamed `A` to `a`, the
+    /// folder was cached as both `/A` and `/a`. `mv /a /B` forgot nothing
+    /// (later only `/a`), so once a new `/A` was made, `put /A/f` landed in
+    /// `/B`. Every capitalization of both paths is forgotten.
+    #[tokio::test]
+    async fn after_a_move_a_new_folder_of_the_old_name_gets_the_upload() {
+        let (mut p, items, changes) = provider_on_box(&[("1", "A", "0", "folder")]).await;
+        p.list("/A").await.expect("list /A");
+        items.lock().unwrap()[0].1 = "a".to_string();
+        p.list("/a").await.expect("list /a");
+        p.rename("/a", "/B").await.expect("mv /a /B");
+        p.mkdir("/A").await.expect("mkdir /A");
+        let file = local_file();
+        p.upload(file.path().to_str().unwrap(), "/A/f", None)
+            .await
+            .expect("put /A/f");
+        assert_eq!(
+            *changes.lock().unwrap(),
+            [
+                "put folder 1 B in 0",
+                "create A in 0 as 100",
+                "upload f in 100"
+            ]
+        );
+    }
+
+    /// Trashing or removing `/a` forgot nothing (trash) or only the exact
+    /// key (rmdir): `/A/sub`, cached before another client changed the
+    /// case, kept the id of the trashed folder, and a new `/A/sub` never got
+    /// what was put there.
+    #[tokio::test]
+    async fn after_a_folder_is_trashed_a_new_one_of_that_name_gets_the_upload() {
+        for trash in [true, false] {
+            let (mut p, items, changes) =
+                provider_on_box(&[("1", "A", "0", "folder"), ("2", "sub", "1", "folder")]).await;
+            p.list("/A/sub").await.expect("list /A/sub");
+            items.lock().unwrap()[0].1 = "a".to_string();
+            p.list("/a/sub").await.expect("list /a/sub");
+            if trash {
+                p.trash_files(&["/a".to_string()]).await.expect("trash /a");
+            } else {
+                p.rmdir("/a").await.expect("rmdir /a");
+            }
+            p.mkdir("/A").await.expect("mkdir /A");
+            p.mkdir("/A/sub").await.expect("mkdir /A/sub");
+            let file = local_file();
+            p.upload(file.path().to_str().unwrap(), "/A/sub/f", None)
+                .await
+                .expect("put /A/sub/f");
+            assert_eq!(
+                changes.lock().unwrap()[1..],
+                [
+                    "create A in 0 as 100",
+                    "create sub in 100 as 101",
+                    "upload f in 101"
+                ],
+                "trash: {trash}"
+            );
+        }
     }
 
     #[test]
