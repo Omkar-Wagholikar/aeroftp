@@ -2150,13 +2150,24 @@ mod tests {
         let (addr, asked) = serve(Limits::APP);
         let port = addr.port();
         let mut stream = connect(addr);
-        write!(
+        let sent = write!(
             stream,
             "GET /index.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n\
              GET /assets/app.css HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n\
              GET /assets/app.css HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-        )
-        .unwrap();
+        );
+        // The refusal is allowed to close the socket before the client has
+        // finished writing the third pipelined request. The responses below
+        // still prove that the first was served and the second was refused.
+        if let Err(error) = sent {
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ),
+                "unexpected write error: {error}"
+            );
+        }
         let responses = responses_until_close(&mut stream);
         let statuses: Vec<u16> = responses.iter().map(|(status, _)| *status).collect();
         assert_eq!(statuses, [200, 421]);
