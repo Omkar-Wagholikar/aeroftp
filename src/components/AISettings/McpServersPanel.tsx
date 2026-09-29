@@ -4,6 +4,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Plus, RefreshCw, Save, Trash2 } from 'lucide-react';
+import { createPortal } from 'react-dom';
+import { ConfirmOverlay } from '../common/ConfirmOverlay';
+import { MODAL_Z } from '../../utils/modalLayers';
 
 interface SecretRef { vault_account: string }
 interface ServerConfig {
@@ -28,6 +31,7 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
     const [secret, setSecret] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
+    const [pendingRemoval, setPendingRemoval] = useState<{ kind: 'server' } | { kind: 'secret'; name: string } | null>(null);
 
     useEffect(() => { setCommand(server.command); setArgs(server.args.join('\n')); }, [server.command, server.args]);
 
@@ -65,9 +69,7 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
                         onChange={(event) => perform(() => edit({ enabled: event.target.checked }))} /> Enabled
                 </label>
                 <button type="button" disabled={busy} aria-label={`Remove ${server.id}`} className="text-red-400 disabled:opacity-50"
-                    onClick={() => { if (window.confirm(`Remove ${server.id} and its saved MCP secrets?`)) {
-                        void perform(() => invoke('mcp_client_remove_server', { serverId: server.id }));
-                    } }}><Trash2 size={16} /></button>
+                    onClick={() => setPendingRemoval({ kind: 'server' })}><Trash2 size={16} /></button>
             </div>
         </div>
         <label className="block text-xs text-gray-300">Absolute executable path
@@ -85,9 +87,7 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
             {Object.keys(server.env).map(name => <div key={name} className="flex items-center gap-2 text-xs">
                 <span className="font-mono text-gray-300">{name}</span><span className="text-gray-500">Saved value hidden</span>
                 <button type="button" disabled={busy} className="text-red-400 disabled:opacity-50" aria-label={`Remove ${name}`}
-                    onClick={() => { if (window.confirm(`Remove ${name} and its saved secret?`)) {
-                        void perform(() => { const env = { ...server.env }; delete env[name]; return edit({ env }); });
-                    } }}><Trash2 size={13} /></button>
+                    onClick={() => setPendingRemoval({ kind: 'secret', name })}><Trash2 size={13} /></button>
             </div>)}
             <div className="flex flex-wrap gap-2">
                 <input className="min-w-32 flex-1 rounded bg-gray-900 border border-gray-600 p-2 text-sm" value={envName}
@@ -101,6 +101,26 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
             </div>
         </div>
         {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
+        {pendingRemoval && createPortal(<ConfirmOverlay
+            message={pendingRemoval.kind === 'server'
+                ? `Remove ${server.id} and its saved MCP secrets?`
+                : `Remove ${pendingRemoval.name} and its saved secret?`}
+            onCancel={() => setPendingRemoval(null)}
+            onConfirm={() => {
+                const removal = pendingRemoval;
+                setPendingRemoval(null);
+                if (removal.kind === 'server') {
+                    void perform(() => invoke('mcp_client_remove_server', { serverId: server.id }));
+                } else {
+                    void perform(() => {
+                        const env = { ...server.env };
+                        delete env[removal.name];
+                        return edit({ env });
+                    });
+                }
+            }}
+            zClass={MODAL_Z.globalConfirm}
+        />, document.body)}
     </div>;
 }
 
