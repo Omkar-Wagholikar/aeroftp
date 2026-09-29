@@ -15,7 +15,9 @@ use crate::user_partitions;
 const SETTING_SCOPE: &str = "aeroagent_mcp_servers";
 const MAX_SERVERS: usize = 32;
 
-fn context(app: &AppHandle) -> Result<(Connection, Zeroizing<[u8; 32]>, i64), &'static str> {
+pub(crate) fn context(
+    app: &AppHandle,
+) -> Result<(Connection, Zeroizing<[u8; 32]>, i64), &'static str> {
     user_partitions::init_or_migrate(app).map_err(|_| "MCP_STORE_UNAVAILABLE")?;
     let store = CredentialStore::from_cache().ok_or("MCP_STORE_UNAVAILABLE")?;
     let root_key = Zeroizing::new(store.derive_user_partition_wrapping_key());
@@ -40,7 +42,7 @@ fn validate_catalog(configs: &[McpServerConfig]) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn load(
+pub(crate) fn load(
     conn: &Connection,
     root_key: &[u8; 32],
     user_id: i64,
