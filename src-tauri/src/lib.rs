@@ -62,6 +62,7 @@ mod localhost_security;
 mod mcp_client_commands;
 pub mod mcp_client_config;
 pub mod mcp_client_framing;
+pub mod mcp_client_protocol;
 mod openai_responses;
 #[cfg(target_os = "linux")]
 mod ui_server;
