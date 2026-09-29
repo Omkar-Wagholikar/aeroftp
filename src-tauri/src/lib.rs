@@ -63,6 +63,9 @@ mod mcp_client_commands;
 pub mod mcp_client_config;
 pub mod mcp_client_framing;
 pub mod mcp_client_protocol;
+// Backend-only gate until approved process isolation and runtime wiring.
+#[allow(dead_code)]
+mod mcp_client_gate;
 // Kept private until backend approval, audit and OS isolation are decided.
 #[allow(dead_code)]
 mod mcp_client_transport;
