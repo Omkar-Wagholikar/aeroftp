@@ -2150,13 +2150,15 @@ mod tests {
         let (addr, asked) = serve(Limits::APP);
         let port = addr.port();
         let mut stream = connect(addr);
-        write!(
+        // The server may close as soon as it rejects the second request,
+        // before the client finishes writing the third. Response assertions
+        // below still require the first two requests to have been processed.
+        let _ = write!(
             stream,
             "GET /index.html HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n\
              GET /assets/app.css HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n\
              GET /assets/app.css HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
-        )
-        .unwrap();
+        );
         let responses = responses_until_close(&mut stream);
         let statuses: Vec<u16> = responses.iter().map(|(status, _)| *status).collect();
         assert_eq!(statuses, [200, 421]);
