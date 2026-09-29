@@ -3254,7 +3254,9 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                                     <div key={profile.id} className={`${ct.textMuted} break-all`}>{profile.name}: {profile.root}</div>
                                 ))}
                                 {Array.from(new Set(delegationView.events.flatMap(event => event.childId ? [event.childId] : []))).map((childId, index) => {
-                                    const status = delegationView.events.filter(event => event.childId === childId).slice(-1)[0]?.status ?? 'queued';
+                                    const lastStatus = delegationView.events.filter(event => event.childId === childId).slice(-1)[0]?.status ?? 'queued';
+                                    const status = delegationView.status === 'cancelled' && (lastStatus === 'queued' || lastStatus === 'running')
+                                        ? 'cancelled' : lastStatus;
                                     const worker = delegationView.workers.find(item => item.childId === childId);
                                     return (
                                         <div key={childId} className={`rounded border ${ct.border} px-2 py-1.5`}>
