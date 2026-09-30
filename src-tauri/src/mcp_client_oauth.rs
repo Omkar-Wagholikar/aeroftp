@@ -217,13 +217,12 @@ fn validate_authorization_server(
     if document.get("issuer").and_then(Value::as_str) != Some(expected_issuer) {
         return Err(OAuthError::InvalidMetadata);
     }
-    if let Some(methods) = document.get("code_challenge_methods_supported") {
-        if !methods
-            .as_array()
-            .is_some_and(|methods| methods.iter().any(|method| method.as_str() == Some("S256")))
-        {
-            return Err(OAuthError::InvalidMetadata);
-        }
+    if !document
+        .get("code_challenge_methods_supported")
+        .and_then(Value::as_array)
+        .is_some_and(|methods| methods.iter().any(|method| method.as_str() == Some("S256")))
+    {
+        return Err(OAuthError::InvalidMetadata);
     }
     let endpoint = |key: &str| -> Result<Url, OAuthError> {
         let raw = document
@@ -798,6 +797,27 @@ mod tests {
             "https://auth.example.com/tenant1",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn authorization_metadata_requires_explicit_s256_pkce() {
+        let base = json!({"issuer":"https://auth.example.com/tenant1",
+            "authorization_endpoint":"https://auth.example.com/authorize","token_endpoint":"https://auth.example.com/token"});
+        assert!(matches!(
+            validate_authorization_server(&base, "https://auth.example.com/tenant1"),
+            Err(OAuthError::InvalidMetadata)
+        ));
+        for methods in [Value::Null, json!("S256"), json!([]), json!(["plain"])] {
+            let mut document = base.clone();
+            document["code_challenge_methods_supported"] = methods;
+            assert!(matches!(
+                validate_authorization_server(&document, "https://auth.example.com/tenant1"),
+                Err(OAuthError::InvalidMetadata)
+            ));
+        }
+        let mut valid = base;
+        valid["code_challenge_methods_supported"] = json!(["S256"]);
+        assert!(validate_authorization_server(&valid, "https://auth.example.com/tenant1").is_ok());
     }
 
     fn config() -> McpHttpServerConfig {
