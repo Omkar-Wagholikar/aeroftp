@@ -65,10 +65,13 @@ const MCP_MAX_SERVERS = 32;
 const MCP_MAX_TOOLS = 64;
 const MCP_MAX_SCHEMA_BYTES = 8192;
 const MCP_MAX_PARAMETERS = 16;
+const MCP_MAX_HEADERS = 24;
 const MCP_MAX_DEPTH = 3;
 const MCP_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const MCP_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.\/-]{0,127}$/;
 const PARAM_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+// Mirrors the backend's RFC token check for Mcp-Param-<suffix> headers.
+const MCP_HEADER_SUFFIX = /^[!#$%&'*+.^_`|~A-Za-z0-9-]{1,64}$/;
 const object = (value: unknown): value is Record<string, unknown> =>
     value !== null && typeof value === 'object' && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 const keysOnly = (value: Record<string, unknown>, allowed: string[]) => Object.keys(value).every(key => allowed.includes(key));
@@ -77,7 +80,7 @@ const shortText = (value: unknown, max: number): value is string => typeof value
 
 /** The current AITool contract supports flat primitive parameters and string arrays only.
  *  Reject other JSON Schema features instead of silently weakening validation. */
-function mcpParameters(input: unknown): AITool['parameters'] | undefined {
+function mcpParameters(input: unknown): Pick<AITool, 'parameters' | 'additionalProperties'> | undefined {
     if (!object(input)) return undefined;
     let nodes = 0;
     const withinDepth = (value: unknown, depth: number): boolean => {
@@ -101,19 +104,27 @@ function mcpParameters(input: unknown): AITool['parameters'] | undefined {
     const required = (input.required ?? []) as unknown[];
     if (required.some(name => typeof name !== 'string' || !names.includes(name)) || new Set(required).size !== required.length) return undefined;
     const parameters: AITool['parameters'] = [];
+    const headerNames = new Set<string>();
     for (const name of names) {
         const property = input.properties[name];
-        if (!object(property) || !keysOnly(property, ['type', 'description', 'items'])
+        if (!object(property) || !keysOnly(property, ['type', 'description', 'items', 'x-mcp-header'])
             || property.description !== undefined && !shortText(property.description, 512)) return undefined;
         const type = property.type;
-        if (!['string', 'number', 'boolean', 'array'].includes(type as string)) return undefined;
+        if (!['string', 'number', 'integer', 'boolean', 'array'].includes(type as string)) return undefined;
+        if (Object.prototype.hasOwnProperty.call(property, 'x-mcp-header')) {
+            const suffix = property['x-mcp-header'];
+            if (typeof suffix !== 'string' || !MCP_HEADER_SUFFIX.test(suffix)
+                || !['string', 'integer', 'boolean'].includes(type as string)
+                || headerNames.size >= MCP_MAX_HEADERS || headerNames.has(suffix.toLowerCase())) return undefined;
+            headerNames.add(suffix.toLowerCase());
+        }
         if (type === 'array') {
             if (!object(property.items) || !keysOnly(property.items, ['type']) || property.items.type !== 'string') return undefined;
         } else if (property.items !== undefined) return undefined;
         parameters.push({ name, type: type as AITool['parameters'][number]['type'],
             description: (property.description as string | undefined) ?? '', required: required.includes(name) });
     }
-    return parameters;
+    return { parameters, ...(input.additionalProperties === false ? { additionalProperties: false as const } : {}) };
 }
 
 /** Snapshot only. No credentials, commands or approval grants are exposed to the model. */
@@ -154,12 +165,13 @@ export function buildToolRegistry(plugins: PluginManifest[], macros: ToolMacro[]
             if (!object(tool) || tool.enabled !== true || typeof tool.name !== 'string' || !MCP_NAME.test(tool.name)
                 || names.filter(name => name === tool.name).length !== 1
                 || !shortText(tool.description ?? '', 512)) continue;
-            const parameters = mcpParameters(tool.inputSchema);
-            if (!parameters) continue;
+            const schema = mcpParameters(tool.inputSchema);
+            if (!schema) continue;
             // Server-declared read-only/safe annotations are untrusted. Backend approval is still required.
             add({ name: tool.name, description: `[MCP: ${server.id}] ${tool.description ?? ''}`,
-                parameters, dangerLevel: 'high' },
-            { kind: 'mcp', ownerId: server.id, toolName: tool.name }, tool.name, server.revision);
+                ...schema, dangerLevel: 'high' },
+            { kind: 'mcp', ownerId: server.id, toolName: tool.name }, tool.name,
+            [server.revision, tool.inputSchema]);
         }
     }
     // Fail closed on duplicate identities or wire collisions, independently of input order.

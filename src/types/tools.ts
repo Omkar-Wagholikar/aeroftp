@@ -9,12 +9,13 @@ export interface AITool {
     name: string;
     description: string;
     parameters: AIToolParameter[];
+    additionalProperties?: false;
     dangerLevel: DangerLevel;
 }
 
 export interface AIToolParameter {
     name: string;
-    type: 'string' | 'number' | 'boolean' | 'array';
+    type: 'string' | 'number' | 'integer' | 'boolean' | 'array';
     description: string;
     required: boolean;
 }
@@ -759,6 +760,7 @@ export const toJSONSchema = (tool: AITool): Record<string, unknown> => ({
         }])
     ),
     required: tool.parameters.filter(p => p.required).map(p => p.name),
+    ...(tool.additionalProperties === false ? { additionalProperties: false } : {}),
 });
 
 // Convert all tools to native function definitions for AI providers
