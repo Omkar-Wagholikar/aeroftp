@@ -66,7 +66,8 @@ const MCP_MAX_TOOLS = 64;
 const MCP_MAX_SCHEMA_BYTES = 8192;
 const MCP_MAX_PARAMETERS = 16;
 const MCP_MAX_HEADERS = 24;
-const MCP_MAX_DEPTH = 3;
+// root -> properties -> property -> items -> items.type
+const MCP_MAX_DEPTH = 4;
 const MCP_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const MCP_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.\/-]{0,127}$/;
 const PARAM_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
