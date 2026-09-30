@@ -66,6 +66,10 @@ mod mcp_client_dispatch;
 pub mod mcp_client_framing;
 #[allow(dead_code)] // HTTP configuration is private until transport and approval are wired.
 mod mcp_client_http_config;
+#[allow(dead_code)] // Private until HTTP settings and model routing are integrated.
+mod mcp_client_http_transport;
+#[allow(dead_code)] // OAuth flow is private until the HTTP settings integration.
+mod mcp_client_oauth;
 pub mod mcp_client_protocol;
 #[allow(dead_code)] // Used only by the private outbound STDIO transport.
 mod mcp_client_sandbox;

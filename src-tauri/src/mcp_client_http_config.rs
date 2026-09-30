@@ -23,6 +23,8 @@ pub(crate) enum McpHttpAuth {
     },
     OAuth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id_metadata_url: Option<String>,
     },
 }
@@ -86,7 +88,7 @@ fn valid_id(value: &str) -> bool {
 
 /// DNS resolution, proxy selection, and every redirect must be checked again
 /// against the actual connected address by the HTTP transport.
-fn parse_public_https(value: &str, max_len: usize) -> Result<Url, &'static str> {
+pub(crate) fn parse_public_https(value: &str, max_len: usize) -> Result<Url, &'static str> {
     if value.is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
         return Err("MCP_HTTP_INVALID_ENDPOINT");
     }
@@ -134,10 +136,24 @@ impl McpHttpServerConfig {
                 }
             }
             McpHttpAuth::OAuth {
+                client_id,
                 client_id_metadata_url,
             } => {
+                if client_id.is_some() && client_id_metadata_url.is_some() {
+                    return Err("MCP_HTTP_INVALID_OAUTH_CLIENT");
+                }
+                if client_id.as_ref().is_some_and(|client_id| {
+                    client_id.is_empty()
+                        || client_id.len() > 512
+                        || client_id.chars().any(char::is_control)
+                }) {
+                    return Err("MCP_HTTP_INVALID_OAUTH_CLIENT");
+                }
                 if let Some(url) = client_id_metadata_url {
-                    parse_public_https(url, MAX_CLIENT_METADATA_URL)?;
+                    let parsed = parse_public_https(url, MAX_CLIENT_METADATA_URL)?;
+                    if parsed.path() == "/" {
+                        return Err("MCP_HTTP_INVALID_OAUTH_CLIENT");
+                    }
                 }
             }
         }
@@ -266,6 +282,7 @@ mod tests {
         };
         assert_eq!(bearer.validate(), Err("MCP_HTTP_INVALID_BEARER_REF"));
         bearer.auth = McpHttpAuth::OAuth {
+            client_id: None,
             client_id_metadata_url: Some("http://id.example.com/client".into()),
         };
         assert_eq!(bearer.validate(), Err("MCP_HTTP_INVALID_ENDPOINT"));
