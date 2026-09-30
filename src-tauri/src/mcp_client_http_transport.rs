@@ -539,6 +539,17 @@ pub(crate) async fn request(
         return Err(HttpError::InvalidRequest);
     }
     let client = pinned_client(&url, cancel).await?;
+    send_prepared(&client, url, headers, body, id, cancel).await
+}
+
+async fn send_prepared(
+    client: &Client,
+    url: Url,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Result<Value, HttpError> {
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(HttpError::Cancelled),
@@ -590,6 +601,176 @@ pub(crate) async fn request(
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Local test-only wire peer for response handling. Production still
+    // constructs its own HTTPS client after DNS and address validation.
+    async fn wire_fixture(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (Url, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(split) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&request[..split]);
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+                assert!(request.len() <= MAX_REPLY_BYTES + 4096);
+            }
+            tokio::time::sleep(delay).await;
+            let _ = socket.write_all(&response).await;
+            String::from_utf8(request).unwrap()
+        });
+        (Url::parse(&format!("http://{address}/mcp")).unwrap(), task)
+    }
+
+    fn wire_reply(status: &str, content_type: &str, extra: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+            body.len()
+        ).into_bytes()
+    }
+
+    fn test_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    async fn fixture_request(response: Vec<u8>) -> (Result<Value, HttpError>, String) {
+        let (url, peer) = wire_fixture(response, Duration::ZERO).await;
+        let params = Map::from_iter([
+            ("name".into(), json!("probe")),
+            ("arguments".into(), json!({"region":"west"})),
+        ]);
+        let schema = json!({"type":"object","properties":{"region":{"type":"string","x-mcp-header":"Region"}}});
+        let headers = request_headers("tools/call", &params, Some(&schema)).unwrap();
+        let body = serde_json::to_vec(
+            &protocol::request(Era::Modern, 7, "tools/call", params, "AeroFTP", "4.2").unwrap(),
+        )
+        .unwrap();
+        let result = send_prepared(
+            &test_client(),
+            url,
+            headers,
+            body,
+            7,
+            &CancellationToken::new(),
+        )
+        .await;
+        (result, peer.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn wire_fixture_checks_json_sse_headers_and_correlated_reply() {
+        let json = r#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","content":[]}}"#;
+        let (result, request) =
+            fixture_request(wire_reply("200 OK", "application/json", "", json)).await;
+        assert_eq!(result.unwrap()["content"], json!([]));
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("mcp-method: tools/call\r\n"));
+        assert!(request.contains("mcp-name: probe\r\n"));
+        assert!(request.contains("mcp-param-region: west\r\n"));
+        assert!(request.contains("mcp-protocol-version: 2026-07-28\r\n"));
+        assert!(request.contains("io.modelcontextprotocol/protocolversion"));
+
+        let sse = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"resultType\":\"complete\",\"content\":[]}}\n\n";
+        let (result, _) = fixture_request(wire_reply("200 OK", "text/event-stream", "", sse)).await;
+        assert_eq!(result.unwrap()["content"], json!([]));
+        let wrong = r#"{"jsonrpc":"2.0","id":8,"result":{"resultType":"complete"}}"#;
+        let (result, _) =
+            fixture_request(wire_reply("200 OK", "application/json", "", wrong)).await;
+        assert_eq!(result, Err(HttpError::InvalidResponse));
+    }
+
+    #[tokio::test]
+    async fn wire_fixture_rejects_redirect_large_body_and_handles_401_scope() {
+        let (result, _) = fixture_request(wire_reply(
+            "401 Unauthorized",
+            "application/json",
+            "WWW-Authenticate: Bearer scope=\"files:read files:write\"\r\n",
+            "",
+        ))
+        .await;
+        assert!(
+            matches!(result, Err(HttpError::Unauthorized(challenge)) if challenge.scopes == ["files:read", "files:write"])
+        );
+        let (result, _) = fixture_request(wire_reply(
+            "302 Found",
+            "application/json",
+            "Location: https://elsewhere.example/mcp\r\n",
+            "",
+        ))
+        .await;
+        assert_eq!(result, Err(HttpError::Redirect));
+        let (result, _) = fixture_request(wire_reply(
+            "200 OK",
+            "application/json",
+            "",
+            &"x".repeat(MAX_REPLY_BYTES + 1),
+        ))
+        .await;
+        assert_eq!(result, Err(HttpError::ResponseTooLarge));
+        let unsupported =
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32022,"message":"unsupported"}}"#;
+        let (result, _) = fixture_request(wire_reply(
+            "400 Bad Request",
+            "application/json",
+            "",
+            unsupported,
+        ))
+        .await;
+        assert_eq!(result, Err(HttpError::UnsupportedVersion));
+    }
+
+    #[tokio::test]
+    async fn wire_fixture_cancellation_stops_a_pending_request() {
+        let (url, peer) = wire_fixture(
+            wire_reply("200 OK", "application/json", "", "{}"),
+            Duration::from_secs(1),
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let cancelled = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancelled.cancel();
+        });
+        let result = send_prepared(
+            &test_client(),
+            url,
+            HeaderMap::new(),
+            b"{}".to_vec(),
+            7,
+            &cancel,
+        )
+        .await;
+        assert_eq!(result, Err(HttpError::Cancelled));
+        peer.abort();
+    }
 
     #[test]
     fn header_annotations_are_reachable_primitive_unique_and_safe() {
