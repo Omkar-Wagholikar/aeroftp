@@ -402,6 +402,7 @@ fn random_urlsafe() -> Zeroizing<String> {
     Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes.as_ref()))
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit issuer/resource/user/PKCE scope binding.
 pub(crate) fn begin_authorization(
     config: &McpHttpServerConfig,
     resource: &ProtectedResource,

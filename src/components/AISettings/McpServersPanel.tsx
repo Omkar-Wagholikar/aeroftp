@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Plus, RefreshCw, Save, Trash2 } from 'lucide-react';
 import { createPortal } from 'react-dom';
@@ -20,7 +20,7 @@ interface ServerConfig {
 
 const idValid = (value: string) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value);
 const envValid = (value: string) => /^[A-Z_][A-Z0-9_]{0,63}$/.test(value)
-    && !['PATH', 'HOME', 'SHELL', 'ENV', 'IFS', 'COMSPEC', 'PATHEXT', 'NODE_OPTIONS', 'RUSTFLAGS'].includes(value)
+    && !['PATH', 'HOME', 'SHELL', 'ENV', 'IFS', 'COMSPEC', 'PATHEXT', 'NODE_OPTIONS', 'NODE_PATH', 'RUSTFLAGS'].includes(value)
     && !/^(LD_|DYLD_|PYTHON)/.test(value);
 const accountFor = (serverId: string, envName: string) => `mcp_env_${serverId.length}_${serverId}_${envName}`;
 
@@ -33,7 +33,9 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
     const [error, setError] = useState('');
     const [pendingRemoval, setPendingRemoval] = useState<{ kind: 'server' } | { kind: 'secret'; name: string } | null>(null);
 
-    useEffect(() => { setCommand(server.command); setArgs(server.args.join('\n')); }, [server.command, server.args]);
+    const storedArgs = server.args.join('\n');
+    useEffect(() => { setCommand(server.command); }, [server.command]);
+    useEffect(() => { setArgs(storedArgs); }, [storedArgs]);
 
     const perform = async (action: () => Promise<void>) => {
         setBusy(true); setError('');
@@ -130,8 +132,11 @@ export function McpServersPanel() {
     const [command, setCommand] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
+    const refreshSequence = useRef(0);
     const refresh = useCallback(async () => {
-        setServers(await invoke<ServerConfig[]>('mcp_client_list_servers'));
+        const sequence = ++refreshSequence.current;
+        const result = await invoke<ServerConfig[]>('mcp_client_list_servers');
+        if (sequence === refreshSequence.current) setServers(result);
     }, []);
     useEffect(() => { void refresh().catch(cause => setError(String(cause))); }, [refresh]);
 

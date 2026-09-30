@@ -377,13 +377,13 @@ async fn bounded_sse(
             .enumerate()
             .filter(|(_, window)| *window == b"\n\n")
             .map(|(index, _)| index + 2)
-            .last();
+            .next_back();
         let crlf_end = bytes
             .windows(4)
             .enumerate()
             .filter(|(_, window)| *window == b"\r\n\r\n")
             .map(|(index, _)| index + 4)
-            .last();
+            .next_back();
         let end = lf_end.into_iter().chain(crlf_end).max();
         if let Some(end) = end {
             if let Ok(result) = parse_sse(&bytes[..end], expected_id) {

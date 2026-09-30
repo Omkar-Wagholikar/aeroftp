@@ -5,7 +5,7 @@
 
 use rusqlite::Connection;
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Webview};
 use zeroize::Zeroizing;
 
 use crate::credential_store::CredentialStore;
@@ -104,23 +104,40 @@ fn upsert_catalog(
     Ok(stale_accounts)
 }
 
+fn begin_catalog_write<'a>(
+    conn: &'a mut Connection,
+    root_key: &[u8; 32],
+    user_id: i64,
+) -> Result<(rusqlite::Transaction<'a>, Vec<McpServerConfig>), &'static str> {
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
+    let configs = load(&transaction, root_key, user_id)?;
+    Ok((transaction, configs))
+}
+
 #[tauri::command]
-pub fn mcp_client_list_servers(app: AppHandle) -> Result<Vec<McpServerConfig>, &'static str> {
+pub fn mcp_client_list_servers(
+    webview: Webview,
+    app: AppHandle,
+) -> Result<Vec<McpServerConfig>, &'static str> {
+    crate::only_main_window(webview.label(), "mcp_client_list_servers")
+        .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
     let (conn, root_key, user_id) = context(&app)?;
     load(&conn, &root_key, user_id)
 }
 
 #[tauri::command]
 pub fn mcp_client_upsert_server(
+    webview: Webview,
     app: AppHandle,
     config: McpServerConfig,
 ) -> Result<(), &'static str> {
-    let (conn, root_key, user_id) = context(&app)?;
-    let mut configs = load(&conn, &root_key, user_id)?;
+    crate::only_main_window(webview.label(), "mcp_client_upsert_server")
+        .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
+    let (mut conn, root_key, user_id) = context(&app)?;
+    let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
     let stale_accounts = upsert_catalog(&mut configs, config)?;
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
     for account in stale_accounts {
         user_partitions::delete_user_credential_for(&transaction, user_id, &account)
             .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
@@ -130,17 +147,20 @@ pub fn mcp_client_upsert_server(
 }
 
 #[tauri::command]
-pub fn mcp_client_remove_server(app: AppHandle, server_id: String) -> Result<(), &'static str> {
-    let (conn, root_key, user_id) = context(&app)?;
-    let mut configs = load(&conn, &root_key, user_id)?;
+pub fn mcp_client_remove_server(
+    webview: Webview,
+    app: AppHandle,
+    server_id: String,
+) -> Result<(), &'static str> {
+    crate::only_main_window(webview.label(), "mcp_client_remove_server")
+        .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
+    let (mut conn, root_key, user_id) = context(&app)?;
+    let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
     let index = configs
         .iter()
         .position(|item| item.id == server_id)
         .ok_or("MCP_CONFIG_NOT_FOUND")?;
     let removed = configs.remove(index);
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
     for secret_ref in removed.env.values() {
         user_partitions::delete_user_credential_for(
             &transaction,
@@ -155,14 +175,17 @@ pub fn mcp_client_remove_server(app: AppHandle, server_id: String) -> Result<(),
 
 #[tauri::command]
 pub fn mcp_client_set_secret(
+    webview: Webview,
     app: AppHandle,
     server_id: String,
     env_name: String,
     secret: String,
 ) -> Result<(), &'static str> {
+    crate::only_main_window(webview.label(), "mcp_client_set_secret")
+        .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
     let secret = Zeroizing::new(secret);
-    let (conn, root_key, user_id) = context(&app)?;
-    let mut configs = load(&conn, &root_key, user_id)?;
+    let (mut conn, root_key, user_id) = context(&app)?;
+    let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
     let config = configs
         .iter_mut()
         .find(|item| item.id == server_id)
@@ -176,9 +199,6 @@ pub fn mcp_client_set_secret(
         .revision
         .checked_add(1)
         .ok_or("MCP_CONFIG_REVISION_OVERFLOW")?;
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
     user_partitions::set_user_credential_for(
         &transaction,
         &root_key,
@@ -209,6 +229,35 @@ mod tests {
             enabled: false,
             revision: 1,
         }
+    }
+
+    #[test]
+    fn concurrent_catalog_writer_cannot_read_stale_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.sqlite");
+        let mut first = Connection::open(&path).unwrap();
+        user_partitions::init_db_schema(&first).unwrap();
+        let root_key = [7; 32];
+        let user =
+            user_partitions::create_user(&mut first, &root_key, "MCP test", None, None, None)
+                .unwrap();
+        let user_id = user.id;
+        save(&first, &root_key, user_id, &[fixture("test")]).unwrap();
+        let mut second = Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let (transaction, mut configs) =
+            begin_catalog_write(&mut first, &root_key, user_id).unwrap();
+        let mut update = fixture("test");
+        update.revision = 2;
+        upsert_catalog(&mut configs, update.clone()).unwrap();
+        assert!(begin_catalog_write(&mut second, &root_key, user_id).is_err());
+        save(&transaction, &root_key, user_id, &configs).unwrap();
+        transaction.commit().unwrap();
+        let (transaction, mut configs) =
+            begin_catalog_write(&mut second, &root_key, user_id).unwrap();
+        assert_eq!(configs[0].revision, 2);
+        assert!(upsert_catalog(&mut configs, update).is_err());
+        drop(transaction);
     }
 
     #[test]

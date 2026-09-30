@@ -45,6 +45,20 @@ lines.on('line', (line) => {
   if (mode.startsWith('legacy') && !initialized && method !== 'initialize') {
     process.exit(0); // Models legacy servers that exit on a pre-initialize probe.
   }
+  if (method === 'tools/list' || method === 'tools/call') {
+    if (mode === 'notifications') {
+      send({ jsonrpc: '2.0', method: 'notifications/progress', params: { progress: 1 } });
+      send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+    }
+    if (mode === 'notification-request') {
+      send({ jsonrpc: '2.0', id: 42, method: 'notifications/message', params: {} });
+      return;
+    }
+    if (mode === 'notification-flood') {
+      setInterval(() => send({ jsonrpc: '2.0', method: 'notifications/progress', params: {} }), 5);
+      return;
+    }
+  }
   if (method === 'server/discover') {
     const version = req.params?._meta?.['io.modelcontextprotocol/protocolVersion'];
     if (version !== '2026-07-28') {

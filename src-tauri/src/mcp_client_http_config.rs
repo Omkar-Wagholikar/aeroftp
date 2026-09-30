@@ -269,13 +269,11 @@ mod tests {
             vault_account: bearer.bearer_vault_account(),
         };
         assert!(bearer.validate().is_ok());
-        assert_eq!(
+        assert!(
             serde_json::from_str::<McpHttpServerConfig>(
                 r#"{"id":"example","endpoint":"https://mcp.example.com/mcp","auth":{"mode":"bearer","token":"plaintext"},"enabled":true,"revision":1}"#
             )
-            .err()
-            .is_some(),
-            true
+            .is_err()
         );
         bearer.auth = McpHttpAuth::Bearer {
             vault_account: "mcp_env_7_example_API_KEY".into(),

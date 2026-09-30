@@ -21,10 +21,10 @@ fn test_fixture(config: &McpServerConfig) -> bool {
     {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_fixture.mjs");
-        return config
+        config
             .args
             .first()
-            .is_some_and(|arg| arg == &path.to_string_lossy().into_owned());
+            .is_some_and(|arg| arg == &path.to_string_lossy().into_owned())
     }
     #[cfg(not(test))]
     {
@@ -113,11 +113,11 @@ pub(crate) fn peer_command(config: &McpServerConfig) -> Result<Command, SandboxE
     #[cfg(target_os = "linux")]
     {
         match linux_command(config) {
-            Ok(command) => return Ok(command),
+            Ok(command) => Ok(command),
             Err(SandboxError::Unavailable) if test_fixture(config) => {
-                return Ok(Command::new(&config.command));
+                Ok(Command::new(&config.command))
             }
-            Err(error) => return Err(error),
+            Err(error) => Err(error),
         }
     }
     #[cfg(not(target_os = "linux"))]

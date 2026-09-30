@@ -162,7 +162,7 @@ trait Peer {
     ) -> Result<Value, BridgeError>;
 }
 enum Connection {
-    Stdio(StdioSupervisor),
+    Stdio(Box<StdioSupervisor>),
     Http {
         config: McpHttpServerConfig,
         auth: ResolvedMcpHttpAuth,
@@ -196,14 +196,19 @@ impl Peer for Connection {
     }
 }
 impl Connection {
-    async fn connect(config: Config, cancel: &CancellationToken) -> Result<Self, BridgeError> {
+    async fn connect(
+        config: Config,
+        cancel: &CancellationToken,
+        fresh: impl FnMut() -> Result<(), BridgeError>,
+    ) -> Result<Self, BridgeError> {
         check_cancel(cancel)?;
         match config {
             Config::Stdio(config, env) => {
                 let mut peer =
-                    StdioSupervisor::connect(config, env, Limits::default(), cancel).await?;
+                    StdioSupervisor::connect_checked(config, env, Limits::default(), cancel, fresh)
+                        .await?;
                 peer.disable_restart();
-                Ok(Self::Stdio(peer))
+                Ok(Self::Stdio(Box::new(peer)))
             }
             Config::Http(config, auth) => Ok(Self::Http {
                 config,
@@ -329,7 +334,14 @@ async fn with_backend(
         let user_id = state.user_id;
         audit_user = Some(user_id);
         let revision = state.revision;
-        let mut peer = Connection::connect(state.config, cancel).await?;
+        let mut peer = Connection::connect(state.config, cancel, || {
+            let current = resolve(app, key, request)?;
+            if current.user_id != user_id || current.revision != revision {
+                return Err(GateError::StaleRevision.into());
+            }
+            Ok(())
+        })
+        .await?;
         let mut preparation = None;
         let preparation_slot = &mut preparation;
         let outcome = run(
@@ -766,7 +778,7 @@ mod wire_tests {
                     approval_grant_id: None,
                 },
             };
-            let mut peer = Connection::connect(Config::Stdio(config, env), &cancel)
+            let mut peer = Connection::connect(Config::Stdio(config, env), &cancel, || Ok(()))
                 .await
                 .unwrap();
             let result = run(

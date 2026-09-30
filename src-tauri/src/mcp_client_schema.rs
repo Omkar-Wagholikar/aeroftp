@@ -149,7 +149,7 @@ pub(crate) fn validate_arguments(schema: &Value, arguments: &Value) -> Result<()
     validate_schema(schema)?;
     let invalid = SchemaError::Arguments;
     let arguments = arguments.as_object().ok_or(invalid)?;
-    if serde_json::to_vec(arguments).map_err(|_| invalid)?.len() > 64 * 1024 {
+    if serde_json::to_vec(arguments).map_err(|_| invalid)?.len() > 60 * 1024 {
         return Err(invalid);
     }
     let properties = schema["properties"].as_object().ok_or(invalid)?;
@@ -241,6 +241,35 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn arguments_leave_room_for_the_complete_transport_envelope() {
+        let schema = serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}});
+        assert_eq!(
+            validate_arguments(&schema, &serde_json::json!({"text":"x".repeat(60 * 1024)})),
+            Err(SchemaError::Arguments)
+        );
+        let arguments = serde_json::json!({"text":"x".repeat(60 * 1024 - 32)});
+        validate_arguments(&schema, &arguments).unwrap();
+        let mut params = serde_json::Map::new();
+        params.insert("name".into(), serde_json::json!("x".repeat(128)));
+        params.insert("arguments".into(), arguments);
+        for era in [
+            crate::mcp_client_protocol::Era::Modern,
+            crate::mcp_client_protocol::Era::Legacy(crate::mcp_client_protocol::LEGACY_PREFERRED),
+        ] {
+            let request = crate::mcp_client_protocol::request(
+                era,
+                u64::MAX,
+                "tools/call",
+                params.clone(),
+                "AeroFTP",
+                env!("CARGO_PKG_VERSION"),
+            )
+            .unwrap();
+            assert!(serde_json::to_vec(&request).unwrap().len() < 64 * 1024);
+        }
+    }
+
     #[test]
     fn unsupported_constraints_and_header_collisions_fail_closed() {
         for key in ["$ref", "oneOf", "minimum", "pattern"] {
