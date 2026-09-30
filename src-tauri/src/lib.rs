@@ -61,10 +61,14 @@ mod archive_browse;
 mod localhost_security;
 mod mcp_client_commands;
 pub mod mcp_client_config;
+#[allow(dead_code)] // Private entry point; model dispatch is gated by a later integration slice.
+mod mcp_client_dispatch;
 pub mod mcp_client_framing;
 #[allow(dead_code)] // HTTP configuration is private until transport and approval are wired.
 mod mcp_client_http_config;
 pub mod mcp_client_protocol;
+#[allow(dead_code)] // Used only by the private outbound STDIO transport.
+mod mcp_client_sandbox;
 // Backend-only gate until approved process isolation and runtime wiring.
 #[allow(dead_code)]
 mod mcp_client_gate;
