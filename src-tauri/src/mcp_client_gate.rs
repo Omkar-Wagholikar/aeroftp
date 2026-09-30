@@ -75,6 +75,11 @@ pub(crate) struct GateRequest {
     pub approval_grant_id: Option<String>,
 }
 
+fn unsafe_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}')
+}
+
 impl GateRequest {
     fn validate(&self) -> Result<Vec<u8>, GateError> {
         let server = &self.server_id;
@@ -87,7 +92,7 @@ impl GateRequest {
         if !valid_server
             || self.tool_name.is_empty()
             || self.tool_name.len() > MAX_TOOL_NAME_BYTES
-            || self.tool_name.chars().any(char::is_control)
+            || self.tool_name.chars().any(unsafe_display_char)
             || self.session_id.is_empty()
             || self.session_id.len() > MAX_SESSION_ID_BYTES
             || self.session_id.chars().any(char::is_control)
@@ -161,7 +166,7 @@ fn audit_event(
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
     let safe_tool = !request.tool_name.is_empty()
         && request.tool_name.len() <= MAX_TOOL_NAME_BYTES
-        && !request.tool_name.chars().any(char::is_control);
+        && !request.tool_name.chars().any(unsafe_display_char);
     AuditEvent {
         user_id,
         server_id: if safe_server {
@@ -695,6 +700,29 @@ mod tests {
         assert_eq!(events.borrow()[0].server_id, "-");
         assert_eq!(events.borrow()[0].tool_name, "-");
         assert_eq!(events.borrow()[0].status, AuditStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn invisible_tool_names_never_reach_approval_or_raw_audit() {
+        for character in [
+            '\u{061C}', '\u{200B}', '\u{200F}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            let store = MockStore::new();
+            let mut request = request(&store);
+            request.tool_name = format!("safe{character}tool");
+            let events = RefCell::new(Vec::new());
+            let result = authorize_with(
+                &store,
+                &KEY,
+                &request,
+                |_| async { panic!("approval must not be reached") },
+                |event| events.borrow_mut().push(event),
+            )
+            .await;
+            assert!(matches!(result, Err(GateError::InvalidRequest)));
+            assert_eq!(events.borrow()[0].tool_name, "-");
+            assert_eq!(events.borrow()[0].status, AuditStatus::Rejected);
+        }
     }
 
     #[tokio::test]
