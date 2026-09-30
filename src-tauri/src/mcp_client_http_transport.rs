@@ -500,6 +500,16 @@ fn parse_reply(content_type: &str, bytes: &[u8], expected_id: u64) -> Result<Val
     }
 }
 
+fn authorization_header(token: &str) -> Result<HeaderValue, HttpError> {
+    if token.is_empty() || token.len() > MAX_HEADER_VALUE_BYTES {
+        return Err(HttpError::InvalidRequest);
+    }
+    let mut value =
+        HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| HttpError::InvalidRequest)?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 pub(crate) async fn request(
     config: &McpHttpServerConfig,
     method: &str,
@@ -516,14 +526,7 @@ pub(crate) async fn request(
     let url = parse_public_https(&config.endpoint, 2048).map_err(|_| HttpError::InvalidEndpoint)?;
     let mut headers = request_headers(method, &params, schema)?;
     if let Some(token) = token {
-        if token.is_empty() || token.len() > MAX_HEADER_VALUE_BYTES {
-            return Err(HttpError::InvalidRequest);
-        }
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| HttpError::InvalidRequest)?,
-        );
+        headers.insert(AUTHORIZATION, authorization_header(token)?);
     }
     let body = protocol::request(
         Era::Modern,
@@ -597,12 +600,64 @@ async fn send_prepared(
     }
 }
 
+/// Test-only local wire adapter. Production always constructs a DNS-pinned
+/// public HTTPS client inside request; this helper is absent from app builds.
+#[cfg(test)]
+pub(crate) async fn fixture_exchange(
+    url: Url,
+    method: &str,
+    params: Map<String, Value>,
+    schema: Option<&Value>,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Result<Value, HttpError> {
+    let headers = request_headers(method, &params, schema)?;
+    let body = protocol::request(
+        Era::Modern,
+        id,
+        method,
+        params,
+        "AeroFTP",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|_| HttpError::InvalidRequest)?;
+    let client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| HttpError::Connect)?;
+    send_prepared(
+        &client,
+        url,
+        headers,
+        serde_json::to_vec(&body).map_err(|_| HttpError::InvalidRequest)?,
+        id,
+        cancel,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn bearer_header_is_sensitive_and_debug_redacted() {
+        let value = authorization_header("fixture-bearer-secret").unwrap();
+        assert!(value.is_sensitive());
+        assert_eq!(value.to_str().unwrap(), "Bearer fixture-bearer-secret");
+        assert!(!format!("{value:?}").contains("fixture-bearer-secret"));
+        let mut map = HeaderMap::new();
+        map.insert(AUTHORIZATION, value);
+        assert!(!format!("{map:?}").contains("fixture-bearer-secret"));
+        assert_eq!(
+            authorization_header("bad\nvalue"),
+            Err(HttpError::InvalidRequest)
+        );
+    }
 
     // Local test-only wire peer for response handling. Production still
     // constructs its own HTTPS client after DNS and address validation.

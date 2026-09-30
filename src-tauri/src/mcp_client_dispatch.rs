@@ -31,19 +31,6 @@ impl From<TransportError> for DispatchError {
     }
 }
 
-fn tool_is_advertised(result: &Value, name: &str) -> bool {
-    result
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| {
-            tools.len() <= 128
-                && tools.iter().any(|tool| {
-                    tool.get("name").and_then(Value::as_str) == Some(name)
-                        && tool.get("inputSchema").is_some_and(Value::is_object)
-                })
-        })
-}
-
 async fn execute_authorized<F>(
     authorized: AuthorizedCall,
     mut fresh: F,
@@ -64,9 +51,10 @@ where
     let result = async {
         fresh()?;
         let advertised = peer.call("tools/list", Map::new(), cancel).await?;
-        if !tool_is_advertised(&advertised, &authorized.tool_name) {
-            return Err(DispatchError::ToolUnavailable);
-        }
+        let schema = crate::mcp_client_schema::discover(&advertised, &authorized.tool_name)
+            .map_err(|_| DispatchError::ToolUnavailable)?;
+        crate::mcp_client_schema::validate_arguments(&schema, &authorized.arguments)
+            .map_err(|_| DispatchError::ToolUnavailable)?;
         fresh()?;
         let mut params = Map::new();
         params.insert("name".into(), Value::String(authorized.tool_name));

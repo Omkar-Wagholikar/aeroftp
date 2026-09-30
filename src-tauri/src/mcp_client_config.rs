@@ -94,6 +94,7 @@ fn environment_override(name: &str) -> bool {
             | "COMSPEC"
             | "PATHEXT"
             | "NODE_OPTIONS"
+            | "NODE_PATH"
             | "RUSTFLAGS"
     ) || name.starts_with("LD_")
         || name.starts_with("DYLD_")
@@ -134,6 +135,8 @@ impl McpServerConfig {
             "cmd.exe",
             "powershell.exe",
             "pwsh",
+            "pwsh.exe",
+            "dash",
             "env",
         ]
         .contains(&executable.as_str())
@@ -288,7 +291,13 @@ mod tests {
         ] {
             assert!(changed.validate().is_err());
         }
-        for name in ["PATH", "LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH"] {
+        for name in [
+            "PATH",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PYTHONPATH",
+        ] {
             let mut changed = fixture();
             changed.env = BTreeMap::from([(
                 name.into(),
@@ -298,6 +307,27 @@ mod tests {
             )]);
             assert!(changed.validate().is_err());
         }
+        #[cfg(unix)]
+        for command in ["/bin/dash", "/usr/bin/pwsh.exe"] {
+            assert_eq!(
+                McpServerConfig {
+                    command: command.into(),
+                    ..fixture()
+                }
+                .validate(),
+                Err("MCP_CONFIG_SHELL_FORBIDDEN")
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            McpServerConfig {
+                command: r"C:\Program Files\PowerShell\7\pwsh.exe".into(),
+                args: vec!["-Command".into(), "Write-Output hello".into()],
+                ..fixture()
+            }
+            .validate(),
+            Err("MCP_CONFIG_SHELL_FORBIDDEN")
+        );
         assert!(serde_json::from_str::<McpServerConfig>(r#"{"id":"example","command":"/usr/bin/node","args":[],"env":{"API_KEY":"plaintext"},"enabled":true,"revision":1}"#).is_err());
     }
 

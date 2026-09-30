@@ -76,6 +76,19 @@ describe('untrusted MCP registry snapshot', () => {
         ]) expect(schema(invalid)).toBe(false);
     });
 
+    it('exposes supported string arrays without admitting nested arrays', () => {
+        const server = mcp('arrays');
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            paths: { type: 'array', items: { type: 'string' } },
+        }, required: ['paths'], additionalProperties: false };
+        const entry = buildToolRegistry([], [], [server]).find(tool => tool.source.kind === 'mcp');
+        expect(entry?.tool.parameters).toEqual([{ name: 'paths', type: 'array', description: '', required: true }]);
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            paths: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
+        } };
+        expect(buildToolRegistry([], [], [server]).some(tool => tool.source.kind === 'mcp')).toBe(false);
+    });
+
     it('preserves flat header annotations and integer types without granting approval', () => {
         const server = mcp('headers');
         server.tools[0].inputSchema = { type: 'object', properties: {

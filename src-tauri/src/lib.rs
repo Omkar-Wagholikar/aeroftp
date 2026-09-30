@@ -59,9 +59,12 @@ pub mod app_events;
 mod archive_browse;
 #[cfg(target_os = "linux")]
 mod localhost_security;
+#[allow(dead_code)] // Private until settings/model routing activation.
+mod mcp_client_bridge;
 mod mcp_client_commands;
 pub mod mcp_client_config;
 #[allow(dead_code)] // Private entry point; model dispatch is gated by a later integration slice.
+#[cfg(test)] // Superseded by the schema-bound private bridge.
 mod mcp_client_dispatch;
 pub mod mcp_client_framing;
 #[allow(dead_code)] // HTTP configuration is private until transport and approval are wired.
@@ -73,6 +76,8 @@ mod mcp_client_oauth;
 pub mod mcp_client_protocol;
 #[allow(dead_code)] // Used only by the private outbound STDIO transport.
 mod mcp_client_sandbox;
+#[allow(dead_code)]
+mod mcp_client_schema;
 // Backend-only gate until approved process isolation and runtime wiring.
 #[allow(dead_code)]
 mod mcp_client_gate;

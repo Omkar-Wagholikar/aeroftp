@@ -76,7 +76,7 @@ pub(crate) struct GateRequest {
 }
 
 impl GateRequest {
-    fn validate(&self) -> Result<Vec<u8>, GateError> {
+    pub(crate) fn validate(&self) -> Result<Vec<u8>, GateError> {
         let server = &self.server_id;
         let valid_server = !server.is_empty()
             && server.len() <= 64
