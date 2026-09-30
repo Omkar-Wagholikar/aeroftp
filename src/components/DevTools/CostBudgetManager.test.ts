@@ -34,3 +34,13 @@ it('bounds corrupt loaded counters before adding a valid delta', async () => {
     await budget.recordSpending('p', 2, 5);
     expect(budget.getMonthlySpending()[0]).toMatchObject({ totalCost: 2, tokenCount: Number.MAX_SAFE_INTEGER, requestCount: Number.MAX_SAFE_INTEGER });
 });
+
+it('normalizes missing and non-numeric persisted counter fields', async () => {
+    const budget = await import('./CostBudgetManager');
+    const month = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+    mocks.invoke.mockImplementation(async (command: string, args: { key: string }) => command === 'vault_get' && args.key.startsWith('ai_spending_')
+        ? JSON.stringify([{ providerId: 'p', month, totalCost: 'invalid', tokenCount: null }]) : undefined);
+    await budget.initBudgetManager();
+    await budget.recordSpending('p', 2, 5);
+    expect(budget.getMonthlySpending()[0]).toMatchObject({ totalCost: 2, tokenCount: 5, requestCount: 1 });
+});

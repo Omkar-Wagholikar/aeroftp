@@ -132,7 +132,7 @@ export function checkBudget(providerId: string): BudgetCheckResult {
 
 /** Keep persisted counters finite; positive overflow saturates to fail closed. */
 function addBoundedCounter(current: number, delta: number): number {
-    const bounded = (value: number): number => Number.isNaN(value) || value < 0
+    const bounded = (value: number): number => typeof value !== 'number' || Number.isNaN(value) || value < 0
         ? 0
         : Math.min(value, Number.MAX_SAFE_INTEGER);
     return Math.min(Number.MAX_SAFE_INTEGER, bounded(current) + bounded(delta));
