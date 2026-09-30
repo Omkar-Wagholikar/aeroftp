@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
 import { describe, expect, it, vi } from 'vitest';
-import { AGENT_TOOLS, generateToolsPrompt } from '../../types/tools';
+import { AGENT_TOOLS, generateToolsPrompt, toJSONSchema } from '../../types/tools';
 import type { PluginManifest } from '../../types/plugins';
 import { DEFAULT_MACROS } from './aiChatToolMacros';
 import { appendAssistantTurn, appendToolResult, assertToolResultsComplete } from './aiChatNativeTurn';
@@ -74,6 +74,70 @@ describe('untrusted MCP registry snapshot', () => {
             { ...base, description: 'x'.repeat(8192) },
             { ...base, properties: { path: { type: 'array', items: { type: 'array', items: { type: 'string' } } } } },
         ]) expect(schema(invalid)).toBe(false);
+    });
+
+    it('preserves flat header annotations and integer types without granting approval', () => {
+        const server = mcp('headers');
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            region: { type: 'string', 'x-mcp-header': 'Region' },
+            retries: { type: 'integer', 'x-mcp-header': 'Retry-Count' },
+            enabled: { type: 'boolean', 'x-mcp-header': 'X_Feature' },
+            fraction: { type: 'number' },
+        }, required: ['region'], additionalProperties: false };
+        const entry = buildToolRegistry([], [], [server]).find(tool => tool.source.kind === 'mcp');
+        expect(entry?.tool.dangerLevel).toBe('high');
+        expect(entry?.tool.parameters.map(p => [p.name, p.type])).toEqual([
+            ['region', 'string'], ['retries', 'integer'], ['enabled', 'boolean'], ['fraction', 'number'],
+        ]);
+        expect(toJSONSchema(entry!.tool).properties).toMatchObject({ retries: { type: 'integer' } });
+        expect(toJSONSchema(entry!.tool).additionalProperties).toBe(false);
+    });
+
+    it('rejects malformed, duplicate, nested or unrepresentable header annotations', () => {
+        const accepted = (inputSchema: unknown) => buildToolRegistry([], [], [{ ...mcp('headers'),
+            tools: [{ ...mcp('headers').tools[0], inputSchema }] }]).some(entry => entry.source.kind === 'mcp');
+        const field = (annotation: unknown, type = 'string') => ({ type: 'object', properties: {
+            region: { type, 'x-mcp-header': annotation },
+        } });
+        expect(accepted(field('X.Region_1'))).toBe(true);
+        for (const invalid of [
+            field(''), field('x'.repeat(65)), field('bad name'), field('bad\rname'),
+            field(42), field(undefined), field('Region', 'number'), field('Region', 'array'),
+            { type: 'object', properties: { a: { type: 'string', 'x-mcp-header': 'Region' },
+                b: { type: 'boolean', 'x-mcp-header': 'region' } } },
+            { type: 'object', 'x-mcp-header': 'Root', properties: {} },
+            { type: 'object', properties: { nested: { type: 'object', properties: {
+                region: { type: 'string', 'x-mcp-header': 'Region' },
+            } } } },
+            { type: 'object', properties: { a: { type: 'array', items: {
+                type: 'string', 'x-mcp-header': 'Region',
+            } } } },
+            { type: 'object', properties: { region: {
+                type: 'string', 'x-mcp-header': 'Region', enum: ['eu'],
+            } } },
+        ]) expect(accepted(invalid)).toBe(false);
+    });
+
+    it('invalidates exposure when only the original header annotation changes', () => {
+        const server = mcp('headers');
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            region: { type: 'string', 'x-mcp-header': 'Region' },
+        } };
+        const before = buildToolRegistry([], [], [server]);
+        const entry = before.find(tool => tool.source.kind === 'mcp')!;
+        const exposure = new ToolExposure('turn', before);
+        exposure.search(entry.tool.name);
+        expect(exposure.permits('turn', entry.tool.name, before)).toBe(true);
+        const changed = mcp('headers');
+        changed.tools[0].inputSchema = { type: 'object', properties: {
+            region: { type: 'string', 'x-mcp-header': 'Other-Region' },
+        } };
+        const after = buildToolRegistry([], [], [changed]);
+        const replacement = after.find(tool => tool.source.kind === 'mcp')!;
+        expect(replacement.tool).toEqual(entry.tool);
+        expect(replacement.revision).not.toBe(entry.revision);
+        expect(exposure.permits('turn', entry.tool.name, after)).toBe(false);
+        expect(() => assertToolExecutionCurrent(entry, after, 'turn', 'turn', STALE)).toThrow(STALE.identityChanged);
     });
 
     it('invalidates exposure after revision, schema or enablement changes, without shadowing builtins', () => {
