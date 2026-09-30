@@ -766,6 +766,15 @@ flatpak install flatpark com.aeroftp.AeroFTP
 
 Visit [launchpad.net/aeroftp](https://launchpad.net/aeroftp) for PPA instructions and .deb packages.
 
+#### AM / AppMan (AppImage package managers)
+
+AeroFTP is available in [AM and AppMan](https://github.com/ivan-hc/AM), which install and update the AppImage for you:
+
+```bash
+am -i aeroftp        # system-wide (AM)
+appman -i aeroftp    # per user, no root (AppMan)
+```
+
 #### Other Linux Formats
 Download from [GitHub Releases](https://github.com/axpdev-lab/aeroftp/releases/latest):
 - **.deb** - Ubuntu, Debian, Linux Mint, Pop!_OS
