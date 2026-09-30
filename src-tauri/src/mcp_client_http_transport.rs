@@ -57,6 +57,7 @@ pub(crate) enum HttpError {
     InvalidResponse,
     Timeout,
     Cancelled,
+    StaleBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +219,8 @@ fn parameter_headers(schema: &Value, arguments: &Value) -> Result<HeaderMap, Htt
     Ok(headers)
 }
 
-fn request_headers(
+fn era_headers(
+    era: Era,
     method: &str,
     params: &Map<String, Value>,
     schema: Option<&Value>,
@@ -237,8 +239,14 @@ fn request_headers(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         "mcp-protocol-version",
-        HeaderValue::from_static(protocol::MODERN_VERSION),
+        HeaderValue::from_static(match era {
+            Era::Modern => protocol::MODERN_VERSION,
+            Era::Legacy(version) => version,
+        }),
     );
+    if matches!(era, Era::Legacy(_)) {
+        return Ok(headers);
+    }
     headers.insert(
         "mcp-method",
         HeaderValue::from_str(method).map_err(|_| HttpError::InvalidRequest)?,
@@ -354,6 +362,7 @@ pub(crate) async fn bounded_body(
 async fn bounded_sse(
     response: reqwest::Response,
     expected_id: u64,
+    era: Era,
     cancel: &CancellationToken,
 ) -> Result<Value, HttpError> {
     let mut bytes = Vec::new();
@@ -365,7 +374,7 @@ async fn bounded_sse(
             chunk = stream.next() => chunk,
         };
         let Some(chunk) = chunk else {
-            return parse_sse(&bytes, expected_id);
+            return era_sse(&bytes, expected_id, era);
         };
         let chunk = chunk.map_err(|_| HttpError::Connect)?;
         if bytes.len().saturating_add(chunk.len()) > MAX_REPLY_BYTES {
@@ -386,14 +395,14 @@ async fn bounded_sse(
             .next_back();
         let end = lf_end.into_iter().chain(crlf_end).max();
         if let Some(end) = end {
-            if let Ok(result) = parse_sse(&bytes[..end], expected_id) {
+            if let Ok(result) = era_sse(&bytes[..end], expected_id, era) {
                 return Ok(result);
             }
         }
     }
 }
 
-fn parse_sse(bytes: &[u8], expected_id: u64) -> Result<Value, HttpError> {
+fn era_sse(bytes: &[u8], expected_id: u64, era: Era) -> Result<Value, HttpError> {
     let input = std::str::from_utf8(bytes).map_err(|_| HttpError::InvalidResponse)?;
     let mut data = String::new();
     let mut result = None;
@@ -422,7 +431,7 @@ fn parse_sse(bytes: &[u8], expected_id: u64) -> Result<Value, HttpError> {
                 return Err(HttpError::InvalidResponse);
             }
             result = Some(
-                protocol::accept_result(&message, expected_id, Era::Modern)
+                protocol::accept_result(&message, expected_id, era)
                     .map_err(|_| HttpError::InvalidResponse)?
                     .clone(),
             );
@@ -485,17 +494,22 @@ fn parse_challenge(value: Option<&HeaderValue>) -> AuthChallenge {
     parsed
 }
 
-fn parse_reply(content_type: &str, bytes: &[u8], expected_id: u64) -> Result<Value, HttpError> {
+fn era_reply(
+    content_type: &str,
+    bytes: &[u8],
+    expected_id: u64,
+    era: Era,
+) -> Result<Value, HttpError> {
     let media_type = content_type.split(';').next().unwrap_or("").trim();
     match media_type {
         "application/json" => {
             let message: Value =
                 serde_json::from_slice(bytes).map_err(|_| HttpError::InvalidResponse)?;
-            protocol::accept_result(&message, expected_id, Era::Modern)
+            protocol::accept_result(&message, expected_id, era)
                 .map_err(|_| HttpError::InvalidResponse)
                 .cloned()
         }
-        "text/event-stream" => parse_sse(bytes, expected_id),
+        "text/event-stream" => era_sse(bytes, expected_id, era),
         _ => Err(HttpError::InvalidResponse),
     }
 }
@@ -510,53 +524,25 @@ fn authorization_header(token: &str) -> Result<HeaderValue, HttpError> {
     Ok(value)
 }
 
-pub(crate) async fn request(
-    config: &McpHttpServerConfig,
-    method: &str,
-    params: Map<String, Value>,
-    schema: Option<&Value>,
-    token: Option<&str>,
-    id: u64,
-    cancel: &CancellationToken,
-) -> Result<Value, HttpError> {
-    config.validate().map_err(|_| HttpError::InvalidEndpoint)?;
-    if !config.enabled {
-        return Err(HttpError::InvalidEndpoint);
-    }
-    let url = parse_public_https(&config.endpoint, 2048).map_err(|_| HttpError::InvalidEndpoint)?;
-    let mut headers = request_headers(method, &params, schema)?;
-    if let Some(token) = token {
-        headers.insert(AUTHORIZATION, authorization_header(token)?);
-    }
-    let body = protocol::request(
-        Era::Modern,
-        id,
-        method,
-        params,
-        "AeroFTP",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(|_| HttpError::InvalidRequest)?;
-    let body = serde_json::to_vec(&body).map_err(|_| HttpError::InvalidRequest)?;
-    if body.len() > MAX_REPLY_BYTES {
-        return Err(HttpError::InvalidRequest);
-    }
-    let client = pinned_client(&url, cancel).await?;
-    send_prepared(&client, url, headers, body, id, cancel).await
-}
-
-async fn send_prepared(
+#[allow(clippy::too_many_arguments)] // Explicit era/session and prepared wire request.
+async fn exchange(
+    era: Era,
+    session: Option<&HeaderValue>,
+    notification: bool,
     client: &Client,
     url: Url,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Vec<u8>,
     id: u64,
     cancel: &CancellationToken,
-) -> Result<Value, HttpError> {
+) -> Result<(Value, Option<HeaderValue>), HttpError> {
+    if let Some(session) = session {
+        headers.insert("mcp-session-id", session.clone());
+    }
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(HttpError::Cancelled),
-        result = client.post(url).headers(headers).body(body).send() => result.map_err(|_| HttpError::Connect)?,
+        result = client.post(url).headers(headers).body(body).send() => result.map_err(|error| if error.is_timeout() { HttpError::Timeout } else { HttpError::Connect })?,
     };
     if response.status().is_redirection() {
         return Err(HttpError::Redirect);
@@ -572,15 +558,40 @@ async fn send_prepared(
         )));
     }
     if response.status() == StatusCode::BAD_REQUEST {
+        if response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_none_or(|v| v.split(';').next().unwrap_or("").trim() != "application/json")
+        {
+            return Err(HttpError::InvalidResponse);
+        }
         let body = bounded_body(response, cancel).await?;
         let error: Value = serde_json::from_slice(&body).map_err(|_| HttpError::InvalidResponse)?;
-        if error.pointer("/error/code").and_then(Value::as_i64) == Some(-32022) {
+        if era == Era::Modern && authoritative_legacy(&error, id)? {
             return Err(HttpError::UnsupportedVersion);
         }
         return Err(HttpError::InvalidResponse);
     }
     if !response.status().is_success() {
         return Err(HttpError::InvalidResponse);
+    }
+    let received_session = session_header(response.headers())?;
+    if matches!(era, Era::Modern) && received_session.is_some()
+        || session.is_some()
+            && received_session
+                .as_ref()
+                .is_some_and(|v| Some(v) != session)
+    {
+        return Err(HttpError::InvalidResponse);
+    }
+    if notification {
+        if response.status() != StatusCode::ACCEPTED
+            || !bounded_body(response, cancel).await?.is_empty()
+        {
+            return Err(HttpError::InvalidResponse);
+        }
+        return Ok((Value::Null, received_session));
     }
     let content_type = response
         .headers()
@@ -593,48 +604,379 @@ async fn send_prepared(
         .next()
         .is_some_and(|media| media.trim() == "text/event-stream")
     {
-        bounded_sse(response, id, cancel).await
+        Ok((
+            bounded_sse(response, id, era, cancel).await?,
+            received_session,
+        ))
     } else {
         let bytes = bounded_body(response, cancel).await?;
-        parse_reply(&content_type, &bytes, id)
+        Ok((era_reply(&content_type, &bytes, id, era)?, received_session))
     }
 }
 
-/// Test-only local wire adapter. Production always constructs a DNS-pinned
-/// public HTTPS client inside request; this helper is absent from app builds.
 #[cfg(test)]
-pub(crate) async fn fixture_exchange(
-    url: Url,
+fn request_headers(
     method: &str,
-    params: Map<String, Value>,
+    params: &Map<String, Value>,
     schema: Option<&Value>,
+) -> Result<HeaderMap, HttpError> {
+    era_headers(Era::Modern, method, params, schema)
+}
+#[cfg(test)]
+fn parse_reply(content_type: &str, bytes: &[u8], id: u64) -> Result<Value, HttpError> {
+    era_reply(content_type, bytes, id, Era::Modern)
+}
+#[cfg(test)]
+async fn send_prepared(
+    client: &Client,
+    url: Url,
+    headers: HeaderMap,
+    body: Vec<u8>,
     id: u64,
     cancel: &CancellationToken,
 ) -> Result<Value, HttpError> {
-    let headers = request_headers(method, &params, schema)?;
-    let body = protocol::request(
+    Ok(exchange(
         Era::Modern,
-        id,
-        method,
-        params,
-        "AeroFTP",
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(|_| HttpError::InvalidRequest)?;
-    let client = Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| HttpError::Connect)?;
-    send_prepared(
-        &client,
+        None,
+        false,
+        client,
         url,
         headers,
-        serde_json::to_vec(&body).map_err(|_| HttpError::InvalidRequest)?,
+        body,
         id,
         cancel,
     )
-    .await
+    .await?
+    .0)
+}
+
+/// A downgrade needs a correlated, well-formed error explicitly excluding the
+/// requested modern revision and advertising a pinned legacy revision.
+fn authoritative_legacy(message: &Value, id: u64) -> Result<bool, HttpError> {
+    let protocol::Reply::Error {
+        code: -32022,
+        data: Some(data),
+    } = protocol::reply(message, id).map_err(|_| HttpError::InvalidResponse)?
+    else {
+        return Ok(false);
+    };
+    let versions = data
+        .get("supported")
+        .and_then(Value::as_array)
+        .ok_or(HttpError::InvalidResponse)?;
+    if data.get("requested").and_then(Value::as_str) != Some(protocol::MODERN_VERSION)
+        || versions.is_empty()
+        || versions.len() > 32
+        || !versions
+            .iter()
+            .all(|v| v.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64))
+    {
+        return Err(HttpError::InvalidResponse);
+    }
+    Ok(!versions.iter().any(|v| v == protocol::MODERN_VERSION)
+        && versions
+            .iter()
+            .any(|v| v == protocol::LEGACY_PREFERRED || v == protocol::LEGACY_AEROFTP))
+}
+
+fn session_header(headers: &HeaderMap) -> Result<Option<HeaderValue>, HttpError> {
+    let mut values = headers.get_all("mcp-session-id").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some()
+        || value.is_empty()
+        || value.as_bytes().len() > 256
+        || !value.as_bytes().iter().all(|b| (0x21..=0x7e).contains(b))
+    {
+        return Err(HttpError::InvalidResponse);
+    }
+    let mut value = value.clone();
+    value.set_sensitive(true);
+    Ok(Some(value))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct HttpBinding {
+    pub endpoint: String,
+    pub user_id: i64,
+    pub revision: String,
+}
+/// Never persisted or reused across users, endpoints or effective revisions.
+pub(crate) struct HttpSession {
+    binding: HttpBinding,
+    era: Era,
+    session: Option<HeaderValue>,
+    id: u64,
+    negotiated: bool,
+    failed: bool,
+}
+impl HttpSession {
+    pub(crate) fn new(binding: HttpBinding) -> Self {
+        Self {
+            binding,
+            era: Era::Modern,
+            session: None,
+            id: 0,
+            negotiated: false,
+            failed: false,
+        }
+    }
+    fn next_id(&mut self) -> Result<u64, HttpError> {
+        self.id = self.id.checked_add(1).ok_or(HttpError::InvalidRequest)?;
+        Ok(self.id)
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit private security and wire boundaries.
+    async fn wire<F, E>(
+        &mut self,
+        client: &Client,
+        url: &Url,
+        method: &str,
+        params: Map<String, Value>,
+        schema: Option<&Value>,
+        token: Option<&str>,
+        cancel: &CancellationToken,
+        fresh: &mut F,
+    ) -> Result<Value, E>
+    where
+        F: FnMut() -> Result<(), E>,
+        E: From<HttpError>,
+    {
+        fresh()?;
+        let id = self.next_id()?;
+        let mut headers = era_headers(self.era, method, &params, schema)?;
+        if let Some(token) = token {
+            headers.insert(AUTHORIZATION, authorization_header(token)?);
+        }
+        let notification = method == "notifications/initialized";
+        let body = if notification {
+            protocol::initialized_notification()
+        } else if method == "initialize" {
+            protocol::initialize_request(id, "AeroFTP", env!("CARGO_PKG_VERSION"))
+                .map_err(|_| HttpError::InvalidRequest)?
+        } else {
+            protocol::request(
+                self.era,
+                id,
+                method,
+                params,
+                "AeroFTP",
+                env!("CARGO_PKG_VERSION"),
+            )
+            .map_err(|_| HttpError::InvalidRequest)?
+        };
+        let bytes = serde_json::to_vec(&body).map_err(|_| HttpError::InvalidRequest)?;
+        if bytes.len() > MAX_REPLY_BYTES {
+            return Err(HttpError::InvalidRequest.into());
+        }
+        let response = exchange(
+            self.era,
+            self.session.as_ref(),
+            notification,
+            client,
+            url.clone(),
+            headers,
+            bytes,
+            id,
+            cancel,
+        )
+        .await;
+        fresh()?;
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled.into());
+        }
+        let (result, session) = response?;
+        if method == "initialize" {
+            // Reconstruct only the already correlated result for the existing validator.
+            self.era = protocol::accept_legacy_initialize(
+                &serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+                id,
+            )
+            .map_err(|_| HttpError::InvalidResponse)?;
+            self.session = session;
+        } else if session.is_some() && self.session.is_none() {
+            return Err(HttpError::InvalidResponse.into());
+        }
+        Ok(result)
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn call_wire<F, E>(
+        &mut self,
+        binding: &HttpBinding,
+        client: &Client,
+        url: &Url,
+        method: &str,
+        params: Map<String, Value>,
+        schema: Option<&Value>,
+        token: Option<&str>,
+        cancel: &CancellationToken,
+        fresh: &mut F,
+    ) -> Result<Value, E>
+    where
+        F: FnMut() -> Result<(), E>,
+        E: From<HttpError>,
+    {
+        if self.failed
+            || &self.binding != binding
+            || Url::parse(&binding.endpoint).as_ref() != Ok(url)
+        {
+            self.failed = true;
+            self.session = None;
+            return Err(HttpError::StaleBinding.into());
+        }
+        // Negotiation can retry discovery, never an approved mutating call.
+        if !self.negotiated && method != "tools/list" {
+            return Err(HttpError::InvalidRequest.into());
+        }
+        let result = async {
+            if !self.negotiated {
+                // Keep the typed transport outcome separate from caller freshness errors.
+                let mut wire_fresh = || fresh();
+                let id = self.next_id()?;
+                wire_fresh()?;
+                let mut headers = era_headers(Era::Modern, method, &params, schema)?;
+                if let Some(token) = token {
+                    headers.insert(AUTHORIZATION, authorization_header(token)?);
+                }
+                let body = protocol::request(
+                    Era::Modern,
+                    id,
+                    method,
+                    params.clone(),
+                    "AeroFTP",
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .map_err(|_| HttpError::InvalidRequest)?;
+                let bytes = serde_json::to_vec(&body).map_err(|_| HttpError::InvalidRequest)?;
+                if bytes.len() > MAX_REPLY_BYTES {
+                    return Err(HttpError::InvalidRequest.into());
+                }
+                let outcome = exchange(
+                    Era::Modern,
+                    None,
+                    false,
+                    client,
+                    url.clone(),
+                    headers,
+                    bytes,
+                    id,
+                    cancel,
+                )
+                .await;
+                wire_fresh()?;
+                if cancel.is_cancelled() {
+                    return Err(HttpError::Cancelled.into());
+                }
+                match outcome {
+                    Ok((value, _)) => {
+                        self.negotiated = true;
+                        return Ok(value);
+                    }
+                    Err(HttpError::UnsupportedVersion) => {
+                        self.era = Era::Legacy(protocol::LEGACY_PREFERRED);
+                        self.wire(
+                            client,
+                            url,
+                            "initialize",
+                            Map::new(),
+                            None,
+                            token,
+                            cancel,
+                            fresh,
+                        )
+                        .await?;
+                        self.wire(
+                            client,
+                            url,
+                            "notifications/initialized",
+                            Map::new(),
+                            None,
+                            token,
+                            cancel,
+                            fresh,
+                        )
+                        .await?;
+                        self.negotiated = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.wire(client, url, method, params, schema, token, cancel, fresh)
+                .await
+        }
+        .await;
+        if result.is_err() {
+            self.failed = true;
+            self.session = None;
+        }
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_checked<F, E>(
+        &mut self,
+        config: &McpHttpServerConfig,
+        binding: &HttpBinding,
+        method: &str,
+        params: Map<String, Value>,
+        schema: Option<&Value>,
+        token: Option<&str>,
+        cancel: &CancellationToken,
+        fresh: &mut F,
+    ) -> Result<Value, E>
+    where
+        F: FnMut() -> Result<(), E>,
+        E: From<HttpError>,
+    {
+        let result = async {
+            fresh()?;
+            config.validate().map_err(|_| HttpError::InvalidEndpoint)?;
+            if !config.enabled || config.endpoint != binding.endpoint || self.binding != *binding {
+                return Err(HttpError::StaleBinding.into());
+            }
+            let url = parse_public_https(&config.endpoint, 2048)
+                .map_err(|_| HttpError::InvalidEndpoint)?;
+            let client = pinned_client(&url, cancel).await?;
+            self.call_wire(
+                binding, &client, &url, method, params, schema, token, cancel, fresh,
+            )
+            .await
+        }
+        .await;
+        if result.is_err() {
+            self.failed = true;
+            self.session = None;
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+impl HttpSession {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fixture_call_checked<F, E>(
+        &mut self,
+        binding: &HttpBinding,
+        url: &Url,
+        method: &str,
+        params: Map<String, Value>,
+        schema: Option<&Value>,
+        cancel: &CancellationToken,
+        fresh: &mut F,
+    ) -> Result<Value, E>
+    where
+        F: FnMut() -> Result<(), E>,
+        E: From<HttpError>,
+    {
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| HttpError::Connect)?;
+        self.call_wire(
+            binding, &client, url, method, params, schema, None, cancel, fresh,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -644,6 +986,449 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    async fn sequence_fixture(
+        responses: Vec<Vec<u8>>,
+    ) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/mcp", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(split) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..split]);
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':')
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= split + 4 + length {
+                            break;
+                        }
+                    }
+                    assert!(bytes.len() <= MAX_REPLY_BYTES + 4096);
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                socket.write_all(&response).await.unwrap();
+            }
+            requests
+        });
+        (url, task)
+    }
+    fn binding(url: &Url) -> HttpBinding {
+        HttpBinding {
+            endpoint: url.to_string(),
+            user_id: 1,
+            revision: "revision-1".into(),
+        }
+    }
+    fn downgrade(id: u64) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32022,"message":"unsupported","data":{"requested":protocol::MODERN_VERSION,"supported":[protocol::LEGACY_PREFERRED, protocol::LEGACY_AEROFTP]}}})
+    }
+    fn legacy_responses(version: &str, sse: bool) -> Vec<Vec<u8>> {
+        let init = json!({"jsonrpc":"2.0","id":2,"result":{"protocolVersion":version,"capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}});
+        let list = json!({"jsonrpc":"2.0","id":4,"result":{"tools":[]}}).to_string();
+        vec![
+            wire_reply(
+                "400 Bad Request",
+                "application/json",
+                "",
+                &downgrade(1).to_string(),
+            ),
+            wire_reply(
+                "200 OK",
+                "application/json",
+                "Mcp-Session-Id: private-fixture-session\r\n",
+                &init.to_string(),
+            ),
+            wire_reply("202 Accepted", "application/json", "", ""),
+            wire_reply(
+                "200 OK",
+                if sse {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+                "",
+                &if sse {
+                    format!("data: {list}\n\n")
+                } else {
+                    list
+                },
+            ),
+        ]
+    }
+    #[tokio::test]
+    async fn guarded_legacy_negotiation_initializes_and_binds_json_and_sse_session() {
+        for (version, sse) in [
+            (protocol::LEGACY_PREFERRED, false),
+            (protocol::LEGACY_AEROFTP, true),
+        ] {
+            let (url, peer) = sequence_fixture(legacy_responses(version, sse)).await;
+            let binding = binding(&url);
+            let mut state = HttpSession::new(binding.clone());
+            let result: Result<Value, HttpError> = state
+                .call_wire(
+                    &binding,
+                    &test_client(),
+                    &url,
+                    "tools/list",
+                    Map::new(),
+                    None,
+                    None,
+                    &CancellationToken::new(),
+                    &mut || Ok(()),
+                )
+                .await;
+            assert_eq!(result.unwrap()["tools"], json!([]));
+            assert_eq!(state.era, Era::Legacy(version));
+            assert!(state.session.as_ref().unwrap().is_sensitive());
+            let requests = peer.await.unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(requests[0].contains("io.modelcontextprotocol/protocolVersion"));
+            assert!(!requests[1].contains("mcp-session-id:"));
+            for (i, method) in [
+                (1, "initialize"),
+                (2, "notifications/initialized"),
+                (3, "tools/list"),
+            ] {
+                let (header, body) = requests[i].split_once("\r\n\r\n").unwrap();
+                assert!(!header.contains("mcp-method:"));
+                assert!(!body.contains("_meta"));
+                assert_eq!(
+                    serde_json::from_str::<Value>(body).unwrap()["method"],
+                    method
+                );
+                if i >= 2 {
+                    assert!(header.contains("mcp-session-id: private-fixture-session"));
+                    assert!(header.contains(&format!("mcp-protocol-version: {version}")));
+                }
+            }
+        }
+    }
+    #[test]
+    fn downgrade_requires_authoritative_version_and_correlated_envelope() {
+        assert_eq!(authoritative_legacy(&downgrade(7), 7), Ok(true));
+        let mut bad = Vec::new();
+        for (pointer, value) in [
+            ("/id", json!(8)),
+            ("/jsonrpc", json!("1.0")),
+            ("/error/data/requested", json!(protocol::LEGACY_PREFERRED)),
+            ("/error/data/supported", json!([])),
+            ("/error/data/supported", json!([42])),
+        ] {
+            let mut message = downgrade(7);
+            *message.pointer_mut(pointer).unwrap() = value;
+            bad.push(message);
+        }
+        let mut both = downgrade(7);
+        both["result"] = json!({});
+        bad.push(both);
+        let mut server_request = downgrade(7);
+        server_request["method"] = json!("sampling/createMessage");
+        bad.push(server_request);
+        for message in bad {
+            assert!(authoritative_legacy(&message, 7).is_err());
+        }
+        for versions in [
+            json!([protocol::MODERN_VERSION, protocol::LEGACY_PREFERRED]),
+            json!(["2027-01-01"]),
+        ] {
+            let mut message = downgrade(7);
+            message["error"]["data"]["supported"] = versions;
+            assert_eq!(authoritative_legacy(&message, 7), Ok(false));
+        }
+        for code in [-32020, -32601, -1] {
+            let mut message = downgrade(7);
+            message["error"]["code"] = json!(code);
+            assert_eq!(authoritative_legacy(&message, 7), Ok(false));
+        }
+    }
+    #[tokio::test]
+    async fn guarded_negotiation_never_retries_auth_arbitrary_error_or_malformed_reply() {
+        for response in [
+            wire_reply("401 Unauthorized", "application/json", "", ""),
+            wire_reply("403 Forbidden", "application/json", "", ""),
+            wire_reply("400 Bad Request", "application/json", "", "{}"),
+            wire_reply(
+                "400 Bad Request",
+                "application/json",
+                "",
+                &downgrade(9).to_string(),
+            ),
+            wire_reply(
+                "400 Bad Request",
+                "application/json",
+                "",
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"unsupported"}}"#,
+            ),
+            wire_reply("200 OK", "application/json", "", "bad json"),
+        ] {
+            let (url, peer) = sequence_fixture(vec![response]).await;
+            let binding = binding(&url);
+            let mut state = HttpSession::new(binding.clone());
+            let result: Result<Value, HttpError> = state
+                .call_wire(
+                    &binding,
+                    &test_client(),
+                    &url,
+                    "tools/list",
+                    Map::new(),
+                    None,
+                    None,
+                    &CancellationToken::new(),
+                    &mut || Ok(()),
+                )
+                .await;
+            assert!(result.is_err());
+            assert!(state.failed);
+            assert!(state.session.is_none());
+            assert_eq!(peer.await.unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn modern_success_stays_stateless_and_later_version_error_never_replays_call() {
+        let first = json!({"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","tools":[]}});
+        let (url, peer) = sequence_fixture(vec![
+            wire_reply("200 OK", "application/json", "", &first.to_string()),
+            wire_reply(
+                "400 Bad Request",
+                "application/json",
+                "",
+                &downgrade(2).to_string(),
+            ),
+        ])
+        .await;
+        let binding = binding(&url);
+        let mut state = HttpSession::new(binding.clone());
+        let client = test_client();
+        let cancel = CancellationToken::new();
+        let result: Result<Value, HttpError> = state
+            .call_wire(
+                &binding,
+                &client,
+                &url,
+                "tools/list",
+                Map::new(),
+                None,
+                None,
+                &cancel,
+                &mut || Ok(()),
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(state.era, Era::Modern);
+        assert!(state.session.is_none());
+        let schema = json!({"type":"object","properties":{}});
+        let params = Map::from_iter([
+            ("name".into(), json!("echo")),
+            ("arguments".into(), json!({})),
+        ]);
+        let result: Result<Value, HttpError> = state
+            .call_wire(
+                &binding,
+                &client,
+                &url,
+                "tools/call",
+                params,
+                Some(&schema),
+                None,
+                &cancel,
+                &mut || Ok(()),
+            )
+            .await;
+        assert_eq!(result, Err(HttpError::UnsupportedVersion));
+        let requests = peer.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests.iter().any(|r| r.contains("mcp-session-id:")));
+    }
+    #[tokio::test]
+    async fn legacy_handshake_rejects_unknown_version_id_and_session_replacement() {
+        for variant in 0..4 {
+            let mut responses = legacy_responses(protocol::LEGACY_PREFERRED, false);
+            match variant {
+                0 => responses[1] = wire_reply("200 OK", "application/json", "", &json!({"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string()),
+                1 => responses[1] = wire_reply("200 OK", "application/json", "", &json!({"jsonrpc":"2.0","id":99,"result":{"protocolVersion":protocol::LEGACY_PREFERRED}}).to_string()),
+                2 => responses[2] = wire_reply("202 Accepted", "application/json", "Mcp-Session-Id: swapped\r\n", ""),
+                _ => responses[3] = wire_reply("200 OK", "application/json", "Mcp-Session-Id: swapped\r\n", r#"{"jsonrpc":"2.0","id":4,"result":{"tools":[]}}"#),
+            }
+            let limit = if variant < 2 { 2 } else { variant + 1 };
+            responses.truncate(limit);
+            let (url, peer) = sequence_fixture(responses).await;
+            let binding = binding(&url);
+            let mut state = HttpSession::new(binding.clone());
+            let result: Result<Value, HttpError> = state
+                .call_wire(
+                    &binding,
+                    &test_client(),
+                    &url,
+                    "tools/list",
+                    Map::new(),
+                    None,
+                    None,
+                    &CancellationToken::new(),
+                    &mut || Ok(()),
+                )
+                .await;
+            assert_eq!(result, Err(HttpError::InvalidResponse));
+            assert!(state.session.is_none());
+            assert_eq!(peer.await.unwrap().len(), limit);
+        }
+    }
+    #[tokio::test]
+    async fn timeout_and_network_failure_never_negotiate_legacy() {
+        let (url, peer) = wire_fixture(
+            wire_reply("200 OK", "application/json", "", "{}"),
+            Duration::from_secs(1),
+        )
+        .await;
+        let binding = binding(&url);
+        let mut state = HttpSession::new(binding.clone());
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let result: Result<Value, HttpError> = state
+            .call_wire(
+                &binding,
+                &client,
+                &url,
+                "tools/list",
+                Map::new(),
+                None,
+                None,
+                &CancellationToken::new(),
+                &mut || Ok(()),
+            )
+            .await;
+        assert_eq!(result, Err(HttpError::Timeout));
+        assert_eq!(state.era, Era::Modern);
+        assert!(state.failed);
+        peer.abort();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/mcp", listener.local_addr().unwrap())).unwrap();
+        drop(listener);
+        let binding = super::tests::binding(&url);
+        let mut state = HttpSession::new(binding.clone());
+        let result: Result<Value, HttpError> = state
+            .call_wire(
+                &binding,
+                &client,
+                &url,
+                "tools/list",
+                Map::new(),
+                None,
+                None,
+                &CancellationToken::new(),
+                &mut || Ok(()),
+            )
+            .await;
+        assert_eq!(result, Err(HttpError::Connect));
+        assert_eq!(state.era, Era::Modern);
+        assert!(state.failed);
+    }
+    #[test]
+    fn session_ids_are_bounded_unique_visible_ascii_and_sensitive() {
+        for value in ["", "has space", "tab\tvalue", &"x".repeat(257)] {
+            let mut headers = HeaderMap::new();
+            headers.insert("mcp-session-id", HeaderValue::from_str(value).unwrap());
+            assert!(session_header(&headers).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.append("mcp-session-id", HeaderValue::from_static("one"));
+        headers.append("mcp-session-id", HeaderValue::from_static("two"));
+        assert!(session_header(&headers).is_err());
+    }
+    #[tokio::test]
+    async fn stale_user_config_or_endpoint_cannot_reuse_session() {
+        let url = Url::parse("http://127.0.0.1:1/mcp").unwrap();
+        let original = binding(&url);
+        for variant in 0..3 {
+            let mut state = HttpSession::new(original.clone());
+            state.era = Era::Legacy(protocol::LEGACY_PREFERRED);
+            state.negotiated = true;
+            state.session = Some(HeaderValue::from_static("private-session"));
+            let mut changed = original.clone();
+            match variant {
+                0 => changed.user_id += 1,
+                1 => changed.revision.push('2'),
+                _ => changed.endpoint.push('2'),
+            };
+            let result: Result<Value, HttpError> = state
+                .call_wire(
+                    &changed,
+                    &test_client(),
+                    &url,
+                    "tools/list",
+                    Map::new(),
+                    None,
+                    None,
+                    &CancellationToken::new(),
+                    &mut || Ok(()),
+                )
+                .await;
+            assert_eq!(result, Err(HttpError::StaleBinding));
+            assert!(state.failed);
+            assert!(state.session.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn freshness_and_cancellation_guard_every_negotiation_call_and_result() {
+        for stop_at in 1..=8 {
+            for cancelled in [false, true] {
+                let (url, peer) =
+                    sequence_fixture(legacy_responses(protocol::LEGACY_PREFERRED, false)).await;
+                let binding = binding(&url);
+                let mut state = HttpSession::new(binding.clone());
+                let cancel = CancellationToken::new();
+                let mut checks = 0;
+                let result: Result<Value, HttpError> = state
+                    .call_wire(
+                        &binding,
+                        &test_client(),
+                        &url,
+                        "tools/list",
+                        Map::new(),
+                        None,
+                        None,
+                        &cancel,
+                        &mut || {
+                            checks += 1;
+                            if checks == stop_at {
+                                if cancelled {
+                                    cancel.cancel();
+                                } else {
+                                    return Err(HttpError::StaleBinding);
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                    .await;
+                assert_eq!(
+                    result,
+                    Err(if cancelled {
+                        HttpError::Cancelled
+                    } else {
+                        HttpError::StaleBinding
+                    })
+                );
+                assert!(state.failed);
+                assert!(state.session.is_none());
+                peer.abort();
+            }
+        }
+    }
     #[test]
     fn bearer_header_is_sensitive_and_debug_redacted() {
         let value = authorization_header("fixture-bearer-secret").unwrap();
@@ -789,8 +1574,7 @@ mod tests {
         ))
         .await;
         assert_eq!(result, Err(HttpError::ResponseTooLarge));
-        let unsupported =
-            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32022,"message":"unsupported"}}"#;
+        let unsupported = r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32022,"message":"unsupported","data":{"requested":"2026-07-28","supported":["2025-11-25"]}}}"#;
         let (result, _) = fixture_request(wire_reply(
             "400 Bad Request",
             "application/json",

@@ -160,37 +160,63 @@ trait Peer {
         schema: Option<&Value>,
         cancel: &CancellationToken,
     ) -> Result<Value, BridgeError>;
+    async fn call_checked(
+        &mut self,
+        method: &str,
+        params: Map<String, Value>,
+        schema: Option<&Value>,
+        cancel: &CancellationToken,
+        _fresh: &mut impl FnMut() -> Result<(), BridgeError>,
+    ) -> Result<Value, BridgeError> {
+        self.call(method, params, schema, cancel).await
+    }
 }
 enum Connection {
     Stdio(Box<StdioSupervisor>),
-    Http {
-        config: McpHttpServerConfig,
-        auth: ResolvedMcpHttpAuth,
-        id: u64,
-    },
+    Http(Box<HttpConnection>),
+}
+struct HttpConnection {
+    session: mcp_client_http_transport::HttpSession,
+    binding: mcp_client_http_transport::HttpBinding,
+    config: McpHttpServerConfig,
+    auth: ResolvedMcpHttpAuth,
 }
 impl Peer for Connection {
     async fn call(
         &mut self,
         method: &str,
         params: Map<String, Value>,
-        schema: Option<&Value>,
+        _schema: Option<&Value>,
         cancel: &CancellationToken,
     ) -> Result<Value, BridgeError> {
         match self {
             Self::Stdio(peer) => Ok(peer.call(method, params, cancel).await?),
-            Self::Http { config, auth, id } => {
-                *id = id.checked_add(1).ok_or(HttpError::InvalidRequest)?;
-                Ok(mcp_client_http_transport::request(
-                    config,
-                    method,
-                    params,
-                    schema,
-                    auth.bearer.as_deref().map(String::as_str),
-                    *id,
-                    cancel,
-                )
-                .await?)
+            Self::Http(_) => Err(HttpError::InvalidRequest.into()),
+        }
+    }
+    async fn call_checked(
+        &mut self,
+        method: &str,
+        params: Map<String, Value>,
+        schema: Option<&Value>,
+        cancel: &CancellationToken,
+        fresh: &mut impl FnMut() -> Result<(), BridgeError>,
+    ) -> Result<Value, BridgeError> {
+        match self {
+            Self::Stdio(peer) => Ok(peer.call(method, params, cancel).await?),
+            Self::Http(peer) => {
+                peer.session
+                    .call_checked(
+                        &peer.config,
+                        &peer.binding,
+                        method,
+                        params,
+                        schema,
+                        peer.auth.bearer.as_deref().map(String::as_str),
+                        cancel,
+                        fresh,
+                    )
+                    .await
             }
         }
     }
@@ -198,6 +224,8 @@ impl Peer for Connection {
 impl Connection {
     async fn connect(
         config: Config,
+        user_id: i64,
+        revision: &str,
         cancel: &CancellationToken,
         fresh: impl FnMut() -> Result<(), BridgeError>,
     ) -> Result<Self, BridgeError> {
@@ -210,11 +238,19 @@ impl Connection {
                 peer.disable_restart();
                 Ok(Self::Stdio(Box::new(peer)))
             }
-            Config::Http(config, auth) => Ok(Self::Http {
-                config,
-                auth,
-                id: 0,
-            }),
+            Config::Http(config, auth) => {
+                let binding = mcp_client_http_transport::HttpBinding {
+                    endpoint: config.endpoint.clone(),
+                    user_id,
+                    revision: revision.to_owned(),
+                };
+                Ok(Self::Http(Box::new(HttpConnection {
+                    session: mcp_client_http_transport::HttpSession::new(binding.clone()),
+                    binding,
+                    config,
+                    auth,
+                })))
+            }
         }
     }
     async fn shutdown(&mut self) {
@@ -277,7 +313,9 @@ where
     validate_request(request)?;
     fresh()?;
     check_cancel(cancel)?;
-    let listed = peer.call("tools/list", Map::new(), None, cancel).await?;
+    let listed = peer
+        .call_checked("tools/list", Map::new(), None, cancel, &mut fresh)
+        .await?;
     fresh()?;
     check_cancel(cancel)?;
     let input = schema::discover(&listed, &request.call.tool_name)?;
@@ -298,7 +336,9 @@ where
     if !execute {
         return Ok((revision, None));
     }
-    let listed = peer.call("tools/list", Map::new(), None, cancel).await?;
+    let listed = peer
+        .call_checked("tools/list", Map::new(), None, cancel, &mut fresh)
+        .await?;
     fresh()?;
     check_cancel(cancel)?;
     let latest = schema::discover(&listed, &request.call.tool_name)?;
@@ -312,7 +352,7 @@ where
     fresh()?;
     check_cancel(cancel)?;
     let result = peer
-        .call("tools/call", params, Some(&latest), cancel)
+        .call_checked("tools/call", params, Some(&latest), cancel, &mut fresh)
         .await?;
     fresh()?;
     check_cancel(cancel)?;
@@ -334,7 +374,7 @@ async fn with_backend(
         let user_id = state.user_id;
         audit_user = Some(user_id);
         let revision = state.revision;
-        let mut peer = Connection::connect(state.config, cancel, || {
+        let mut peer = Connection::connect(state.config, user_id, &revision, cancel, || {
             let current = resolve(app, key, request)?;
             if current.user_id != user_id || current.revision != revision {
                 return Err(GateError::StaleRevision.into());
@@ -782,9 +822,10 @@ mod wire_tests {
                     approval_grant_id: None,
                 },
             };
-            let mut peer = Connection::connect(Config::Stdio(config, env), &cancel, || Ok(()))
-                .await
-                .unwrap();
+            let mut peer =
+                Connection::connect(Config::Stdio(config, env), 1, "fixture", &cancel, || Ok(()))
+                    .await
+                    .unwrap();
             let result = run(
                 &mut peer,
                 &request,
@@ -811,36 +852,55 @@ mod http_wire_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     struct Wire {
         url: url::Url,
-        id: u64,
+        binding: mcp_client_http_transport::HttpBinding,
+        session: mcp_client_http_transport::HttpSession,
     }
     impl Peer for Wire {
         async fn call(
+            &mut self,
+            _method: &str,
+            _params: Map<String, Value>,
+            _schema: Option<&Value>,
+            _cancel: &CancellationToken,
+        ) -> Result<Value, BridgeError> {
+            Err(HttpError::InvalidRequest.into())
+        }
+        async fn call_checked(
             &mut self,
             method: &str,
             params: Map<String, Value>,
             schema: Option<&Value>,
             cancel: &CancellationToken,
+            fresh: &mut impl FnMut() -> Result<(), BridgeError>,
         ) -> Result<Value, BridgeError> {
-            self.id += 1;
-            Ok(mcp_client_http_transport::fixture_exchange(
-                self.url.clone(),
-                method,
-                params,
-                schema,
-                self.id,
-                cancel,
-            )
-            .await?)
+            self.session
+                .fixture_call_checked(
+                    &self.binding,
+                    &self.url,
+                    method,
+                    params,
+                    schema,
+                    cancel,
+                    fresh,
+                )
+                .await
         }
     }
     #[tokio::test]
     async fn backend_discovered_header_is_mirrored_on_real_http_wire() {
+        bridge_wire(false).await;
+    }
+    #[tokio::test]
+    async fn private_bridge_reaches_guarded_legacy_http_with_fresh_schema_and_approval() {
+        bridge_wire(true).await;
+    }
+    async fn bridge_wire(legacy: bool) {
         let input = json!({"type":"object","properties":{"text":{"type":"string","x-mcp-header":"Fresh"}},"required":["text"],"additionalProperties":false});
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let response_schema = input.clone();
         let server = tokio::spawn(async move {
-            for id in 1..=3 {
+            for id in 1..=if legacy { 6 } else { 3 } {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = vec![];
                 let mut buf = [0; 4096];
@@ -867,17 +927,45 @@ mod http_wire_tests {
                         }
                     }
                 };
+                if legacy && id <= 3 {
+                    let (status, extra, reply) = match id {
+                        1 => ("400 Bad Request", "", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32022,"message":"unsupported","data":{"requested":"2026-07-28","supported":["2025-11-25"]}}}).to_string()),
+                        2 => {
+                            assert_eq!(body["method"], "initialize");
+                            assert!(!headers.to_ascii_lowercase().contains("mcp-session-id:"));
+                            ("200 OK", "Mcp-Session-Id: bridge-session\r\n", json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}).to_string())
+                        }
+                        _ => {
+                            assert_eq!(body["method"], "notifications/initialized");
+                            assert!(body.get("id").is_none());
+                            assert!(headers.to_ascii_lowercase().contains("mcp-session-id: bridge-session"));
+                            ("202 Accepted", "", String::new())
+                        }
+                    };
+                    let http = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{reply}", reply.len());
+                    stream.write_all(http.as_bytes()).await.unwrap();
+                    continue;
+                }
                 assert_eq!(body["id"], id);
-                let result = if id < 3 {
+                if legacy {
+                    assert!(body["params"].get("_meta").is_none());
+                    assert!(headers
+                        .to_ascii_lowercase()
+                        .contains("mcp-session-id: bridge-session"));
+                }
+                let result = if id < if legacy { 6 } else { 3 } {
                     assert_eq!(body["method"], "tools/list");
                     assert!(!headers.to_ascii_lowercase().contains("mcp-param-fresh"));
                     json!({"resultType":"complete","tools":[{"name":"echo","inputSchema":response_schema}]})
                 } else {
                     assert_eq!(body["method"], "tools/call");
                     assert_eq!(body["params"]["arguments"]["text"], "wire value");
-                    assert!(headers
-                        .to_ascii_lowercase()
-                        .contains("mcp-param-fresh: wire value"));
+                    assert_eq!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("mcp-param-fresh: wire value"),
+                        !legacy
+                    );
                     json!({"resultType":"complete","content":[{"type":"text","text":"HTTP bridge reply"}]})
                 };
                 let reply = json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
@@ -898,9 +986,16 @@ mod http_wire_tests {
                 approval_grant_id: None,
             },
         };
+        let url = url::Url::parse(&format!("http://{addr}/mcp")).unwrap();
+        let binding = mcp_client_http_transport::HttpBinding {
+            endpoint: url.to_string(),
+            user_id: 1,
+            revision: req.call.expected_revision.clone(),
+        };
         let mut peer = Wire {
-            url: url::Url::parse(&format!("http://{addr}/mcp")).unwrap(),
-            id: 0,
+            url,
+            session: mcp_client_http_transport::HttpSession::new(binding.clone()),
+            binding,
         };
         let outcome = run(
             &mut peer,
