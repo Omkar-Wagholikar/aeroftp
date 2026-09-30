@@ -477,15 +477,22 @@ jobs:
           chmod +x appimagetool
           # -u embeds the zsync update information that AppImageUpdate,
           # appimageupdatetool and AppImage managers (AM/AppMan) read to find
-          # the delta-update file, and makes appimagetool write
-          # "$APPIMAGE".zsync next to the image. The zsync glob matches the
-          # productName_version_amd64 file name Tauri produces.
+          # the delta-update file, and makes appimagetool generate the .zsync
+          # file. The zsync glob matches the productName_version_amd64 file
+          # name Tauri produces.
           UPDATE_INFO="gh-releases-zsync|axpdev-lab|aeroftp|latest|AeroFTP_*_amd64.AppImage.zsync"
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run \
             -u "$UPDATE_INFO" \
             squashfs-root "$APPIMAGE"
           NEW_SIZE=$(du -m "$APPIMAGE" | cut -f1)
           echo "AppImage re-packaged: ${ORIG_SIZE}MB -> ${NEW_SIZE}MB (system libs only)"
+
+          # zsyncmake writes the .zsync into the working directory, not next
+          # to the output image; move it alongside the AppImage so the
+          # installer artifact glob picks it up.
+          if [ -f "$(basename "$APPIMAGE").zsync" ]; then
+            mv "$(basename "$APPIMAGE").zsync" "${APPIMAGE}.zsync"
+          fi
 
           # Verify the update information on the CI artifact itself, not on
           # the flags passed to appimagetool: the embedded string must
@@ -673,6 +680,38 @@ jobs:
         with:
           name: aeroftp-macos-x64-${{ github.sha }}
           path: release-assets
+
+      # Keep the published AppImage and its .zsync from the same build.
+      # overwrite_files: false repairs a partial release by uploading only the
+      # missing assets, so a re-run whose fresh build produced a byte-different
+      # AppImage would publish a .zsync that does not match the AppImage
+      # already on the release, breaking delta updates. When the release
+      # already has the AppImage but not its .zsync, regenerate the .zsync
+      # from the published bytes instead of shipping this run's one.
+      - name: Pair AppImage .zsync with the published AppImage
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          appimages=(release-assets/*.AppImage)
+          if [ ${#appimages[@]} -eq 0 ]; then exit 0; fi
+          if ! gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > /tmp/published-assets.txt 2>/dev/null; then
+            echo "Release $GITHUB_REF_NAME does not exist yet: fresh publish, the pair comes from this build"
+            exit 0
+          fi
+          for appimage in "${appimages[@]}"; do
+            base=$(basename "$appimage")
+            if grep -qx "$base" /tmp/published-assets.txt && ! grep -qx "${base}.zsync" /tmp/published-assets.txt; then
+              echo "Repair case: the release has $base but no .zsync; regenerating from the published asset"
+              sudo apt-get update && sudo apt-get install -y --no-install-recommends zsync
+              mkdir -p /tmp/published-appimage
+              gh release download "$GITHUB_REF_NAME" --pattern "$base" --dir /tmp/published-appimage --clobber
+              (cd /tmp/published-appimage && zsyncmake "$base")
+              mv "/tmp/published-appimage/${base}.zsync" "release-assets/${base}.zsync"
+            fi
+          done
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
