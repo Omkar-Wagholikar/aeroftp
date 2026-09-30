@@ -58,8 +58,14 @@ where
     if cancel.is_cancelled() {
         return Err(TransportError::Cancelled.into());
     }
-    let mut peer =
-        StdioSupervisor::connect(authorized.config, authorized.environment, limits, cancel).await?;
+    let mut peer = StdioSupervisor::connect_checked(
+        authorized.config,
+        authorized.environment,
+        limits,
+        cancel,
+        || fresh().map_err(DispatchError::from),
+    )
+    .await?;
     peer.disable_restart();
     let result = async {
         fresh()?;
@@ -213,40 +219,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result["content"][0]["text"], "fixture reply");
-        assert_eq!(checks.get(), 4);
+        assert_eq!(checks.get(), 6);
     }
 
     #[tokio::test]
     async fn stale_revision_after_connect_suppresses_tool_call() {
-        let checks = Cell::new(0);
-        let result = execute_authorized(
-            fixture(),
-            || {
-                checks.set(checks.get() + 1);
-                if checks.get() == 2 {
-                    Err(GateError::StaleRevision)
-                } else {
-                    Ok(())
-                }
-            },
-            limits(),
-            &CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(result, Err(DispatchError::Gate(GateError::StaleRevision)));
-        assert_eq!(checks.get(), 2);
-    }
-
-    #[tokio::test]
-    async fn unknown_advertised_tool_is_not_called() {
-        let mut call = fixture();
-        call.tool_name = "absent".into();
-        let result = execute_authorized(call, || Ok(()), limits(), &CancellationToken::new()).await;
-        assert_eq!(result, Err(DispatchError::ToolUnavailable));
-    }
-
-    #[tokio::test]
-    async fn revision_change_during_call_discards_result() {
         let checks = Cell::new(0);
         let result = execute_authorized(
             fixture(),
@@ -264,6 +241,35 @@ mod tests {
         .await;
         assert_eq!(result, Err(DispatchError::Gate(GateError::StaleRevision)));
         assert_eq!(checks.get(), 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_advertised_tool_is_not_called() {
+        let mut call = fixture();
+        call.tool_name = "absent".into();
+        let result = execute_authorized(call, || Ok(()), limits(), &CancellationToken::new()).await;
+        assert_eq!(result, Err(DispatchError::ToolUnavailable));
+    }
+
+    #[tokio::test]
+    async fn revision_change_during_call_discards_result() {
+        let checks = Cell::new(0);
+        let result = execute_authorized(
+            fixture(),
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 6 {
+                    Err(GateError::StaleRevision)
+                } else {
+                    Ok(())
+                }
+            },
+            limits(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result, Err(DispatchError::Gate(GateError::StaleRevision)));
+        assert_eq!(checks.get(), 6);
     }
 
     #[tokio::test]

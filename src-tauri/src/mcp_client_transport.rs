@@ -253,12 +253,36 @@ pub(crate) struct StdioSupervisor {
 }
 
 impl StdioSupervisor {
+    #[cfg(test)]
     pub(crate) async fn connect(
         config: McpServerConfig,
         env: ResolvedMcpEnvironment,
         limits: Limits,
         cancel: &CancellationToken,
     ) -> Result<Self, TransportError> {
+        let mut peer =
+            Self::connect_checked(config, env, limits, cancel, || Ok::<(), TransportError>(()))
+                .await?;
+        // Only transport-only fixtures exercise the generic restart contract.
+        peer.restart_enabled = true;
+        Ok(peer)
+    }
+
+    pub(crate) async fn connect_checked<F, E>(
+        config: McpServerConfig,
+        env: ResolvedMcpEnvironment,
+        limits: Limits,
+        cancel: &CancellationToken,
+        mut fresh: F,
+    ) -> Result<Self, E>
+    where
+        F: FnMut() -> Result<(), E>,
+        E: From<TransportError>,
+    {
+        fresh()?;
+        if cancel.is_cancelled() {
+            return Err(TransportError::Cancelled.into());
+        }
         let mut probe = Peer::spawn(&config, &env)?;
         let verdict = async {
             let request = protocol::discover_request(1, CLIENT_NAME, CLIENT_VERSION)?;
@@ -288,6 +312,12 @@ impl StdioSupervisor {
             ProbeVerdict::Modern => Era::Modern,
             ProbeVerdict::LegacyHandshakeRequired => Era::Legacy(protocol::LEGACY_PREFERRED),
         };
+        // Discovery and probe shutdown await external work. Do not launch the
+        // real session with secrets/config retained before those awaits.
+        fresh()?;
+        if cancel.is_cancelled() {
+            return Err(TransportError::Cancelled.into());
+        }
         let (peer, era) = start_session(&config, &env, era, limits, cancel).await?;
         Ok(Self {
             config,
@@ -296,7 +326,7 @@ impl StdioSupervisor {
             era,
             next_id: 3,
             restarts: 0,
-            restart_enabled: true,
+            restart_enabled: false,
             limits,
         })
     }
@@ -415,6 +445,30 @@ mod tests {
     async fn connect(mode: &str) -> Result<StdioSupervisor, TransportError> {
         let (config, env) = fixture(mode);
         StdioSupervisor::connect(config, env, limits(), &CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn freshness_after_probe_prevents_session_launch() {
+        use std::cell::Cell;
+        let checks = Cell::new(0);
+        let (config, env) = fixture("modern");
+        let result = StdioSupervisor::connect_checked(
+            config,
+            env,
+            limits(),
+            &CancellationToken::new(),
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 2 {
+                    Err(TransportError::Closed)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(TransportError::Closed)));
+        assert_eq!(checks.get(), 2);
     }
 
     #[tokio::test]
