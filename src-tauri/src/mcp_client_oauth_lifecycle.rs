@@ -160,7 +160,19 @@ impl PendingAuthorizationManager {
             .lock()
             .map_err(|_| OAuthError::PendingUnavailable)?;
         records.retain(|_, r| r.deadline > Instant::now() && !r.cancel.is_cancelled());
-        // One active attempt per user/server, superseded attempts are zeroized on drop.
+        // A consumed exchange or refresh keeps its lease until completion. Do
+        // not supersede it: its eventual error must not cancel a newer attempt.
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| OAuthError::PendingUnavailable)?;
+        if active.values().any(|attempt| {
+            attempt.user == record.binding.user_id && attempt.server == record.binding.server_id
+        }) {
+            return Err(OAuthError::PendingUnavailable);
+        }
+        drop(active);
+        // Only a still-pending browser attempt may be superseded.
         records.retain(|_, r| {
             let keep = r.binding.user_id != record.binding.user_id
                 || r.binding.server_id != record.binding.server_id;
@@ -169,17 +181,6 @@ impl PendingAuthorizationManager {
             }
             keep
         });
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| OAuthError::PendingUnavailable)?;
-        for attempt in active.values() {
-            if attempt.user == record.binding.user_id && attempt.server == record.binding.server_id
-            {
-                attempt.cancel.cancel();
-            }
-        }
-        drop(active);
         if records.len() >= MAX_PENDING {
             return Err(OAuthError::PendingUnavailable);
         }
@@ -222,6 +223,18 @@ impl PendingAuthorizationManager {
         server: &str,
         cancel: CancellationToken,
     ) -> Result<String, OAuthError> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| OAuthError::PendingUnavailable)?;
+        if records.values().any(|r| {
+            r.binding.user_id == user
+                && r.binding.server_id == server
+                && r.deadline > Instant::now()
+                && !r.cancel.is_cancelled()
+        }) {
+            return Err(OAuthError::PendingUnavailable);
+        }
         let mut active = self
             .active
             .lock()
@@ -229,7 +242,7 @@ impl PendingAuthorizationManager {
         if active.len() >= MAX_PENDING
             || active
                 .values()
-                .any(|a| a.user == user && a.server == server && !a.cancel.is_cancelled())
+                .any(|a| a.user == user && a.server == server)
         {
             return Err(OAuthError::PendingUnavailable);
         }
@@ -243,6 +256,12 @@ impl PendingAuthorizationManager {
             },
         );
         Ok(handle)
+    }
+    fn invalidate_error(&self, user: i64, server: &str, error: &OAuthError) {
+        match error {
+            OAuthError::UserChanged | OAuthError::Locked => self.invalidate_all(),
+            _ => self.invalidate(user, Some(server)),
+        }
     }
     pub(crate) fn invalidate(&self, user: i64, server: Option<&str>) {
         if let Ok(mut records) = self.records.lock() {
@@ -585,8 +604,7 @@ fn token_revision(
 // Freshness must never run migrations or request a second writer while save owns
 // an Immediate transaction. Open the existing database read-only, fail on lock.
 fn fresh_context(app: &AppHandle) -> Result<(Connection, Zeroizing<[u8; 32]>, i64), OAuthError> {
-    let store = crate::credential_store::CredentialStore::from_cache()
-        .ok_or(OAuthError::StoreUnavailable)?;
+    let store = crate::credential_store::CredentialStore::from_cache().ok_or(OAuthError::Locked)?;
     let root = Zeroizing::new(store.derive_user_partition_wrapping_key());
     let path = user_partitions::db_path(app).map_err(|_| OAuthError::StoreUnavailable)?;
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -642,8 +660,8 @@ pub(crate) async fn start(
             }
             Ok(())
         })();
-        if result.is_err() {
-            manager.invalidate_all();
+        if let Err(error) = &result {
+            manager.invalidate_error(user, server_id, error);
         }
         result
     };
@@ -676,8 +694,8 @@ pub(crate) async fn start(
         Ok((handle, url))
     }
     .await;
-    if result.is_err() {
-        manager.invalidate(user, Some(server_id));
+    if let Err(error) = &result {
+        manager.invalidate_error(user, server_id, error);
     }
     result
 }
@@ -732,8 +750,8 @@ pub(crate) async fn complete(
         )
         } => result,
     };
-    if result.is_err() {
-        manager.invalidate_all();
+    if let Err(error) = &result {
+        manager.invalidate_error(record.binding.user_id, &record.binding.server_id, error);
     }
     result
 }
@@ -782,8 +800,8 @@ pub(crate) async fn refresh(
             }
             Ok(())
         })();
-        if result.is_err() {
-            manager.invalidate_all();
+        if let Err(error) = &result {
+            manager.invalidate_error(user, server_id, error);
         }
         result
     };
@@ -825,8 +843,8 @@ pub(crate) async fn refresh(
         )
     }
     .await;
-    if result.is_err() {
-        manager.invalidate(user, Some(server_id));
+    if let Err(error) = &result {
+        manager.invalidate_error(user, server_id, error);
     }
     result
 }
@@ -1002,6 +1020,10 @@ mod tests {
                 .count(),
             1
         );
+        drop(Finish {
+            manager: &manager,
+            handle: &handle,
+        });
         let mut expired = record(1);
         expired.deadline = Instant::now();
         let handle = manager.insert(expired).unwrap();
@@ -1280,6 +1302,11 @@ mod tests {
                 "invalid",
             ),
             (500, r#"{"error":"invalid_grant"}"#, "other"),
+            (
+                400,
+                r#"{"error":"invalid_grant","error_codes":[70000],"timestamp":"fixture","trace_id":"fixture","correlation_id":"fixture"}"#,
+                "invalid",
+            ),
             (
                 400,
                 r#"{"error":"invalid_grant","error":"invalid_grant"}"#,
@@ -1627,5 +1654,62 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn local_oauth_errors_preserve_other_servers_and_users_while_lock_invalidates_all() {
+        for error in [
+            OAuthError::Denied,
+            OAuthError::InvalidCallback,
+            OAuthError::InvalidToken,
+            OAuthError::StaleBinding,
+            OAuthError::Http(HttpError::Cancelled),
+        ] {
+            let manager = PendingAuthorizationManager::default();
+            let affected = CancellationToken::new();
+            let other_server = CancellationToken::new();
+            let other_user = CancellationToken::new();
+            manager
+                .lease_refresh(1, "fixture", affected.clone())
+                .unwrap();
+            manager
+                .lease_refresh(1, "other-server", other_server.clone())
+                .unwrap();
+            manager
+                .lease_refresh(2, "other-server", other_user.clone())
+                .unwrap();
+            let pending = record(2);
+            let handle = manager.insert(pending).unwrap();
+            let pending = record(3);
+            let preserved_handle = manager.insert(pending).unwrap();
+            manager.invalidate_error(1, "fixture", &error);
+            assert!(affected.is_cancelled());
+            assert!(!other_server.is_cancelled());
+            assert!(!other_user.is_cancelled());
+            assert!(manager.take(&preserved_handle).is_ok());
+            assert!(manager.take(&handle).is_ok());
+            manager.invalidate_error(1, "fixture", &OAuthError::Locked);
+            assert!(other_server.is_cancelled());
+        }
+    }
+    #[test]
+    fn active_exchange_cannot_be_superseded_and_pending_authorization_blocks_refresh() {
+        let manager = PendingAuthorizationManager::default();
+        let handle = manager.insert(record(1)).unwrap();
+        let active = manager.take(&handle).unwrap();
+        assert!(manager.insert(record(1)).is_err());
+        assert!(!active.cancel.is_cancelled());
+        drop(Finish {
+            manager: &manager,
+            handle: &handle,
+        });
+        let pending_handle = manager.insert(record(1)).unwrap();
+        assert!(manager
+            .lease_refresh(1, "fixture", CancellationToken::new())
+            .is_err());
+        manager.invalidate(1, Some("fixture"));
+        assert!(manager.take(&pending_handle).is_err());
+        assert!(manager
+            .lease_refresh(1, "fixture", CancellationToken::new())
+            .is_ok());
     }
 }

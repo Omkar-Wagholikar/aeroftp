@@ -23,6 +23,7 @@ use crate::user_partitions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OAuthError {
+    Locked,
     StaleBinding,
     PendingUnavailable,
     Denied,
@@ -612,7 +613,6 @@ async fn refresh_access_token(
     checkpoint(cancel, fresh)?;
     if !status.is_success() {
         #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct TokenErrorReply {
             error: String,
             #[serde(default)]
