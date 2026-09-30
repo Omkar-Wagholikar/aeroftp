@@ -136,6 +136,7 @@ mod anthropic_messages_url_tests {
 pub enum AIProviderType {
     Google,
     OpenAI,
+    Bedrock,
     Anthropic,
     Xai,
     OpenRouter,
@@ -844,7 +845,7 @@ mod openai_compat {
         request: &AIRequest,
         endpoint: &str,
     ) -> Result<AIResponse, AIError> {
-        let url = format!("{}{}", request.base_url, endpoint);
+        let url = format!("{}{}", request.base_url.trim_end_matches('/'), endpoint);
 
         let mut headers = reqwest::header::HeaderMap::new();
 
@@ -1418,11 +1419,37 @@ pub async fn test_provider(
     provider_type: AIProviderType,
     base_url: String,
     api_key: Option<String>,
+    model: Option<String>,
 ) -> Result<bool, AIError> {
     let client = &*AI_HTTP_CLIENT;
     let api_key = clean_api_key(api_key);
 
     match provider_type {
+        AIProviderType::Bedrock => {
+            let api_key = api_key.ok_or(AIError::MissingApiKey)?;
+            let model = model.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
+                AIError::Api("Add an Amazon Bedrock model ID before testing the connection".into())
+            })?;
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            let response = client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply OK."}],
+                    "max_tokens": 1
+                }))
+                .send()
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(AIError::Api(format!(
+                    "Amazon Bedrock returned HTTP {}; check the Region, API key, and model access",
+                    status
+                )));
+            }
+            Ok(true)
+        }
         AIProviderType::Ollama => {
             // Just check if Ollama is running
             let url = format!("{}/api/tags", base_url);
@@ -1464,6 +1491,9 @@ pub async fn list_models(
     let api_key = clean_api_key(api_key);
 
     match provider_type {
+        AIProviderType::Bedrock if base_url.contains("bedrock-runtime.") => Err(AIError::Api(
+            "Amazon Bedrock Runtime does not provide GET /models; add a model ID manually".into(),
+        )),
         AIProviderType::Ollama => {
             let url = format!("{}/api/tags", base_url);
             let response = client.get(&url).send().await?;
@@ -2033,5 +2063,78 @@ mod api_key_tests {
         // reported success for a key the chat then saw rejected with 401.
         assert_eq!(provider_test_path(&AIProviderType::OpenRouter), "/key");
         assert_eq!(provider_test_path(&AIProviderType::OpenAI), "/models");
+    }
+
+    #[tokio::test]
+    async fn bedrock_runtime_requires_a_model_and_never_lists_models() {
+        let base = "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1".to_string();
+        let missing = test_provider(
+            AIProviderType::Bedrock,
+            base.clone(),
+            Some("fixture-key".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.to_string().contains("model ID"));
+
+        let catalog = list_models(AIProviderType::Bedrock, base, None)
+            .await
+            .unwrap_err();
+        assert!(catalog.to_string().contains("does not provide GET /models"));
+    }
+
+    #[tokio::test]
+    async fn bedrock_test_sends_a_bounded_chat_completion_to_the_selected_model() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut headers = String::new();
+            let length = loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(!line.is_empty());
+                if line == "\r\n" {
+                    break headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|n| n.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                }
+                headers.push_str(&line);
+            };
+            assert!(headers.starts_with("POST /openai/v1/chat/completions HTTP/1.1"));
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-key"));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "openai.gpt-oss-120b-1:0");
+            assert_eq!(body["max_tokens"], 1);
+            let mut socket = reader.into_inner();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let ok = test_provider(
+            AIProviderType::Bedrock,
+            format!("http://{addr}/openai/v1/"),
+            Some("fixture-key".into()),
+            Some("openai.gpt-oss-120b-1:0".into()),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+        peer.await.unwrap();
     }
 }

@@ -157,6 +157,13 @@
       "twin": "reģions",
       "reason": "Untranslated English rather than a stripped Latvian string, which is a different defect tracked separately."
     },
+    "lv\u001flocalTabs.newTab\u001fJauna cilne": {
+      "locale": "lv",
+      "key": "localTabs.newTab",
+      "folded": "cilne",
+      "twin": "cilnē",
+      "reason": "Jauna cilne is correct Latvian nominative for New tab; cilnē is the locative form meaning in a tab."
+    },
     "no\u001faerocryptNative.keyslotsLoad\u001fLast inn spor": {
       "locale": "no",
       "key": "aerocryptNative.keyslotsLoad",

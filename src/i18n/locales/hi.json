@@ -2614,7 +2614,9 @@
                 "openAIResponsesEnable": "संगत OpenAI मॉडल के लिए Responses सक्षम करें",
                 "routingPreferred": "पसंदीदा",
                 "routingFallback": "वैकल्पिक",
-                "routingNoFallback": "कोई नहीं"
+                "routingNoFallback": "कोई नहीं",
+                "bedrockNeedsModel": "परीक्षण करने से पहले मॉडल टैब में Bedrock मॉडल जोड़ें और सक्षम करें।",
+                "bedrockSetup": "अपने AWS क्षेत्र के लिए Runtime URL सेट करें। मॉडल में ऐसी ID जोड़ें जो Bedrock Runtime पर Chat Completions का समर्थन करती हो। Runtime मॉडल सूचीबद्ध नहीं करता। परीक्षण एक छोटा इन्फ़रेंस अनुरोध भेजता है, जिससे AWS शुल्क लग सकता है।"
             },
             "rag": {
                 "indexing": "फ़ाइलें इंडेक्स हो रही हैं...",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI प्रदाता मार्केटप्लेस",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "क्षेत्रीय API कुंजी से उपलब्ध AWS पर होस्ट किए गए मॉडल। अपना model ID मैन्युअल रूप से जोड़ें।",
+                "bedrockHighlight": "AWS क्षेत्रीय एंडपॉइंट"
             },
             "history": {
                 "cancel": "रद्द करें",

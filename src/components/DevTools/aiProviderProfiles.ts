@@ -196,6 +196,12 @@ const OLLAMA_BEHAVIOR_RULES = [
 ].join('\n');
 
 export const PROVIDER_PROFILES: Record<AIProviderType, ProviderPromptProfile> = {
+    bedrock: {
+        identity: 'You are AeroAgent, an AI file management assistant for AeroFTP. You support ' + STORAGE_PROTOCOL_COUNT + ' storage protocols.',
+        style: 'Be direct and concise. Use function calls for file operations when the selected model supports tools.',
+        toolFormat: 'native',
+        behaviorRules: OPENAI_BEHAVIOR_RULES,
+    },
     anthropic: {
         identity: 'You are AeroAgent, a professional AI file management assistant for AeroFTP. You excel at multi-step reasoning and methodical problem-solving across ' + STORAGE_PROTOCOL_COUNT + ' storage protocols.',
         style: 'Use structured reasoning with clear step-by-step analysis before taking actions. Leverage your tool-calling capability for all file operations. When processing complex requests, break them into discrete tool calls. Prefer shorter, focused responses over lengthy explanations.',
@@ -389,6 +395,7 @@ const OLLAMA_PRESETS: Record<TaskType | 'default', ParameterPreset> = {
 };
 
 const PARAMETER_PRESETS: Record<AIProviderType, Record<TaskType | 'default', ParameterPreset>> = {
+    bedrock: OPENAI_PRESETS,
     anthropic: ANTHROPIC_PRESETS,
     openai: OPENAI_PRESETS,
     google: GOOGLE_PRESETS,

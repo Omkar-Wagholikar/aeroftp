@@ -10,7 +10,7 @@ import type { PluginManifest } from '../../types/plugins';
 import { DEFAULT_MACROS } from '../DevTools/aiChatToolMacros';
 import { detectOllamaModelFamily } from '../DevTools/aiProviderProfiles';
 import { OllamaGpuMonitor } from '../DevTools/OllamaGpuMonitor';
-import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from '../DevTools/AIIcons';
+import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon, BedrockIcon } from '../DevTools/AIIcons';
 import { AIProvider, AIModel, AISettings, AIProviderType, PROVIDER_PRESETS, DEFAULT_MODELS, generateId, getDefaultAISettings } from '../../types/ai';
 import { logger } from '../../utils/logger';
 import './AISettingsPanel.css';
@@ -36,6 +36,8 @@ const getProviderIcon = (type: AIProviderType): React.ReactNode => {
             return <GeminiIcon size={16} />;
         case 'openai':
             return <OpenAIIcon size={16} />;
+        case 'bedrock':
+            return <BedrockIcon size={16} />;
         case 'anthropic':
             return <AnthropicIcon size={16} />;
         case 'xai':
@@ -520,10 +522,18 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                 throw new Error('API key required');
             }
 
+            const model = provider.type === 'bedrock'
+                ? settings.models.find((m) => m.providerId === provider.id && m.isEnabled)?.name
+                : undefined;
+            if (provider.type === 'bedrock' && !model) {
+                throw new Error(t('ai.settings.bedrockNeedsModel'));
+            }
+
             const result = await invoke<boolean>('ai_test_provider', {
                 providerType: provider.type,
                 baseUrl: provider.baseUrl,
                 apiKey: provider.apiKey || null,
+                model: model || null,
             });
 
             if (result) {
@@ -941,10 +951,10 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                                                                 {testingProvider === provider.id ? <span className="animate-spin">⏳</span> : <Zap size={14} />}
                                                                 {t('ai.settings.test')}
                                                             </button>
-                                                            <button onClick={() => fetchProviderModels(provider)} disabled={fetchingModels === provider.id || (!provider.apiKey && provider.type !== 'ollama')} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg text-sm flex items-center gap-2 transition-colors whitespace-nowrap" title={t('ai.settings.browseModels')}>
+                                                            {!(provider.type === 'bedrock' && provider.baseUrl.includes('bedrock-runtime.')) && <button onClick={() => fetchProviderModels(provider)} disabled={fetchingModels === provider.id || (!provider.apiKey && provider.type !== 'ollama')} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded-lg text-sm flex items-center gap-2 transition-colors whitespace-nowrap" title={t('ai.settings.browseModels')}>
                                                                 {fetchingModels === provider.id ? <span className="animate-spin">⏳</span> : <List size={14} />}
                                                                 {t('ai.settings.fetchModels')}
-                                                            </button>
+                                                            </button>}
                                                             {provider.type === 'ollama' && (
                                                                 <button onClick={() => detectOllamaModels(provider)} disabled={detectingModels === provider.id} className="px-4 py-2 bg-cyan-600 hover:bg-cyan-700 disabled:opacity-50 rounded-lg text-sm flex items-center gap-2 transition-colors whitespace-nowrap" title="Auto-detect available Ollama models">
                                                                     {detectingModels === provider.id ? <span className="animate-spin">⏳</span> : <span>🔍</span>}
@@ -1063,6 +1073,9 @@ export const AISettingsPanel: React.FC<AISettingsPanelProps> = ({ isOpen, onClos
                                                     </div>
 
                                                     {/* Models for this provider */}
+                                                    {provider.type === 'bedrock' && (
+                                                        <p className="text-xs text-amber-300">{t('ai.settings.bedrockSetup')}</p>
+                                                    )}
                                                     <div>
                                                         <label className="block text-sm text-gray-400 mb-2">
                                                             <Cpu size={12} className="inline mr-1" />

@@ -11,10 +11,12 @@ export interface MarketplaceProvider {
     type: AIProviderType;
     name: string;
     description: string;
+    descriptionKey?: string;
     category: MarketplaceCategory;
     features: ProviderFeature[];
     pricingTier: 'free' | 'freemium' | 'paid';
     highlight?: string;
+    highlightKey?: string;
 }
 
 export const MARKETPLACE_CATEGORIES: { id: MarketplaceCategory | 'all'; i18nKey: string; fallback: string }[] = [
@@ -37,6 +39,17 @@ export const MARKETPLACE_PROVIDERS: MarketplaceProvider[] = [
         features: ['streaming', 'tools', 'vision', 'thinking'],
         pricingTier: 'paid',
         highlight: 'Most capable models',
+    },
+    {
+        type: 'bedrock',
+        name: 'Amazon Bedrock',
+        description: 'AWS-hosted models with regional API key access. Add your model ID manually.',
+        descriptionKey: 'ai.marketplace.bedrockDescription',
+        category: 'gateway',
+        features: ['streaming'],
+        pricingTier: 'paid',
+        highlight: 'AWS regional endpoint',
+        highlightKey: 'ai.marketplace.bedrockHighlight',
     },
     {
         type: 'anthropic',

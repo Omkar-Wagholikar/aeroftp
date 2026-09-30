@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Omogoči Responses za združljive modele OpenAI",
                 "routingPreferred": "Prednostni",
                 "routingFallback": "Rezervni",
-                "routingNoFallback": "Brez"
+                "routingNoFallback": "Brez",
+                "bedrockNeedsModel": "Pred preizkusom dodajte in omogočite model Bedrock na zavihku Modeli.",
+                "bedrockSetup": "Nastavite Runtime URL za svojo regijo AWS. Na zavihku Modeli dodajte ID, ki podpira Chat Completions v Bedrock Runtime. Runtime ne prikaže seznama modelov. Preizkus pošlje majhno zahtevo za sklepanje, ki lahko povzroči stroške AWS."
             },
             "copy": "Kopiraj",
             "attachImage": "Priloži sliko",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Tržnica ponudnikov AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modeli, gostovani v AWS, z dostopom prek regionalnega ključa API. Svoj model ID dodajte ročno.",
+                "bedrockHighlight": "Regionalna končna točka AWS"
             },
             "history": {
                 "cancel": "Preklic",

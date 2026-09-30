@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "为兼容的 OpenAI 模型启用 Responses",
                 "routingPreferred": "首选",
                 "routingFallback": "备用",
-                "routingNoFallback": "无"
+                "routingNoFallback": "无",
+                "bedrockNeedsModel": "测试前，请在模型选项卡中添加并启用 Bedrock 模型。",
+                "bedrockSetup": "设置您的 AWS 区域的 Runtime URL。在模型中添加支持 Bedrock Runtime 上 Chat Completions 的 ID。Runtime 不会列出模型。测试会发送一个小型推理请求，可能产生 AWS 费用。"
             },
             "copy": "复制",
             "attachImage": "附加图片",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI 提供商市场",
                 "tools": "工具",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "托管在 AWS 上的模型，可通过区域 API 密钥访问。请手动添加您的 model ID。",
+                "bedrockHighlight": "AWS 区域端点"
             },
             "history": {
                 "cancel": "取消",

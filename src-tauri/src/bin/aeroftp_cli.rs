@@ -27041,6 +27041,7 @@ fn list_ai_models(cli: &Cli, format: OutputFormat) -> i32 {
     let env_var_for = |ptype: &str| -> &str {
         match ptype {
             "openai" => "OPENAI_API_KEY",
+            "bedrock" => "AWS_BEARER_TOKEN_BEDROCK",
             "anthropic" => "ANTHROPIC_API_KEY",
             "google" => "GEMINI_API_KEY",
             "xai" => "XAI_API_KEY",
@@ -27113,18 +27114,27 @@ fn list_ai_models(cli: &Cli, format: OutputFormat) -> i32 {
                         "env"
                     };
 
-                    // Find the active model from settings
+                    // Prefer the saved default model; legacy settings used isActive.
                     let active_model =
                         settings
                             .get("models")
                             .and_then(|m| m.as_array())
                             .and_then(|models| {
-                                models.iter().find(|m| {
+                                let enabled = |m: &&serde_json::Value| {
                                     m.get("providerId").and_then(|v| v.as_str()) == Some(id)
-                                        && m.get("isActive")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false)
-                                })
+                                        && m.get("isEnabled").and_then(|v| v.as_bool())
+                                            != Some(false)
+                                };
+                                models
+                                    .iter()
+                                    .find(|m| {
+                                        enabled(m)
+                                            && (m.get("isDefault").and_then(|v| v.as_bool())
+                                                == Some(true)
+                                                || m.get("isActive").and_then(|v| v.as_bool())
+                                                    == Some(true))
+                                    })
+                                    .or_else(|| models.iter().find(enabled))
                             });
                     let model_name = active_model
                         .and_then(|m| m.get("name").and_then(|v| v.as_str()))
@@ -67185,6 +67195,7 @@ fn default_model(provider: &str) -> &'static str {
     match provider {
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
+        "bedrock" => "",
         "gemini" => "gemini-2.0-flash",
         "xai" => "grok-3",
         "ollama" => "llama3.1",
@@ -67207,6 +67218,7 @@ fn provider_type_from_name(name: &str) -> ftp_client_gui_lib::ai::AIProviderType
     match name {
         "anthropic" => AIProviderType::Anthropic,
         "openai" => AIProviderType::OpenAI,
+        "bedrock" => AIProviderType::Bedrock,
         "gemini" | "google" => AIProviderType::Google,
         "xai" => AIProviderType::Xai,
         "ollama" => AIProviderType::Ollama,
@@ -69022,12 +69034,17 @@ async fn cmd_agent(
 ) -> i32 {
     // Detect provider
     let (prov_name, api_key, base_url) = if let Some(ref name) = provider_name {
-        let env_key = format!("{}_API_KEY", name.to_uppercase());
+        let env_key = if name == "bedrock" {
+            "AWS_BEARER_TOKEN_BEDROCK".to_string()
+        } else {
+            format!("{}_API_KEY", name.to_uppercase())
+        };
         let key =
             ftp_client_gui_lib::ai::clean_api_key(std::env::var(&env_key).ok()).unwrap_or_default();
         let url = match name.as_str() {
             "anthropic" => "https://api.anthropic.com/v1",
             "openai" => "https://api.openai.com/v1",
+            "bedrock" => "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1",
             "gemini" | "google" => "https://generativelanguage.googleapis.com",
             "ollama" => "http://localhost:11434",
             "groq" => "https://api.groq.com/openai/v1",
@@ -69082,6 +69099,12 @@ async fn cmd_agent(
     // Ensure vault is open for server_list_saved/server_exec tools (even when provider came from env)
     let _ = open_vault(_cli);
 
+    if prov_name == "bedrock" && model_override.as_deref().unwrap_or("").trim().is_empty() {
+        eprintln!(
+            "Error: Amazon Bedrock requires --model with an exact model or inference profile ID."
+        );
+        return 5;
+    }
     let model = model_override.unwrap_or_else(|| default_model(&prov_name).to_string());
     let provider_type = provider_type_from_name(&prov_name);
     let approve_level = parse_approve_level(&auto_approve);

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Activați Responses pentru modelele OpenAI compatibile",
                 "routingPreferred": "Preferat",
                 "routingFallback": "Rezervă",
-                "routingNoFallback": "Niciunul"
+                "routingNoFallback": "Niciunul",
+                "bedrockNeedsModel": "Adăugați și activați un model Bedrock în fila Modele înainte de testare.",
+                "bedrockSetup": "Setați Runtime URL pentru regiunea dvs. AWS. În fila Modele, adăugați un ID care acceptă Chat Completions pe Bedrock Runtime. Runtime nu afișează o listă de modele. Testul trimite o mică solicitare de inferență care poate genera costuri AWS."
             },
             "copy": "Copiază",
             "attachImage": "Atașează imagine",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marketplace Furnizori AI",
                 "tools": "Instrumente",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modele găzduite pe AWS, cu acces prin cheie API regională. Adăugați manual model ID.",
+                "bedrockHighlight": "Punct final regional AWS"
             },
             "history": {
                 "cancel": "Anulează",

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Responses-ის ჩართვა თავსებადი OpenAI მოდელებისთვის",
                 "routingPreferred": "სასურველი",
                 "routingFallback": "სარეზერვო",
-                "routingNoFallback": "არცერთი"
+                "routingNoFallback": "არცერთი",
+                "bedrockNeedsModel": "ტესტირებამდე მოდელები ჩანართში დაამატეთ და ჩართეთ Bedrock მოდელი.",
+                "bedrockSetup": "დააყენეთ Runtime URL თქვენი AWS რეგიონისთვის. მოდელები ჩანართში დაამატეთ ID, რომელსაც Bedrock Runtime-ზე Chat Completions-ის მხარდაჭერა აქვს. Runtime მოდელების სიას არ აჩვენებს. ტესტი აგზავნის მცირე ინფერენციის მოთხოვნას, რამაც შეიძლება AWS-ის საფასური გამოიწვიოს."
             },
             "copy": "კოპირება",
             "attachImage": "სურათის მიმაგრება",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI პროვაიდერების მარკეტპლეისი",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS-ზე განთავსებული მოდელები რეგიონული API გასაღებით წვდომით. ხელით დაამატეთ თქვენი model ID.",
+                "bedrockHighlight": "AWS-ის რეგიონული საბოლოო წერტილი"
             },
             "history": {
                 "cancel": "გაუქმება",

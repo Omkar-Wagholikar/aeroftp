@@ -2560,7 +2560,9 @@
                 "openAIResponsesEnable": "互換性のあるOpenAIモデルでResponsesを有効にする",
                 "routingPreferred": "優先",
                 "routingFallback": "フォールバック",
-                "routingNoFallback": "なし"
+                "routingNoFallback": "なし",
+                "bedrockNeedsModel": "テストする前に、モデル タブで Bedrock モデルを追加して有効にしてください。",
+                "bedrockSetup": "AWS リージョンの Runtime URL を設定してください。モデル で、Bedrock Runtime の Chat Completions に対応する ID を追加してください。Runtime はモデルを一覧表示しません。テストでは小さな推論リクエストを送信するため、AWS の料金が発生する場合があります。"
             },
             "copy": "コピー",
             "attachImage": "画像を添付",
@@ -2902,7 +2904,9 @@
                 "thinking": "Thinking",
                 "title": "AIプロバイダーマーケットプレイス",
                 "tools": "ツール",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "リージョン別の API キーでアクセスできる AWS ホストのモデルです。model ID を手動で追加してください。",
+                "bedrockHighlight": "AWS リージョンのエンドポイント"
             },
             "history": {
                 "cancel": "キャンセル",

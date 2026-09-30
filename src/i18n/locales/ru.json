@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Включить Responses для совместимых моделей OpenAI",
                 "routingPreferred": "Предпочтительная",
                 "routingFallback": "Запасная",
-                "routingNoFallback": "Нет"
+                "routingNoFallback": "Нет",
+                "bedrockNeedsModel": "Перед проверкой добавьте и включите модель Bedrock на вкладке Модели.",
+                "bedrockSetup": "Укажите Runtime URL для вашего региона AWS. На вкладке Модели добавьте ID, поддерживающий Chat Completions в Bedrock Runtime. Runtime не показывает список моделей. Тест отправляет небольшой запрос на вывод, за который AWS может взимать плату."
             },
             "copy": "Копировать",
             "attachImage": "Прикрепить изображение",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Маркетплейс провайдеров ИИ",
                 "tools": "Инструменты",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Модели, размещённые в AWS, с доступом по региональному ключу API. Добавьте свой model ID вручную.",
+                "bedrockHighlight": "Региональная конечная точка AWS"
             },
             "history": {
                 "cancel": "Отмена",

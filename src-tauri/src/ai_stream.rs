@@ -381,7 +381,10 @@ async fn stream_openai(
     stream_id: &str,
     cancel: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/chat/completions", request.base_url);
+    let url = format!(
+        "{}/chat/completions",
+        request.base_url.trim_end_matches('/')
+    );
     let api_key = request.api_key.as_ref().ok_or("Missing API key")?;
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -467,7 +470,7 @@ async fn stream_openai(
     // Note: some providers (Cohere, Perplexity) reject unknown fields like stream_options
     let supports_stream_options = !matches!(
         request.provider_type,
-        AIProviderType::Cohere | AIProviderType::Perplexity
+        AIProviderType::Cohere | AIProviderType::Perplexity | AIProviderType::Bedrock
     );
     if supports_stream_options {
         body["stream_options"] = serde_json::json!({ "include_usage": true });

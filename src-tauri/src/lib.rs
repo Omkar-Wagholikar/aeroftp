@@ -14894,8 +14894,9 @@ async fn ai_test_provider(
     provider_type: ai::AIProviderType,
     base_url: String,
     api_key: Option<String>,
+    model: Option<String>,
 ) -> Result<bool, String> {
-    ai::test_provider(provider_type, base_url, api_key)
+    ai::test_provider(provider_type, base_url, api_key, model)
         .await
         .map_err(|e| e.to_string())
 }

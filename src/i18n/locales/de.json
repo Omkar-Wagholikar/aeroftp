@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Responses für kompatible OpenAI-Modelle aktivieren",
                 "routingPreferred": "Bevorzugt",
                 "routingFallback": "Ersatz",
-                "routingNoFallback": "Keiner"
+                "routingNoFallback": "Keiner",
+                "bedrockNeedsModel": "Fügen Sie vor dem Testen auf der Registerkarte Modelle ein Bedrock-Modell hinzu und aktivieren Sie es.",
+                "bedrockSetup": "Legen Sie die Runtime URL für Ihre AWS-Region fest. Fügen Sie unter Modelle eine ID hinzu, die Chat Completions auf Bedrock Runtime unterstützt. Runtime listet keine Modelle auf. Der Test sendet eine kleine Inferenzanfrage, für die AWS Gebühren berechnen kann."
             },
             "copy": "Kopieren",
             "attachImage": "Bild anhängen",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "KI-Anbieter Marketplace",
                 "tools": "Werkzeuge",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Auf AWS gehostete Modelle mit Zugriff über einen regionalen API-Schlüssel. Fügen Sie Ihre model ID manuell hinzu.",
+                "bedrockHighlight": "Regionaler AWS-Endpunkt"
             },
             "history": {
                 "cancel": "Abbrechen",

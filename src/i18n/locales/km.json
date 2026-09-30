@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "បើក Responses សម្រាប់ម៉ូដែល OpenAI ដែលត្រូវគ្នា",
                 "routingPreferred": "ដែលពេញចិត្ត",
                 "routingFallback": "បម្រុង",
-                "routingNoFallback": "គ្មាន"
+                "routingNoFallback": "គ្មាន",
+                "bedrockNeedsModel": "បន្ថែម និងបើកម៉ូដែល Bedrock នៅផ្ទាំង ម៉ូដែល មុនពេលសាកល្បង។",
+                "bedrockSetup": "កំណត់ Runtime URL សម្រាប់តំបន់ AWS របស់អ្នក។ នៅក្នុង ម៉ូដែល បន្ថែម ID ដែលគាំទ្រ Chat Completions លើ Bedrock Runtime។ Runtime មិនបង្ហាញបញ្ជីម៉ូដែលទេ។ ការសាកល្បងផ្ញើសំណើអនុមានតូចមួយ ដែលអាចបណ្តាលឱ្យមានការគិតថ្លៃពី AWS។"
             },
             "copy": "ចម្លង",
             "attachImage": "ភ្ជប់រូបភាព",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "ស្តុកអ្នកផ្តល់ AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "ម៉ូដែលដែលបង្ហោះលើ AWS អាចចូលប្រើដោយសោ API តាមតំបន់។ បន្ថែម model ID របស់អ្នកដោយដៃ។",
+                "bedrockHighlight": "ចំណុចបញ្ចប់តាមតំបន់ AWS"
             },
             "history": {
                 "cancel": "បោះបង់",

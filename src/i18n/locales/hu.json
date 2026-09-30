@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Responses engedélyezése kompatibilis OpenAI-modellekhez",
                 "routingPreferred": "Elsődleges",
                 "routingFallback": "Tartalék",
-                "routingNoFallback": "Nincs"
+                "routingNoFallback": "Nincs",
+                "bedrockNeedsModel": "A tesztelés előtt adjon hozzá és engedélyezzen egy Bedrock-modellt a(z) Modellek lapon.",
+                "bedrockSetup": "Állítsa be az AWS-régió Runtime URL címét. A(z) Modellek lapon adjon hozzá egy ID azonosítót, amely támogatja a Chat Completions funkciót a Bedrock Runtime szolgáltatásban. A Runtime nem sorolja fel a modelleket. A teszt egy kis következtetési kérést küld, amely AWS-díjakkal járhat."
             },
             "copy": "Másolás",
             "attachImage": "Kép csatolása",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI szolgáltató piactér",
                 "tools": "Eszközök",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS-en tárolt modellek regionális API-kulcsos hozzáféréssel. Adja hozzá kézzel a model ID értékét.",
+                "bedrockHighlight": "AWS regionális végpont"
             },
             "history": {
                 "cancel": "Mégse",
