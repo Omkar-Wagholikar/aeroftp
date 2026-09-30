@@ -1,7 +1,7 @@
 # AeroFTP CLI - User Guide
 
 > **Binary**: `aeroftp-cli` (ships alongside the GUI)
-> **Version reference**: v4.2.0 - last reviewed 19 September 2026
+> **Version reference**: v4.2.1 - last reviewed 30 September 2026
 > **License**: GPL-3.0
 
 ---

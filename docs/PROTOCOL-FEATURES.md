@@ -1,7 +1,7 @@
 # AeroFTP Protocol Features Matrix
 
-> Last Updated: 19 September 2026
-> Version: v4.2.0
+> Last Updated: 30 September 2026
+> Version: v4.2.1
 >
 > **Note**: AeroFTP organizes integrations on three tiers:
 >
