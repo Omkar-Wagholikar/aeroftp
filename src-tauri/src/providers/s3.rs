@@ -509,7 +509,7 @@ impl S3Provider {
         }
         let xml = String::from_utf8(bytes)
             .map_err(|_| ProviderError::ParseError("Worker S3 list is not UTF-8".into()))?;
-        let (mut entries, next) = self.parse_list_response(&xml, false)?;
+        let (entries, next) = self.parse_list_response(&xml, false)?;
         if entries.iter().any(|entry| {
             !entry
                 .path
@@ -520,10 +520,18 @@ impl S3Provider {
                 "Worker S3 list escaped its prefix".into(),
             ));
         }
-        let truncated = next.is_some() || entries.len() >= max_entries;
-        entries.truncate(max_entries);
-        Ok((entries, truncated))
+        Ok(Self::finish_worker_page(entries, next, max_entries))
     }
+    fn finish_worker_page(
+        mut entries: Vec<RemoteEntry>,
+        next: Option<String>,
+        max_entries: usize,
+    ) -> (Vec<RemoteEntry>, bool) {
+        let truncated = next.is_some() || entries.len() > max_entries;
+        entries.truncate(max_entries);
+        (entries, truncated)
+    }
+
     /// Create a new S3 provider with the given configuration
     pub fn new(config: S3Config) -> Result<Self, ProviderError> {
         debug!(
@@ -8350,6 +8358,26 @@ mod tests {
             allow_cleartext_endpoint: false,
         })
         .expect("Failed to create S3Provider")
+    }
+
+    #[test]
+    fn bounded_worker_page_distinguishes_exact_cap_from_sentinel() {
+        let provider = trim_text_test_provider();
+        for (count, token, truncated) in [(2, false, false), (3, false, true), (2, true, true)] {
+            let contents = (0..count)
+                .map(|n| format!("<Contents><Key>root/{n}.txt</Key><Size>1</Size></Contents>"))
+                .collect::<String>();
+            let next = if token {
+                "<NextContinuationToken>more</NextContinuationToken>"
+            } else {
+                ""
+            };
+            let xml = format!("<ListBucketResult>{contents}{next}</ListBucketResult>");
+            let (entries, next) = provider.parse_list_response(&xml, false).unwrap();
+            let (entries, actual) = S3Provider::finish_worker_page(entries, next, 2);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(actual, truncated);
+        }
     }
 
     /// CR-536 regression: a whitespace-ONLY Text fragment is indentation

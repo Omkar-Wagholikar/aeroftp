@@ -30,6 +30,7 @@ import { ToolMacro, resolveMacroSteps, DEFAULT_MACROS, MAX_TOTAL_MACRO_STEPS, cr
 import { buildToolRegistry, resolveRegisteredTool, resolveMacroStep, ToolExposure, TOOL_EXPOSURE_GUIDE, assertToolExecutionCurrent, recordToolDispatch } from './aiChatToolRegistry';
 import { validateToolArgs } from './aiChatToolValidation';
 import { computeTokenInfo } from './aiChatTokenInfo';
+import { runBudgetedDelegation } from './aiChatDelegationBudget';
 import { delegationCardEntries } from './aiChatDelegationCards';
 import { useAIChatImages } from './useAIChatImages';
 import { useAIChatConversations } from './useAIChatConversations';
@@ -2257,14 +2258,21 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             const activeModel = resolveRoutedModels(selectedModel, settings, goal).primary;
             if (!activeModel) throw new Error(t('ai.noModelsConfigured'));
             if (activeDelegationIdRef.current !== requestId) return;
-            const result = await invoke<DelegationResult>('ai_delegate_local', {
-                requestId,
-                providerId: activeModel.providerId,
-                modelName: activeModel.modelName,
-                root: localPath,
-                goal,
-                remoteProfiles: remoteProfiles.map(profile => ({ profileId: profile.id, root: profile.root })),
-            });
+            const provider = settings.providers.find(item => item.id === activeModel.providerId);
+            if (!provider) throw new Error(t('ai.noModelsConfigured'));
+            const configuredModel = settings.models.find(item => item.id === activeModel.modelId);
+            const modelDef = configuredModel ? resolveProviderModel(configuredModel, provider) : undefined;
+            const { result, tokenInfo } = await runBudgetedDelegation(
+                activeModel.providerId, modelDef, activeConversationId || undefined,
+                () => invoke<DelegationResult>('ai_delegate_local', {
+                    requestId,
+                    providerId: activeModel.providerId,
+                    modelName: activeModel.modelName,
+                    root: localPath,
+                    goal,
+                    remoteProfiles: remoteProfiles.map(profile => ({ profileId: profile.id, root: profile.root })),
+                }), setBudgetCheck,
+            );
             if (activeDelegationIdRef.current !== requestId) return;
             if (cancelRequestedDelegationIdRef.current === requestId) {
                 setDelegationView(previous => previous?.requestId === requestId
@@ -2280,11 +2288,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
                     providerName: activeModel.providerName,
                     providerType: activeModel.providerType,
                 },
-                tokenInfo: {
-                    inputTokens: result.inputTokens,
-                    outputTokens: result.outputTokens,
-                    totalTokens: result.inputTokens + result.outputTokens,
-                },
+                tokenInfo,
             }]);
         } catch (error) {
             if (activeDelegationIdRef.current !== requestId) return;

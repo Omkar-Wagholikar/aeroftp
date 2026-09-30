@@ -489,3 +489,23 @@ async fn pending_http_is_dropped_but_tool_work_is_awaited_to_quiescence() {
         assert!(*adapter.dropped.lock().unwrap());
     }
 }
+
+#[test]
+fn parent_conservative_admission_excludes_api_key_bytes() {
+    let mut request = template();
+    request.max_tokens = Some(64);
+    request.api_key = None;
+    request.messages = vec![message("user", "UTF-8 evidence: è界".into())];
+    let without_key = shared_ledger(1);
+    let first = ParentRequestReservation::new(&without_key, &request).unwrap();
+    let baseline = without_key.snapshot().unwrap().0.input_tokens;
+    request.api_key = Some("secret-key".repeat(10_000));
+    let with_key = shared_ledger(1);
+    let second = ParentRequestReservation::new(&with_key, &request).unwrap();
+    assert_eq!(with_key.snapshot().unwrap().0.input_tokens, baseline);
+    assert!(baseline >= request.messages[0].content.len() as u64);
+    drop(first);
+    drop(second);
+    without_key.finish(ledger::Terminal::Completed).unwrap();
+    with_key.finish(ledger::Terminal::Completed).unwrap();
+}

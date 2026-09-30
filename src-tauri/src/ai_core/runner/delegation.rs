@@ -94,6 +94,8 @@ fn message(role: &str, content: String) -> ChatMessage {
 
 fn limits() -> Limits {
     Limits {
+        // 200 KiB-scale conservative aggregate input reservation ceiling,
+        // including serialized messages/tools, deliberately not 200k BPE tokens.
         input_tokens: 200_000,
         output_tokens: 12_000,
         requests: 8,

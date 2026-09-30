@@ -66,6 +66,10 @@ struct ParentRequestReservation {
 
 impl ParentRequestReservation {
     fn new(ledger: &Ledger, request: &AIRequest) -> Result<Self, String> {
+        // Admission is intentionally conservative: one input reservation unit
+        // per serialized UTF-8 byte, not a provider tokenizer estimate. The
+        // shared limit is sized as a byte ceiling; known provider tokens replace
+        // this upper reservation on settlement. No guessed bytes/token divisor.
         // The model key is excluded before estimating the serialized prompt.
         // Its temporary clone is wiped rather than left in a JSON buffer.
         let mut budget_request = request.clone();

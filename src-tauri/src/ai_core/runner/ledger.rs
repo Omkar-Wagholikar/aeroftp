@@ -12,6 +12,10 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    /// Conservative admission units: parent requests reserve serialized UTF-8
+    /// bytes; worker callers supply worst-case input ceilings. Known provider
+    /// tokens replace reservations at settlement, unknown usage retains them.
+    /// Size this as a byte-based upper bound, not a model context-window size.
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub requests: u64,
