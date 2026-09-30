@@ -62,6 +62,8 @@ mod localhost_security;
 mod mcp_client_commands;
 pub mod mcp_client_config;
 pub mod mcp_client_framing;
+#[allow(dead_code)] // HTTP configuration is private until transport and approval are wired.
+mod mcp_client_http_config;
 pub mod mcp_client_protocol;
 // Backend-only gate until approved process isolation and runtime wiring.
 #[allow(dead_code)]
