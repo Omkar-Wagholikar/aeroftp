@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::mcp_client_config::{McpServerConfig, ResolvedMcpEnvironment};
 use crate::mcp_client_framing::{FrameError, McpLineDecoder, MAX_MCP_FRAME_BYTES};
 use crate::mcp_client_protocol::{self as protocol, Era, ProbeReply, ProbeVerdict, ProtocolError};
+use crate::mcp_client_sandbox::{self, SandboxError};
 
 const CLIENT_NAME: &str = "AeroFTP";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,6 +27,7 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) enum TransportError {
     InvalidConfig,
     Spawn,
+    SandboxUnavailable,
     Io,
     Frame(FrameError),
     Protocol(ProtocolError),
@@ -87,8 +89,18 @@ impl Peer {
         if !config.env.keys().eq(env.vars.keys()) {
             return Err(TransportError::InvalidConfig);
         }
-        let mut command = Command::new(&config.command);
-        command.args(&config.args).env_clear();
+        let mut command =
+            mcp_client_sandbox::peer_command(config).map_err(|error| match error {
+                SandboxError::Unavailable => TransportError::SandboxUnavailable,
+                SandboxError::InvalidPath => TransportError::InvalidConfig,
+            })?;
+        command.env_clear();
+        #[cfg(target_os = "linux")]
+        command
+            .env("HOME", "/tmp")
+            .env("XDG_CONFIG_HOME", "/tmp/.config")
+            .env("XDG_DATA_HOME", "/tmp/.local/share")
+            .env("TMPDIR", "/tmp");
         for (name, secret) in &env.vars {
             command.env(name, secret.as_str());
         }
@@ -236,6 +248,7 @@ pub(crate) struct StdioSupervisor {
     era: Era,
     next_id: u64,
     restarts: u8,
+    restart_enabled: bool,
     limits: Limits,
 }
 
@@ -283,8 +296,14 @@ impl StdioSupervisor {
             era,
             next_id: 3,
             restarts: 0,
+            restart_enabled: true,
             limits,
         })
+    }
+
+    /// One-shot dispatches have no later request to benefit from a restart.
+    pub(crate) fn disable_restart(&mut self) {
+        self.restart_enabled = false;
     }
 
     pub(crate) fn era(&self) -> Era {
@@ -326,6 +345,9 @@ impl StdioSupervisor {
                 error,
                 TransportError::Eof | TransportError::Io | TransportError::Timeout
             ) {
+                if !self.restart_enabled {
+                    return Err(error);
+                }
                 if self.restarts == 1 {
                     return Err(TransportError::RestartExhausted);
                 }

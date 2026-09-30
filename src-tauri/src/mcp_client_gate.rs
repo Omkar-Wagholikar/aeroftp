@@ -415,6 +415,31 @@ pub(crate) async fn authorize(
     .await
 }
 
+/// Reopen the active-user store at each dispatch boundary. A grant cannot be
+/// kept alive across account, config, or secret changes by retaining the
+/// previously resolved environment.
+pub(crate) fn revalidate_for_dispatch(
+    app: &AppHandle,
+    revision_key: &[u8; 32],
+    request: &GateRequest,
+    authorized_user_id: i64,
+    authorized_revision: &str,
+) -> Result<(), GateError> {
+    let (conn, root_key, _) =
+        mcp_client_commands::context(app).map_err(|_| GateError::UserUnavailable)?;
+    let store = SqliteStore {
+        conn: &conn,
+        root_key: &root_key,
+    };
+    let current = preflight(&store, revision_key, request)?;
+    if current.user_id != authorized_user_id
+        || current.environment.effective_revision != authorized_revision
+    {
+        return Err(GateError::StaleRevision);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
