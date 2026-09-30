@@ -13,18 +13,20 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::mcp_client_commands;
 use crate::mcp_client_http_config::{parse_public_https, McpHttpAuth, McpHttpServerConfig};
 use crate::mcp_client_http_transport::{self, AuthChallenge, HttpError, MAX_REPLY_BYTES};
 use crate::user_partitions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OAuthError {
+    StaleBinding,
+    PendingUnavailable,
+    Denied,
+    InvalidGrant,
     InvalidMetadata,
     AmbiguousIssuer,
     RegistrationRequired,
@@ -252,17 +254,25 @@ fn validate_authorization_server(
     })
 }
 
-async fn get_json(url: &Url, cancel: &CancellationToken) -> Result<Option<Value>, OAuthError> {
-    let client = mcp_client_http_transport::pinned_client(url, cancel).await?;
+async fn get_json(
+    url: &Url,
+    cancel: &CancellationToken,
+    fresh: &mut impl FnMut() -> Result<(), OAuthError>,
+) -> Result<Option<Value>, OAuthError> {
+    checkpoint(cancel, fresh)?;
+    let client = oauth_client(url, cancel).await?;
+    checkpoint(cancel, fresh)?;
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(HttpError::Cancelled.into()),
-        result = client.get(url.clone()).header(ACCEPT, "application/json").send() =>
+        result = client.get(wire_url(url)).header(ACCEPT, "application/json").send() =>
             result.map_err(|_| HttpError::Connect)?,
     };
+    checkpoint(cancel, fresh)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
+    checkpoint(cancel, fresh)?;
     if response.status().is_redirection() {
         return Err(HttpError::Redirect.into());
     }
@@ -270,6 +280,7 @@ async fn get_json(url: &Url, cancel: &CancellationToken) -> Result<Option<Value>
         return Err(OAuthError::InvalidMetadata);
     }
     let bytes = mcp_client_http_transport::bounded_body(response, cancel).await?;
+    checkpoint(cancel, fresh)?;
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|_| OAuthError::InvalidMetadata)
@@ -279,8 +290,13 @@ pub(crate) async fn discover(
     config: &McpHttpServerConfig,
     challenge: &AuthChallenge,
     cancel: &CancellationToken,
+    fresh: &mut impl FnMut() -> Result<(), OAuthError>,
 ) -> Result<(ProtectedResource, AuthorizationServer), OAuthError> {
     config.validate().map_err(|_| OAuthError::InvalidMetadata)?;
+    if !config.enabled || !matches!(config.auth, McpHttpAuth::OAuth { .. }) {
+        return Err(OAuthError::StaleBinding);
+    }
+    checkpoint(cancel, fresh)?;
     let endpoint =
         parse_public_https(&config.endpoint, 2048).map_err(|_| OAuthError::InvalidMetadata)?;
     let candidates = if let Some(raw) = &challenge.metadata_url {
@@ -294,7 +310,7 @@ pub(crate) async fn discover(
     };
     let mut resource = None;
     for url in candidates {
-        if let Some(document) = get_json(&url, cancel).await? {
+        if let Some(document) = get_json(&url, cancel, fresh).await? {
             resource = Some(validate_protected_metadata(&document, &endpoint)?);
             break;
         }
@@ -308,11 +324,12 @@ pub(crate) async fn discover(
         parse_public_https(issuer_raw, 2048).map_err(|_| OAuthError::InvalidMetadata)?;
     let mut server = None;
     for url in issuer_metadata_paths(&issuer_url) {
-        if let Some(document) = get_json(&url, cancel).await? {
+        if let Some(document) = get_json(&url, cancel, fresh).await? {
             server = Some(validate_authorization_server(&document, issuer_raw)?);
             break;
         }
     }
+    checkpoint(cancel, fresh)?;
     Ok((resource, server.ok_or(OAuthError::InvalidMetadata)?))
 }
 
@@ -344,17 +361,20 @@ pub(crate) async fn register_dynamic(
     server: &AuthorizationServer,
     redirect_uri: &str,
     cancel: &CancellationToken,
+    fresh: &mut impl FnMut() -> Result<(), OAuthError>,
 ) -> Result<String, OAuthError> {
     let endpoint = server
         .registration_endpoint
         .as_ref()
         .ok_or(OAuthError::RegistrationRequired)?;
     validate_redirect_uri(redirect_uri)?;
-    let client = mcp_client_http_transport::pinned_client(endpoint, cancel).await?;
+    checkpoint(cancel, fresh)?;
+    let client = oauth_client(endpoint, cancel).await?;
+    checkpoint(cancel, fresh)?;
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(HttpError::Cancelled.into()),
-        result = client.post(endpoint.clone()).json(&json!({
+        result = client.post(wire_url(endpoint)).json(&json!({
             "redirect_uris": [redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
@@ -362,6 +382,7 @@ pub(crate) async fn register_dynamic(
             "client_name": "AeroFTP"
         })).send() => result.map_err(|_| HttpError::Connect)?,
     };
+    checkpoint(cancel, fresh)?;
     if response.status().is_redirection() {
         return Err(HttpError::Redirect.into());
     }
@@ -369,6 +390,7 @@ pub(crate) async fn register_dynamic(
         return Err(OAuthError::InvalidClient);
     }
     let bytes = mcp_client_http_transport::bounded_body(response, cancel).await?;
+    checkpoint(cancel, fresh)?;
     let document: Value = serde_json::from_slice(&bytes).map_err(|_| OAuthError::InvalidClient)?;
     let client_id = document
         .get("client_id")
@@ -414,10 +436,15 @@ pub(crate) fn begin_authorization(
     previous_scopes: &[String],
 ) -> Result<(Url, PendingAuthorization), OAuthError> {
     config.validate().map_err(|_| OAuthError::InvalidClient)?;
-    if !matches!(config.auth, McpHttpAuth::OAuth { .. })
+    if !config.enabled
+        || !matches!(config.auth, McpHttpAuth::OAuth { .. })
         || user_id <= 0
         || client_id.is_empty()
         || client_id.len() > 512
+        || client_id.chars().any(char::is_control)
+        || resource.resource
+            != parse_public_https(&config.endpoint, 2048)
+                .map_err(|_| OAuthError::InvalidMetadata)?
     {
         return Err(OAuthError::InvalidClient);
     }
@@ -494,19 +521,22 @@ pub(crate) fn validate_callback(
     Ok(())
 }
 
-pub(crate) async fn exchange_code(
+#[allow(clippy::too_many_arguments)] // Private one-shot lifecycle supplies the freshness guard.
+async fn exchange_code(
     pending: &PendingAuthorization,
     server: &AuthorizationServer,
     code: &str,
     returned_state: &str,
     returned_iss: Option<&str>,
     cancel: &CancellationToken,
+    fresh: &mut impl FnMut() -> Result<(), OAuthError>,
 ) -> Result<TokenSet, OAuthError> {
     validate_callback(pending, returned_state, returned_iss, code)?;
     if pending.issuer != server.issuer {
         return Err(OAuthError::InvalidMetadata);
     }
-    let client = mcp_client_http_transport::pinned_client(&server.token_endpoint, cancel).await?;
+    checkpoint(cancel, fresh)?;
+    let client = oauth_client(&server.token_endpoint, cancel).await?;
     let form = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs([
             ("grant_type", "authorization_code"),
@@ -517,13 +547,15 @@ pub(crate) async fn exchange_code(
             ("resource", pending.resource.as_str()),
         ])
         .finish();
+    checkpoint(cancel, fresh)?;
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(HttpError::Cancelled.into()),
-        result = client.post(server.token_endpoint.clone())
+        result = client.post(wire_url(&server.token_endpoint))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(form).send() => result.map_err(|_| HttpError::Connect)?,
     };
+    checkpoint(cancel, fresh)?;
     if response.status().is_redirection() {
         return Err(HttpError::Redirect.into());
     }
@@ -531,17 +563,19 @@ pub(crate) async fn exchange_code(
         return Err(OAuthError::InvalidToken);
     }
     let bytes = Zeroizing::new(mcp_client_http_transport::bounded_body(response, cancel).await?);
+    checkpoint(cancel, fresh)?;
     parse_token_response(&bytes, &pending.scopes)
 }
 
 /// Refresh is explicit: the caller must reload the active user's binding and
 /// revalidate config revision before storing the replacement token set.
-pub(crate) async fn refresh_access_token(
+async fn refresh_access_token(
     resource: &ProtectedResource,
     server: &AuthorizationServer,
     client_id: &str,
     previous: &TokenSet,
     cancel: &CancellationToken,
+    fresh: &mut impl FnMut() -> Result<(), OAuthError>,
 ) -> Result<TokenSet, OAuthError> {
     if !resource.issuers.contains(&server.issuer)
         || client_id.is_empty()
@@ -559,21 +593,52 @@ pub(crate) async fn refresh_access_token(
             ("resource", resource.resource.as_str()),
         ])
         .finish();
-    let client = mcp_client_http_transport::pinned_client(&server.token_endpoint, cancel).await?;
+    checkpoint(cancel, fresh)?;
+    let client = oauth_client(&server.token_endpoint, cancel).await?;
+    checkpoint(cancel, fresh)?;
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(HttpError::Cancelled.into()),
-        result = client.post(server.token_endpoint.clone())
+        result = client.post(wire_url(&server.token_endpoint))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(form).send() => result.map_err(|_| HttpError::Connect)?,
     };
+    checkpoint(cancel, fresh)?;
     if response.status().is_redirection() {
         return Err(HttpError::Redirect.into());
     }
-    if !response.status().is_success() {
-        return Err(OAuthError::InvalidToken);
-    }
+    let status = response.status();
     let bytes = Zeroizing::new(mcp_client_http_transport::bounded_body(response, cancel).await?);
+    checkpoint(cancel, fresh)?;
+    if !status.is_success() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TokenErrorReply {
+            error: String,
+            #[serde(default)]
+            error_description: Option<String>,
+            #[serde(default)]
+            error_uri: Option<String>,
+        }
+        let reply: TokenErrorReply =
+            serde_json::from_slice(&bytes).map_err(|_| OAuthError::InvalidToken)?;
+        if reply.error.len() > 128
+            || reply
+                .error_description
+                .as_ref()
+                .is_some_and(|v| v.len() > 4096)
+            || reply.error_uri.as_ref().is_some_and(|v| v.len() > 2048)
+        {
+            return Err(OAuthError::InvalidToken);
+        }
+        return Err(
+            if status == reqwest::StatusCode::BAD_REQUEST && reply.error == "invalid_grant" {
+                OAuthError::InvalidGrant
+            } else {
+                OAuthError::InvalidToken
+            },
+        );
+    }
     let mut replacement = parse_token_response(&bytes, &previous.scopes)?;
     if replacement.refresh.is_none() {
         replacement.refresh = Some(Zeroizing::new(refresh.to_string()));
@@ -655,7 +720,8 @@ fn account_key(prefix: &str, server_id: &str, issuer: &str, resource: &str) -> S
     )
 }
 
-pub(crate) fn save_tokens_for(
+#[cfg(test)]
+fn save_tokens_for(
     conn: &Connection,
     root_key: &[u8; 32],
     user_id: i64,
@@ -712,7 +778,8 @@ pub(crate) fn save_tokens_for(
     tx.commit().map_err(|_| OAuthError::StoreUnavailable)
 }
 
-pub(crate) fn load_tokens_for(
+#[cfg(test)]
+fn load_tokens_for(
     conn: &Connection,
     root_key: &[u8; 32],
     user_id: i64,
@@ -744,25 +811,37 @@ pub(crate) fn load_tokens_for(
     }))
 }
 
-pub(crate) fn save_tokens_for_active_user(
-    app: &AppHandle,
-    pending: &PendingAuthorization,
-    tokens: &TokenSet,
+#[path = "mcp_client_oauth_lifecycle.rs"]
+pub(crate) mod lifecycle;
+
+fn checkpoint(
+    cancel: &CancellationToken,
+    fresh: &mut impl FnMut() -> Result<(), OAuthError>,
 ) -> Result<(), OAuthError> {
-    let (conn, root_key, user_id) =
-        mcp_client_commands::context(app).map_err(|_| OAuthError::StoreUnavailable)?;
-    if user_id != pending.user_id {
-        return Err(OAuthError::UserChanged);
+    if cancel.is_cancelled() {
+        return Err(HttpError::Cancelled.into());
     }
-    save_tokens_for(
-        &conn,
-        &root_key,
-        user_id,
-        &pending.server_id,
-        &pending.issuer,
-        &pending.resource,
-        tokens,
-    )
+    fresh()
+}
+
+// Only unit fixtures can inject a wire client. Production always pins public HTTPS.
+#[cfg(test)]
+tokio::task_local! { static WIRE_CLIENT: reqwest::Client; static WIRE_PORT: u16; }
+fn wire_url(url: &Url) -> Url {
+    #[cfg(test)]
+    if let Ok(port) = WIRE_PORT.try_with(|p| *p) {
+        let mut local = Url::parse(&format!("http://127.0.0.1:{port}")).expect("fixture URL");
+        local.set_path(url.path());
+        return local;
+    }
+    url.clone()
+}
+async fn oauth_client(url: &Url, cancel: &CancellationToken) -> Result<reqwest::Client, HttpError> {
+    #[cfg(test)]
+    if let Ok(client) = WIRE_CLIENT.try_with(Clone::clone) {
+        return Ok(client);
+    }
+    mcp_client_http_transport::pinned_client(url, cancel).await
 }
 
 #[cfg(test)]

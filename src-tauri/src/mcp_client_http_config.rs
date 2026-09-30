@@ -193,7 +193,8 @@ impl McpHttpServerConfig {
                 hasher.update(secret.as_bytes());
                 Some(secret)
             }
-            _ => None,
+            McpHttpAuth::OAuth { .. } => None, // Config-only revision; token resolver is separate.
+            McpHttpAuth::None => None,
         };
         Ok(ResolvedMcpHttpAuth {
             effective_revision: hasher.finalize().to_hex().to_string(),
@@ -208,6 +209,9 @@ impl McpHttpServerConfig {
         root_key: &[u8; 32],
         revision_key: &[u8; 32],
     ) -> Result<ResolvedMcpHttpAuth, &'static str> {
+        if matches!(self.auth, McpHttpAuth::OAuth { .. }) {
+            return Err("MCP_HTTP_OAUTH_RESOLVER_REQUIRED");
+        }
         let user_id = crate::user_partitions::active_user_id(conn)
             .map_err(|_| "MCP_HTTP_USER_UNAVAILABLE")?
             .ok_or("MCP_HTTP_USER_UNAVAILABLE")?;

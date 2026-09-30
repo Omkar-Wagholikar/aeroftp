@@ -76,11 +76,10 @@ enum Config {
     Http(McpHttpServerConfig, ResolvedMcpHttpAuth),
 }
 
-/// HTTP settings are backend-only. OAuth stays unavailable until its lifecycle
-/// can rebind tokens to live issuer/resource/user state in the next slice.
+/// HTTP settings are backend-only. OAuth uses the separate revision-bound token resolver.
 fn resolve(app: &AppHandle, key: &[u8; 32], request: &BridgeRequest) -> Result<State, BridgeError> {
     validate_request(request)?;
-    let (conn, root_key, user_id) =
+    let (mut conn, root_key, user_id) =
         mcp_client_commands::context(app).map_err(|_| GateError::UserUnavailable)?;
     let config = match request.transport {
         Transport::Stdio => {
@@ -129,12 +128,16 @@ fn resolve(app: &AppHandle, key: &[u8; 32], request: &BridgeRequest) -> Result<S
             if !config.enabled {
                 return Err(GateError::ConfigDisabled.into());
             }
-            if matches!(config.auth, McpHttpAuth::OAuth { .. }) {
-                return Err(BridgeError::OAuthPending);
-            }
-            let auth = config
-                .resolve_from_active_user(&conn, &root_key, key)
-                .map_err(|_| GateError::SecretUnavailable)?;
+            let auth = if matches!(config.auth, McpHttpAuth::OAuth { .. }) {
+                crate::mcp_client_oauth::lifecycle::resolve_token(
+                    &mut conn, &root_key, key, user_id, &config,
+                )
+                .map_err(|_| BridgeError::OAuthPending)?
+            } else {
+                config
+                    .resolve_from_active_user(&conn, &root_key, key)
+                    .map_err(|_| GateError::SecretUnavailable)?
+            };
             Config::Http(config, auth)
         }
     };
