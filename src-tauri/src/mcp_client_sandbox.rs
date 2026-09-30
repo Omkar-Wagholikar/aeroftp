@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
+#[cfg(any(test, target_os = "linux"))]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ pub(crate) enum SandboxError {
     InvalidPath,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn test_fixture(config: &McpServerConfig) -> bool {
     #[cfg(test)]
     {
@@ -31,6 +33,44 @@ fn test_fixture(config: &McpServerConfig) -> bool {
         let _ = config;
         false
     }
+}
+
+/// Test-only transport fixtures can run without an OS sandbox on CI hosts.
+/// Production builds never compile this fallback.
+#[cfg(test)]
+fn fixture_command(config: &McpServerConfig) -> Result<Command, SandboxError> {
+    if !test_fixture(config) {
+        return Err(SandboxError::Unavailable);
+    }
+    let mut command = Command::new(&config.command);
+    command.args(&config.args);
+    Ok(command)
+}
+
+/// A binary on disk does not prove its required flags/user namespaces work.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn fixture_sandbox_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let config = McpServerConfig {
+            id: "sandbox_probe".into(),
+            command: "/usr/bin/true".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            enabled: true,
+            revision: 1,
+        };
+        let Ok(mut command) = linux_command(&config) else {
+            return false;
+        };
+        command
+            .as_std_mut()
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -110,20 +150,32 @@ fn linux_command(config: &McpServerConfig) -> Result<Command, SandboxError> {
 
 pub(crate) fn peer_command(config: &McpServerConfig) -> Result<Command, SandboxError> {
     config.validate().map_err(|_| SandboxError::InvalidPath)?;
+    #[cfg(all(test, target_os = "linux"))]
+    if test_fixture(config) && !fixture_sandbox_available() {
+        return fixture_command(config);
+    }
     #[cfg(target_os = "linux")]
     {
         match linux_command(config) {
             Ok(command) => Ok(command),
             Err(SandboxError::Unavailable) if test_fixture(config) => {
-                Ok(Command::new(&config.command))
+                #[cfg(test)]
+                {
+                    fixture_command(config)
+                }
+                #[cfg(not(test))]
+                {
+                    Err(SandboxError::Unavailable)
+                }
             }
             Err(error) => Err(error),
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(test)]
         if test_fixture(config) {
-            return Ok(Command::new(&config.command));
+            return fixture_command(config);
         }
         Err(SandboxError::Unavailable)
     }
@@ -163,6 +215,31 @@ mod tests {
         assert!(!view.contains("--bind /home"));
     }
 
+    #[tokio::test]
+    async fn unsandboxed_test_fixture_receives_its_script_and_literal_arguments() {
+        let executable = if cfg!(windows) { "node.exe" } else { "node" };
+        let node = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .map(|dir| dir.join(executable))
+            .find(|path| path.is_file())
+            .expect("Node runtime");
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_fixture.mjs");
+        let mut config = fixture(vec![script.to_string_lossy().into_owned(), "exit".into()]);
+        config.command = node.to_string_lossy().into_owned();
+        let output = fixture_command(&config)
+            .unwrap()
+            .env_clear()
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        config.args[0] = "untrusted-other-script.mjs".into();
+        assert_eq!(
+            fixture_command(&config).err(),
+            Some(SandboxError::Unavailable)
+        );
+    }
+
     #[test]
     fn invalid_config_cannot_form_a_command() {
         let config = fixture(Vec::new());
@@ -179,7 +256,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_sandbox_hides_unlisted_host_files() {
-        if !Path::new("/usr/bin/bwrap").is_file() {
+        if !fixture_sandbox_available() {
+            eprintln!("Sandbox integration unavailable: required bubblewrap flags or user namespaces unsupported");
             return;
         }
         let host_file = tempfile::NamedTempFile::new().unwrap();

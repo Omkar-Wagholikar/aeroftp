@@ -117,64 +117,76 @@ fn begin_catalog_write<'a>(
 }
 
 #[tauri::command]
-pub fn mcp_client_list_servers(
+pub async fn mcp_client_list_servers(
     webview: Webview,
     app: AppHandle,
 ) -> Result<Vec<McpServerConfig>, &'static str> {
     crate::only_main_window(webview.label(), "mcp_client_list_servers")
         .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
-    let (conn, root_key, user_id) = context(&app)?;
-    load(&conn, &root_key, user_id)
+    tokio::task::spawn_blocking(move || {
+        let (conn, root_key, user_id) = context(&app)?;
+        load(&conn, &root_key, user_id)
+    })
+    .await
+    .map_err(|_| "MCP_STORE_UNAVAILABLE")?
 }
 
 #[tauri::command]
-pub fn mcp_client_upsert_server(
+pub async fn mcp_client_upsert_server(
     webview: Webview,
     app: AppHandle,
     config: McpServerConfig,
 ) -> Result<(), &'static str> {
     crate::only_main_window(webview.label(), "mcp_client_upsert_server")
         .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
-    let (mut conn, root_key, user_id) = context(&app)?;
-    let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
-    let stale_accounts = upsert_catalog(&mut configs, config)?;
-    for account in stale_accounts {
-        user_partitions::delete_user_credential_for(&transaction, user_id, &account)
-            .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
-    }
-    save(&transaction, &root_key, user_id, &configs)?;
-    transaction.commit().map_err(|_| "MCP_STORE_UNAVAILABLE")
+    tokio::task::spawn_blocking(move || {
+        let (mut conn, root_key, user_id) = context(&app)?;
+        let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
+        let stale_accounts = upsert_catalog(&mut configs, config)?;
+        for account in stale_accounts {
+            user_partitions::delete_user_credential_for(&transaction, user_id, &account)
+                .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
+        }
+        save(&transaction, &root_key, user_id, &configs)?;
+        transaction.commit().map_err(|_| "MCP_STORE_UNAVAILABLE")
+    })
+    .await
+    .map_err(|_| "MCP_STORE_UNAVAILABLE")?
 }
 
 #[tauri::command]
-pub fn mcp_client_remove_server(
+pub async fn mcp_client_remove_server(
     webview: Webview,
     app: AppHandle,
     server_id: String,
 ) -> Result<(), &'static str> {
     crate::only_main_window(webview.label(), "mcp_client_remove_server")
         .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
-    let (mut conn, root_key, user_id) = context(&app)?;
-    let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
-    let index = configs
-        .iter()
-        .position(|item| item.id == server_id)
-        .ok_or("MCP_CONFIG_NOT_FOUND")?;
-    let removed = configs.remove(index);
-    for secret_ref in removed.env.values() {
-        user_partitions::delete_user_credential_for(
-            &transaction,
-            user_id,
-            &secret_ref.vault_account,
-        )
-        .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
-    }
-    save(&transaction, &root_key, user_id, &configs)?;
-    transaction.commit().map_err(|_| "MCP_STORE_UNAVAILABLE")
+    tokio::task::spawn_blocking(move || {
+        let (mut conn, root_key, user_id) = context(&app)?;
+        let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
+        let index = configs
+            .iter()
+            .position(|item| item.id == server_id)
+            .ok_or("MCP_CONFIG_NOT_FOUND")?;
+        let removed = configs.remove(index);
+        for secret_ref in removed.env.values() {
+            user_partitions::delete_user_credential_for(
+                &transaction,
+                user_id,
+                &secret_ref.vault_account,
+            )
+            .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
+        }
+        save(&transaction, &root_key, user_id, &configs)?;
+        transaction.commit().map_err(|_| "MCP_STORE_UNAVAILABLE")
+    })
+    .await
+    .map_err(|_| "MCP_STORE_UNAVAILABLE")?
 }
 
 #[tauri::command]
-pub fn mcp_client_set_secret(
+pub async fn mcp_client_set_secret(
     webview: Webview,
     app: AppHandle,
     server_id: String,
@@ -184,32 +196,36 @@ pub fn mcp_client_set_secret(
     crate::only_main_window(webview.label(), "mcp_client_set_secret")
         .map_err(|_| "MCP_MAIN_WINDOW_REQUIRED")?;
     let secret = Zeroizing::new(secret);
-    let (mut conn, root_key, user_id) = context(&app)?;
-    let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
-    let config = configs
-        .iter_mut()
-        .find(|item| item.id == server_id)
-        .ok_or("MCP_CONFIG_NOT_FOUND")?;
-    let secret_ref = config
-        .env
-        .get(&env_name)
-        .ok_or("MCP_CONFIG_INVALID_SECRET_REF")?;
-    let account = secret_ref.vault_account.clone();
-    config.revision = config
-        .revision
-        .checked_add(1)
-        .ok_or("MCP_CONFIG_REVISION_OVERFLOW")?;
-    user_partitions::set_user_credential_for(
-        &transaction,
-        &root_key,
-        user_id,
-        &account,
-        "mcp_env",
-        &secret,
-    )
-    .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
-    save(&transaction, &root_key, user_id, &configs)?;
-    transaction.commit().map_err(|_| "MCP_STORE_UNAVAILABLE")
+    tokio::task::spawn_blocking(move || {
+        let (mut conn, root_key, user_id) = context(&app)?;
+        let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
+        let config = configs
+            .iter_mut()
+            .find(|item| item.id == server_id)
+            .ok_or("MCP_CONFIG_NOT_FOUND")?;
+        let secret_ref = config
+            .env
+            .get(&env_name)
+            .ok_or("MCP_CONFIG_INVALID_SECRET_REF")?;
+        let account = secret_ref.vault_account.clone();
+        config.revision = config
+            .revision
+            .checked_add(1)
+            .ok_or("MCP_CONFIG_REVISION_OVERFLOW")?;
+        user_partitions::set_user_credential_for(
+            &transaction,
+            &root_key,
+            user_id,
+            &account,
+            "mcp_env",
+            &secret,
+        )
+        .map_err(|_| "MCP_STORE_UNAVAILABLE")?;
+        save(&transaction, &root_key, user_id, &configs)?;
+        transaction.commit().map_err(|_| "MCP_STORE_UNAVAILABLE")
+    })
+    .await
+    .map_err(|_| "MCP_STORE_UNAVAILABLE")?
 }
 
 #[cfg(test)]

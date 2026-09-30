@@ -744,6 +744,10 @@ mod wire_tests {
     use std::collections::BTreeMap;
     #[tokio::test]
     async fn isolated_stdio_bridge_round_trips_modern_and_legacy_fixture() {
+        if !crate::mcp_client_sandbox::fixture_sandbox_available() {
+            eprintln!("Isolated bridge fixture unavailable: required bubblewrap/user namespaces unsupported");
+            return;
+        }
         let node = std::env::split_paths(&std::env::var_os("PATH").unwrap())
             .map(|p| p.join("node"))
             .find(|p| p.is_file())
