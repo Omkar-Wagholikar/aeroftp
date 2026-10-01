@@ -173,7 +173,8 @@ mod tests {
 
     fn limits() -> Limits {
         Limits {
-            request: Duration::from_secs(3),
+            // Match transport fixtures: loaded MSVC runners can take >3s to start Node.
+            request: Duration::from_secs(10),
             shutdown: Duration::from_millis(250),
         }
     }
@@ -197,6 +198,26 @@ mod tests {
         let checks = Cell::new(0);
         let result = execute_authorized(
             fixture(),
+            || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            },
+            limits(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], "fixture reply");
+        assert_eq!(checks.get(), 6);
+    }
+
+    #[tokio::test]
+    async fn delayed_modern_probe_keeps_metadata_and_freshness_checks() {
+        let mut call = fixture();
+        call.config.args[1] = "modern-slow-probe".into();
+        let checks = Cell::new(0);
+        let result = execute_authorized(
+            call,
             || {
                 checks.set(checks.get() + 1);
                 Ok(())

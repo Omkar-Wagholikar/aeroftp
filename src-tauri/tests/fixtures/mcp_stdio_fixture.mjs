@@ -60,6 +60,10 @@ lines.on('line', (line) => {
     }
   }
   if (method === 'server/discover') {
+    if (mode === 'modern-slow-probe') {
+      setTimeout(() => send({ jsonrpc: '2.0', id, result: { resultType: 'complete', supportedVersions: ['2026-07-28'], capabilities: { tools: {} }, ttlMs: 0, cacheScope: 'private', _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'fixture', version: '1' } } } }), 3500);
+      return;
+    }
     const version = req.params?._meta?.['io.modelcontextprotocol/protocolVersion'];
     if (version !== '2026-07-28') {
       send({ jsonrpc: '2.0', id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: ['2026-07-28'], requested: version } } });
