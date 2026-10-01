@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Plus, RefreshCw, Save, Trash2 } from 'lucide-react';
 import { createPortal } from 'react-dom';
@@ -33,7 +33,9 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
     const [error, setError] = useState('');
     const [pendingRemoval, setPendingRemoval] = useState<{ kind: 'server' } | { kind: 'secret'; name: string } | null>(null);
 
-    useEffect(() => { setCommand(server.command); setArgs(server.args.join('\n')); }, [server.command, server.args]);
+    const storedArgs = server.args.join('\n');
+    useEffect(() => { setCommand(server.command); }, [server.command]);
+    useEffect(() => { setArgs(storedArgs); }, [storedArgs]);
 
     const perform = async (action: () => Promise<void>) => {
         setBusy(true); setError('');
@@ -130,8 +132,11 @@ export function McpServersPanel() {
     const [command, setCommand] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
+    const refreshSequence = useRef(0);
     const refresh = useCallback(async () => {
-        setServers(await invoke<ServerConfig[]>('mcp_client_list_servers'));
+        const sequence = ++refreshSequence.current;
+        const result = await invoke<ServerConfig[]>('mcp_client_list_servers');
+        if (sequence === refreshSequence.current) setServers(result);
     }, []);
     useEffect(() => { void refresh().catch(cause => setError(String(cause))); }, [refresh]);
 
@@ -168,7 +173,7 @@ export function McpServersPanel() {
             </div>
             <p className="text-xs text-gray-500">Arguments are edited as literal values after adding a server. Shell commands and expansion are rejected.</p>
         </div>
-        {servers.map(server => <ServerCard key={`${server.id}:${server.revision}`} server={server} refresh={refresh} />)}
+        {servers.map(server => <ServerCard key={server.id} server={server} refresh={refresh} />)}
         {servers.length === 0 && <p className="text-sm text-gray-500">No MCP servers configured for this user.</p>}
         {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
     </div>;
