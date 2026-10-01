@@ -74,12 +74,23 @@ export async function initBudgetManager(): Promise<void> {
         if (spendingJson) {
             const records: SpendingRecord[] = JSON.parse(spendingJson);
             records.forEach(r => {
-                spendingCache.set(spendingKey(r.providerId, r.month), r);
+                // Admission runs before recordSpending: normalize persisted cost
+                // now, and fail closed when the prior spend cannot be trusted.
+                spendingCache.set(spendingKey(r.providerId, r.month), {
+                    ...r, totalCost: persistedCost(r.totalCost),
+                });
             });
         }
     } catch {
         // No spending data yet
     }
+}
+
+function persistedCost(value: unknown): number {
+    const parsed = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+    return typeof parsed === 'number' && Number.isFinite(parsed) && parsed >= 0
+        ? Math.min(parsed, Number.MAX_SAFE_INTEGER)
+        : Number.MAX_SAFE_INTEGER;
 }
 
 /**

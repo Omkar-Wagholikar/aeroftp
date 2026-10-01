@@ -32,7 +32,7 @@ it('bounds corrupt loaded counters before adding a valid delta', async () => {
         ? JSON.stringify([{ providerId: 'p', month, totalCost: -3, tokenCount: Number.MAX_VALUE, requestCount: Number.MAX_VALUE }]) : undefined);
     await budget.initBudgetManager();
     await budget.recordSpending('p', 2, 5);
-    expect(budget.getMonthlySpending()[0]).toMatchObject({ totalCost: 2, tokenCount: Number.MAX_SAFE_INTEGER, requestCount: Number.MAX_SAFE_INTEGER });
+    expect(budget.getMonthlySpending()[0]).toMatchObject({ totalCost: Number.MAX_SAFE_INTEGER, tokenCount: Number.MAX_SAFE_INTEGER, requestCount: Number.MAX_SAFE_INTEGER });
 });
 
 it('normalizes missing and non-numeric persisted counter fields', async () => {
@@ -42,5 +42,31 @@ it('normalizes missing and non-numeric persisted counter fields', async () => {
         ? JSON.stringify([{ providerId: 'p', month, totalCost: 'invalid', tokenCount: null }]) : undefined);
     await budget.initBudgetManager();
     await budget.recordSpending('p', 2, 5);
-    expect(budget.getMonthlySpending()[0]).toMatchObject({ totalCost: 2, tokenCount: 5, requestCount: 1 });
+    expect(budget.getMonthlySpending()[0]).toMatchObject({ totalCost: Number.MAX_SAFE_INTEGER, tokenCount: 5, requestCount: 1 });
+});
+
+it.each(['invalid', '', null, undefined, -3])('blocks budget admission for corrupt persisted cost %s before spending', async totalCost => {
+    const budget = await import('./CostBudgetManager');
+    const month = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+    mocks.invoke.mockImplementation(async (command: string, args: { key: string }) => {
+        if (command !== 'vault_get') return undefined;
+        return JSON.stringify(args.key === 'ai_budget_config'
+            ? [{ providerId: 'p', monthlyLimitUsd: 10, warningThreshold: 80, hardStop: true }]
+            : [{ providerId: 'p', month, totalCost }]);
+    });
+    await budget.initBudgetManager();
+    expect(budget.checkBudget('p')).toMatchObject({ allowed: false, currentSpend: Number.MAX_SAFE_INTEGER });
+});
+
+it('accepts valid numeric persisted strings before admission without formatting errors', async () => {
+    const budget = await import('./CostBudgetManager');
+    const month = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+    mocks.invoke.mockImplementation(async (command: string, args: { key: string }) => {
+        if (command !== 'vault_get') return undefined;
+        return JSON.stringify(args.key === 'ai_budget_config'
+            ? [{ providerId: 'p', monthlyLimitUsd: 10, warningThreshold: 80, hardStop: true }]
+            : [{ providerId: 'p', month, totalCost: '9' }]);
+    });
+    await budget.initBudgetManager();
+    expect(budget.checkBudget('p')).toMatchObject({ allowed: true, currentSpend: 9, warning: true });
 });
