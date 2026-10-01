@@ -168,6 +168,8 @@ pub async fn ai_chat_stream_with_sink(
     request: AIRequest,
     stream_id: &str,
 ) -> Result<(), String> {
+    crate::ai::validate_provider_endpoint(&request.provider_type, &request.base_url)
+        .map_err(|e| e.to_string())?;
     crate::ai_native::validate_history(&request).map_err(|e| e.to_string())?;
     // Register a cancellation flag for this stream
     let cancel = Arc::new(AtomicBool::new(false));

@@ -600,6 +600,7 @@ fn post(
     request: &AIRequest,
     body: &Value,
 ) -> Result<reqwest::RequestBuilder, AIError> {
+    crate::ai::validate_provider_endpoint(&request.provider_type, &request.base_url)?;
     let anthropic = modern_anthropic(request);
     let url = if anthropic {
         crate::ai::anthropic_messages_url(&request.base_url)

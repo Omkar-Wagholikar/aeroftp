@@ -1383,6 +1383,31 @@ mod anthropic {
     }
 }
 
+/// Reject unsafe Bedrock endpoints before constructing credentialed requests.
+pub(crate) fn validate_provider_endpoint(
+    provider_type: &AIProviderType,
+    base_url: &str,
+) -> Result<(), AIError> {
+    if *provider_type != AIProviderType::Bedrock {
+        return Ok(());
+    }
+    let invalid =
+        || AIError::Api("Amazon Bedrock requires an HTTPS endpoint without URL credentials".into());
+    let url = reqwest::Url::parse(base_url).map_err(|_| invalid())?;
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid());
+    }
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    // Plaintext is available only to in-process fixtures, never production.
+    #[cfg(test)]
+    if url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]")) {
+        return Ok(());
+    }
+    Err(invalid())
+}
+
 // Main AI call function
 pub async fn call_ai(request: AIRequest) -> Result<AIResponse, AIError> {
     // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
@@ -1393,6 +1418,7 @@ pub async fn call_ai(request: AIRequest) -> Result<AIResponse, AIError> {
         ..request
     };
 
+    validate_provider_endpoint(&request.provider_type, &request.base_url)?;
     crate::ai_native::validate_history(&request)?;
     let client = &*AI_HTTP_CLIENT;
     if crate::ai_native::modern_anthropic(&request) || crate::ai_native::modern_chat(&request) {
@@ -1421,6 +1447,7 @@ pub async fn test_provider(
     api_key: Option<String>,
     model: Option<String>,
 ) -> Result<bool, AIError> {
+    validate_provider_endpoint(&provider_type, &base_url)?;
     let client = &*AI_HTTP_CLIENT;
     let api_key = clean_api_key(api_key);
 
@@ -1487,6 +1514,7 @@ pub async fn list_models(
     base_url: String,
     api_key: Option<String>,
 ) -> Result<Vec<String>, AIError> {
+    validate_provider_endpoint(&provider_type, &base_url)?;
     let client = &*AI_HTTP_CLIENT;
     let api_key = clean_api_key(api_key);
 
@@ -2063,6 +2091,84 @@ mod api_key_tests {
         // reported success for a key the chat then saw rejected with 401.
         assert_eq!(provider_test_path(&AIProviderType::OpenRouter), "/key");
         assert_eq!(provider_test_path(&AIProviderType::OpenAI), "/models");
+    }
+
+    #[test]
+    fn bedrock_endpoint_validation_rejects_plaintext_and_url_credentials() {
+        for url in [
+            "http://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1",
+            "http://localhost/openai/v1",
+            "https://user:secret@example.com/v1",
+            "https://user@example.com/v1",
+            "file:///tmp/bedrock",
+            "invalid url",
+        ] {
+            assert!(validate_provider_endpoint(&AIProviderType::Bedrock, url).is_err());
+        }
+        assert!(validate_provider_endpoint(
+            &AIProviderType::Bedrock,
+            "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+        )
+        .is_ok());
+        assert!(validate_provider_endpoint(&AIProviderType::Custom, "http://localhost/v1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn bedrock_public_entrypoints_reject_before_network_or_stream_registration() {
+        let base = "http://plaintext.invalid/openai/v1".to_string();
+        let request: AIRequest = serde_json::from_value(serde_json::json!({
+            "provider_type": "bedrock", "model": "fixture-model",
+            "base_url": base, "api_key": "fixture-key", "messages": []
+        }))
+        .unwrap();
+        assert!(call_ai(request.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("HTTPS endpoint"));
+        assert!(test_provider(
+            AIProviderType::Bedrock,
+            base.clone(),
+            Some("fixture-key".into()),
+            Some("fixture-model".into())
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS endpoint"));
+        assert!(
+            list_models(AIProviderType::Bedrock, base, Some("fixture-key".into()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS endpoint")
+        );
+        let sink = crate::ai_core::cli_impl::StdioEventSink;
+        assert!(crate::ai_stream::ai_chat_stream_with_sink(
+            &sink,
+            request.clone(),
+            "bedrock-unsafe"
+        )
+        .await
+        .unwrap_err()
+        .contains("HTTPS endpoint"));
+        let client = reqwest::Client::new();
+        assert!(crate::ai_native::call(&client, &request)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("HTTPS endpoint"));
+        assert!(crate::ai_native::stream(
+            &client,
+            &request,
+            &sink,
+            "bedrock-unsafe-native",
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS endpoint"));
     }
 
     #[tokio::test]
