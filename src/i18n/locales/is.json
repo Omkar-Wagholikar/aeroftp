@@ -2978,9 +2978,9 @@
                 "fallbackUsed": "varalíkan",
                 "fallbackUsedTooltip": "{model} brást, svo varalíkanið svaraði í staðinn"
             },
-            "delegateLocal": "Vinnuferli með lesaðgangi",
-            "delegateLocalHint": "Aðskilin keyrsla. Vinnuferli mega lesa skrár undir {path}.",
-            "worker": "Vinnuferli",
+            "delegateLocal": "Vinnuþjónar með lesaðgangi",
+            "delegateLocalHint": "Aðskilin keyrsla. Vinnuþjónar mega lesa skrár undir {path}.",
+            "worker": "Vinnuþjónn",
             "workerBudgetExhausted": "Fjárheimild uppurin",
             "workerCancelled": "Hætt við",
             "workerCompleted": "Lokið",

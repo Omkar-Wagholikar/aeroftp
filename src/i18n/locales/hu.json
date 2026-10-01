@@ -2978,9 +2978,9 @@
                 "fallbackUsed": "tartalék",
                 "fallbackUsedTooltip": "A(z) {model} nem volt elérhető, ezért a tartalék modell válaszolt"
             },
-            "delegateLocal": "Csak olvasó munkafolyamatok",
-            "delegateLocalHint": "Külön futtatás. A munkafolyamatok a(z) {path} alatti fájlokat olvashatják.",
-            "worker": "Munkafolyamat",
+            "delegateLocal": "Csak olvasási jogú végrehajtók",
+            "delegateLocalHint": "Külön futtatás. A végrehajtók a(z) {path} alatti fájlokat olvashatják.",
+            "worker": "Végrehajtó",
             "workerBudgetExhausted": "Keret kimerült",
             "workerCancelled": "Megszakítva",
             "workerCompleted": "Befejezve",
