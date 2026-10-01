@@ -5097,6 +5097,30 @@ pub async fn user_partitions_list_active_setting_scopes(
         .collect())
 }
 
+// Every MCP namespace is backend-private, including future transport secrets.
+fn is_private_mcp_credential(id: &str) -> bool {
+    id.starts_with("mcp_")
+}
+
+#[cfg(test)]
+mod private_mcp_credential_tests {
+    #[test]
+    fn reserves_all_mcp_namespaces_without_blocking_provider_credentials() {
+        for id in [
+            "mcp_env_a",
+            "mcp_http_bearer_a",
+            "mcp_oauth_a",
+            "mcp_http_oauth_a",
+            "mcp_future_a",
+        ] {
+            assert!(super::is_private_mcp_credential(id));
+        }
+        for id in ["provider_a", "server_a", "mcp", ""] {
+            assert!(!super::is_private_mcp_credential(id));
+        }
+    }
+}
+
 /// MUV-1: read one secret from the active user's encrypted partition. Returns
 /// JSON null when the credential does not exist. Errors with `USER_LOCKED` when
 /// the active user is a passphrase account that has not been unlocked. The
@@ -5107,7 +5131,7 @@ pub async fn user_partitions_get_user_credential(
     app: AppHandle,
     credential_id: String,
 ) -> Result<Option<String>, String> {
-    if credential_id.starts_with("mcp_env_") {
+    if is_private_mcp_credential(&credential_id) {
         return Err("MCP_CREDENTIAL_PRIVATE".to_string());
     }
     init_or_migrate(&app)?;
@@ -5127,7 +5151,7 @@ pub async fn user_partitions_set_user_credential(
     credential_type: String,
     mut secret: String,
 ) -> Result<(), String> {
-    if credential_id.starts_with("mcp_env_") {
+    if is_private_mcp_credential(&credential_id) {
         secret.zeroize();
         return Err("MCP_CREDENTIAL_PRIVATE".to_string());
     }
@@ -5148,7 +5172,7 @@ pub async fn user_partitions_delete_user_credential(
     app: AppHandle,
     credential_id: String,
 ) -> Result<(), String> {
-    if credential_id.starts_with("mcp_env_") {
+    if is_private_mcp_credential(&credential_id) {
         return Err("MCP_CREDENTIAL_PRIVATE".to_string());
     }
     init_or_migrate(&app)?;
