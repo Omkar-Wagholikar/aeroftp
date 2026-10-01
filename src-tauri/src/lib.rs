@@ -170,10 +170,16 @@ pub mod portable;
 mod only_main_window_tests {
     #[test]
     fn secrets_and_shell_answer_the_main_window_only() {
-        assert!(super::only_main_window("main", "get_credential").is_ok());
-        for label in ["extract", "extract-2", "splashscreen", ""] {
-            let err = super::only_main_window(label, "get_credential").unwrap_err();
-            assert!(err.contains("get_credential"), "{err}");
+        for command in [
+            "get_credential",
+            "ai_delegate_local",
+            "ai_cancel_delegation",
+        ] {
+            assert!(super::only_main_window("main", command).is_ok());
+            for label in ["extract", "extract-2", "splashscreen", ""] {
+                let err = super::only_main_window(label, command).unwrap_err();
+                assert!(err.contains(command), "{err}");
+            }
         }
     }
 }
@@ -14994,6 +15000,7 @@ mod delegation_registration_tests {
 /// address the complete shared ledger rather than one provider stream.
 #[tauri::command]
 async fn ai_delegate_local(
+    webview: tauri::Webview,
     app: tauri::AppHandle,
     request_id: String,
     provider_id: String,
@@ -15002,6 +15009,7 @@ async fn ai_delegate_local(
     goal: String,
     remote_profiles: Option<Vec<ai_core::runner::delegation::RemoteProfileScope>>,
 ) -> Result<serde_json::Value, String> {
+    only_main_window(webview.label(), "ai_delegate_local")?;
     if uuid::Uuid::parse_str(&request_id).is_err() || !std::path::Path::new(&root).is_absolute() {
         return Err("Delegated request ID or local root is invalid".into());
     }
@@ -15054,7 +15062,8 @@ async fn ai_delegate_local(
 }
 
 #[tauri::command]
-async fn ai_cancel_delegation(request_id: String) -> Result<(), String> {
+async fn ai_cancel_delegation(webview: tauri::Webview, request_id: String) -> Result<(), String> {
+    only_main_window(webview.label(), "ai_cancel_delegation")?;
     if uuid::Uuid::parse_str(&request_id).is_err() {
         return Err("Delegated request ID is invalid".into());
     }
