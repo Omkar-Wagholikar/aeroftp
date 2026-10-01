@@ -444,6 +444,10 @@ impl WorkerCoordinator {
         Ok(())
     }
 
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.ledger.cancellation().is_cancelled()
+    }
+
     fn ensure_prepared(&self, child: &PreparedWorker) -> Result<(), String> {
         if child.run_id != self.ledger.run_id()
             || !self
@@ -476,5 +480,6 @@ fn valid_remote_root(root: &str) -> bool {
 #[cfg(test)]
 mod tests;
 
+pub(crate) use worker_run::MAX_TOOL_STEPS;
 mod worker_run;
 pub use worker_run::{LiveWorkerTransport, WorkerResult, WorkerTransport};

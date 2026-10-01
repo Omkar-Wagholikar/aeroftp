@@ -17,7 +17,7 @@ use crate::ai_core::runner::{run, RunnerAdapter, RunnerOptions};
 const MAX_REQUEST_BYTES: usize = 65_536;
 const MAX_TRANSPORT_RESPONSE_BYTES: usize = 131_072;
 const MAX_OUTPUT_TOKENS: u32 = 1_024;
-const MAX_TOOL_STEPS: u32 = 3;
+pub(crate) const MAX_TOOL_STEPS: u32 = 3;
 
 #[async_trait]
 pub trait WorkerTransport: Send + Sync {
@@ -155,6 +155,24 @@ struct WorkerAdapter<'a> {
     observations: Mutex<Vec<WorkerObservation>>,
 }
 
+fn recoverable_tool_error(error: &str) -> bool {
+    [
+        "Worker tool call requires an exact root ID",
+        "Worker tool call requires an exact profile ID",
+        "Worker remote tool requires a relative path",
+        "local_read requires a path string",
+        "Worker read denied or unavailable:",
+        "Worker file metadata failed:",
+        "Worker file read failed:",
+        "Worker S3 connection failed",
+        "Worker S3 stat failed",
+        "Worker S3 bounded read failed",
+        "Worker S3 bounded list failed",
+    ]
+    .iter()
+    .any(|prefix| error.starts_with(prefix))
+}
+
 #[async_trait]
 impl RunnerAdapter for WorkerAdapter<'_> {
     async fn complete(
@@ -187,33 +205,57 @@ impl RunnerAdapter for WorkerAdapter<'_> {
         if cancel.is_cancelled() {
             return Err(crate::ai_core::runner::CANCELLED.into());
         }
-        let result = match call.name.as_str() {
-            "local_read" => {
-                let root_id = call
-                    .arguments
-                    .get("root_id")
-                    .and_then(Value::as_str)
-                    .ok_or("Worker tool call requires an exact root ID")?;
+        self.coordinator.ensure_prepared(self.child)?;
+        let operation: Result<Value, String> = async {
+            Ok(match call.name.as_str() {
+                "local_read" => {
+                    let root_id = call
+                        .arguments
+                        .get("root_id")
+                        .and_then(Value::as_str)
+                        .ok_or("Worker tool call requires an exact root ID")?;
+                    self.coordinator
+                        .local_tool(self.child, root_id, &call.name, &call.arguments)
+                        .await?
+                }
+                "remote_stat" | "remote_read" | "remote_list" => {
+                    let profile_id = call
+                        .arguments
+                        .get("profile_id")
+                        .and_then(Value::as_str)
+                        .ok_or("Worker tool call requires an exact profile ID")?;
+                    let path = call
+                        .arguments
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .ok_or("Worker remote tool requires a relative path")?;
+                    self.coordinator
+                        .remote_tool(self.child, profile_id, path, &call.name)
+                        .await?
+                }
+                _ => return Err("Tool is not in the worker allowlist".into()),
+            })
+        }
+        .await;
+        // Scope, credential, ledger and lifecycle failures remain terminal.
+        // Ordinary per-call failures can be corrected by the next model turn;
+        // charge errors here because this child uses the coordinator ledger.
+        self.coordinator.ensure_prepared(self.child)?;
+        let result = match operation {
+            Ok(result) => result,
+            Err(error) if recoverable_tool_error(&error) => {
+                let safe: String = crate::ai::sanitize_error_message(&error)
+                    .chars()
+                    .take(1024)
+                    .collect();
+                let content = json!({"error": safe}).to_string();
                 self.coordinator
-                    .local_tool(self.child, root_id, &call.name, &call.arguments)
-                    .await?
+                    .ledger
+                    .reserve_result_bytes(&self.child.child_id, content.len() as u64)?;
+                self.coordinator.ensure_prepared(self.child)?;
+                return Ok(content);
             }
-            "remote_stat" | "remote_read" | "remote_list" => {
-                let profile_id = call
-                    .arguments
-                    .get("profile_id")
-                    .and_then(Value::as_str)
-                    .ok_or("Worker tool call requires an exact profile ID")?;
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or("Worker remote tool requires a relative path")?;
-                self.coordinator
-                    .remote_tool(self.child, profile_id, path, &call.name)
-                    .await?
-            }
-            _ => return Err("Tool is not in the worker allowlist".into()),
+            Err(error) => return Err(error),
         };
         let path = result
             .get("path")

@@ -663,3 +663,104 @@ async fn invalid_second_task_releases_prepared_first_child_without_dispatch() {
     assert!(error.contains("granted scope"), "{error}");
     assert!(child.requests.lock().unwrap().is_empty());
 }
+
+#[test]
+fn worker_status_reports_shared_budget_cancellation_without_caller_stop() {
+    let mut cap = limits();
+    assert_eq!(cap.requests, 10);
+    cap.requests = 0;
+    let ledger = Ledger::new(cap);
+    let caller = CancellationToken::new();
+    assert!(ledger
+        .reserve_request(
+            ledger.run_id(),
+            Usage {
+                input_tokens: 1,
+                output_tokens: 1
+            }
+        )
+        .is_err());
+    assert!(!caller.is_cancelled());
+    assert!(ledger.cancellation().is_cancelled());
+    assert_eq!(
+        worker_status(
+            caller.is_cancelled(),
+            ledger.cancellation().is_cancelled(),
+            false
+        ),
+        "cancelled"
+    );
+    assert_eq!(worker_status(false, false, true), "completed");
+    assert_eq!(worker_status(false, false, false), "failed");
+}
+
+struct FullStepChildren;
+
+#[async_trait]
+impl WorkerTransport for FullStepChildren {
+    async fn complete(&self, request: AIRequest) -> Result<AIResponse, String> {
+        let step = request
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .count();
+        Ok(
+            if step < super::super::worker_coordinator::MAX_TOOL_STEPS as usize {
+                response(
+                    "",
+                    Some((
+                        &format!("read-{step}"),
+                        "local_read",
+                        json!({"root_id":"workspace","path":"note.txt"}),
+                    )),
+                )
+            } else {
+                response("Full three-step summary", None)
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn two_workers_can_use_all_three_tool_steps_and_the_parent_can_join() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("note.txt"), "fixture").unwrap();
+    let parent = Arc::new(Script {
+        replies: Mutex::new(VecDeque::from([
+            response(
+                "",
+                Some((
+                    "batch",
+                    "delegate_local_reads",
+                    json!({"tasks":[
+                        {"root_id":"workspace","goal":"first"}, {"root_id":"workspace","goal":"second"}
+                    ]}),
+                )),
+            ),
+            response("Joined both complete workers", None),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let result = run_local_delegation(
+        DelegationRequest {
+            provider_id: "provider-1".into(),
+            model_name: "fixture-model".into(),
+            root: root.path().into(),
+            goal: "Read twice".into(),
+            remote_profiles: vec![],
+        },
+        source(),
+        parent.clone(),
+        Arc::new(FullStepChildren),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.answer, "Joined both complete workers");
+    assert_eq!(result.workers.len(), 2);
+    assert!(result
+        .workers
+        .iter()
+        .all(|worker| worker.observations.len() == 3));
+    assert_eq!(parent.requests.lock().unwrap().len(), 2);
+}

@@ -92,13 +92,23 @@ fn message(role: &str, content: String) -> ChatMessage {
     }
 }
 
+fn worker_status(caller_cancelled: bool, ledger_cancelled: bool, succeeded: bool) -> &'static str {
+    if caller_cancelled || ledger_cancelled {
+        "cancelled"
+    } else if succeeded {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
 fn limits() -> Limits {
     Limits {
         // 200 KiB-scale conservative aggregate input reservation ceiling,
         // including serialized messages/tools, deliberately not 200k BPE tokens.
         input_tokens: 200_000,
         output_tokens: 12_000,
-        requests: 8,
+        requests: 2 + 2 * u64::from(super::worker_coordinator::MAX_TOOL_STEPS + 1),
         tool_steps: 8,
         result_bytes: 40_000,
         concurrent_children: 2,
@@ -336,13 +346,11 @@ impl RunnerAdapter for ParentAdapter {
                 let joined = task.await;
                 self.events.emit(
                     Some(&child_id),
-                    if cancel.is_cancelled() {
-                        "cancelled"
-                    } else if joined.as_ref().is_ok_and(Result::is_ok) {
-                        "completed"
-                    } else {
-                        "failed"
-                    },
+                    worker_status(
+                        cancel.is_cancelled(),
+                        self.coordinator.is_cancelled(),
+                        joined.as_ref().is_ok_and(Result::is_ok),
+                    ),
                 );
                 let result = joined.map_err(|_| "Delegated worker task interrupted")?;
                 vec![result?]
@@ -390,13 +398,11 @@ impl RunnerAdapter for ParentAdapter {
                 for (id, joined) in [(&first_id, &left), (&second_id, &right)] {
                     self.events.emit(
                         Some(id),
-                        if cancel.is_cancelled() {
-                            "cancelled"
-                        } else if joined.as_ref().is_ok_and(|result| result.is_ok()) {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
+                        worker_status(
+                            cancel.is_cancelled(),
+                            self.coordinator.is_cancelled(),
+                            joined.as_ref().is_ok_and(Result::is_ok),
+                        ),
                     );
                 }
                 let left = left.map_err(|_| "Delegated worker task interrupted")?;
@@ -415,13 +421,11 @@ impl RunnerAdapter for ParentAdapter {
                 let joined = task.await;
                 self.events.emit(
                     Some(&child_id),
-                    if cancel.is_cancelled() {
-                        "cancelled"
-                    } else if joined.as_ref().is_ok_and(Result::is_ok) {
-                        "completed"
-                    } else {
-                        "failed"
-                    },
+                    worker_status(
+                        cancel.is_cancelled(),
+                        self.coordinator.is_cancelled(),
+                        joined.as_ref().is_ok_and(Result::is_ok),
+                    ),
                 );
                 vec![joined.map_err(|_| "Delegated remote worker task interrupted")??]
             }
@@ -472,13 +476,11 @@ impl RunnerAdapter for ParentAdapter {
                 for (id, joined) in [(&first_id, &left), (&second_id, &right)] {
                     self.events.emit(
                         Some(id),
-                        if cancel.is_cancelled() {
-                            "cancelled"
-                        } else if joined.as_ref().is_ok_and(Result::is_ok) {
-                            "completed"
-                        } else {
-                            "failed"
-                        },
+                        worker_status(
+                            cancel.is_cancelled(),
+                            self.coordinator.is_cancelled(),
+                            joined.as_ref().is_ok_and(Result::is_ok),
+                        ),
                     );
                 }
                 vec![

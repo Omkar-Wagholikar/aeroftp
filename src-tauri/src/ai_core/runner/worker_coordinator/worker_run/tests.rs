@@ -184,3 +184,129 @@ async fn undelegated_worker_tool_fails_and_releases_child_after_quiescence() {
     );
     ledger.finish(Terminal::Failed).unwrap();
 }
+
+#[tokio::test]
+async fn worker_recovers_from_missing_file_and_arguments_without_recording_false_evidence() {
+    for arguments in [
+        json!({"root_id":"root-1","path":"missing.txt"}),
+        json!({"path":"note.txt"}),
+    ] {
+        let (coordinator, child, ledger, _root) = fixture();
+        let script = Arc::new(Script {
+            replies: Mutex::new(VecDeque::from([
+                response(
+                    "",
+                    Some(vec![AIToolCall {
+                        id: "bad".into(),
+                        name: "local_read".into(),
+                        arguments,
+                    }]),
+                ),
+                response(
+                    "",
+                    Some(vec![AIToolCall {
+                        id: "good".into(),
+                        name: "local_read".into(),
+                        arguments: json!({"root_id":"root-1","path":"note.txt"}),
+                    }]),
+                ),
+                response("Recovered summary", None),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let result = coordinator
+            .spawn_local_worker(child, script.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.summary, "Recovered summary");
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(result.observations[0].path, "note.txt");
+        let requests = script.requests.lock().unwrap();
+        let error = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("bad"))
+            .unwrap();
+        assert!(error.content.contains("error"));
+        assert!(error.content.len() <= 1100);
+        assert!(ledger.snapshot().unwrap().3 >= error.content.len() as u64);
+    }
+}
+
+#[test]
+fn worker_scope_and_budget_errors_are_never_recoverable() {
+    for error in [
+        "Local root is not delegated",
+        "Worker remote path escapes or obscures its granted root",
+        "Worker is inactive or belongs to another run",
+        "Tool is not in the worker allowlist",
+        "Budget exceeded",
+        "Worker read task interrupted: error",
+    ] {
+        assert!(!recoverable_tool_error(error), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn recoverable_worker_error_still_exhausts_the_shared_result_budget() {
+    let (coordinator, child, ledger, _root) = fixture();
+    ledger
+        .reserve_result_bytes(&child.child_id, 19_999)
+        .unwrap();
+    let script = Script {
+        replies: Mutex::new(VecDeque::new()),
+        requests: Mutex::new(Vec::new()),
+    };
+    let request = template(&child).unwrap();
+    let adapter = WorkerAdapter {
+        coordinator: &coordinator,
+        child: &child,
+        transport: &script,
+        trusted_prefix: &request.messages,
+        trusted_tools: request.tools.as_deref(),
+        observations: Mutex::new(Vec::new()),
+    };
+    let caller = CancellationToken::new();
+    let call = AIToolCall {
+        id: "bad".into(),
+        name: "local_read".into(),
+        arguments: json!({"path":"note.txt"}),
+    };
+    assert!(adapter
+        .execute(&call, &caller)
+        .await
+        .unwrap_err()
+        .contains("budget"));
+    assert!(ledger.cancellation().is_cancelled());
+    assert!(!caller.is_cancelled());
+    assert!(adapter.observations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn undelegated_root_remains_terminal_instead_of_becoming_a_tool_error() {
+    let (coordinator, child, _ledger, _root) = fixture();
+    let script = Script {
+        replies: Mutex::new(VecDeque::new()),
+        requests: Mutex::new(Vec::new()),
+    };
+    let request = template(&child).unwrap();
+    let adapter = WorkerAdapter {
+        coordinator: &coordinator,
+        child: &child,
+        transport: &script,
+        trusted_prefix: &request.messages,
+        trusted_tools: request.tools.as_deref(),
+        observations: Mutex::new(Vec::new()),
+    };
+    let call = AIToolCall {
+        id: "outside".into(),
+        name: "local_read".into(),
+        arguments: json!({"root_id":"outside","path":"note.txt"}),
+    };
+    assert!(adapter
+        .execute(&call, &CancellationToken::new())
+        .await
+        .unwrap_err()
+        .contains("not delegated"));
+}
