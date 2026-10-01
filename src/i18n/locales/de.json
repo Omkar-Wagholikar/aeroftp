@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Keine geeigneten gespeicherten S3-Profile verfügbar.",
             "workerStopping": "Wird gestoppt...",
             "mcpClient": {
-                "notAvailable": "MCP-Client-Ausführung ist noch nicht verfügbar. Das Speichern, Aktivieren oder Autorisieren eines Servers hier startet ihn nicht und gewährt keinen Tool-Zugriff.",
                 "refresh": "MCP-Server aktualisieren",
                 "serverId": "Server-ID",
                 "addServer": "Server hinzufügen",
                 "enabled": "Aktiviert",
                 "removeServer": "{name} entfernen",
                 "saveServer": "Server speichern",
-                "healthPending": "Status und Tools: verfügbar, sobald das Modell-Routing aktiviert ist",
                 "stdioTitle": "Lokale STDIO-Server",
                 "stdioSubtitle": "Manuelle STDIO-Konfiguration für den aktiven Benutzer",
                 "executablePath": "Absoluter Pfad der ausführbaren Datei",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Geben Sie einen öffentlichen HTTPS-Endpunkt ohne Anmeldedaten, Abfrage oder Fragment ein.",
                     "invalidSecret": "Geben Sie ein gültiges Token ohne Zeilenumbrüche ein.",
                     "invalidClient": "Geben Sie eine gültige Client-ID oder HTTPS-URL für Client-Metadaten ein, nicht beides.",
-                    "notFound": "Dieser Server existiert nicht mehr. Aktualisieren Sie die Liste."
-                }
+                    "notFound": "Dieser Server existiert nicht mehr. Aktualisieren Sie die Liste.",
+                    "configDisabled": "Dieser Server ist deaktiviert.",
+                    "secretUnavailable": "Ein gespeichertes Geheimnis für diesen Server fehlt.",
+                    "invalidCall": "Der Tool-Aufruf war ungültig.",
+                    "approvalRequired": "Der Tool-Aufruf wurde nicht genehmigt.",
+                    "oauthRequired": "Dieser Server benötigt eine Autorisierung. Autorisieren Sie ihn in den KI-Einstellungen.",
+                    "schemaChanged": "Der Server hat dieses Tool geändert, nachdem es angeboten wurde. Versuchen Sie es erneut.",
+                    "toolArguments": "Die Argumente passen nicht zum Schema des Tools.",
+                    "toolsUnsupported": "Die Tool-Liste des Servers liegt außerhalb dessen, was AeroFTP unterstützt.",
+                    "toolCancelled": "Der Tool-Aufruf wurde abgebrochen.",
+                    "serverTimeout": "Der Server hat nicht rechtzeitig geantwortet.",
+                    "sandboxUnavailable": "Lokale MCP-Server können auf diesem System noch nicht ausgeführt werden.",
+                    "startFailed": "Der lokale Server konnte nicht gestartet werden.",
+                    "serverFailed": "Der Server wurde beendet oder hat eine ungültige Antwort gesendet.",
+                    "httpUnauthorized": "Der Server hat die gespeicherten Anmeldedaten abgelehnt.",
+                    "unsupportedVersion": "Der Server verwendet eine MCP-Version, die AeroFTP nicht unterstützt."
+                },
+                "routingNotice": "Aktivierte Server stellen AeroAgent ihre Tools zur Verfügung. Jeder Tool-Aufruf erfordert zuerst Ihre Genehmigung.",
+                "checkNow": "Jetzt prüfen",
+                "healthChecking": "Server wird geprüft...",
+                "healthDisabled": "Wird nicht gestartet, solange deaktiviert",
+                "healthError": "Nicht verfügbar: {reason}",
+                "healthReady": "Bereit, für AeroAgent verfügbare Tools: {count}",
+                "healthUnsupported": "Tools mit nicht unterstützten Schemas: {count}",
+                "healthShowTools": "Tools anzeigen"
             }
         },
         "archive": {

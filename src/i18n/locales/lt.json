@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Tinkamų išsaugotų S3 profilių nėra.",
             "workerStopping": "Stabdoma...",
             "mcpClient": {
-                "notAvailable": "MCP kliento vykdymas dar nepasiekiamas. Serverio įrašymas, įjungimas ar įgaliojimas čia jo nepaleidžia ir nesuteikia prieigos prie įrankių.",
                 "refresh": "Atnaujinti MCP serverius",
                 "serverId": "Serverio ID",
                 "addServer": "Pridėti serverį",
                 "enabled": "Įjungta",
                 "removeServer": "Pašalinti {name}",
                 "saveServer": "Įrašyti serverį",
-                "healthPending": "Būsena ir įrankiai: bus pasiekiami įjungus modelių maršrutizavimą",
                 "stdioTitle": "Vietiniai STDIO serveriai",
                 "stdioSubtitle": "Rankinė STDIO konfigūracija aktyviam naudotojui",
                 "executablePath": "Vykdomojo failo absoliutus kelias",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Įveskite viešą HTTPS galinį tašką be prisijungimo duomenų, užklausos ar fragmento.",
                     "invalidSecret": "Įveskite tinkamą žetoną be eilučių lūžių.",
                     "invalidClient": "Įveskite tinkamą kliento ID arba HTTPS kliento metaduomenų URL, ne abu.",
-                    "notFound": "Šio serverio nebėra. Atnaujinkite sąrašą."
-                }
+                    "notFound": "Šio serverio nebėra. Atnaujinkite sąrašą.",
+                    "configDisabled": "Šis serveris išjungtas.",
+                    "secretUnavailable": "Trūksta šiam serveriui išsaugotos paslapties.",
+                    "invalidCall": "Įrankio iškvietimas buvo netinkamas.",
+                    "approvalRequired": "Įrankio iškvietimas nebuvo patvirtintas.",
+                    "oauthRequired": "Šiam serveriui reikia įgaliojimo. Suteikite jį AI nustatymuose.",
+                    "schemaChanged": "Serveris pakeitė šį įrankį jį pasiūlęs. Bandykite dar kartą.",
+                    "toolArguments": "Argumentai neatitinka įrankio schemos.",
+                    "toolsUnsupported": "Serverio įrankių sąrašas viršija tai, ką palaiko AeroFTP.",
+                    "toolCancelled": "Įrankio iškvietimas atšauktas.",
+                    "serverTimeout": "Serveris neatsakė laiku.",
+                    "sandboxUnavailable": "Vietiniai MCP serveriai šioje sistemoje dar negali veikti.",
+                    "startFailed": "Nepavyko paleisti vietinio serverio.",
+                    "serverFailed": "Serveris sustojo arba atsiuntė netinkamą atsakymą.",
+                    "httpUnauthorized": "Serveris atmetė išsaugotus prisijungimo duomenis.",
+                    "unsupportedVersion": "Serveris naudoja MCP versiją, kurios AeroFTP nepalaiko."
+                },
+                "routingNotice": "Įjungti serveriai teikia savo įrankius AeroAgent. Kiekvienas įrankio iškvietimas pirmiausia prašo jūsų patvirtinimo.",
+                "checkNow": "Tikrinti dabar",
+                "healthChecking": "Tikrinamas serveris...",
+                "healthDisabled": "Nepaleidžiamas, kol išjungtas",
+                "healthError": "Nepasiekiamas: {reason}",
+                "healthReady": "Paruoštas, AeroAgent prieinami įrankiai: {count}",
+                "healthUnsupported": "Įrankiai su nepalaikomomis schemomis: {count}",
+                "healthShowTools": "Rodyti įrankius"
             }
         },
         "archive": {

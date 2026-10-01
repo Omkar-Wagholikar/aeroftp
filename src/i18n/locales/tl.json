@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Walang available na kwalipikadong naka-save na S3 profile.",
             "workerStopping": "Humihinto...",
             "mcpClient": {
-                "notAvailable": "Hindi pa available ang pagpapatakbo ng MCP client. Ang pag-save, pag-enable o pag-authorize ng server dito ay hindi nagsisimula nito at hindi nagbibigay ng access sa mga tool.",
                 "refresh": "I-refresh ang mga MCP server",
                 "serverId": "ID ng server",
                 "addServer": "Magdagdag ng server",
                 "enabled": "Naka-enable",
                 "removeServer": "Alisin ang {name}",
                 "saveServer": "I-save ang server",
-                "healthPending": "Kalusugan at mga tool: available kapag na-enable na ang model routing",
                 "stdioTitle": "Mga lokal na STDIO server",
                 "stdioSubtitle": "Manu-manong STDIO configuration para sa aktibong user",
                 "executablePath": "Absolute path ng executable",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Maglagay ng pampublikong HTTPS endpoint na walang credentials, query, o fragment.",
                     "invalidSecret": "Maglagay ng valid na token na walang line break.",
                     "invalidClient": "Maglagay ng valid na client ID o HTTPS client metadata URL, hindi pareho.",
-                    "notFound": "Wala na ang server na ito. I-refresh ang listahan."
-                }
+                    "notFound": "Wala na ang server na ito. I-refresh ang listahan.",
+                    "configDisabled": "Naka-disable ang server na ito.",
+                    "secretUnavailable": "Nawawala ang naka-save na lihim para sa server na ito.",
+                    "invalidCall": "Hindi valid ang tawag sa tool.",
+                    "approvalRequired": "Hindi naaprubahan ang tawag sa tool.",
+                    "oauthRequired": "Kailangan ng awtorisasyon ng server na ito. Pahintulutan ito sa Mga Setting ng AI.",
+                    "schemaChanged": "Binago ng server ang tool na ito matapos itong ialok. Subukan muli.",
+                    "toolArguments": "Hindi tugma ang mga argumento sa schema ng tool.",
+                    "toolsUnsupported": "Ang listahan ng tool ng server ay lampas sa sinusuportahan ng AeroFTP.",
+                    "toolCancelled": "Kinansela ang tawag sa tool.",
+                    "serverTimeout": "Hindi sumagot ang server sa oras.",
+                    "sandboxUnavailable": "Hindi pa maaaring tumakbo ang mga lokal na MCP server sa system na ito.",
+                    "startFailed": "Hindi masimulan ang lokal na server.",
+                    "serverFailed": "Huminto ang server o nagpadala ng di-wastong sagot.",
+                    "httpUnauthorized": "Tinanggihan ng server ang mga naka-save na kredensyal.",
+                    "unsupportedVersion": "Gumagamit ang server ng bersyon ng MCP na hindi sinusuportahan ng AeroFTP."
+                },
+                "routingNotice": "Ibinibigay ng mga naka-enable na server ang kanilang mga tool sa AeroAgent. Humihingi muna ng iyong pag-apruba ang bawat tawag sa tool.",
+                "checkNow": "Suriin ngayon",
+                "healthChecking": "Sinusuri ang server...",
+                "healthDisabled": "Hindi sinisimulan habang naka-disable",
+                "healthError": "Hindi available: {reason}",
+                "healthReady": "Handa, mga tool na available sa AeroAgent: {count}",
+                "healthUnsupported": "Mga tool na may hindi sinusuportahang schema: {count}",
+                "healthShowTools": "Ipakita ang mga tool"
             }
         },
         "archive": {

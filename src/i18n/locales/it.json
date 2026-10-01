@@ -3185,14 +3185,12 @@
             "delegateRemoteEmpty": "Nessun profilo S3 salvato idoneo disponibile.",
             "workerStopping": "Arresto...",
             "mcpClient": {
-                "notAvailable": "L'esecuzione del client MCP non è ancora disponibile. Salvare, abilitare o autorizzare un server qui non lo avvia e non concede accesso agli strumenti.",
                 "refresh": "Aggiorna server MCP",
                 "serverId": "ID server",
                 "addServer": "Aggiungi server",
                 "enabled": "Abilitato",
                 "removeServer": "Rimuovi {name}",
                 "saveServer": "Salva server",
-                "healthPending": "Stato e strumenti: disponibili dopo l'attivazione dell'instradamento dei modelli",
                 "stdioTitle": "Server STDIO locali",
                 "stdioSubtitle": "Configurazione STDIO manuale per l'utente attivo",
                 "executablePath": "Percorso assoluto dell'eseguibile",
@@ -3261,8 +3259,31 @@
                     "invalidEndpoint": "Inserisci un endpoint HTTPS pubblico senza credenziali, query o frammento.",
                     "invalidSecret": "Inserisci un token valido senza interruzioni di riga.",
                     "invalidClient": "Inserisci un ID client valido o un URL HTTPS dei metadati del client, non entrambi.",
-                    "notFound": "Questo server non esiste più. Aggiorna l'elenco."
-                }
+                    "notFound": "Questo server non esiste più. Aggiorna l'elenco.",
+                    "configDisabled": "Questo server è disabilitato.",
+                    "secretUnavailable": "Manca un segreto salvato per questo server.",
+                    "invalidCall": "La chiamata allo strumento non è valida.",
+                    "approvalRequired": "La chiamata allo strumento non è stata approvata.",
+                    "oauthRequired": "Questo server richiede un'autorizzazione. Autorizzalo nelle Impostazioni AI.",
+                    "schemaChanged": "Il server ha modificato questo strumento dopo averlo offerto. Riprova.",
+                    "toolArguments": "Gli argomenti non corrispondono allo schema dello strumento.",
+                    "toolsUnsupported": "L'elenco degli strumenti del server non rientra in ciò che AeroFTP supporta.",
+                    "toolCancelled": "La chiamata allo strumento è stata annullata.",
+                    "serverTimeout": "Il server non ha risposto in tempo.",
+                    "sandboxUnavailable": "I server MCP locali non possono ancora essere eseguiti su questo sistema.",
+                    "startFailed": "Non è stato possibile avviare il server locale.",
+                    "serverFailed": "Il server si è arrestato o ha inviato una risposta non valida.",
+                    "httpUnauthorized": "Il server ha rifiutato le credenziali salvate.",
+                    "unsupportedVersion": "Il server usa una versione di MCP che AeroFTP non supporta."
+                },
+                "routingNotice": "I server abilitati offrono i loro strumenti ad AeroAgent. Ogni chiamata a uno strumento chiede prima la tua approvazione.",
+                "checkNow": "Verifica ora",
+                "healthChecking": "Verifica del server in corso...",
+                "healthDisabled": "Non avviato finché è disabilitato",
+                "healthError": "Non disponibile: {reason}",
+                "healthReady": "Pronto, strumenti disponibili per AeroAgent: {count}",
+                "healthUnsupported": "Strumenti con schemi non supportati: {count}",
+                "healthShowTools": "Mostra strumenti"
             }
         },
         "archive": {

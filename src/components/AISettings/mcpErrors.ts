@@ -26,6 +26,22 @@ const ERROR_KEYS: Record<string, string> = {
     MCP_HTTP_SECRET_INVALID: 'ai.mcpClient.errors.invalidSecret',
     MCP_HTTP_INVALID_OAUTH_CLIENT: 'ai.mcpClient.errors.invalidClient',
     MCP_CONFIG_NOT_FOUND: 'ai.mcpClient.errors.notFound',
+    MCP_CONFIG_UNAVAILABLE: 'ai.mcpClient.errors.notFound',
+    MCP_CONFIG_DISABLED: 'ai.mcpClient.errors.configDisabled',
+    MCP_SECRET_UNAVAILABLE: 'ai.mcpClient.errors.secretUnavailable',
+    MCP_CALL_INVALID_REQUEST: 'ai.mcpClient.errors.invalidCall',
+    MCP_APPROVAL_REQUIRED: 'ai.mcpClient.errors.approvalRequired',
+    MCP_OAUTH_REQUIRED: 'ai.mcpClient.errors.oauthRequired',
+    MCP_TOOL_SCHEMA_CHANGED: 'ai.mcpClient.errors.schemaChanged',
+    MCP_TOOL_ARGUMENTS: 'ai.mcpClient.errors.toolArguments',
+    MCP_TOOLS_UNSUPPORTED: 'ai.mcpClient.errors.toolsUnsupported',
+    MCP_TOOL_CANCELLED: 'ai.mcpClient.errors.toolCancelled',
+    MCP_SERVER_TIMEOUT: 'ai.mcpClient.errors.serverTimeout',
+    MCP_STDIO_SANDBOX_UNAVAILABLE: 'ai.mcpClient.errors.sandboxUnavailable',
+    MCP_STDIO_START_FAILED: 'ai.mcpClient.errors.startFailed',
+    MCP_SERVER_FAILED: 'ai.mcpClient.errors.serverFailed',
+    MCP_HTTP_UNAUTHORIZED: 'ai.mcpClient.errors.httpUnauthorized',
+    MCP_HTTP_UNSUPPORTED_VERSION: 'ai.mcpClient.errors.unsupportedVersion',
 };
 
 export function describeMcpError(t: TranslationFunction, cause: unknown): string {

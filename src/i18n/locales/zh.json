@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "没有可用的符合条件的已保存 S3 配置。",
             "workerStopping": "正在停止...",
             "mcpClient": {
-                "notAvailable": "MCP 客户端执行功能暂不可用。在此保存、启用或授权服务器不会启动它，也不会授予工具访问权限。",
                 "refresh": "刷新 MCP 服务器",
                 "serverId": "服务器 ID",
                 "addServer": "添加服务器",
                 "enabled": "已启用",
                 "removeServer": "移除 {name}",
                 "saveServer": "保存服务器",
-                "healthPending": "运行状况和工具：启用模型路由后可用",
                 "stdioTitle": "本地 STDIO 服务器",
                 "stdioSubtitle": "为当前用户手动配置 STDIO",
                 "executablePath": "可执行文件的绝对路径",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "请输入不含凭据、查询或片段的公共 HTTPS 端点。",
                     "invalidSecret": "请输入不含换行的有效令牌。",
                     "invalidClient": "请输入有效的客户端 ID 或 HTTPS 客户端元数据 URL，不能同时输入两者。",
-                    "notFound": "此服务器不存在。请刷新列表。"
-                }
+                    "notFound": "此服务器不存在。请刷新列表。",
+                    "configDisabled": "此服务器已被禁用。",
+                    "secretUnavailable": "缺少为此服务器保存的密钥。",
+                    "invalidCall": "工具调用无效。",
+                    "approvalRequired": "工具调用未获批准。",
+                    "oauthRequired": "此服务器需要授权。请在 AI 设置中授权。",
+                    "schemaChanged": "服务器在提供此工具后对其进行了更改。请重试。",
+                    "toolArguments": "参数与工具的架构不匹配。",
+                    "toolsUnsupported": "服务器的工具列表超出了 AeroFTP 支持的范围。",
+                    "toolCancelled": "工具调用已取消。",
+                    "serverTimeout": "服务器未能及时响应。",
+                    "sandboxUnavailable": "本地 MCP 服务器目前还无法在此系统上运行。",
+                    "startFailed": "无法启动本地服务器。",
+                    "serverFailed": "服务器已停止或发送了无效的回复。",
+                    "httpUnauthorized": "服务器拒绝了已保存的凭据。",
+                    "unsupportedVersion": "服务器使用的 MCP 版本不受 AeroFTP 支持。"
+                },
+                "routingNotice": "已启用的服务器会向 AeroAgent 提供其工具。每次调用工具前都会先征求你的批准。",
+                "checkNow": "立即检查",
+                "healthChecking": "正在检查服务器...",
+                "healthDisabled": "禁用期间不会启动",
+                "healthError": "不可用：{reason}",
+                "healthReady": "已就绪，AeroAgent 可用的工具：{count}",
+                "healthUnsupported": "架构不受支持的工具：{count}",
+                "healthShowTools": "显示工具"
             }
         },
         "archive": {

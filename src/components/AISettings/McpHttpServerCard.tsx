@@ -10,6 +10,8 @@ import { MODAL_Z } from '../../utils/modalLayers';
 import { useTranslation } from '../../i18n';
 import type { TranslationFunction } from '../../i18n/types';
 import { describeMcpError } from './mcpErrors';
+import { McpHealthLine } from './mcpHealth';
+import { notifyMcpServersChanged } from '../DevTools/aiChatMcp';
 
 export type HttpAuthMode = 'none' | 'bearer' | 'oauth';
 export type HttpAuth =
@@ -108,7 +110,7 @@ export function McpHttpServerCard({ server, refresh }: { server: HttpServerView;
         finally {
             try { await refresh(); }
             catch (cause) { if (!failed) setError(describeMcpError(t, cause)); }
-            finally { setBusy(false); }
+            finally { setBusy(false); notifyMcpServersChanged(); }
         }
     };
 
@@ -149,7 +151,8 @@ export function McpHttpServerCard({ server, refresh }: { server: HttpServerView;
             <div className="min-w-0">
                 <h3 className="font-medium text-white">{server.id}</h3>
                 <p className="text-xs text-gray-400 break-all">{server.endpoint}</p>
-                <p className="text-xs text-gray-400">{credentialText(t, server)} · {t('ai.mcpClient.healthPending')}</p>
+                <p className="text-xs text-gray-400">{credentialText(t, server)}</p>
+                <McpHealthLine transport="http" id={server.id} />
             </div>
             <div className="flex items-center gap-3">
                 <label className="flex items-center gap-2 text-sm text-gray-300">

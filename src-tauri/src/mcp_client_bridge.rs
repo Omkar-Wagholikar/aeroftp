@@ -62,9 +62,40 @@ impl From<HttpError> for BridgeError {
         Self::Http(e)
     }
 }
-pub(crate) struct Preparation {
-    pub approval: AiToolApprovalPreparation,
-    pub schema_revision: String,
+impl BridgeError {
+    /// Stable code for the frontend. Transport detail never leaves the backend.
+    pub(crate) const fn code(&self) -> &'static str {
+        match self {
+            Self::Gate(error) => error.code(),
+            Self::Schema(SchemaError::Arguments) => "MCP_TOOL_ARGUMENTS",
+            Self::Schema(_) => "MCP_TOOLS_UNSUPPORTED",
+            Self::SchemaChanged => "MCP_TOOL_SCHEMA_CHANGED",
+            Self::OAuthPending => "MCP_OAUTH_REQUIRED",
+            Self::Stdio(TransportError::Cancelled) | Self::Http(HttpError::Cancelled) => {
+                "MCP_TOOL_CANCELLED"
+            }
+            Self::Stdio(TransportError::Timeout) | Self::Http(HttpError::Timeout) => {
+                "MCP_SERVER_TIMEOUT"
+            }
+            Self::Stdio(TransportError::SandboxUnavailable) => "MCP_STDIO_SANDBOX_UNAVAILABLE",
+            Self::Stdio(TransportError::InvalidConfig | TransportError::Spawn) => {
+                "MCP_STDIO_START_FAILED"
+            }
+            Self::Stdio(_) => "MCP_SERVER_FAILED",
+            Self::Http(
+                HttpError::Dns
+                | HttpError::Connect
+                | HttpError::UnsafeAddress
+                | HttpError::InvalidEndpoint,
+            ) => "MCP_HTTP_UNREACHABLE",
+            Self::Http(HttpError::Unauthorized(_) | HttpError::Forbidden(_)) => {
+                "MCP_HTTP_UNAUTHORIZED"
+            }
+            Self::Http(HttpError::StaleBinding) => "MCP_CONFIG_STALE_REVISION",
+            Self::Http(HttpError::UnsupportedVersion) => "MCP_HTTP_UNSUPPORTED_VERSION",
+            Self::Http(_) => "MCP_HTTP_FAILED",
+        }
+    }
 }
 struct State {
     user_id: i64,
@@ -79,14 +110,29 @@ enum Config {
 /// HTTP settings are backend-only. OAuth uses the separate revision-bound token resolver.
 fn resolve(app: &AppHandle, key: &[u8; 32], request: &BridgeRequest) -> Result<State, BridgeError> {
     validate_request(request)?;
+    let state = resolve_server(app, key, request.transport, &request.call.server_id)?;
+    if state.revision != request.call.expected_revision {
+        return Err(GateError::StaleRevision.into());
+    }
+    Ok(state)
+}
+
+/// The active user's enabled server with its secrets resolved, and the
+/// effective revision that binds both.
+fn resolve_server(
+    app: &AppHandle,
+    key: &[u8; 32],
+    transport: Transport,
+    server_id: &str,
+) -> Result<State, BridgeError> {
     let (mut conn, root_key, user_id) =
         mcp_client_commands::context(app).map_err(|_| GateError::UserUnavailable)?;
-    let config = match request.transport {
+    let config = match transport {
         Transport::Stdio => {
             let config = mcp_client_commands::load(&conn, &root_key, user_id)
                 .map_err(|_| GateError::ConfigUnavailable)?
                 .into_iter()
-                .find(|c| c.id == request.call.server_id)
+                .find(|c| c.id == server_id)
                 .ok_or(GateError::ConfigUnavailable)?;
             if !config.enabled {
                 return Err(GateError::ConfigDisabled.into());
@@ -103,27 +149,10 @@ fn resolve(app: &AppHandle, key: &[u8; 32], request: &BridgeRequest) -> Result<S
             Config::Stdio(config, environment)
         }
         Transport::Http => {
-            let value = crate::user_partitions::get_user_setting_for(
-                &conn,
-                &root_key,
-                user_id,
-                "aeroagent_mcp_http_servers",
-            )
-            .map_err(|_| GateError::ConfigUnavailable)?
-            .unwrap_or(json!([]));
-            let configs: Vec<McpHttpServerConfig> =
-                serde_json::from_value(value).map_err(|_| GateError::ConfigUnavailable)?;
-            let mut ids = std::collections::HashSet::new();
-            if configs.len() > 32
-                || configs
-                    .iter()
-                    .any(|c| c.validate().is_err() || !ids.insert(c.id.clone()))
-            {
-                return Err(GateError::ConfigUnavailable.into());
-            }
-            let config = configs
+            let config = crate::mcp_client_http_commands::load(&conn, &root_key, user_id)
+                .map_err(|_| GateError::ConfigUnavailable)?
                 .into_iter()
-                .find(|c| c.id == request.call.server_id)
+                .find(|c| c.id == server_id)
                 .ok_or(GateError::ConfigUnavailable)?;
             if !config.enabled {
                 return Err(GateError::ConfigDisabled.into());
@@ -145,13 +174,124 @@ fn resolve(app: &AppHandle, key: &[u8; 32], request: &BridgeRequest) -> Result<S
         Config::Stdio(_, e) => e.effective_revision.clone(),
         Config::Http(_, a) => a.effective_revision.clone(),
     };
-    if revision != request.call.expected_revision {
-        return Err(GateError::StaleRevision.into());
-    }
     Ok(State {
         user_id,
         revision,
         config,
+    })
+}
+
+/// The user and effective revision the server resolves to now, without
+/// connecting. Fails as a call would: disabled, missing, locked or no token.
+pub(crate) fn binding(
+    app: &AppHandle,
+    key: &[u8; 32],
+    transport: Transport,
+    server_id: &str,
+) -> Result<(i64, String), BridgeError> {
+    let state = resolve_server(app, key, transport, server_id)?;
+    Ok((state.user_id, state.revision))
+}
+
+/// The binding a connection was opened under is still the live one.
+fn same_binding(
+    app: &AppHandle,
+    key: &[u8; 32],
+    transport: Transport,
+    server_id: &str,
+    user_id: i64,
+    revision: &str,
+) -> Result<(), BridgeError> {
+    let current = resolve_server(app, key, transport, server_id)?;
+    if current.user_id != user_id || current.revision != revision {
+        return Err(GateError::StaleRevision.into());
+    }
+    Ok(())
+}
+
+/// One advertised tool whose schema passed the backend subset. Untrusted
+/// discovery data: it grants nothing and carries no server annotations.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdvertisedTool {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+    pub schema_revision: String,
+}
+pub(crate) struct Discovery {
+    pub user_id: i64,
+    pub revision: String,
+    pub tools: Vec<AdvertisedTool>,
+    /// Advertised tools left out because their schema is outside the subset.
+    pub unsupported: usize,
+}
+
+/// Keeps every tool the backend could later call and counts the rest. A
+/// paginated or oversized catalog is refused whole, as `discover` would.
+fn advertised(listed: &Value, key: &[u8; 32]) -> Result<(Vec<AdvertisedTool>, usize), BridgeError> {
+    let entries = listed
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or(SchemaError::Unavailable)?;
+    if entries.len() > 128 || listed.get("nextCursor").is_some() {
+        return Err(SchemaError::Unavailable.into());
+    }
+    let mut tools = Vec::new();
+    let mut unsupported = 0;
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match schema::discover(listed, name) {
+            Ok(input_schema) => tools.push(AdvertisedTool {
+                name: name.to_owned(),
+                description: entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                schema_revision: schema::revision(&input_schema, key),
+                input_schema,
+            }),
+            Err(_) => unsupported += 1,
+        }
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((tools, unsupported))
+}
+
+/// Connects under the live binding, lists the tools once and closes. The
+/// result is a snapshot: a later call re-lists and re-checks everything.
+pub(crate) async fn discover_tools(
+    app: &AppHandle,
+    key: &[u8; 32],
+    transport: Transport,
+    server_id: &str,
+    cancel: &CancellationToken,
+) -> Result<Discovery, BridgeError> {
+    check_cancel(cancel)?;
+    let state = resolve_server(app, key, transport, server_id)?;
+    let (user_id, revision) = (state.user_id, state.revision.clone());
+    let fresh = || same_binding(app, key, transport, server_id, user_id, &revision);
+    let mut peer = Connection::connect(state.config, user_id, &revision, cancel, fresh).await?;
+    let mut fresh = || same_binding(app, key, transport, server_id, user_id, &revision);
+    let listed = async {
+        let listed = peer
+            .call_checked("tools/list", Map::new(), None, cancel, &mut fresh)
+            .await?;
+        fresh()?;
+        check_cancel(cancel)?;
+        Ok::<_, BridgeError>(listed)
+    }
+    .await;
+    peer.shutdown().await;
+    let (tools, unsupported) = advertised(&listed?, key)?;
+    Ok(Discovery {
+        user_id,
+        revision,
+        tools,
+        unsupported,
     })
 }
 
@@ -272,6 +412,16 @@ fn validate_request(request: &BridgeRequest) -> Result<(), BridgeError> {
         return Err(GateError::InvalidRequest.into());
     }
     Ok(())
+}
+/// What the approval window shows: the supplying server, its transport and
+/// the tool. The arguments are bound by the approval key, not displayed.
+fn approval_message(request: &BridgeRequest) -> String {
+    format!(
+        "AeroAgent wants to: Run MCP Tool\n\n  server: {}\n  transport: {}\n  tool: {}",
+        request.call.server_id,
+        request.transport.label(),
+        request.call.tool_name
+    )
 }
 fn check_cancel(cancel: &CancellationToken) -> Result<(), BridgeError> {
     if cancel.is_cancelled() {
@@ -424,10 +574,7 @@ async fn with_backend(
                             approval_key.clone(),
                             approval_key,
                             false,
-                            format!(
-                                "AeroAgent wants to: Run MCP Tool\n\n  server: {}\n  tool: {}",
-                                request.call.server_id, request.call.tool_name
-                            ),
+                            approval_message(request),
                         )
                         .await,
                     );
@@ -468,17 +615,16 @@ async fn with_backend(
         status, duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64, "private MCP bridge");
     result
 }
+/// Opens the approval request for a call whose schema revision the caller
+/// already holds from a snapshot; a different live schema is refused.
 pub(crate) async fn prepare(
     app: &AppHandle,
     key: &[u8; 32],
     request: &BridgeRequest,
     cancel: &CancellationToken,
-) -> Result<Preparation, BridgeError> {
-    let (schema_revision, _, approval) = with_backend(app, key, request, false, cancel).await?;
-    Ok(Preparation {
-        schema_revision,
-        approval: approval.ok_or(GateError::ApprovalRequired)?,
-    })
+) -> Result<AiToolApprovalPreparation, BridgeError> {
+    let (_, _, approval) = with_backend(app, key, request, false, cancel).await?;
+    Ok(approval.ok_or(GateError::ApprovalRequired)?)
 }
 pub(crate) async fn dispatch(
     app: &AppHandle,
@@ -494,6 +640,119 @@ pub(crate) async fn dispatch(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn advertised_tools_keep_the_callable_subset_and_count_the_rest() {
+        let ok =
+            json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]});
+        let listed = json!({"tools":[
+            {"name":"read","description":"Read a file","inputSchema":ok,
+             "annotations":{"readOnlyHint":true,"destructiveHint":false}},
+            {"name":"nested","inputSchema":{"type":"object","properties":{"o":{"type":"object"}}}},
+            {"name":"dup","inputSchema":ok},
+            {"name":"dup","inputSchema":ok},
+            {"name":"bad name!","inputSchema":ok},
+            {"name":"alpha","inputSchema":{"type":"object","properties":{}}}
+        ]});
+        let (tools, unsupported) = advertised(&listed, &KEY).unwrap();
+        assert_eq!(unsupported, 4);
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["alpha", "read"]
+        );
+        let read = &tools[1];
+        assert_eq!(read.description.as_deref(), Some("Read a file"));
+        assert_eq!(read.input_schema, ok);
+        assert_eq!(read.schema_revision, schema::revision(&ok, &KEY));
+        assert_ne!(read.schema_revision, schema::revision(&ok, &[7; 32]));
+        // Server annotations never reach the snapshot.
+        let value = serde_json::to_value(read).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["description", "inputSchema", "name", "schemaRevision"]
+        );
+        for refused in [
+            json!({"tools":[], "nextCursor":"2"}),
+            json!({"tools":vec![json!({"name":"t","inputSchema":ok}); 129]}),
+            json!({"items":[]}),
+        ] {
+            assert_eq!(
+                advertised(&refused, &KEY).unwrap_err(),
+                BridgeError::Schema(SchemaError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn the_approval_names_server_transport_and_tool() {
+        let mut req = request();
+        assert_eq!(
+            approval_message(&req),
+            "AeroAgent wants to: Run MCP Tool\n\n  server: fixture\n  transport: http\n  tool: echo"
+        );
+        req.transport = Transport::Stdio;
+        assert!(approval_message(&req).contains("\n  transport: stdio\n"));
+    }
+
+    #[test]
+    fn every_bridge_failure_has_a_stable_code() {
+        for (error, code) in [
+            (BridgeError::OAuthPending, "MCP_OAUTH_REQUIRED"),
+            (BridgeError::SchemaChanged, "MCP_TOOL_SCHEMA_CHANGED"),
+            (
+                BridgeError::Schema(SchemaError::Arguments),
+                "MCP_TOOL_ARGUMENTS",
+            ),
+            (
+                BridgeError::Schema(SchemaError::Unsupported),
+                "MCP_TOOLS_UNSUPPORTED",
+            ),
+            (
+                BridgeError::Gate(GateError::StaleRevision),
+                "MCP_CONFIG_STALE_REVISION",
+            ),
+            (
+                BridgeError::Gate(GateError::ApprovalRequired),
+                "MCP_APPROVAL_REQUIRED",
+            ),
+            (
+                BridgeError::Stdio(TransportError::Cancelled),
+                "MCP_TOOL_CANCELLED",
+            ),
+            (
+                BridgeError::Http(HttpError::Cancelled),
+                "MCP_TOOL_CANCELLED",
+            ),
+            (
+                BridgeError::Stdio(TransportError::Timeout),
+                "MCP_SERVER_TIMEOUT",
+            ),
+            (
+                BridgeError::Stdio(TransportError::SandboxUnavailable),
+                "MCP_STDIO_SANDBOX_UNAVAILABLE",
+            ),
+            (
+                BridgeError::Stdio(TransportError::Spawn),
+                "MCP_STDIO_START_FAILED",
+            ),
+            (BridgeError::Stdio(TransportError::Eof), "MCP_SERVER_FAILED"),
+            (BridgeError::Http(HttpError::Dns), "MCP_HTTP_UNREACHABLE"),
+            (
+                BridgeError::Http(HttpError::StaleBinding),
+                "MCP_CONFIG_STALE_REVISION",
+            ),
+            (
+                BridgeError::Http(HttpError::UnsupportedVersion),
+                "MCP_HTTP_UNSUPPORTED_VERSION",
+            ),
+            (
+                BridgeError::Http(HttpError::InvalidResponse),
+                "MCP_HTTP_FAILED",
+            ),
+        ] {
+            assert_eq!(error.code(), code, "{error:?}");
+        }
+    }
     const KEY: [u8; 32] = [41; 32];
     fn input() -> Value {
         json!({"type":"object","properties":{"text":{"type":"string","x-mcp-header":"Text"}},"required":["text"],"additionalProperties":false})

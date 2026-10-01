@@ -16,7 +16,8 @@ const plugin = (id: string, name = 'local_read'): PluginManifest => ({
 });
 
 const mcp = (id: string, name = 'remote.read'): McpServerSnapshot => ({
-    id, revision: 'rev-1', enabled: true, tools: [{ name, description: 'Fetch remote data', enabled: true,
+    id, transport: 'stdio', revision: 'rev-1', enabled: true, tools: [{ name, description: 'Fetch remote data', enabled: true,
+        schemaRevision: 'a'.repeat(64),
         dangerLevel: 'safe', inputSchema: { type: 'object', properties: {
             path: { type: 'string', description: 'Remote path' }, limit: { type: 'number' },
         }, required: ['path'], additionalProperties: false } }],
@@ -41,6 +42,20 @@ describe('untrusted MCP registry snapshot', () => {
         expect(updated.find(entry => entry.source.kind === 'mcp')?.tool.name).toBe(tools[0].tool.name);
     });
 
+    it('carries transport and backend revisions as provenance, and a new schema revision makes a call stale', () => {
+        const http = { ...mcp('remote'), transport: 'http' as const, revision: 'b'.repeat(64) };
+        const before = buildToolRegistry([], [], [http]);
+        const entry = before.find(tool => tool.source.kind === 'mcp')!;
+        expect(entry.source).toEqual({ kind: 'mcp', ownerId: 'remote', toolName: 'remote.read', transport: 'http',
+            serverRevision: 'b'.repeat(64), schemaRevision: 'a'.repeat(64) });
+        expect(entry.tool.description).toBe('[MCP http: remote] Fetch remote data');
+        const after = buildToolRegistry([], [], [{ ...http, tools: [{ ...http.tools[0], schemaRevision: 'c'.repeat(64) }] }]);
+        expect(after.find(tool => tool.source.kind === 'mcp')!.tool.name).toBe(entry.tool.name);
+        expect(() => assertToolExecutionCurrent(entry, after, undefined, null, STALE)).toThrow(STALE.identityChanged);
+        const moved = buildToolRegistry([], [], [{ ...http, transport: 'stdio' }]);
+        expect(() => assertToolExecutionCurrent(entry, moved, undefined, null, STALE)).toThrow(STALE.identityChanged);
+    });
+
     it('rejects duplicate server IDs, tool names, disabled entries and unsafe identifiers', () => {
         expect(buildToolRegistry([], [], [mcp('same'), mcp('same')]).some(entry => entry.source.kind === 'mcp')).toBe(false);
         const duplicate = mcp('one'); duplicate.tools.push({ ...duplicate.tools[0] });
@@ -48,10 +63,13 @@ describe('untrusted MCP registry snapshot', () => {
         for (const server of [
             { ...mcp('off'), enabled: false }, { ...mcp('bad id'), id: '../escape' },
             { ...mcp('empty'), revision: '' },
+            { ...mcp('no-transport'), transport: undefined }, { ...mcp('odd-transport'), transport: 'sse' },
+            { ...mcp('no-schema-rev'), tools: [{ ...mcp('no-schema-rev').tools[0], schemaRevision: undefined }] },
+            { ...mcp('short-schema-rev'), tools: [{ ...mcp('short-schema-rev').tools[0], schemaRevision: 'abc' }] },
             { ...mcp('tool-off'), tools: [{ ...mcp('tool-off').tools[0], enabled: false }] },
             { ...mcp('bad-name'), tools: [{ ...mcp('bad-name').tools[0], name: 'bad\nname' }] },
             { ...mcp('too-many'), tools: Array.from({ length: 129 }, (_, i) => ({ ...mcp('too-many').tools[0], name: `tool${i}` })) },
-        ]) expect(buildToolRegistry([], [], [server]).some(entry => entry.source.kind === 'mcp')).toBe(false);
+        ] as unknown as McpServerSnapshot[]) expect(buildToolRegistry([], [], [server]).some(entry => entry.source.kind === 'mcp')).toBe(false);
         expect(buildToolRegistry([], [], Array.from({ length: 33 }, (_, i) => mcp(`server${i}`)))
             .some(entry => entry.source.kind === 'mcp')).toBe(false);
         expect(buildToolRegistry([], [], [null, { ...mcp('malformed'), tools: [null] }] as unknown as McpServerSnapshot[])

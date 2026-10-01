@@ -8,18 +8,22 @@ import type { ToolMacro } from './aiChatToolMacros';
 type Source = { kind: 'builtin' | 'discovery' }
     | { kind: 'plugin'; ownerId: string; toolName: string; version: string }
     | { kind: 'macro'; ownerId: string; macro: ToolMacro }
-    | { kind: 'mcp'; ownerId: string; toolName: string };
+    | { kind: 'mcp'; ownerId: string; toolName: string; transport: McpTransport; serverRevision: string; schemaRevision: string };
+export type McpTransport = 'stdio' | 'http';
 /** Untrusted discovery data. Process configuration and credentials belong in the backend. */
 export interface McpToolSnapshot {
     name: string;
     description?: string;
     inputSchema: unknown;
+    /** Backend digest of the validated schema; a call is approved against it. */
+    schemaRevision: string;
     enabled: boolean;
     /** Server claims cannot lower the local approval floor. */
     dangerLevel?: 'safe' | 'medium' | 'high';
 }
 export interface McpServerSnapshot {
     id: string;
+    transport: McpTransport;
     revision: string;
     enabled: boolean;
     tools: McpToolSnapshot[];
@@ -72,6 +76,7 @@ const MCP_MAX_DEPTH = 4;
 const MCP_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
 const MCP_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.\/-]{0,127}$/;
 const PARAM_NAME = /^[a-zA-Z_][a-zA-Z0-9_]{0,63}$/;
+const SCHEMA_REVISION = /^[a-f0-9]{64}$/;
 // Mirrors the backend's RFC token check for Mcp-Param-<suffix> headers.
 const MCP_HEADER_SUFFIX = /^[!#$%&'*+.^_`|~A-Za-z0-9-]{1,64}$/;
 const object = (value: unknown): value is Record<string, unknown> =>
@@ -161,19 +166,23 @@ export function buildToolRegistry(plugins: PluginManifest[], macros: ToolMacro[]
     }
     if (mcpServers.length <= MCP_MAX_SERVERS) for (const server of uniqueOwners(mcpServers.filter(object) as McpServerSnapshot[])) {
         if (typeof server.id !== 'string' || !MCP_ID.test(server.id) || !shortText(server.revision, 128) || !server.revision
+            || server.transport !== 'stdio' && server.transport !== 'http'
             || server.enabled !== true || !Array.isArray(server.tools) || server.tools.length > MCP_MAX_TOOLS) continue;
         const names = server.tools.map(tool => object(tool) ? tool.name : undefined);
         for (const tool of server.tools) {
             if (!object(tool) || tool.enabled !== true || typeof tool.name !== 'string' || !MCP_NAME.test(tool.name)
                 || names.filter(name => name === tool.name).length !== 1
+                || typeof tool.schemaRevision !== 'string' || !SCHEMA_REVISION.test(tool.schemaRevision)
                 || !shortText(tool.description ?? '', 512)) continue;
             const schema = mcpParameters(tool.inputSchema);
             if (!schema) continue;
             // Server-declared read-only/safe annotations are untrusted. Backend approval is still required.
-            add({ name: tool.name, description: `[MCP: ${server.id}] ${tool.description ?? ''}`,
+            // Provenance names the supplying server and its transport.
+            add({ name: tool.name, description: `[MCP ${server.transport}: ${server.id}] ${tool.description ?? ''}`,
                 ...schema, dangerLevel: 'high' },
-            { kind: 'mcp', ownerId: server.id, toolName: tool.name }, tool.name,
-            [server.revision, tool.inputSchema]);
+            { kind: 'mcp', ownerId: server.id, toolName: tool.name, transport: server.transport,
+                serverRevision: server.revision, schemaRevision: tool.schemaRevision }, tool.name,
+            [server.transport, server.revision, tool.schemaRevision, tool.inputSchema]);
         }
     }
     // Fail closed on duplicate identities or wire collisions, independently of input order.

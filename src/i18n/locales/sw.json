@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Hakuna wasifu wa S3 uliohifadhiwa unaofaa unaopatikana.",
             "workerStopping": "Inasimamisha...",
             "mcpClient": {
-                "notAvailable": "Uendeshaji wa mteja wa MCP bado haupatikani. Kuhifadhi, kuwezesha au kuidhinisha seva hapa hakuianzishi wala hakutoi ufikiaji wa zana.",
                 "refresh": "Onyesha upya seva za MCP",
                 "serverId": "Kitambulisho cha seva",
                 "addServer": "Ongeza seva",
                 "enabled": "Imewezeshwa",
                 "removeServer": "Ondoa {name}",
                 "saveServer": "Hifadhi seva",
-                "healthPending": "Afya na zana: zinapatikana baada ya uelekezaji wa modeli kuwezeshwa",
                 "stdioTitle": "Seva za STDIO za ndani",
                 "stdioSubtitle": "Usanidi wa mkono wa STDIO kwa mtumiaji anayetumika",
                 "executablePath": "Njia kamili ya faili inayotekelezeka",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Weka sehemu ya mwisho ya HTTPS ya umma bila vitambulisho, hoja au kipande.",
                     "invalidSecret": "Weka tokeni halali bila migawanyiko ya mistari.",
                     "invalidClient": "Weka ID halali ya mteja au URL ya HTTPS ya metadata ya mteja, si zote mbili.",
-                    "notFound": "Seva hii haipo tena. Onyesha upya orodha."
-                }
+                    "notFound": "Seva hii haipo tena. Onyesha upya orodha.",
+                    "configDisabled": "Seva hii imezimwa.",
+                    "secretUnavailable": "Siri iliyohifadhiwa ya seva hii haipo.",
+                    "invalidCall": "Ombi la zana halikuwa halali.",
+                    "approvalRequired": "Ombi la zana halikuidhinishwa.",
+                    "oauthRequired": "Seva hii inahitaji idhini. Iidhinishe katika Mipangilio ya AI.",
+                    "schemaChanged": "Seva ilibadilisha zana hii baada ya kutolewa. Jaribu tena.",
+                    "toolArguments": "Hoja hazilingani na muundo wa zana.",
+                    "toolsUnsupported": "Orodha ya zana za seva iko nje ya kile ambacho AeroFTP inakisaidia.",
+                    "toolCancelled": "Ombi la zana lilighairiwa.",
+                    "serverTimeout": "Seva haikujibu kwa wakati.",
+                    "sandboxUnavailable": "Seva za MCP za ndani bado haziwezi kuendeshwa kwenye mfumo huu.",
+                    "startFailed": "Seva ya ndani haikuweza kuanzishwa.",
+                    "serverFailed": "Seva ilisimama au ilituma jibu lisilo sahihi.",
+                    "httpUnauthorized": "Seva ilikataa vitambulisho vilivyohifadhiwa.",
+                    "unsupportedVersion": "Seva inatumia toleo la MCP ambalo AeroFTP haiungi mkono."
+                },
+                "routingNotice": "Seva zilizowezeshwa hutoa zana zake kwa AeroAgent. Kila ombi la zana huomba idhini yako kwanza.",
+                "checkNow": "Kagua sasa",
+                "healthChecking": "Inakagua seva...",
+                "healthDisabled": "Haianzishwi ikiwa imezimwa",
+                "healthError": "Haipatikani: {reason}",
+                "healthReady": "Tayari, zana zinazopatikana kwa AeroAgent: {count}",
+                "healthUnsupported": "Zana zenye skima zisizotumika: {count}",
+                "healthShowTools": "Onyesha zana"
             }
         },
         "archive": {

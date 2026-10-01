@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Nav pieejamu piemērotu saglabātu S3 profilu.",
             "workerStopping": "Apturēšana...",
             "mcpClient": {
-                "notAvailable": "MCP klienta palaišana vēl nav pieejama. Servera saglabāšana, iespējošana vai autorizēšana šeit to neaizsāk un nepiešķir piekļuvi rīkiem.",
                 "refresh": "Atsvaidzināt MCP serverus",
                 "serverId": "Servera ID",
                 "addServer": "Pievienot serveri",
                 "enabled": "Iespējots",
                 "removeServer": "Noņemt {name}",
                 "saveServer": "Saglabāt serveri",
-                "healthPending": "Stāvoklis un rīki: pieejami pēc modeļu maršrutēšanas iespējošanas",
                 "stdioTitle": "Vietējie STDIO serveri",
                 "stdioSubtitle": "Manuāla STDIO konfigurācija aktīvajam lietotājam",
                 "executablePath": "Izpildāmā faila absolūtais ceļš",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Ievadiet publisku HTTPS galapunktu bez akreditācijas datiem, vaicājuma vai fragmenta.",
                     "invalidSecret": "Ievadiet derīgu pilnvaru bez rindu pārtraukumiem.",
                     "invalidClient": "Ievadiet derīgu klienta ID vai HTTPS klienta metadatu URL, ne abus.",
-                    "notFound": "Šī servera vairs nav. Atsvaidziniet sarakstu."
-                }
+                    "notFound": "Šī servera vairs nav. Atsvaidziniet sarakstu.",
+                    "configDisabled": "Šis serveris ir atspējots.",
+                    "secretUnavailable": "Trūkst šim serverim saglabātā noslēpuma.",
+                    "invalidCall": "Rīka izsaukums nebija derīgs.",
+                    "approvalRequired": "Rīka izsaukums netika apstiprināts.",
+                    "oauthRequired": "Šim serverim nepieciešama autorizācija. Autorizējiet to AI iestatījumos.",
+                    "schemaChanged": "Serveris mainīja šo rīku pēc tā piedāvāšanas. Mēģiniet vēlreiz.",
+                    "toolArguments": "Argumenti neatbilst rīka shēmai.",
+                    "toolsUnsupported": "Servera rīku saraksts pārsniedz to, ko atbalsta AeroFTP.",
+                    "toolCancelled": "Rīka izsaukums tika atcelts.",
+                    "serverTimeout": "Serveris laikus neatbildēja.",
+                    "sandboxUnavailable": "Vietējie MCP serveri šajā sistēmā vēl nevar darboties.",
+                    "startFailed": "Vietējo serveri neizdevās startēt.",
+                    "serverFailed": "Serveris apstājās vai nosūtīja nederīgu atbildi.",
+                    "httpUnauthorized": "Serveris noraidīja saglabātos akreditācijas datus.",
+                    "unsupportedVersion": "Serveris izmanto MCP versiju, ko AeroFTP neatbalsta."
+                },
+                "routingNotice": "Iespējotie serveri piedāvā savus rīkus AeroAgent. Katrs rīka izsaukums vispirms pieprasa jūsu apstiprinājumu.",
+                "checkNow": "Pārbaudīt tagad",
+                "healthChecking": "Notiek servera pārbaude...",
+                "healthDisabled": "Netiek startēts, kamēr ir atspējots",
+                "healthError": "Nav pieejams: {reason}",
+                "healthReady": "Gatavs, AeroAgent pieejamie rīki: {count}",
+                "healthUnsupported": "Rīki ar neatbalstītām shēmām: {count}",
+                "healthShowTools": "Rādīt rīkus"
             }
         },
         "archive": {

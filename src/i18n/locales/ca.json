@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "No hi ha perfils S3 desats aptes disponibles.",
             "workerStopping": "S'està aturant...",
             "mcpClient": {
-                "notAvailable": "L'execució del client MCP encara no està disponible. Desar, activar o autoritzar un servidor aquí no l'inicia ni concedeix accés a les eines.",
                 "refresh": "Actualitza els servidors MCP",
                 "serverId": "ID del servidor",
                 "addServer": "Afegeix un servidor",
                 "enabled": "Activat",
                 "removeServer": "Elimina {name}",
                 "saveServer": "Desa el servidor",
-                "healthPending": "Estat i eines: disponibles quan s'activi l'encaminament de models",
                 "stdioTitle": "Servidors STDIO locals",
                 "stdioSubtitle": "Configuració STDIO manual per a l'usuari actiu",
                 "executablePath": "Ruta absoluta de l'executable",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Introduïu un punt final HTTPS públic sense credencials, consulta ni fragment.",
                     "invalidSecret": "Introduïu un token vàlid sense salts de línia.",
                     "invalidClient": "Introduïu un ID de client vàlid o una URL HTTPS de metadades del client, no tots dos.",
-                    "notFound": "Aquest servidor ja no existeix. Actualitzeu la llista."
-                }
+                    "notFound": "Aquest servidor ja no existeix. Actualitzeu la llista.",
+                    "configDisabled": "Aquest servidor està desactivat.",
+                    "secretUnavailable": "Falta un secret desat per a aquest servidor.",
+                    "invalidCall": "La crida a l'eina no era vàlida.",
+                    "approvalRequired": "La crida a l'eina no s'ha aprovat.",
+                    "oauthRequired": "Aquest servidor necessita autorització. Autoritzeu-lo a Configuració de la IA.",
+                    "schemaChanged": "El servidor ha canviat aquesta eina després d'oferir-la. Torneu-ho a provar.",
+                    "toolArguments": "Els arguments no coincideixen amb l'esquema de l'eina.",
+                    "toolsUnsupported": "La llista d'eines del servidor queda fora del que admet AeroFTP.",
+                    "toolCancelled": "La crida a l'eina s'ha cancel·lat.",
+                    "serverTimeout": "El servidor no ha respost a temps.",
+                    "sandboxUnavailable": "Els servidors MCP locals encara no es poden executar en aquest sistema.",
+                    "startFailed": "No s'ha pogut iniciar el servidor local.",
+                    "serverFailed": "El servidor s'ha aturat o ha enviat una resposta no vàlida.",
+                    "httpUnauthorized": "El servidor ha rebutjat les credencials desades.",
+                    "unsupportedVersion": "El servidor utilitza una versió de MCP que AeroFTP no admet."
+                },
+                "routingNotice": "Els servidors activats ofereixen les seves eines a AeroAgent. Cada crida a una eina demana primer la teva aprovació.",
+                "checkNow": "Comprova ara",
+                "healthChecking": "Comprovant el servidor...",
+                "healthDisabled": "No s'inicia mentre està desactivat",
+                "healthError": "No disponible: {reason}",
+                "healthReady": "Preparat, eines disponibles per a AeroAgent: {count}",
+                "healthUnsupported": "Eines amb esquemes no compatibles: {count}",
+                "healthShowTools": "Mostra les eines"
             }
         },
         "archive": {
