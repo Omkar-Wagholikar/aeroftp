@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::lifecycle::{self, PendingAuthorizationManager};
 use super::*;
+use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::time::Duration;
 use tauri::AppHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,6 +17,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_HEAD: usize = 8192;
 const MAX_HEADERS: usize = 64;
 const MAX_STRAY_REQUESTS: usize = 16;
+/// Connections read or answered at once, so an idle one cannot stall the rest.
+const MAX_IN_FLIGHT: usize = 8;
 
 pub(crate) struct Loopback {
     listener: TcpListener,
@@ -26,6 +30,12 @@ enum Request {
     /// Full callback URL rebuilt from the bound origin and the request target.
     Callback(String),
     Stray(&'static str),
+}
+
+enum Step {
+    /// A request head, or `None` when the peer sent none before the read timeout.
+    Read(TcpStream, Option<Result<Vec<u8>, &'static str>>),
+    Answered,
 }
 
 impl Loopback {
@@ -44,9 +54,12 @@ impl Loopback {
         format!("http://127.0.0.1:{}/callback", self.port)
     }
 
-    /// Waits for the one request whose single `state` matches. Stray requests
-    /// are answered and ignored within a fixed budget so a local process cannot
-    /// consume the pending record; anything else ends the attempt.
+    /// Waits for the one request whose single `state` matches. Connections are
+    /// read and answered concurrently up to `MAX_IN_FLIGHT`, so a slow peer
+    /// delays nobody else. Complete stray requests are answered and ignored
+    /// within a fixed budget so a local process cannot consume the pending
+    /// record; a peer that sends nothing only costs its own slot until the read
+    /// timeout and does not spend the budget. Anything else ends the attempt.
     async fn accept_callback(
         &self,
         is_ours: impl Fn(&str) -> bool,
@@ -54,33 +67,44 @@ impl Loopback {
         deadline: Instant,
     ) -> Result<(TcpStream, String), OAuthError> {
         let mut strays = 0;
+        let mut in_flight = FuturesUnordered::<BoxFuture<'static, Step>>::new();
         loop {
-            let (mut stream, _) = tokio::select! {
+            let step = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(HttpError::Cancelled.into()),
                 _ = tokio::time::sleep_until(deadline) => return Err(HttpError::Timeout.into()),
-                accepted = self.listener.accept() => accepted.map_err(|_| OAuthError::PendingUnavailable)?,
-            };
-            let read_until = deadline.min(Instant::now() + READ_TIMEOUT);
-            let request = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(HttpError::Cancelled.into()),
-                result = tokio::time::timeout_at(read_until, read_head(&mut stream)) => match result {
-                    Ok(Ok(head)) => parse_request(&head, self.port, &is_ours),
-                    Ok(Err(reason)) => Request::Stray(reason),
-                    Err(_) => Request::Stray("408 Request Timeout"),
-                },
-            };
-            match request {
-                Request::Callback(url) => return Ok((stream, url)),
-                Request::Stray(status) => {
-                    respond(&mut stream, status, STRAY_PAGE).await;
-                    strays += 1;
-                    if strays >= MAX_STRAY_REQUESTS {
-                        return Err(OAuthError::InvalidCallback);
-                    }
+                Some(step) = in_flight.next(), if !in_flight.is_empty() => step,
+                accepted = self.listener.accept(), if in_flight.len() < MAX_IN_FLIGHT => {
+                    let (mut stream, _) = accepted.map_err(|_| OAuthError::PendingUnavailable)?;
+                    let read_until = deadline.min(Instant::now() + READ_TIMEOUT);
+                    in_flight.push(Box::pin(async move {
+                        let head = tokio::time::timeout_at(read_until, read_head(&mut stream)).await;
+                        Step::Read(stream, head.ok())
+                    }));
+                    continue;
                 }
+            };
+            let Step::Read(mut stream, head) = step else {
+                continue;
+            };
+            let (request, counted) = match head {
+                Some(Ok(head)) => (parse_request(&head, self.port, &is_ours), true),
+                Some(Err(reason)) => (Request::Stray(reason), true),
+                None => (Request::Stray("408 Request Timeout"), false),
+            };
+            let status = match request {
+                Request::Callback(url) => return Ok((stream, url)),
+                Request::Stray(status) => status,
+            };
+            strays += usize::from(counted);
+            if strays >= MAX_STRAY_REQUESTS {
+                respond(&mut stream, status, STRAY_PAGE).await;
+                return Err(OAuthError::InvalidCallback);
             }
+            in_flight.push(Box::pin(async move {
+                respond(&mut stream, status, STRAY_PAGE).await;
+                Step::Answered
+            }));
         }
     }
 }
@@ -424,6 +448,81 @@ mod tests {
             OAuthError::InvalidCallback
         );
         flood.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_connections_neither_stall_the_callback_nor_spend_the_stray_budget() {
+        let loopback = Loopback::bind().await.unwrap();
+        let port = loopback.port;
+        let client = tokio::spawn(async move {
+            let mut idle = Vec::new();
+            for _ in 0..MAX_IN_FLIGHT - 1 {
+                idle.push(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+            }
+            let mut real = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            real.write_all(
+                format!("GET /callback?code=c&state=s HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+            (idle, real)
+        });
+        // Well under READ_TIMEOUT: an idle peer read inline would hold the listener for it.
+        let (_stream, url) = tokio::time::timeout(
+            READ_TIMEOUT / 4,
+            loopback.accept_callback(
+                |s| s == "s",
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("an idle connection stalled the callback")
+        .unwrap();
+        assert_eq!(
+            url,
+            format!("http://127.0.0.1:{port}/callback?code=c&state=s")
+        );
+        drop(client.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_timeouts_do_not_end_the_attempt() {
+        let loopback = Loopback::bind().await.unwrap();
+        // Established before the listener runs, so the paused clock cannot jump
+        // past them: every peer is already queued when the first accept polls.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_STRAY_REQUESTS * 3 {
+            idle.push(
+                TcpStream::connect(("127.0.0.1", loopback.port))
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Past the point where reading and answering each idle peer in turn (two
+        // read timeouts apiece) would have spent the whole stray budget.
+        let deadline = Instant::now() + READ_TIMEOUT * (2 * MAX_STRAY_REQUESTS as u32 + 4);
+        assert_eq!(
+            loopback
+                .accept_callback(|_| true, &CancellationToken::new(), deadline)
+                .await
+                .unwrap_err(),
+            OAuthError::Http(HttpError::Timeout)
+        );
+        // Control: more idle peers timed out than the budget allows strays.
+        let mut timed_out = 0;
+        for peer in &idle {
+            let mut reply = [0u8; 32];
+            if matches!(peer.try_read(&mut reply), Ok(read) if reply[..read].starts_with(b"HTTP/1.1 408"))
+            {
+                timed_out += 1;
+            }
+        }
+        assert!(
+            timed_out > MAX_STRAY_REQUESTS,
+            "{timed_out} peers timed out"
+        );
     }
 
     #[test]

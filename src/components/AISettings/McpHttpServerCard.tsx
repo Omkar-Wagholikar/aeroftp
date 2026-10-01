@@ -85,14 +85,19 @@ export function McpHttpServerCard({ server, refresh }: { server: HttpServerView;
     const [attempt, setAttempt] = useState<Attempt | null>(null);
     const [pending, setPending] = useState<'remove' | 'signOut' | null>(null);
     const live = useRef<string | null>(null);
+    const mounted = useRef(true);
 
     useEffect(() => { setEndpoint(server.endpoint); }, [server.endpoint]);
     useEffect(() => { setMode(server.auth.mode); }, [server.auth.mode]);
     useEffect(() => { setClientId(oauth?.client_id ?? ''); }, [oauth?.client_id]);
     useEffect(() => { setMetadataUrl(oauth?.client_id_metadata_url ?? ''); }, [oauth?.client_id_metadata_url]);
     // Leaving the settings abandons the browser authorization: the backend listener ends with it.
-    useEffect(() => () => {
-        if (live.current) void invoke('mcp_client_http_oauth_cancel', { attempt: live.current }).catch(() => undefined);
+    useEffect(() => {
+        mounted.current = true;
+        return () => {
+            mounted.current = false;
+            if (live.current) void invoke('mcp_client_http_oauth_cancel', { attempt: live.current }).catch(() => undefined);
+        };
     }, []);
 
     const perform = async (action: () => Promise<void>, done?: string) => {
@@ -122,6 +127,11 @@ export function McpHttpServerCard({ server, refresh }: { server: HttpServerView;
 
     const authorize = () => perform(async () => {
         const started = await invoke<Attempt>('mcp_client_http_oauth_begin', { serverId: server.id });
+        // The settings closed while the attempt was starting: nobody can finish it, so end it now.
+        if (!mounted.current) {
+            void invoke('mcp_client_http_oauth_cancel', { attempt: started.attempt }).catch(() => undefined);
+            return;
+        }
         live.current = started.attempt;
         setAttempt(started);
         try { await invoke('mcp_client_http_oauth_wait', { attempt: started.attempt }); }

@@ -105,6 +105,23 @@ describe('MCP HTTP settings', () => {
         root = createRoot(host);
     });
 
+    it('cancels an attempt whose start resolves after the settings unmount, without waiting on it', async () => {
+        let started!: (value: unknown) => void;
+        invoke.mockImplementation((command: string) => {
+            if (command === 'mcp_client_http_list_servers') return Promise.resolve([oauthServer]);
+            if (command === 'mcp_client_http_oauth_begin') return new Promise(resolve => { started = resolve; });
+            return Promise.resolve();
+        });
+        await render();
+        await click(button('Authorize'));
+        await act(async () => root.unmount());
+        expect(invoke.mock.calls.some(([command]) => command === 'mcp_client_http_oauth_cancel')).toBe(false);
+        await act(async () => started({ attempt: 'late', authorization_url: 'https://auth.example.com/authorize', browser_opened: true }));
+        expect(invoke).toHaveBeenCalledWith('mcp_client_http_oauth_cancel', { attempt: 'late' });
+        expect(invoke.mock.calls.some(([command]) => command === 'mcp_client_http_oauth_wait')).toBe(false);
+        root = createRoot(host);
+    });
+
     it('shows redacted credential state, refresh and sign-out only for an existing authorization', async () => {
         const authorized = { ...oauthServer, credential: 'authorized', refreshable: true, expires_at: null };
         invoke.mockImplementation(async (command: string) => command === 'mcp_client_http_list_servers' ? [authorized] : undefined);
