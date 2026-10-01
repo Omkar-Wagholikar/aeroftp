@@ -697,12 +697,22 @@ jobs:
           shopt -s nullglob
           appimages=(release-assets/appimage/*.AppImage)
           if [ ${#appimages[@]} -eq 0 ]; then exit 0; fi
-          if ! gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > /tmp/published-assets.txt 2>/dev/null; then
-            echo "Release $GITHUB_REF_NAME does not exist yet: fresh publish, the pair comes from this build"
-            exit 0
+          if ! gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > /tmp/published-release.txt 2>/tmp/published-release-error.txt; then
+            if grep -Eq '^HTTP/[0-9.]+ 404([[:space:]]|$)' /tmp/published-release.txt; then
+              echo "Release $GITHUB_REF_NAME does not exist yet: fresh publish, the pair comes from this build"
+              exit 0
+            fi
+            echo "::error::Release lookup failed; refusing to assume a fresh publication"
+            cat /tmp/published-release-error.txt >&2
+            exit 1
           fi
+          sed '1,/^[[:space:]]*$/d' /tmp/published-release.txt | jq -r '.assets[].name' > /tmp/published-assets.txt
           for appimage in "${appimages[@]}"; do
             base=$(basename "$appimage")
+            if grep -qx "${base}.zsync" /tmp/published-assets.txt && ! grep -qx "$base" /tmp/published-assets.txt; then
+              echo "::error::Release has ${base}.zsync without its AppImage; refusing to pair it with new bytes"
+              exit 1
+            fi
             if grep -qx "$base" /tmp/published-assets.txt && ! grep -qx "${base}.zsync" /tmp/published-assets.txt; then
               echo "Repair case: the release has $base but no .zsync; regenerating from the published asset"
               sudo apt-get update && sudo apt-get install -y --no-install-recommends zsync
