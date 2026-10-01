@@ -813,6 +813,8 @@ fn load_tokens_for(
 
 #[path = "mcp_client_oauth_lifecycle.rs"]
 pub(crate) mod lifecycle;
+#[path = "mcp_client_oauth_loopback.rs"]
+pub(crate) mod loopback;
 
 fn checkpoint(
     cancel: &CancellationToken,

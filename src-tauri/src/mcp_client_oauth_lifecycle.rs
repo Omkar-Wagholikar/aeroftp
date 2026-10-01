@@ -1,11 +1,12 @@
-//! Backend-only OAuth lifecycle. No callback listener, UI command or automatic refresh.
+//! Backend-only OAuth lifecycle. The loopback listener and settings commands drive it;
+//! there is no automatic refresh and no frontend access to pending state or tokens.
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::mcp_client_commands;
 use crate::mcp_client_http_config::ResolvedMcpHttpAuth;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
 
@@ -136,6 +137,27 @@ struct Record {
 pub(crate) struct PendingAuthorizationManager {
     records: Mutex<HashMap<String, Record>>,
     active: Mutex<HashMap<String, Active>>,
+    // Interactive and refresh operations, cancelled together with their bindings
+    // before any pending record exists (discovery) and after it is consumed.
+    operations: Mutex<HashMap<String, Active>>,
+}
+static SHARED: LazyLock<PendingAuthorizationManager> =
+    LazyLock::new(PendingAuthorizationManager::default);
+/// The one process-wide manager. Vault lock, partition lock and user switch
+/// invalidate it from code paths that hold no AppHandle.
+pub(crate) fn shared() -> &'static PendingAuthorizationManager {
+    &SHARED
+}
+pub(crate) struct OperationLease<'a> {
+    manager: &'a PendingAuthorizationManager,
+    id: String,
+}
+impl Drop for OperationLease<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut operations) = self.manager.operations.lock() {
+            operations.remove(&self.id);
+        }
+    }
 }
 struct Active {
     user: i64,
@@ -263,7 +285,81 @@ impl PendingAuthorizationManager {
             _ => self.invalidate(user, Some(server)),
         }
     }
+    /// A new interactive authorization supersedes (cancels) an older operation
+    /// for the same binding; a refresh never supersedes and is refused instead.
+    pub(crate) fn register_operation(
+        &self,
+        user: i64,
+        server: &str,
+        cancel: CancellationToken,
+        supersede: bool,
+    ) -> Result<OperationLease<'_>, OAuthError> {
+        let mut operations = self
+            .operations
+            .lock()
+            .map_err(|_| OAuthError::PendingUnavailable)?;
+        operations.retain(|_, op| !op.cancel.is_cancelled());
+        let same = |op: &Active| op.user == user && op.server == server;
+        if !supersede && operations.values().any(same) {
+            return Err(OAuthError::PendingUnavailable);
+        }
+        for op in operations.values().filter(|op| same(op)) {
+            op.cancel.cancel();
+        }
+        operations.retain(|_, op| !same(op));
+        if operations.len() >= MAX_PENDING {
+            return Err(OAuthError::PendingUnavailable);
+        }
+        let id = random_urlsafe().to_string();
+        operations.insert(
+            id.clone(),
+            Active {
+                user,
+                server: server.to_owned(),
+                cancel,
+            },
+        );
+        Ok(OperationLease { manager: self, id })
+    }
+    /// Cancellation of one still-pending record, for the listener that owns it.
+    pub(crate) fn pending_cancel(&self, handle: &str) -> Option<CancellationToken> {
+        let records = self.records.lock().ok()?;
+        records.get(handle).map(|record| record.cancel.clone())
+    }
+    /// Lets the backend listener ignore stray local requests without consuming
+    /// the record. Only an exact, constant-time state match reaches `complete`.
+    pub(crate) fn pending_state_matches(&self, handle: &str, state: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        let Ok(records) = self.records.lock() else {
+            return false;
+        };
+        records.get(handle).is_some_and(|record| {
+            record.deadline > Instant::now()
+                && !record.cancel.is_cancelled()
+                && bool::from(record.pending.state.as_bytes().ct_eq(state.as_bytes()))
+        })
+    }
+    /// Drops one unconsumed record after its listener has ended.
+    pub(crate) fn discard(&self, handle: &str) {
+        if let Ok(mut records) = self.records.lock() {
+            if let Some(record) = records.remove(handle) {
+                record.cancel.cancel();
+            }
+        }
+    }
+    fn cancel_operations(&self, user: Option<i64>, server: Option<&str>) {
+        if let Ok(operations) = self.operations.lock() {
+            for op in operations.values() {
+                if user.is_none_or(|user| user == op.user)
+                    && server.is_none_or(|server| server == op.server)
+                {
+                    op.cancel.cancel();
+                }
+            }
+        }
+    }
     pub(crate) fn invalidate(&self, user: i64, server: Option<&str>) {
+        self.cancel_operations(Some(user), server);
         if let Ok(mut records) = self.records.lock() {
             records.retain(|_, r| {
                 let remove =
@@ -284,6 +380,7 @@ impl PendingAuthorizationManager {
         }
     }
     pub(crate) fn invalidate_all(&self) {
+        self.cancel_operations(None, None);
         if let Ok(mut records) = self.records.lock() {
             for record in records.values() {
                 record.cancel.cancel();
@@ -849,6 +946,119 @@ pub(crate) async fn refresh(
     result
 }
 
+/// Backend challenge acquisition: one unauthenticated tools/list against the
+/// pinned public endpoint. Only its 401/403 Bearer challenge (or an open server)
+/// feeds discovery; nothing from the frontend shapes metadata, scope or resource.
+pub(crate) async fn acquire_challenge(
+    app: &AppHandle,
+    server_id: &str,
+    cancel: &CancellationToken,
+) -> Result<AuthChallenge, OAuthError> {
+    let (conn, root, user) =
+        mcp_client_commands::context(app).map_err(|_| OAuthError::StoreUnavailable)?;
+    let config = live_config(&conn, &root, user, server_id)?;
+    drop(conn);
+    let revision = config
+        .resolve_with(&root, user, |_| Err(()))
+        .map_err(|_| OAuthError::StaleBinding)?
+        .effective_revision;
+    let binding = mcp_client_http_transport::HttpBinding {
+        endpoint: config.endpoint.clone(),
+        user_id: user,
+        revision: revision.clone(),
+    };
+    let mut fresh = || {
+        let (conn, root, current) = fresh_context(app)?;
+        if current != user {
+            return Err(OAuthError::UserChanged);
+        }
+        let live = live_config(&conn, &root, user, server_id)?;
+        if live
+            .resolve_with(&root, user, |_| Err(()))
+            .map_err(|_| OAuthError::StaleBinding)?
+            .effective_revision
+            != revision
+        {
+            return Err(OAuthError::StaleBinding);
+        }
+        Ok(())
+    };
+    let mut session = mcp_client_http_transport::HttpSession::new(binding.clone());
+    let outcome = session
+        .call_checked::<_, OAuthError>(
+            &config,
+            &binding,
+            "tools/list",
+            serde_json::Map::new(),
+            None,
+            None,
+            cancel,
+            &mut || checkpoint(cancel, &mut fresh),
+        )
+        .await;
+    challenge_from_probe(outcome)
+}
+fn challenge_from_probe(outcome: Result<Value, OAuthError>) -> Result<AuthChallenge, OAuthError> {
+    match outcome {
+        Ok(_) => Ok(AuthChallenge {
+            metadata_url: None,
+            scopes: Vec::new(),
+        }),
+        Err(OAuthError::Http(HttpError::Unauthorized(challenge)))
+        | Err(OAuthError::Http(HttpError::Forbidden(challenge))) => Ok(challenge),
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TokenState {
+    Missing,
+    Authorized,
+    Expired,
+    Invalid,
+}
+/// Redacted token state for settings: no token, issuer, client or scope value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TokenSummary {
+    pub state: TokenState,
+    pub expires_at: Option<i64>,
+    pub refreshable: bool,
+}
+pub(crate) fn token_summary(
+    conn: &Connection,
+    root: &[u8; 32],
+    user: i64,
+    server: &str,
+) -> Result<TokenSummary, OAuthError> {
+    let summary = |state, expires_at, refreshable| TokenSummary {
+        state,
+        expires_at,
+        refreshable,
+    };
+    match read(conn, root, user, server) {
+        Ok(None) => Ok(summary(TokenState::Missing, None, false)),
+        Ok(Some((meta, tokens))) => {
+            let expired = meta
+                .expires_at
+                .is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp());
+            Ok(summary(
+                if expired {
+                    TokenState::Expired
+                } else {
+                    TokenState::Authorized
+                },
+                meta.expires_at,
+                tokens.refresh.is_some(),
+            ))
+        }
+        Err(OAuthError::StaleBinding | OAuthError::InvalidToken) => {
+            Ok(summary(TokenState::Invalid, None, false))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1206,104 @@ mod tests {
             callback(&r.pending, &callback_url(&r)).unwrap().as_str(),
             "code"
         );
+    }
+    #[test]
+    fn operations_supersede_refuse_and_cancel_with_their_binding() {
+        let manager = PendingAuthorizationManager::default();
+        let first = CancellationToken::new();
+        let lease = manager
+            .register_operation(1, "one", first.clone(), true)
+            .unwrap();
+        assert!(matches!(
+            manager.register_operation(1, "one", CancellationToken::new(), false),
+            Err(OAuthError::PendingUnavailable)
+        ));
+        let other = CancellationToken::new();
+        let _other = manager
+            .register_operation(1, "two", other.clone(), false)
+            .unwrap();
+        let second = CancellationToken::new();
+        let _second = manager
+            .register_operation(1, "one", second.clone(), true)
+            .unwrap();
+        assert!(first.is_cancelled() && !second.is_cancelled());
+        drop(lease);
+        manager.invalidate(1, Some("one"));
+        assert!(second.is_cancelled() && !other.is_cancelled());
+        manager.invalidate(2, None);
+        assert!(!other.is_cancelled());
+        manager.invalidate_all();
+        assert!(other.is_cancelled());
+        let fresh = CancellationToken::new();
+        drop(
+            manager
+                .register_operation(1, "one", fresh.clone(), false)
+                .unwrap(),
+        );
+        assert!(manager.operations.lock().unwrap().len() <= 2);
+    }
+    #[test]
+    fn listener_state_check_never_consumes_and_discard_cancels() {
+        let manager = PendingAuthorizationManager::default();
+        let record = record(1);
+        let state = record.pending.state.to_string();
+        let handle = manager.insert(record).unwrap();
+        assert!(!manager.pending_state_matches(&handle, "wrong"));
+        assert!(!manager.pending_state_matches("unknown", &state));
+        assert!(manager.pending_state_matches(&handle, &state));
+        let cancel = manager.pending_cancel(&handle).unwrap();
+        manager.discard(&handle);
+        assert!(cancel.is_cancelled());
+        assert!(!manager.pending_state_matches(&handle, &state));
+        assert!(matches!(
+            manager.take(&handle),
+            Err(OAuthError::PendingUnavailable)
+        ));
+    }
+    #[tokio::test]
+    async fn partition_lock_and_user_switch_cancel_shared_attempts() {
+        let token = CancellationToken::new();
+        let _lease = shared()
+            .register_operation(i64::MAX, "hook-test", token.clone(), true)
+            .unwrap();
+        crate::user_partitions::user_partitions_lock_session()
+            .await
+            .unwrap();
+        assert!(token.is_cancelled());
+    }
+    #[test]
+    fn only_a_bearer_challenge_or_an_open_server_starts_discovery() {
+        let challenge = AuthChallenge {
+            metadata_url: Some(
+                "https://mcp.example.com/.well-known/oauth-protected-resource".into(),
+            ),
+            scopes: vec!["read".into()],
+        };
+        assert_eq!(
+            challenge_from_probe(Err(HttpError::Unauthorized(challenge.clone()).into())),
+            Ok(challenge.clone())
+        );
+        assert_eq!(
+            challenge_from_probe(Err(HttpError::Forbidden(challenge.clone()).into())),
+            Ok(challenge)
+        );
+        assert_eq!(
+            challenge_from_probe(Ok(json!({"tools": []})))
+                .unwrap()
+                .metadata_url,
+            None
+        );
+        for error in [
+            HttpError::Redirect,
+            HttpError::UnsafeAddress,
+            HttpError::InvalidResponse,
+            HttpError::Cancelled,
+        ] {
+            assert_eq!(
+                challenge_from_probe(Err(error.clone().into())),
+                Err(OAuthError::Http(error))
+            );
+        }
     }
     #[test]
     fn pending_concurrent_consumption_expiry_cancel_and_bounded_invalidation() {

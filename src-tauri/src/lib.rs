@@ -67,11 +67,12 @@ pub mod mcp_client_config;
 #[cfg(test)] // Superseded by the schema-bound private bridge.
 mod mcp_client_dispatch;
 pub mod mcp_client_framing;
-#[allow(dead_code)] // HTTP configuration is private until transport and approval are wired.
+mod mcp_client_http_commands;
+#[allow(dead_code)] // Settings use it; bearer resolution waits for model routing.
 mod mcp_client_http_config;
 #[allow(dead_code)] // Private until HTTP settings and model routing are integrated.
 mod mcp_client_http_transport;
-#[allow(dead_code)] // OAuth flow is private until the HTTP settings integration.
+#[allow(dead_code)] // Settings drive authorization; token resolution waits for model routing.
 mod mcp_client_oauth;
 pub mod mcp_client_protocol;
 #[allow(dead_code)] // Used only by the private outbound STDIO transport.
@@ -20201,6 +20202,15 @@ pub fn run() {
             mcp_client_commands::mcp_client_upsert_server,
             mcp_client_commands::mcp_client_remove_server,
             mcp_client_commands::mcp_client_set_secret,
+            mcp_client_http_commands::mcp_client_http_list_servers,
+            mcp_client_http_commands::mcp_client_http_upsert_server,
+            mcp_client_http_commands::mcp_client_http_remove_server,
+            mcp_client_http_commands::mcp_client_http_set_bearer,
+            mcp_client_http_commands::mcp_client_http_oauth_begin,
+            mcp_client_http_commands::mcp_client_http_oauth_wait,
+            mcp_client_http_commands::mcp_client_http_oauth_cancel,
+            mcp_client_http_commands::mcp_client_http_oauth_refresh,
+            mcp_client_http_commands::mcp_client_http_oauth_sign_out,
             user_partitions::user_partitions_find_cross_user_dedup,
             // AeroShare P1 (task 4/5): the peer handshake + inventory surface
             peer_commands::peer_identity_get,

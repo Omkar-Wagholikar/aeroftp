@@ -142,6 +142,14 @@ pub async fn mcp_client_upsert_server(
     tokio::task::spawn_blocking(move || {
         let (mut conn, root_key, user_id) = context(&app)?;
         let (transaction, mut configs) = begin_catalog_write(&mut conn, &root_key, user_id)?;
+        // Server IDs are unique across the STDIO and HTTP catalogs.
+        if !configs.iter().any(|item| item.id == config.id)
+            && crate::mcp_client_http_commands::load(&transaction, &root_key, user_id)?
+                .iter()
+                .any(|item| item.id == config.id)
+        {
+            return Err("MCP_CONFIG_DUPLICATE_ID");
+        }
         let stale_accounts = upsert_catalog(&mut configs, config)?;
         for account in stale_accounts {
             user_partitions::delete_user_credential_for(&transaction, user_id, &account)

@@ -558,7 +558,7 @@
     "mcp_tools_aliases": 38,
     "mcp_tools_primary": 39,
     "mcp_tools_total": 77,
-    "tauri_commands": 868
+    "tauri_commands": 877
   },
   "mcp": {
     "count": 77,
@@ -951,7 +951,7 @@
     ]
   },
   "parity": {
-    "name_matched_count": 491,
+    "name_matched_count": 500,
     "name_unmatched": [
       "app_ready",
       "set_close_to_tray",
@@ -1557,6 +1557,15 @@
       "mcp_client_upsert_server",
       "mcp_client_remove_server",
       "mcp_client_set_secret",
+      "mcp_client_http_list_servers",
+      "mcp_client_http_upsert_server",
+      "mcp_client_http_remove_server",
+      "mcp_client_http_set_bearer",
+      "mcp_client_http_oauth_begin",
+      "mcp_client_http_oauth_wait",
+      "mcp_client_http_oauth_cancel",
+      "mcp_client_http_oauth_refresh",
+      "mcp_client_http_oauth_sign_out",
       "user_partitions_find_cross_user_dedup",
       "peer_identity_get",
       "peer_share_start",
@@ -2206,6 +2215,6 @@
       "checkpoint_endpoints",
       "checkpoint_forget_endpoint"
     ],
-    "count": 868
+    "count": 877
   }
 }

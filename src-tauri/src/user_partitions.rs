@@ -400,6 +400,9 @@ fn clear_user_session() {
     if let Ok(mut session) = USER_SESSION.lock() {
         *session = None;
     }
+    // Partition lock and user switch keep the vault cache, so MCP OAuth freshness
+    // checks alone would not see them: cancel every pending and in-flight attempt.
+    crate::mcp_client_oauth::lifecycle::shared().invalidate_all();
 }
 
 fn set_user_session(user_id: i64, dek: SecretKey) -> Result<(), String> {
