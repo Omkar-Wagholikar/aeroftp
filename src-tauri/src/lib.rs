@@ -15001,7 +15001,6 @@ mod delegation_registration_tests {
 #[tauri::command]
 async fn ai_delegate_local(
     webview: tauri::Webview,
-    app: tauri::AppHandle,
     request_id: String,
     provider_id: String,
     model_name: String,
@@ -15010,6 +15009,7 @@ async fn ai_delegate_local(
     remote_profiles: Option<Vec<ai_core::runner::delegation::RemoteProfileScope>>,
 ) -> Result<serde_json::Value, String> {
     only_main_window(webview.label(), "ai_delegate_local")?;
+    let app = webview.app_handle().clone();
     if uuid::Uuid::parse_str(&request_id).is_err() || !std::path::Path::new(&root).is_absolute() {
         return Err("Delegated request ID or local root is invalid".into());
     }
