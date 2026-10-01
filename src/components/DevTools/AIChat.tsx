@@ -30,7 +30,7 @@ import { buildExecutionLevels, executePipeline } from './aiChatToolPipeline';
 import { toolOutputBelongsToActiveTurn } from './aiChatToolOutput';
 import { ToolMacro, resolveMacroSteps, DEFAULT_MACROS, MAX_TOTAL_MACRO_STEPS, createMacroStepCounter, MacroStepCounter } from './aiChatToolMacros';
 import { buildToolRegistry, resolveRegisteredTool, resolveMacroStep, ToolExposure, TOOL_EXPOSURE_GUIDE, assertToolExecutionCurrent, recordToolDispatch, type McpServerSnapshot } from './aiChatToolRegistry';
-import { MCP_SERVERS_CHANGED, notifyMcpServersChanged, registrySnapshots, runMcpTool } from './aiChatMcp';
+import { MCP_SERVERS_CHANGED, mcpSnapshotLoader, notifyMcpServersChanged, runMcpTool } from './aiChatMcp';
 import { describeMcpError } from '../AISettings/mcpErrors';
 import { validateToolArgs } from './aiChatToolValidation';
 import { computeTokenInfo } from './aiChatTokenInfo';
@@ -979,13 +979,11 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
     // MCP tools come from live backend snapshots; a failing load offers none.
     useEffect(() => {
-        let current = true;
-        const load = () => invoke('mcp_client_tool_snapshots')
-            .then(snapshots => { if (current) setMcpServers(registrySnapshots(snapshots)); })
-            .catch(() => { if (current) setMcpServers([]); });
-        void load();
+        const loader = mcpSnapshotLoader(invoke, setMcpServers);
+        const load = () => { void loader.load(); };
+        load();
         window.addEventListener(MCP_SERVERS_CHANGED, load);
-        return () => { current = false; window.removeEventListener(MCP_SERVERS_CHANGED, load); };
+        return () => { loader.stop(); window.removeEventListener(MCP_SERVERS_CHANGED, load); };
     }, []);
 
     // Phase 4: Init budget manager + load custom templates on mount

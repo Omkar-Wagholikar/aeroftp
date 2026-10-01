@@ -173,6 +173,7 @@ export function McpServersPanel() {
                 className="flex shrink-0 items-center gap-1 rounded bg-gray-700 px-3 py-1.5 text-sm disabled:opacity-50">
                 <RefreshCw size={14} /> {t('ai.mcpClient.checkNow')}</button>
         </div>
+        {health.failure && <p role="alert" className="text-xs text-red-400">{describeMcpError(t, health.failure)}</p>}
         <div className="flex items-center justify-between">
             <div><h2 className="font-medium text-white">{t('ai.mcpClient.stdioTitle')}</h2><p className="text-xs text-gray-400">{t('ai.mcpClient.stdioSubtitle')}</p></div>
             <button type="button" onClick={() => void refresh().catch(cause => setError(describeMcpError(t, cause)))} aria-label={t('ai.mcpClient.refresh')}

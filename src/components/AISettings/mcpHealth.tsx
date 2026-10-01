@@ -10,6 +10,8 @@ import { describeMcpError } from './mcpErrors';
 export interface McpHealth {
     snapshots: ReadonlyMap<string, McpBackendSnapshot>;
     checking: boolean;
+    /** Code of the last failed check, empty when it succeeded. */
+    failure: string;
     /** `refresh` lists again even when the backend still holds a listing. */
     check: (refresh: boolean) => Promise<void>;
 }
@@ -21,6 +23,7 @@ export const McpHealthProvider = McpHealthContext.Provider;
 export function useMcpHealthState(): McpHealth {
     const [snapshots, setSnapshots] = useState<ReadonlyMap<string, McpBackendSnapshot>>(new Map());
     const [checking, setChecking] = useState(false);
+    const [failure, setFailure] = useState('');
     const sequence = useRef(0);
     const check = useCallback(async (refresh: boolean) => {
         const current = ++sequence.current;
@@ -29,9 +32,11 @@ export function useMcpHealthState(): McpHealth {
             const result = await invoke<McpBackendSnapshot[]>('mcp_client_tool_snapshots', { refresh });
             if (current !== sequence.current) return;
             setSnapshots(new Map(result.map(server => [key(server.transport, server.id), server])));
-        } catch {
-            // The server lists report a locked or missing store themselves.
-            if (current === sequence.current) setSnapshots(new Map());
+            setFailure('');
+        } catch (cause) {
+            if (current !== sequence.current) return;
+            setSnapshots(new Map());
+            setFailure(typeof cause === 'string' ? cause : 'MCP_STORE_UNAVAILABLE');
         } finally {
             if (current === sequence.current) setChecking(false);
         }
@@ -42,7 +47,7 @@ export function useMcpHealthState(): McpHealth {
         window.addEventListener(MCP_SERVERS_CHANGED, changed);
         return () => { sequence.current += 1; window.removeEventListener(MCP_SERVERS_CHANGED, changed); };
     }, [check]);
-    return { snapshots, checking, check };
+    return { snapshots, checking, failure, check };
 }
 
 /** Live state of one server: never started while disabled, tools when ready. */

@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
 import { describe, expect, it, vi } from 'vitest';
-import { registrySnapshots, runMcpTool, type McpBackendSnapshot, type McpToolCallContext } from './aiChatMcp';
+import { mcpSnapshotLoader, registrySnapshots, runMcpTool, type McpBackendSnapshot, type McpToolCallContext } from './aiChatMcp';
 import { buildToolRegistry } from './aiChatToolRegistry';
 
 const ready: McpBackendSnapshot = {
@@ -25,6 +25,27 @@ describe('MCP snapshots for the chat registry', () => {
         expect(mcp).toHaveLength(1);
         expect(mcp[0].source).toMatchObject({ ownerId: 'remote', transport: 'http', serverRevision: 'r'.repeat(64) });
         expect(registrySnapshots({ not: 'a list' })).toEqual([]);
+    });
+});
+
+describe('MCP snapshot loader', () => {
+    it('applies only the latest answer, so a slow older load cannot restore old revisions', async () => {
+        const answers: ((value: unknown) => void)[] = [];
+        const invoke = vi.fn(() => new Promise(resolve => { answers.push(resolve); }));
+        const applied: string[][] = [];
+        const loader = mcpSnapshotLoader(invoke as never, servers => applied.push(servers.map(s => s.revision)));
+        const first = loader.load();
+        const second = loader.load();
+        answers[1]([{ ...ready, revision: 'n'.repeat(64) }]);
+        await second;
+        answers[0]([ready]);
+        await first;
+        expect(applied).toEqual([['n'.repeat(64)]]);
+        loader.stop();
+        const third = loader.load();
+        answers[2]([ready]);
+        await third;
+        expect(applied).toHaveLength(1);
     });
 });
 

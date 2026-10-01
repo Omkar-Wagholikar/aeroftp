@@ -40,6 +40,22 @@ export function registrySnapshots(snapshots: unknown): McpServerSnapshot[] {
 }
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
+
+/** Loads the chat's snapshots. Only the answer to the latest request is
+ *  applied, so a slow older load cannot bring back outdated revisions. */
+export function mcpSnapshotLoader(invoke: Invoke, apply: (servers: McpServerSnapshot[]) => void) {
+    let sequence = 0;
+    let active = true;
+    const load = () => {
+        const request = ++sequence;
+        const current = () => active && request === sequence;
+        return invoke<unknown>('mcp_client_tool_snapshots').then(
+            snapshots => { if (current()) apply(registrySnapshots(snapshots)); },
+            () => { if (current()) apply([]); },
+        );
+    };
+    return { load, stop: () => { active = false; } };
+}
 interface Preparation { approvalRequired: boolean; requestId?: string | null }
 interface Grant { approved: boolean; grantId?: string | null }
 

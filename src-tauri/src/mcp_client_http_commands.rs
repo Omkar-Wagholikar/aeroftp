@@ -32,7 +32,13 @@ struct Flow {
     server: String,
     cancel: CancellationToken,
     outcome: watch::Receiver<Outcome>,
+    started: std::time::Instant,
 }
+
+/// A finished attempt stays readable this long after it started, so the wait
+/// that follows its begin still finds the outcome when another begin prunes
+/// first. Twice the listener lifetime, so every outcome is kept for minutes.
+const FINISHED_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 
 static FLOWS: LazyLock<Mutex<HashMap<String, Flow>>> = LazyLock::new(Default::default);
 
@@ -507,7 +513,9 @@ pub async fn mcp_client_http_oauth_refresh(
 }
 
 fn prune_flows(flows: &mut HashMap<String, Flow>) {
-    flows.retain(|_, flow| flow.outcome.borrow().is_none());
+    flows.retain(|_, flow| {
+        flow.outcome.borrow().is_none() || flow.started.elapsed() < FINISHED_KEPT_FOR
+    });
 }
 
 /// Starts a backend-owned authorization. SQLite and the loopback exchange run
@@ -541,6 +549,7 @@ pub async fn mcp_client_http_oauth_begin(
                 server: server_id.clone(),
                 cancel: operation.clone(),
                 outcome: outcome.clone(),
+                started: std::time::Instant::now(),
             },
         );
     }
@@ -628,6 +637,34 @@ mod tests {
     use super::*;
 
     const ROOT: [u8; 32] = [7; 32];
+
+    #[test]
+    fn a_finished_attempt_stays_readable_until_it_ages_out() {
+        let flow = |finished: bool, age: u64| {
+            let (done, outcome) = watch::channel(None);
+            if finished {
+                done.send(Some(Ok(()))).unwrap();
+            }
+            Flow {
+                server: "remote".into(),
+                cancel: CancellationToken::new(),
+                outcome,
+                started: std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(age))
+                    .unwrap(),
+            }
+        };
+        let mut flows = HashMap::from([
+            ("running-old".to_string(), flow(false, 1_000)),
+            ("finished-now".to_string(), flow(true, 1)),
+            ("finished-old".to_string(), flow(true, 1_000)),
+        ]);
+        prune_flows(&mut flows);
+        let mut kept: Vec<_> = flows.keys().cloned().collect();
+        kept.sort();
+        // A finished attempt whose wait has not run yet must survive another begin.
+        assert_eq!(kept, ["finished-now", "running-old"]);
+    }
 
     fn database() -> (tempfile::TempDir, Connection, i64) {
         let dir = tempfile::tempdir().unwrap();

@@ -135,6 +135,23 @@ describe('MCP live health', () => {
         expect(host.textContent).not.toContain('Ready, tools');
     });
 
+    it('shows a failed check as a localized alert instead of blank health', async () => {
+        respond([snapshot({})]);
+        await render();
+        expect(host.textContent).toContain('Ready, tools available to AeroAgent: 1');
+        invoke.mockImplementation(async (command: string) => {
+            if (command === 'mcp_client_list_servers') return [{ ...saved, enabled: true }];
+            if (command === 'mcp_client_tool_snapshots') throw 'MCP_STORE_UNAVAILABLE';
+            return undefined;
+        });
+        await click(Array.from(host.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Check now')!);
+        expect(Array.from(host.querySelectorAll('[role=alert]')).map(a => a.textContent)).toContain('The encrypted settings store is unavailable.');
+        expect(host.textContent).not.toContain('MCP_STORE_UNAVAILABLE');
+        respond([snapshot({})]);
+        await click(Array.from(host.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Check now')!);
+        expect(host.querySelectorAll('[role=alert]')).toHaveLength(0);
+    });
+
     it('reports a disabled server as not started and rechecks after a change', async () => {
         respond([snapshot({ enabled: false, health: 'disabled', tools: [], unsupportedTools: 0, revision: '' })]);
         await render();

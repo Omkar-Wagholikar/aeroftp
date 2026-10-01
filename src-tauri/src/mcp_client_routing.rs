@@ -156,16 +156,23 @@ async fn list_server(
             return Ok((revision, cached));
         }
     }
+    // The deadline cancels discovery instead of dropping it, so a STDIO server
+    // goes through its explicit shutdown rather than only kill-on-drop.
     let cancel = CancellationToken::new();
-    let discovery = tokio::time::timeout(
-        SNAPSHOT_TIMEOUT,
-        bridge::discover_tools(app, key, transport.into(), id, &cancel),
-    )
-    .await
-    .map_err(|_| {
-        cancel.cancel();
-        BridgeError::Http(crate::mcp_client_http_transport::HttpError::Timeout)
-    })??;
+    let deadline = cancel.clone();
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep(SNAPSHOT_TIMEOUT).await;
+        deadline.cancel();
+    });
+    let discovery = bridge::discover_tools(app, key, transport.into(), id, &cancel).await;
+    watchdog.abort();
+    let discovery = discovery.map_err(|error| match error {
+        BridgeError::Stdio(crate::mcp_client_transport::TransportError::Cancelled)
+        | BridgeError::Http(crate::mcp_client_http_transport::HttpError::Cancelled) => {
+            BridgeError::Http(crate::mcp_client_http_transport::HttpError::Timeout)
+        }
+        other => other,
+    })?;
     let listed = Cached {
         tools: discovery.tools,
         unsupported: discovery.unsupported,
@@ -225,6 +232,23 @@ pub async fn mcp_client_tool_snapshots(
         retain_listed(&mut cache, &snapshots);
     }
     Ok(snapshots)
+}
+
+/// Drops every listing of one server, so the next snapshot lists it again.
+fn forget_server(cache: &mut HashMap<CacheKey, Cached>, transport: McpTransport, id: &str) {
+    cache.retain(|(_, cached_transport, cached_id, _), _| {
+        *cached_transport != transport || cached_id != id
+    });
+}
+
+/// A call refused because the live schema moved means the listing behind the
+/// offered snapshot is old even though the binding did not change.
+fn forget_on_schema_change(transport: McpTransport, id: &str, error: &BridgeError) {
+    if *error == BridgeError::SchemaChanged {
+        if let Ok(mut cache) = CACHE.lock() {
+            forget_server(&mut cache, transport, id);
+        }
+    }
 }
 
 /// Keeps only the listings an answer still stands on: a changed binding,
@@ -292,11 +316,15 @@ pub async fn mcp_client_tool_prepare(
     if call.approval_grant_id.is_some() {
         return Err("MCP_CALL_INVALID_REQUEST");
     }
+    let (transport, server) = (call.transport, call.server_id.clone());
     let request = call.request();
     let cancel = CancellationToken::new();
     let prepared = bridge::prepare(&app, revision_key(), &request, &cancel)
         .await
-        .map_err(|e| e.code())?;
+        .map_err(|e| {
+            forget_on_schema_change(transport, &server, &e);
+            e.code()
+        })?;
     Ok(McpToolPreparation {
         approval_required: prepared.approval_required,
         request_id: prepared.request_id,
@@ -316,6 +344,7 @@ pub async fn mcp_client_tool_call(
     if call.approval_grant_id.is_none() {
         return Err("MCP_APPROVAL_REQUIRED");
     }
+    let (transport, server) = (call.transport, call.server_id.clone());
     let request = call.request();
     let cancel = match turn_id.as_deref() {
         Some(turn) => crate::ai_tools::enter_turn_tool(turn).await,
@@ -325,7 +354,10 @@ pub async fn mcp_client_tool_call(
     if let Some(turn) = turn_id.as_deref() {
         crate::ai_tools::leave_turn_tool(turn).await;
     }
-    result.map_err(|e| e.code())
+    result.map_err(|e| {
+        forget_on_schema_change(transport, &server, &e);
+        e.code()
+    })
 }
 
 #[cfg(test)]
@@ -420,6 +452,46 @@ mod tests {
             ],
         );
         assert_eq!(cache.keys().collect::<Vec<_>>(), vec![&key("kept", "r1")]);
+    }
+
+    #[test]
+    fn a_changed_schema_forgets_only_that_servers_listings() {
+        let listed = Cached {
+            tools: Vec::new(),
+            unsupported: 0,
+            at: Instant::now(),
+        };
+        let mut cache: HashMap<CacheKey, Cached> = [
+            (
+                1,
+                McpTransport::Stdio,
+                "moved".to_string(),
+                "r1".to_string(),
+            ),
+            (1, McpTransport::Http, "moved".to_string(), "r1".to_string()),
+            (
+                1,
+                McpTransport::Stdio,
+                "other".to_string(),
+                "r1".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|k| (k, listed.clone()))
+        .collect();
+        forget_server(&mut cache, McpTransport::Stdio, "moved");
+        let mut kept: Vec<_> = cache.keys().map(|(_, t, id, _)| (*t, id.clone())).collect();
+        kept.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then(format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
+        });
+        assert_eq!(
+            kept,
+            [
+                (McpTransport::Http, "moved".to_string()),
+                (McpTransport::Stdio, "other".to_string())
+            ]
+        );
     }
 
     #[test]
