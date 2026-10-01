@@ -2908,8 +2908,9 @@ mod baseline_tests {
     /// F4 (verification of the final round): a file written without pause
     /// (a log, a database, a disk image) waited the whole bound before each
     /// of its three sends, in series, and held up every file after it. The
-    /// bound is the file's, once per cycle.
-    #[tokio::test]
+    /// bound is the file's, once per cycle. The clock is paused so the
+    /// waits are measured, not the runner's load.
+    #[tokio::test(start_paused = true)]
     async fn a_file_written_without_pause_waits_the_bound_once() {
         let root = tempfile::tempdir().expect("local root");
         let file = root.path().join("f.txt");
@@ -2937,16 +2938,16 @@ mod baseline_tests {
             edits_during_upload: usize::MAX,
             ..Default::default()
         };
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         svc.process_comparison_with_provider(&mut provider, &config, &uploaded)
             .await
             .expect("the upload succeeds");
         let took = started.elapsed();
         assert_eq!(provider.sent.len(), 3);
         assert!(
-            took >= std::time::Duration::from_millis(250)
-                && took < std::time::Duration::from_millis(700),
-            "three sends of a file written without pause took {took:?}"
+            took >= std::time::Duration::from_millis(300)
+                && took < std::time::Duration::from_millis(600),
+            "three sends of a file written without pause waited {took:?}"
         );
     }
 
