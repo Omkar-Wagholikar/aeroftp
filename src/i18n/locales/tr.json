@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Uyumlu OpenAI modelleri için Responses'ı etkinleştir",
                 "routingPreferred": "Tercih edilen",
                 "routingFallback": "Yedek",
-                "routingNoFallback": "Yok"
+                "routingNoFallback": "Yok",
+                "bedrockNeedsModel": "Test etmeden önce Modeller sekmesinde bir Bedrock modeli ekleyip etkinleştirin.",
+                "bedrockSetup": "AWS Bölgeniz için Runtime URL değerini ayarlayın. Modeller sekmesinde Bedrock Runtime üzerinde Chat Completions özelliğini destekleyen bir ID ekleyin. Runtime modelleri listelemez. Test, AWS ücretlerine yol açabilecek küçük bir çıkarım isteği gönderir."
             },
             "copy": "Kopyala",
             "attachImage": "Görsel ekle",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI sağlayıcı pazar yeri",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Bölgesel API anahtarıyla erişilen AWS üzerinde barındırılan modeller. model ID değerinizi elle ekleyin.",
+                "bedrockHighlight": "AWS bölgesel uç noktası"
             },
             "history": {
                 "cancel": "İptal",

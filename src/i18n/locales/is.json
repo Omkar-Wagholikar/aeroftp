@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Virkja Responses fyrir samhæf OpenAI-líkön",
                 "routingPreferred": "Valið",
                 "routingFallback": "Varalíkan",
-                "routingNoFallback": "Ekkert"
+                "routingNoFallback": "Ekkert",
+                "bedrockNeedsModel": "Bættu við og virkjaðu Bedrock-líkan á flipanum Líkön áður en þú prófar.",
+                "bedrockSetup": "Stilltu Runtime URL fyrir AWS-svæðið þitt. Í Líkön skaltu bæta við ID sem styður Chat Completions í Bedrock Runtime. Runtime birtir ekki lista yfir líkön. Prófunin sendir litla ályktunarbeiðni sem getur valdið AWS-gjöldum."
             },
             "copy": "Afrita",
             "attachImage": "Hengja mynd við",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-veitendumarkaðstorg",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Líkön hýst hjá AWS með aðgangi um svæðisbundinn API-lykil. Bættu model ID við handvirkt.",
+                "bedrockHighlight": "Svæðisbundinn AWS-endapunktur"
             },
             "history": {
                 "cancel": "Hætta við",

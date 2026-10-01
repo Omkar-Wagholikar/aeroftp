@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Ativar Responses para modelos OpenAI compatíveis",
                 "routingPreferred": "Preferido",
                 "routingFallback": "Alternativo",
-                "routingNoFallback": "Nenhum"
+                "routingNoFallback": "Nenhum",
+                "bedrockNeedsModel": "Adicione e ative um modelo Bedrock no separador Modelos antes de testar.",
+                "bedrockSetup": "Defina o Runtime URL para a sua região AWS. Em Modelos, adicione um ID compatível com Chat Completions no Bedrock Runtime. O Runtime não apresenta uma lista de modelos. O teste envia um pequeno pedido de inferência que pode implicar custos da AWS."
             },
             "copy": "Copiar",
             "attachImage": "Anexar imagem",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marketplace de Provedores IA",
                 "tools": "Ferramentas",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modelos alojados na AWS com acesso por chave API regional. Adicione manualmente o seu model ID.",
+                "bedrockHighlight": "Endpoint regional da AWS"
             },
             "history": {
                 "cancel": "Cancelar",

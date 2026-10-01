@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Povolit Responses pro kompatibilní modely OpenAI",
                 "routingPreferred": "Preferovaný",
                 "routingFallback": "Záložní",
-                "routingNoFallback": "Žádný"
+                "routingNoFallback": "Žádný",
+                "bedrockNeedsModel": "Před testováním přidejte a povolte model Bedrock na kartě Modely.",
+                "bedrockSetup": "Nastavte Runtime URL pro svůj region AWS. Na kartě Modely přidejte ID, které podporuje Chat Completions v Bedrock Runtime. Runtime neuvádí seznam modelů. Test odešle malý inferenční požadavek, za který může AWS účtovat poplatky."
             },
             "copy": "Kopírovat",
             "attachImage": "Přiložit obrázek",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Tržiště poskytovatelů AI",
                 "tools": "Nástroje",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modely hostované na AWS s přístupem přes regionální klíč API. Přidejte svůj model ID ručně.",
+                "bedrockHighlight": "Regionální koncový bod AWS"
             },
             "history": {
                 "cancel": "Zrušit",

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Aktifkan Responses untuk model OpenAI yang kompatibel",
                 "routingPreferred": "Pilihan",
                 "routingFallback": "Cadangan",
-                "routingNoFallback": "Tidak ada"
+                "routingNoFallback": "Tidak ada",
+                "bedrockNeedsModel": "Tambahkan dan aktifkan model Bedrock di tab Model sebelum menguji.",
+                "bedrockSetup": "Atur Runtime URL untuk Wilayah AWS Anda. Di Model, tambahkan ID yang mendukung Chat Completions pada Bedrock Runtime. Runtime tidak mencantumkan model. Pengujian mengirim permintaan inferensi kecil yang mungkin dikenai biaya AWS."
             },
             "copy": "Salin",
             "attachImage": "Lampirkan Gambar",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marketplace Penyedia AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Model yang dihosting di AWS dengan akses kunci API regional. Tambahkan model ID Anda secara manual.",
+                "bedrockHighlight": "Endpoint regional AWS"
             },
             "history": {
                 "cancel": "Batal",

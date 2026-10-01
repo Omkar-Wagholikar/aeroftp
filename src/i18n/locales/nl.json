@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Responses inschakelen voor compatibele OpenAI-modellen",
                 "routingPreferred": "Voorkeur",
                 "routingFallback": "Reserve",
-                "routingNoFallback": "Geen"
+                "routingNoFallback": "Geen",
+                "bedrockNeedsModel": "Voeg vóór het testen een Bedrock-model toe en schakel het in op het tabblad Modellen.",
+                "bedrockSetup": "Stel de Runtime URL voor uw AWS-regio in. Voeg onder Modellen een ID toe die Chat Completions op Bedrock Runtime ondersteunt. Runtime geeft geen modellenlijst weer. De test verstuurt een kleine inferentieaanvraag waarvoor AWS kosten in rekening kan brengen."
             },
             "copy": "Kopiëren",
             "attachImage": "Afbeelding bijvoegen",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-aanbieder Marktplaats",
                 "tools": "Gereedschappen",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modellen gehost op AWS met toegang via een regionale API-sleutel. Voeg uw model ID handmatig toe.",
+                "bedrockHighlight": "Regionaal AWS-eindpunt"
             },
             "history": {
                 "cancel": "Annuleren",

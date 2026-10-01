@@ -11,6 +11,14 @@ interface IconProps {
     className?: string;
 }
 
+// Generic regional cloud glyph for Amazon Bedrock; no AWS trademark artwork.
+export const BedrockIcon: React.FC<IconProps> = ({ size = 16, className = '' }) => (
+    <svg viewBox="0 0 24 24" width={size} height={size} className={className} fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M5 16.5a4 4 0 0 1-.5-7.8A7.5 7.5 0 0 1 19 9a4 4 0 0 1 0 8H6" />
+        <path d="m8 13 2.5 2.5L16 10" />
+    </svg>
+);
+
 // Google Gemini - Official blue/gradient
 export const GeminiIcon: React.FC<IconProps> = ({ size = 16, className = '' }) => (
     <svg

@@ -5,7 +5,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { Send, Bot, Sparkles, Mic, MicOff, ChevronDown, Trash2, MessageSquare, ImageIcon, X, ShieldAlert, AlertTriangle, FolderOpen, FileCode, Search, Archive, Terminal, Shield, RefreshCw, Brain, Eye, Key, Settings, Upload, Download, Square } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { createTauriListener, useTauriListener } from '../../hooks/useTauriListener';
-import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon } from './AIIcons';
+import { GeminiIcon, OpenAIIcon, AnthropicIcon, XAIIcon, OpenRouterIcon, OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon, GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon, AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon, NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon, BedrockIcon } from './AIIcons';
 import { AISettingsPanel } from '../AISettings';
 import { AISettings, AIProviderType } from '../../types/ai';
 import { resolveModelContext, shouldUseOpenAIResponses } from '../../types/aiModelRegistry';
@@ -293,6 +293,7 @@ const getProviderIcon = (type: AIProviderType, size = 12): React.ReactNode => {
     switch (type) {
         case 'google': return <GeminiIcon size={size} />;
         case 'openai': return <OpenAIIcon size={size} />;
+        case 'bedrock': return <BedrockIcon size={size} />;
         case 'anthropic': return <AnthropicIcon size={size} />;
         case 'xai': return <XAIIcon size={size} />;
         case 'openrouter': return <OpenRouterIcon size={size} />;

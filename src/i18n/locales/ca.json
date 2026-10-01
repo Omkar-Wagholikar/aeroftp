@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Activa Responses per als models d'OpenAI compatibles",
                 "routingPreferred": "Preferit",
                 "routingFallback": "Alternatiu",
-                "routingNoFallback": "Cap"
+                "routingNoFallback": "Cap",
+                "bedrockNeedsModel": "Afegiu i activeu un model de Bedrock a la pestanya Models abans de fer la prova.",
+                "bedrockSetup": "Configureu la Runtime URL de la vostra regió d'AWS. A Models, afegiu un ID compatible amb Chat Completions a Bedrock Runtime. Runtime no mostra cap llista de models. La prova envia una petita sol·licitud d'inferència que pot generar càrrecs d'AWS."
             },
             "copy": "Copiar",
             "attachImage": "Adjuntar imatge",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Mercat de proveïdors d'AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Models allotjats a AWS amb accés mitjançant una clau API regional. Afegiu el vostre model ID manualment.",
+                "bedrockHighlight": "Punt de connexió regional d'AWS"
             },
             "history": {
                 "cancel": "Cancel·la",

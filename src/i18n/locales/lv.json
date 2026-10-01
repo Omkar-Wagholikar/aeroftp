@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Iespējot Responses saderīgiem OpenAI modeļiem",
                 "routingPreferred": "Vēlamais",
                 "routingFallback": "Rezerves",
-                "routingNoFallback": "Nav"
+                "routingNoFallback": "Nav",
+                "bedrockNeedsModel": "Pirms testēšanas cilnē Modeļi pievienojiet un iespējojiet Bedrock modeli.",
+                "bedrockSetup": "Iestatiet Runtime URL savam AWS reģionam. Cilnē Modeļi pievienojiet ID, kas atbalsta Chat Completions pakalpojumā Bedrock Runtime. Runtime nerāda modeļu sarakstu. Pārbaude nosūta nelielu inferenču pieprasījumu, par kuru AWS var piemērot maksu."
             },
             "copy": "Kopēt",
             "attachImage": "Pievienot attēlu",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI pakalpojumu sniedzēju tirgus",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS mitināti modeļi ar piekļuvi, izmantojot reģionālu API atslēgu. Pievienojiet savu model ID manuāli.",
+                "bedrockHighlight": "AWS reģionālais galapunkts"
             },
             "history": {
                 "cancel": "Atcelt",

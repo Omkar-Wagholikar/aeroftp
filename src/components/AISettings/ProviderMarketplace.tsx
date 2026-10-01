@@ -16,7 +16,7 @@ import {
     OllamaIcon, KimiIcon, AlibabaModelStudioIcon, DeepSeekIcon, MistralIcon,
     GroqIcon, PerplexityIcon, CohereIcon, TogetherIcon,
     AI21Icon, CerebrasIcon, SambaNovaIcon, FireworksIcon,
-    NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon
+    NvidiaIcon, ZaiIcon, HyperbolicIcon, NovitaIcon, YiIcon, KiloIcon, BedrockIcon
 } from '../DevTools/AIIcons';
 
 interface ProviderMarketplaceProps {
@@ -28,6 +28,7 @@ interface ProviderMarketplaceProps {
 
 const PROVIDER_ICON_MAP: Record<AIProviderType, React.FC<{ size?: number; className?: string }>> = {
     openai: OpenAIIcon,
+    bedrock: BedrockIcon,
     anthropic: AnthropicIcon,
     google: GeminiIcon,
     xai: XAIIcon,
@@ -96,13 +97,13 @@ function ProviderCard({
                         </span>
                     </div>
                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 line-clamp-2">
-                        {provider.description}
+                        {provider.descriptionKey ? t(provider.descriptionKey) : provider.description}
                     </p>
                     {provider.highlight && (
                         <div className="flex items-center gap-1 mt-1.5">
                             <Star size={10} className="text-yellow-500" />
                             <span className="text-[10px] font-medium text-yellow-500">
-                                {provider.highlight}
+                                {provider.highlightKey ? t(provider.highlightKey) : provider.highlight}
                             </span>
                         </div>
                     )}

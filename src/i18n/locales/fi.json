@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Ota Responses käyttöön yhteensopiville OpenAI-malleille",
                 "routingPreferred": "Ensisijainen",
                 "routingFallback": "Varamalli",
-                "routingNoFallback": "Ei mitään"
+                "routingNoFallback": "Ei mitään",
+                "bedrockNeedsModel": "Lisää ja ota Bedrock-malli käyttöön Mallit-välilehdellä ennen testausta.",
+                "bedrockSetup": "Määritä AWS-alueesi Runtime URL. Lisää Mallit-välilehdellä ID, joka tukee Chat Completions -toimintoa Bedrock Runtimessa. Runtime ei listaa malleja. Testi lähettää pienen päättelypyynnön, josta AWS voi veloittaa."
             },
             "copy": "Kopioi",
             "attachImage": "Liitä kuva",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-tarjoajien markkinapaikka",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS:ssä isännöidyt mallit, joita käytetään alueellisella API-avaimella. Lisää model ID käsin.",
+                "bedrockHighlight": "AWS:n alueellinen päätepiste"
             },
             "history": {
                 "cancel": "Peruuta",

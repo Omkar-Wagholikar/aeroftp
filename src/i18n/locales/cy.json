@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Galluogi Responses ar gyfer modelau OpenAI cydnaws",
                 "routingPreferred": "A ffefrir",
                 "routingFallback": "Wrth gefn",
-                "routingNoFallback": "Dim"
+                "routingNoFallback": "Dim",
+                "bedrockNeedsModel": "Ychwanegwch ac actifadwch fodel Bedrock yn y tab Modelau cyn profi.",
+                "bedrockSetup": "Gosodwch y Runtime URL ar gyfer eich rhanbarth AWS. Yn Modelau, ychwanegwch ID sy'n cefnogi Chat Completions ar Bedrock Runtime. Nid yw Runtime yn rhestru modelau. Mae'r prawf yn anfon cais casgliad bach a all achosi taliadau AWS."
             },
             "copy": "Copïo",
             "attachImage": "Atodi delwedd",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marchnadfa darparwyr AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modelau sy'n cael eu lletya gan AWS gyda mynediad drwy allwedd API ranbarthol. Ychwanegwch eich model ID â llaw.",
+                "bedrockHighlight": "Pwynt terfyn rhanbarthol AWS"
             },
             "history": {
                 "cancel": "Canslo",
