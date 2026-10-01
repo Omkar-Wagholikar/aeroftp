@@ -62,7 +62,8 @@ function uniqueOwners<T extends { id: string }>(values: T[]): T[] {
 }
 
 const MCP_MAX_SERVERS = 32;
-const MCP_MAX_TOOLS = 64;
+// Covers AeroFTP primary tools and compatibility aliases with a bounded catalog.
+const MCP_MAX_TOOLS = 128;
 const MCP_MAX_SCHEMA_BYTES = 8192;
 const MCP_MAX_PARAMETERS = 16;
 const MCP_MAX_HEADERS = 24;

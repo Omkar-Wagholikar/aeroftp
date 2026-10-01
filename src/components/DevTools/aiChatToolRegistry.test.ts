@@ -50,12 +50,21 @@ describe('untrusted MCP registry snapshot', () => {
             { ...mcp('empty'), revision: '' },
             { ...mcp('tool-off'), tools: [{ ...mcp('tool-off').tools[0], enabled: false }] },
             { ...mcp('bad-name'), tools: [{ ...mcp('bad-name').tools[0], name: 'bad\nname' }] },
-            { ...mcp('too-many'), tools: Array.from({ length: 65 }, (_, i) => ({ ...mcp('too-many').tools[0], name: `tool${i}` })) },
+            { ...mcp('too-many'), tools: Array.from({ length: 129 }, (_, i) => ({ ...mcp('too-many').tools[0], name: `tool${i}` })) },
         ]) expect(buildToolRegistry([], [], [server]).some(entry => entry.source.kind === 'mcp')).toBe(false);
         expect(buildToolRegistry([], [], Array.from({ length: 33 }, (_, i) => mcp(`server${i}`)))
             .some(entry => entry.source.kind === 'mcp')).toBe(false);
         expect(buildToolRegistry([], [], [null, { ...mcp('malformed'), tools: [null] }] as unknown as McpServerSnapshot[])
             .some(entry => entry.source.kind === 'mcp')).toBe(false);
+    });
+
+    it('accepts a bounded catalog containing native and compatibility tool names', () => {
+        for (const count of [77, 128]) {
+            const server = mcp('native');
+            server.tools = Array.from({ length: count }, (_, index) => ({ ...server.tools[0], name: `native_${index}` }));
+            const entries = buildToolRegistry([], [], [server]).filter(entry => entry.source.kind === 'mcp');
+            expect(entries).toHaveLength(count);
+        }
     });
 
     it('rejects schemas that cannot be represented without losing constraints', () => {

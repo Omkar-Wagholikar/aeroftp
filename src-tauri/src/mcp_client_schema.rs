@@ -4,6 +4,9 @@
 use serde_json::Value;
 use std::collections::HashSet;
 
+// Includes our 77 primary/compatibility names while keeping discovery bounded.
+const MAX_TOOLS: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaError {
     Unavailable,
@@ -36,7 +39,7 @@ pub(crate) fn discover(result: &Value, name: &str) -> Result<Value, SchemaError>
         .get("tools")
         .and_then(Value::as_array)
         .ok_or(SchemaError::Unavailable)?;
-    if tools.len() > 64
+    if tools.len() > MAX_TOOLS
         || result.get("nextCursor").is_some()
         || name.is_empty()
         || name.len() > 128
@@ -287,11 +290,34 @@ mod tests {
         for result in [
             json!({"tools":[tool.clone(),tool.clone()]}),
             json!({"tools":[tool.clone()],"nextCursor":"more"}),
-            json!({"tools":vec![tool;65]}),
+            json!({"tools":vec![tool;MAX_TOOLS + 1]}),
         ] {
             assert_eq!(discover(&result, "echo"), Err(SchemaError::Unavailable));
         }
     }
+    #[test]
+    fn own_server_catalog_including_compatibility_names_can_discover_diagnostics() {
+        let tools: Vec<_> = crate::mcp::tools::tool_definitions().into_iter().map(|tool| {
+            json!({"name":tool.name,"description":tool.description,"inputSchema":tool.input_schema})
+        }).collect();
+        assert!(tools.len() > 64 && tools.len() <= MAX_TOOLS);
+        let schema = discover(&json!({"tools":tools}), "aeroftp_mcp_info").unwrap();
+        validate_arguments(&schema, &json!({})).unwrap();
+    }
+
+    #[test]
+    fn catalog_limit_accepts_128_unique_tools_and_refuses_129() {
+        let mut tools: Vec<_> = (0..MAX_TOOLS)
+            .map(|i| json!({"name":format!("tool_{i}"),"inputSchema":schema()}))
+            .collect();
+        assert!(discover(&json!({"tools":tools}), "tool_0").is_ok());
+        tools.push(json!({"name":"overflow","inputSchema":schema()}));
+        assert_eq!(
+            discover(&json!({"tools":tools}), "tool_0"),
+            Err(SchemaError::Unavailable)
+        );
+    }
+
     #[test]
     fn header_only_change_invalidates_backend_schema_revision() {
         let mut s = schema();
