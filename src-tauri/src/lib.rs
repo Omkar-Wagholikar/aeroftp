@@ -10978,6 +10978,12 @@ async fn save_remote_file(
 /// does not re-show the main window after the user has already closed it.
 static APP_READY_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Claimed by whichever of `app_ready` and the splash safety timeout starts
+/// finishing the startup first; the other one then does nothing, so the two
+/// can never interleave their splash teardown, menu install and window show.
+static STARTUP_FINISH_CLAIMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// User preference: when true, clicking the window close button hides to the
 /// system tray instead of quitting the app. Set by the frontend via
 /// `set_close_to_tray` on startup and whenever the user toggles the option.
@@ -11120,8 +11126,21 @@ fn heal_restored_window_size(window: &tauri::WebviewWindow) {
 /// only sees the tray icon: used for launches from the OS autostart entry.
 #[tauri::command]
 async fn app_ready(app: AppHandle, start_minimized: Option<bool>) {
+    finish_startup(app, start_minimized.unwrap_or(false), "app_ready").await;
+}
+
+/// The one startup sequence, for `app_ready` and for the splash safety timeout
+/// alike. The timeout used to run its own copy that set the global menu in the
+/// same main-thread step as `splash.close()`, while the splash was still alive:
+/// with `appmenu-gtk-module` loaded (the GNOME default `GTK_MODULES`) GTK then
+/// recursed until the main thread overflowed its stack and the app aborted.
+async fn finish_startup(app: AppHandle, start_minimized: bool, by: &'static str) {
     use tauri_plugin_window_state::{StateFlags, WindowExt};
-    let start_minimized = start_minimized.unwrap_or(false);
+    if STARTUP_FINISH_CLAIMED.swap(true, Ordering::SeqCst) {
+        info!("Startup already finished or finishing; {by} has nothing to do");
+        return;
+    }
+    info!("Finishing startup ({by})");
 
     // IMPORTANT: Do NOT set APP_READY_DONE here! Setting it early creates a race
     // condition: rebuild_menu sees the flag, calls app.set_menu() globally, and GTK
@@ -19021,7 +19040,6 @@ pub fn run() {
         )
         .setup(move |app| {
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder};
-            use tauri_plugin_window_state::{StateFlags, WindowExt};
 
             // Bridge `tracing::*` events to the `log` facade so the
             // tauri-plugin-log Webview target picks them up too. Without this
@@ -19579,47 +19597,18 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&file_menu, &edit_menu, &view_menu, &help_menu])?;
             app.manage(std::sync::Mutex::new(Some(menu)));
 
-            // Safety timeout: if frontend doesn't signal app_ready within 10 seconds,
-            // force-close splash, set deferred menu, and show main window.
-            // Skipped entirely if app_ready already ran (prevents window re-show).
+            // Safety timeout: if the frontend does not signal app_ready within 10
+            // seconds, finish the startup anyway through the same sequence as
+            // app_ready (splash torn down first, then the menu, then the window).
+            // Skipped when app_ready already ran or is running.
             let app_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(10));
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 if APP_READY_DONE.load(Ordering::SeqCst) {
-                    return; // app_ready already handled everything
+                    return;
                 }
                 warn!("Splash screen safety timeout reached, force-closing");
-                // This runs on a std thread (OFF the GTK main thread). The splash
-                // teardown, deferred menu and window show below all touch GTK/GLib,
-                // so marshal them onto the main thread or they corrupt the GLib heap
-                // (same "malloc(): unaligned fastbin chunk" abort as app_ready).
-                let app_main = app_handle.clone();
-                let _ = app_handle.run_on_main_thread(move || {
-                    if let Some(splash) = app_main.get_webview_window("splashscreen") {
-                        let _ = splash.close();
-                    }
-                    // Set deferred menu
-                    if let Some(deferred) = app_main
-                        .try_state::<std::sync::Mutex<Option<tauri::menu::Menu<tauri::Wry>>>>()
-                    {
-                        if let Ok(mut guard) = deferred.lock() {
-                            if let Some(menu) = guard.take() {
-                                let _ = app_main.set_menu(menu);
-                            }
-                        }
-                    }
-                    if let Some(main_window) = app_main.get_webview_window("main") {
-                        let _ = main_window.remove_menu();
-                        let _ = main_window.restore_state(
-                            StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
-                        );
-                        // Heal a poisoned 0x0 size restored from earlier broken builds (#290).
-                        heal_restored_window_size(&main_window);
-                        let _ = main_window.show();
-                        let _ = main_window.set_focus();
-                        log_window_diagnostics(&main_window, "safety-timeout post-show");
-                    }
-                });
+                finish_startup(app_handle, false, "safety timeout").await;
             });
             // ============ System Tray Icon ============
             // Create tray menu.
