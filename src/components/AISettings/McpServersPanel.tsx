@@ -39,9 +39,14 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
 
     const perform = async (action: () => Promise<void>) => {
         setBusy(true); setError('');
-        try { await action(); await refresh(); }
-        catch (cause) { setError(String(cause)); }
-        finally { setBusy(false); }
+        let actionFailed = false;
+        try { await action(); }
+        catch (cause) { actionFailed = true; setError(String(cause)); }
+        finally {
+            try { await refresh(); }
+            catch (cause) { if (!actionFailed) setError(String(cause)); }
+            finally { setBusy(false); }
+        }
     };
 
     const edit = (changes: Partial<ServerConfig>) => invoke<void>('mcp_client_upsert_server', {

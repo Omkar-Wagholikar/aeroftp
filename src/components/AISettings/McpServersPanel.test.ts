@@ -60,4 +60,41 @@ describe('MCP settings drafts and refresh ordering', () => {
         await act(async () => initial([{ ...saved, id: 'obsolete' }]));
         expect(host.textContent).toContain('newest'); expect(host.textContent).not.toContain('obsolete');
     });
+    it('refreshes the new revision after a secret write fails and retries without another catalog write', async () => {
+        let current = structuredClone(saved);
+        let writes = 0;
+        invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+            if (command === 'mcp_client_list_servers') return [structuredClone(current)];
+            if (command === 'mcp_client_upsert_server') { current = args.config as typeof current; return; }
+            if (command === 'mcp_client_set_secret' && ++writes === 1) throw new Error('vault unavailable');
+        });
+        await render();
+        const name = host.querySelector('[aria-label="Environment variable name"]') as HTMLInputElement;
+        const secret = host.querySelector('[aria-label="Secret value"]') as HTMLInputElement;
+        const save = Array.from(host.querySelectorAll('button')).find(e => e.textContent === 'Save secret')!;
+        await input(name, 'TOKEN'); await input(secret, 'first'); await click(save);
+        expect(host.textContent).toContain('vault unavailable');
+        expect(secret.value).toBe(''); expect(current.revision).toBe(2);
+        await input(secret, 'retry'); await click(save);
+        expect(writes).toBe(2);
+        expect(invoke.mock.calls.filter(([command]) => command === 'mcp_client_upsert_server')).toHaveLength(1);
+        expect(secret.value).toBe('');
+    });
+
+    it('preserves the action error and clears busy when its refresh also fails', async () => {
+        let lists = 0;
+        invoke.mockImplementation(async (command: string) => {
+            if (command === 'mcp_client_list_servers') {
+                if (++lists > 1) throw new Error('refresh failed');
+                return [saved];
+            }
+            throw new Error('write failed');
+        });
+        await render();
+        const toggle = host.querySelector('input[type=checkbox]') as HTMLInputElement;
+        await click(toggle);
+        expect(host.textContent).toContain('write failed');
+        expect(toggle.disabled).toBe(false);
+    });
+
 });
