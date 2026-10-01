@@ -68988,6 +68988,7 @@ async fn agent_run(
     let options = RunnerOptions {
         max_steps: cfg.max_steps,
         plan_only: cfg.plan_only,
+        fail_on_step_limit: true,
     };
     run(adapter, &request, messages, options, cancel)
         .await

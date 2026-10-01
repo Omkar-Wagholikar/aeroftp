@@ -2966,7 +2966,19 @@
             "routing": {
                 "fallbackUsed": "պահեստային",
                 "fallbackUsedTooltip": "{model}-ը ձախողվեց, ուստի պատասխանեց պահեստային մոդելը"
-            }
+            },
+            "delegateLocal": "Միայն կարդալու աշխատողներ",
+            "delegateLocalHint": "Առանձին գործարկում։ Աշխատողները կարող են կարդալ {path}-ի ներքո գտնվող ֆայլերը։",
+            "worker": "Աշխատող",
+            "workerBudgetExhausted": "Բյուջեն սպառված է",
+            "workerCancelled": "Չեղարկված է",
+            "workerCompleted": "Ավարտված է",
+            "workerFailed": "Ձախողվել է",
+            "workerQueued": "Հերթում է",
+            "workerRunning": "Ընթացքի մեջ է",
+            "delegateRemoteProfiles": "Ընտրովի պահպանված S3 պրոֆիլներ (մինչև երկու), յուրաքանչյուրը սահմանափակված ցուցադրված արմատային պանակով․",
+            "delegateRemoteEmpty": "Համապատասխան պահպանված S3 պրոֆիլներ հասանելի չեն։",
+            "workerStopping": "Կանգնեցվում է..."
         },
         "archive": {
             "passwordRequired": "Արխիվը պաշտպանված է գաղտնաբառով",

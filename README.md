@@ -304,7 +304,7 @@ Web hosting providers can generate encrypted `.aeroftp` connection profiles from
 
 ## File Formats
 
-AeroFTP defines seven user-facing file formats. Each has a single purpose and a distinct extension; desktop file associations are registered on Windows, macOS, and Linux, with `.aerozip` shipping CLI create/list/extract first. They are ordered from simplest to most advanced: compression, then encryption, then error correction, then the profile / script / keystore family.
+AeroFTP defines eight user-facing file formats. Each has a single purpose and a distinct extension; desktop file associations for `.aerozip`, `.aerovault`, `.aeroftp-script`, `.aeroftp` and `.aeroftp-keystore` are registered on Windows, macOS, and Linux, with `.aerozip` shipping CLI create/list/extract first. They are ordered from simplest to most advanced: compression, then encryption, then error correction, then the profile / script / keystore family.
 
 | Extension | Purpose | Encryption | Carries |
 |---|---|---|---|
@@ -312,12 +312,12 @@ AeroFTP defines seven user-facing file formats. Each has a single purpose and a 
 | <img src="src-tauri/icons/mimetypes/application-x-aerovault-64.png" width="32" height="32" alt="" /><br>`.aerovault` | Encrypted container (alternative to Cryptomator / `.zip` / `.rar`) | AES-256-GCM-SIV + Argon2id | Arbitrary files and folders inside a single sealed archive |
 | <img src="src-tauri/icons/mimetypes/application-x-aeroftp-script-64.png" width="32" height="32" alt="" /><br>`.aerocorrect` | Detached Reed-Solomon recovery sidecar (magic `AEROCORR`, format v2), par2-style; shared by AeroVault and AeroSync. The protected file stays byte-identical | None - integrity + recovery, **not confidentiality** | Content-SHA-bound reconstruction parity for a sibling file or vault; selectable overhead (~7% / ~15% / ~25% / ~30%) |
 | <img src="src-tauri/icons/mimetypes/application-x-aeroftp-script-64.png" width="32" height="32" alt="" /><br>`.aeroignore` | Ignore-pattern file (gitignore-style, last-match-wins) for AeroSync and transfers; convert from rclone filters with `aeroftp-cli import rclone-filter` | None (no secrets) | Exclude / include glob rules; references no credentials |
-| <img src="src-tauri/icons/mimetypes/application-x-aeroftp-script-64.png" width="32" height="32" alt="" /><br>`.aeroftp-script` | Portable batch script for `aeroftp-cli batch` (safer alternative to `.sh` / `.ps1`, runs on every OS where AeroFTP is supported) | None (no secrets) | AeroFTP CLI command lines; references saved profiles by name, never inline credentials |
 | <img src="src-tauri/icons/mimetypes/application-x-aeroftp-script-64.png" width="32" height="32" alt="" /><br>`.aerosync` | Shareable AeroSync template: direction, mode, exclusions, verify policy and Plan settings, exported and imported from the AeroSync dialog | None (no secrets) | Sync settings only; paths and saved-profile names, never credentials |
+| <img src="src-tauri/icons/mimetypes/application-x-aeroftp-script-64.png" width="32" height="32" alt="" /><br>`.aeroftp-script` | Portable batch script for `aeroftp-cli batch` (safer alternative to `.sh` / `.ps1`, runs on every OS where AeroFTP is supported) | None (no secrets) | AeroFTP CLI command lines; references saved profiles by name, never inline credentials |
 | <img src="src-tauri/icons/mimetypes/application-x-aeroftp-64.png" width="32" height="32" alt="" /><br>`.aeroftp` | Server-profile export and cross-tool exchange format (bridge with rclone / WinSCP / FileZilla) | AES-256-GCM + Argon2id | Selected saved profiles (host, user, protocol, paths). With *include credentials* on, also per-profile passwords and per-profile OAuth / Jottacloud tokens |
 | <img src="src-tauri/icons/mimetypes/application-x-aeroftp-keystore-64.png" width="32" height="32" alt="" /><br>`.aeroftp-keystore` | Full vault backup | AES-256-GCM + Argon2id | Everything in the vault: every profile, every credential, AI provider keys, app settings, theme and background preferences, AI chats |
 
-`.aerovault`, `.aeroftp` and `.aeroftp-keystore` are encrypted with a user-chosen password at seal / export time. `.aerozip` is plaintext on purpose: it provides integrity and recovery (Reed-Solomon parity is on by default and opt-out, `--recovery-level 0` for a smaller parity-free archive), not secrecy, and `.aerocorrect` is the detached form of that same recovery parity, carrying no secrets. `.aeroignore` and `.aeroftp-script` are also plaintext on purpose: they never carry secrets, so they can be checked into a repository, scheduled by cron / Task Scheduler, or shared with a teammate without any vault round-trip.
+`.aerovault`, `.aeroftp` and `.aeroftp-keystore` are encrypted with a user-chosen password at seal / export time. `.aerozip` is plaintext on purpose: it provides integrity and recovery (Reed-Solomon parity is on by default and opt-out, `--recovery-level 0` for a smaller parity-free archive), not secrecy, and `.aerocorrect` is the detached form of that same recovery parity, carrying no secrets. `.aeroignore`, `.aerosync` and `.aeroftp-script` are also plaintext on purpose: they never carry secrets, so they can be checked into a repository, scheduled by cron / Task Scheduler, or shared with a teammate without any vault round-trip.
 
 ---
 
@@ -765,6 +765,15 @@ flatpak install flatpark com.aeroftp.AeroFTP
 #### Launchpad PPA (Ubuntu / Debian)
 
 Visit [launchpad.net/aeroftp](https://launchpad.net/aeroftp) for PPA instructions and .deb packages.
+
+#### AM / AppMan (AppImage package managers)
+
+AeroFTP is available in [AM and AppMan](https://github.com/ivan-hc/AM), which install and update the AppImage for you:
+
+```bash
+am -i aeroftp        # system-wide (AM)
+appman -i aeroftp    # per user, no root (AppMan)
+```
 
 #### Other Linux Formats
 Download from [GitHub Releases](https://github.com/axpdev-lab/aeroftp/releases/latest):

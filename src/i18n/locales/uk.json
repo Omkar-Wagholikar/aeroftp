@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "запасна",
                 "fallbackUsedTooltip": "{model} не відповіла, тому відповіла запасна модель"
-            }
+            },
+            "delegateLocal": "Виконавці лише для читання",
+            "delegateLocalHint": "Окремий запуск. Виконавці можуть читати файли в {path}.",
+            "worker": "Виконавець",
+            "workerBudgetExhausted": "Бюджет вичерпано",
+            "workerCancelled": "Скасовано",
+            "workerCompleted": "Завершено",
+            "workerFailed": "Помилка",
+            "workerQueued": "У черзі",
+            "workerRunning": "Виконується",
+            "delegateRemoteProfiles": "Необов’язкові збережені профілі S3 (до двох), кожен обмежений показаною кореневою папкою:",
+            "delegateRemoteEmpty": "Немає доступних відповідних збережених профілів S3.",
+            "workerStopping": "Зупинення..."
         },
         "archive": {
             "passwordRequired": "Цей архів захищений паролем",

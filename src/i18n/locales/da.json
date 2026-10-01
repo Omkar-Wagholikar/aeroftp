@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "reserve",
                 "fallbackUsedTooltip": "{model} fejlede, så reservemodellen svarede i stedet"
-            }
+            },
+            "delegateLocal": "Arbejdere med læseadgang",
+            "delegateLocalHint": "Separat kørsel. Arbejdere kan læse filer under {path}.",
+            "worker": "Arbejder",
+            "workerBudgetExhausted": "Budget opbrugt",
+            "workerCancelled": "Annulleret",
+            "workerCompleted": "Fuldført",
+            "workerFailed": "Mislykket",
+            "workerQueued": "I kø",
+            "workerRunning": "Kører",
+            "delegateRemoteProfiles": "Valgfrie gemte S3-profiler (op til to), hver begrænset til den viste rod:",
+            "delegateRemoteEmpty": "Ingen egnede gemte S3-profiler er tilgængelige.",
+            "workerStopping": "Stopper..."
         },
         "archive": {
             "passwordRequired": "Dette arkiv er adgangskodebeskyttet",

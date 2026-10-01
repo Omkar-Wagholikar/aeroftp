@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "yedek",
                 "fallbackUsedTooltip": "{model} başarısız oldu, bu nedenle yedek model yanıt verdi"
-            }
+            },
+            "delegateLocal": "Salt okunur çalışanlar",
+            "delegateLocalHint": "Ayrı çalıştırma. Çalışanlar {path} altındaki dosyaları okuyabilir.",
+            "worker": "Çalışan",
+            "workerBudgetExhausted": "Bütçe tükendi",
+            "workerCancelled": "İptal edildi",
+            "workerCompleted": "Tamamlandı",
+            "workerFailed": "Başarısız",
+            "workerQueued": "Kuyrukta",
+            "workerRunning": "Çalışıyor",
+            "delegateRemoteProfiles": "İsteğe bağlı kayıtlı S3 profilleri (en fazla iki), her biri gösterilen kökle sınırlıdır:",
+            "delegateRemoteEmpty": "Uygun kayıtlı S3 profili yok.",
+            "workerStopping": "Durduruluyor..."
         },
         "archive": {
             "passwordRequired": "Bu arşiv parola korumalı",

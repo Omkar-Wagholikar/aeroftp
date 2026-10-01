@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "Ersatz",
                 "fallbackUsedTooltip": "{model} ist fehlgeschlagen, daher hat das Ersatzmodell geantwortet"
-            }
+            },
+            "delegateLocal": "Worker mit Lesezugriff",
+            "delegateLocalHint": "Separater Lauf. Worker können Dateien unter {path} lesen.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Budget erschöpft",
+            "workerCancelled": "Abgebrochen",
+            "workerCompleted": "Abgeschlossen",
+            "workerFailed": "Fehlgeschlagen",
+            "workerQueued": "In Warteschlange",
+            "workerRunning": "Läuft",
+            "delegateRemoteProfiles": "Optionale gespeicherte S3-Profile (bis zu zwei), jeweils auf das angezeigte Stammverzeichnis beschränkt:",
+            "delegateRemoteEmpty": "Keine geeigneten gespeicherten S3-Profile verfügbar.",
+            "workerStopping": "Wird gestoppt..."
         },
         "archive": {
             "passwordRequired": "Dieses Archiv ist passwortgeschützt",

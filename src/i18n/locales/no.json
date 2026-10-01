@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "reserve",
                 "fallbackUsedTooltip": "{model} feilet, så reservemodellen svarte i stedet"
-            }
+            },
+            "delegateLocal": "Arbeidere med lesetilgang",
+            "delegateLocalHint": "Separat kjøring. Arbeidere kan lese filer under {path}.",
+            "worker": "Arbeider",
+            "workerBudgetExhausted": "Budsjett brukt opp",
+            "workerCancelled": "Avbrutt",
+            "workerCompleted": "Fullført",
+            "workerFailed": "Mislyktes",
+            "workerQueued": "I kø",
+            "workerRunning": "Kjører",
+            "delegateRemoteProfiles": "Valgfrie lagrede S3-profiler (opptil to), hver begrenset til den viste rotmappen:",
+            "delegateRemoteEmpty": "Ingen egnede lagrede S3-profiler er tilgjengelige.",
+            "workerStopping": "Stopper..."
         },
         "archive": {
             "passwordRequired": "Dette arkivet er passordbeskyttet",

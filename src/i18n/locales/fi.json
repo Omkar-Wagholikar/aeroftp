@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "varamalli",
                 "fallbackUsedTooltip": "{model} epäonnistui, joten varamalli vastasi"
-            }
+            },
+            "delegateLocal": "Vain lukuun sallitut työntekijät",
+            "delegateLocalHint": "Erillinen suoritus. Työntekijät voivat lukea tiedostoja polun {path} alta.",
+            "worker": "Työntekijä",
+            "workerBudgetExhausted": "Budjetti käytetty",
+            "workerCancelled": "Peruutettu",
+            "workerCompleted": "Valmis",
+            "workerFailed": "Epäonnistui",
+            "workerQueued": "Jonossa",
+            "workerRunning": "Käynnissä",
+            "delegateRemoteProfiles": "Valinnaiset tallennetut S3-profiilit (enintään kaksi), kukin rajattu näytettyyn juurikansioon:",
+            "delegateRemoteEmpty": "Sopivia tallennettuja S3-profiileja ei ole saatavilla.",
+            "workerStopping": "Pysäytetään..."
         },
         "archive": {
             "passwordRequired": "Tämä arkisto on salasanasuojattu",

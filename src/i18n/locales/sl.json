@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "rezervni",
                 "fallbackUsedTooltip": "{model} ni uspel, zato je odgovoril rezervni model"
-            }
+            },
+            "delegateLocal": "Delavci samo za branje",
+            "delegateLocalHint": "Ločen zagon. Delavci lahko berejo datoteke pod {path}.",
+            "worker": "Delavec",
+            "workerBudgetExhausted": "Proračun izčrpan",
+            "workerCancelled": "Preklicano",
+            "workerCompleted": "Dokončano",
+            "workerFailed": "Neuspešno",
+            "workerQueued": "V čakalni vrsti",
+            "workerRunning": "Se izvaja",
+            "delegateRemoteProfiles": "Izbirni shranjeni profili S3 (največ dva), vsak omejen na prikazano korensko mapo:",
+            "delegateRemoteEmpty": "Ni razpoložljivih ustreznih shranjenih profilov S3.",
+            "workerStopping": "Ustavljanje..."
         },
         "archive": {
             "passwordRequired": "Ta arhiv je zaščiten z geslom",

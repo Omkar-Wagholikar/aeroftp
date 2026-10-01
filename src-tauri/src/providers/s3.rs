@@ -460,6 +460,78 @@ struct EffectiveCredentials {
 }
 
 impl S3Provider {
+    /// Worker-only single-page listing. The request cap is advisory for S3
+    /// compatible servers, so cap the received XML before parsing as well.
+    pub(crate) async fn list_worker_capped(
+        &mut self,
+        path: &str,
+        max_entries: usize,
+    ) -> Result<(Vec<RemoteEntry>, bool), ProviderError> {
+        const MAX_XML_BYTES: usize = 131_072;
+        if !self.connected || self.is_filen_s3_endpoint() || max_entries == 0 || max_entries > 50 {
+            return Err(ProviderError::NotSupported(
+                "Bounded worker S3 listing".into(),
+            ));
+        }
+        let prefix = path.trim_matches('/');
+        let prefix_with_slash = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        let max_keys = (max_entries + 1).to_string();
+        let params = [
+            ("list-type", "2"),
+            ("delimiter", "/"),
+            ("max-keys", max_keys.as_str()),
+            ("prefix", prefix_with_slash.as_str()),
+        ];
+        let mut response = self
+            .s3_request(Method::GET, "", Some(&params), None)
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(ProviderError::ServerError(
+                "Bounded worker S3 list failed".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| ProviderError::ParseError("Worker S3 list body failed".into()))?
+        {
+            if chunk.len() > MAX_XML_BYTES - bytes.len() {
+                return Err(ProviderError::ParseError(
+                    "Worker S3 list body exceeds cap".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let xml = String::from_utf8(bytes)
+            .map_err(|_| ProviderError::ParseError("Worker S3 list is not UTF-8".into()))?;
+        let (entries, next) = self.parse_list_response(&xml, false)?;
+        if entries.iter().any(|entry| {
+            !entry
+                .path
+                .trim_start_matches('/')
+                .starts_with(&prefix_with_slash)
+        }) {
+            return Err(ProviderError::ParseError(
+                "Worker S3 list escaped its prefix".into(),
+            ));
+        }
+        Ok(Self::finish_worker_page(entries, next, max_entries))
+    }
+    fn finish_worker_page(
+        mut entries: Vec<RemoteEntry>,
+        next: Option<String>,
+        max_entries: usize,
+    ) -> (Vec<RemoteEntry>, bool) {
+        let truncated = next.is_some() || entries.len() > max_entries;
+        entries.truncate(max_entries);
+        (entries, truncated)
+    }
+
     /// Create a new S3 provider with the given configuration
     pub fn new(config: S3Config) -> Result<Self, ProviderError> {
         debug!(
@@ -824,6 +896,21 @@ impl S3Provider {
     /// `--s3-no-check-bucket`.
     pub fn set_no_check_bucket(&mut self, enabled: bool) {
         self.no_check_bucket = enabled;
+    }
+
+    /// Workers pin one exact saved endpoint. A local bridge can rewrite its
+    /// scheme and even replace IPv6 loopback with IPv4 during `connect()`, so
+    /// it cannot be used behind that immutable worker grant.
+    pub(crate) fn worker_endpoint_may_reconcile_bridge(&self) -> bool {
+        let Ok(url) = url::Url::parse(&self.endpoint()) else {
+            return true;
+        };
+        let Some(host) = url.host_str() else {
+            return true;
+        };
+        url.port().is_some_and(|port| {
+            crate::local_bridge::is_local_bridge_authority(host.trim_matches(['[', ']']), port)
+        })
     }
 
     /// KE-B1.3: Suppress payload SHA-256 hashing in signed requests by
@@ -6057,10 +6144,27 @@ impl StorageProvider for S3Provider {
                     .get(reqwest::header::CONTENT_RANGE)
                     .and_then(|v| v.to_str().ok())
                     .map(|value| value.trim().to_string());
-                let bytes = response
-                    .bytes()
+                // A misbehaving endpoint can ignore the requested byte count
+                // while still returning 206. Bound allocation as chunks arrive,
+                // before validating Content-Range or returning bytes to callers.
+                let mut response = response;
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
                     .await
-                    .map_err(|e| ProviderError::TransferFailed(e.to_string()))?;
+                    .map_err(|e| ProviderError::TransferFailed(e.to_string()))?
+                {
+                    if chunk.len() > len as usize - bytes.len() {
+                        return Err(ProviderError::ParallelRefused(
+                            super::multi_thread::parallel_refused(
+                                "S3 range read",
+                                path,
+                                "the server exceeded the requested byte range",
+                            ),
+                        ));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
                 match super::multi_thread::ranged_answer(
                     StatusCode::PARTIAL_CONTENT,
                     answered.as_deref(),
@@ -6068,7 +6172,7 @@ impl StorageProvider for S3Provider {
                     offset,
                     end,
                 ) {
-                    Ok(_) => Ok(bytes.to_vec()),
+                    Ok(_) => Ok(bytes),
                     Err(why) => Err(ProviderError::ParallelRefused(
                         super::multi_thread::parallel_refused("S3 range read", path, &why),
                     )),
@@ -8286,6 +8390,26 @@ mod tests {
             allow_cleartext_endpoint: false,
         })
         .expect("Failed to create S3Provider")
+    }
+
+    #[test]
+    fn bounded_worker_page_distinguishes_exact_cap_from_sentinel() {
+        let provider = trim_text_test_provider();
+        for (count, token, truncated) in [(2, false, false), (3, false, true), (2, true, true)] {
+            let contents = (0..count)
+                .map(|n| format!("<Contents><Key>root/{n}.txt</Key><Size>1</Size></Contents>"))
+                .collect::<String>();
+            let next = if token {
+                "<NextContinuationToken>more</NextContinuationToken>"
+            } else {
+                ""
+            };
+            let xml = format!("<ListBucketResult>{contents}{next}</ListBucketResult>");
+            let (entries, next) = provider.parse_list_response(&xml, false).unwrap();
+            let (entries, actual) = S3Provider::finish_worker_page(entries, next, 2);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(actual, truncated);
+        }
     }
 
     /// CR-536 regression: a whitespace-ONLY Text fragment is indentation
@@ -10844,6 +10968,49 @@ mod tests {
             format!("{err}").contains("changed while it was being downloaded"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn range_read_rejects_an_oversized_partial_response_before_collecting_it() {
+        let app = axum::Router::new().fallback(axum::routing::any(
+            |_req: axum::extract::Request| async move {
+                axum::response::Response::builder()
+                    .status(206)
+                    .header("content-range", "bytes 0-3/8")
+                    .body(axum::body::Body::from(vec![b'x'; 8192]))
+                    .unwrap()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let mut provider = make_provider(Some(&format!("http://{addr}")));
+        provider.connected = true;
+        let error = provider.read_range("/file", 0, 4).await.unwrap_err();
+        assert!(format!("{error}").contains("exceeded the requested byte range"));
+    }
+
+    #[tokio::test]
+    async fn worker_list_rejects_a_server_that_ignores_the_page_body_cap() {
+        let app = axum::Router::new().fallback(axum::routing::any(
+            |_req: axum::extract::Request| async move {
+                axum::response::Response::builder()
+                    .status(200)
+                    .body(axum::body::Body::from(vec![b'x'; 131_073]))
+                    .unwrap()
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let mut provider = make_provider(Some(&format!("http://{addr}")));
+        provider.connected = true;
+        let error = provider.list_worker_capped("/safe", 20).await.unwrap_err();
+        assert!(format!("{error}").contains("body exceeds cap"));
     }
 
     #[tokio::test]

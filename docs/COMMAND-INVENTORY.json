@@ -558,7 +558,7 @@
     "mcp_tools_aliases": 38,
     "mcp_tools_primary": 39,
     "mcp_tools_total": 77,
-    "tauri_commands": 862
+    "tauri_commands": 864
   },
   "mcp": {
     "count": 77,
@@ -1079,6 +1079,8 @@
       "install_windows_update",
       "ai_chat",
       "ai_cancel_chat",
+      "ai_delegate_local",
+      "ai_cancel_delegation",
       "ai_test_provider",
       "ai_execute_tool",
       "validate_tool_args",
@@ -1329,7 +1331,7 @@
       "checkpoint_endpoints",
       "checkpoint_forget_endpoint"
     ],
-    "name_unmatched_count": 375,
+    "name_unmatched_count": 377,
     "note": "Name-based structural diff, not a semantic one. `name_matched` are Tauri commands whose token set matches a CLI/MCP/agent command (a LOWER bound on real coverage, since differently-named equivalents are missed). `name_unmatched` is the remainder: an UPPER bound for manual triage, dominated by GUI, OS-integration and internal commands with no command-line meaning, plus real capabilities named differently. Neither figure is a capability-gap count; curating genuine gaps stays manual (tracker #9)."
   },
   "schema_version": 1,
@@ -1620,6 +1622,8 @@
       "install_windows_update",
       "ai_chat",
       "ai_cancel_chat",
+      "ai_delegate_local",
+      "ai_cancel_delegation",
       "ai_test_provider",
       "ai_list_models",
       "ai_execute_tool",
@@ -2198,6 +2202,6 @@
       "checkpoint_endpoints",
       "checkpoint_forget_endpoint"
     ],
-    "count": 862
+    "count": 864
   }
 }

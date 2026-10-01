@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "varalíkan",
                 "fallbackUsedTooltip": "{model} brást, svo varalíkanið svaraði í staðinn"
-            }
+            },
+            "delegateLocal": "Vinnuferli með lesaðgangi",
+            "delegateLocalHint": "Aðskilin keyrsla. Vinnuferli mega lesa skrár undir {path}.",
+            "worker": "Vinnuferli",
+            "workerBudgetExhausted": "Fjárheimild uppurin",
+            "workerCancelled": "Hætt við",
+            "workerCompleted": "Lokið",
+            "workerFailed": "Mistókst",
+            "workerQueued": "Í biðröð",
+            "workerRunning": "Í gangi",
+            "delegateRemoteProfiles": "Valfrjáls vistuð S3-snið (allt að tvö), hvert takmarkað við sýnda rótarmöppu:",
+            "delegateRemoteEmpty": "Engin gjaldgeng vistuð S3-snið eru tiltæk.",
+            "workerStopping": "Stöðvar..."
         },
         "archive": {
             "passwordRequired": "Þessi skjalasafn er varið með lykilorði",

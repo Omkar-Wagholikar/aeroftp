@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "वैकल्पिक",
                 "fallbackUsedTooltip": "{model} विफल रहा, इसलिए वैकल्पिक मॉडल ने उत्तर दिया"
-            }
+            },
+            "delegateLocal": "केवल पढ़ने वाले वर्कर",
+            "delegateLocalHint": "अलग निष्पादन। वर्कर {path} के अंतर्गत फ़ाइलें पढ़ सकते हैं।",
+            "worker": "वर्कर",
+            "workerBudgetExhausted": "बजट समाप्त",
+            "workerCancelled": "रद्द किया गया",
+            "workerCompleted": "पूर्ण",
+            "workerFailed": "विफल",
+            "workerQueued": "कतार में",
+            "workerRunning": "चल रहा है",
+            "delegateRemoteProfiles": "वैकल्पिक सहेजे गए S3 प्रोफ़ाइल (अधिकतम दो), प्रत्येक दिखाए गए मूल फ़ोल्डर तक सीमित:",
+            "delegateRemoteEmpty": "कोई उपयुक्त सहेजी गई S3 प्रोफ़ाइल उपलब्ध नहीं है।",
+            "workerStopping": "रोक रहा है..."
         },
         "archive": {
             "passwordRequired": "यह आर्काइव पासवर्ड सुरक्षित है",

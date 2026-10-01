@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "dự phòng",
                 "fallbackUsedTooltip": "{model} đã thất bại, nên mô hình dự phòng đã trả lời thay"
-            }
+            },
+            "delegateLocal": "Worker chỉ đọc",
+            "delegateLocalHint": "Chạy riêng biệt. Worker có thể đọc tệp trong {path}.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Đã hết ngân sách",
+            "workerCancelled": "Đã hủy",
+            "workerCompleted": "Đã hoàn tất",
+            "workerFailed": "Thất bại",
+            "workerQueued": "Đang xếp hàng",
+            "workerRunning": "Đang chạy",
+            "delegateRemoteProfiles": "Hồ sơ S3 đã lưu tùy chọn (tối đa hai), mỗi hồ sơ chỉ giới hạn trong thư mục gốc được hiển thị:",
+            "delegateRemoteEmpty": "Không có hồ sơ S3 đã lưu phù hợp.",
+            "workerStopping": "Đang dừng..."
         },
         "archive": {
             "passwordRequired": "Tệp lưu trữ này được bảo vệ bằng mật khẩu",

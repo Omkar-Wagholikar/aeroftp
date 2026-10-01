@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "secours",
                 "fallbackUsedTooltip": "{model} a échoué, le modèle de secours a répondu à la place"
-            }
+            },
+            "delegateLocal": "Agents en lecture seule",
+            "delegateLocalHint": "Exécution séparée. Les agents peuvent lire les fichiers sous {path}.",
+            "worker": "Agent",
+            "workerBudgetExhausted": "Budget épuisé",
+            "workerCancelled": "Annulé",
+            "workerCompleted": "Terminé",
+            "workerFailed": "Échec",
+            "workerQueued": "En attente",
+            "workerRunning": "En cours",
+            "delegateRemoteProfiles": "Profils S3 enregistrés facultatifs (deux maximum), chacun limité à la racine affichée :",
+            "delegateRemoteEmpty": "Aucun profil S3 enregistré admissible n'est disponible.",
+            "workerStopping": "Arrêt en cours..."
         },
         "archive": {
             "passwordRequired": "Cette archive est protégée par mot de passe",

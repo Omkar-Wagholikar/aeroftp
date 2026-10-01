@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "atsarginis",
                 "fallbackUsedTooltip": "{model} nepavyko, todėl atsakė atsarginis modelis"
-            }
+            },
+            "delegateLocal": "Tik skaitymo vykdytojai",
+            "delegateLocalHint": "Atskiras vykdymas. Vykdytojai gali skaityti failus po {path}.",
+            "worker": "Vykdytojas",
+            "workerBudgetExhausted": "Biudžetas išnaudotas",
+            "workerCancelled": "Atšaukta",
+            "workerCompleted": "Baigta",
+            "workerFailed": "Nepavyko",
+            "workerQueued": "Eilėje",
+            "workerRunning": "Vykdoma",
+            "delegateRemoteProfiles": "Pasirenkami išsaugoti S3 profiliai (iki dviejų), kiekvienas apribotas rodomu šakniniu aplanku:",
+            "delegateRemoteEmpty": "Tinkamų išsaugotų S3 profilių nėra.",
+            "workerStopping": "Stabdoma..."
         },
         "archive": {
             "passwordRequired": "Šis archyvas apsaugotas slaptažodžiu",

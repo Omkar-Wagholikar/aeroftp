@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "varumudel",
                 "fallbackUsedTooltip": "{model} ebaõnnestus, seetõttu vastas varumudel"
-            }
+            },
+            "delegateLocal": "Ainult lugemisõigusega töötajad",
+            "delegateLocalHint": "Eraldi käivitus. Töötajad võivad lugeda faile asukohas {path}.",
+            "worker": "Töötaja",
+            "workerBudgetExhausted": "Eelarve ammendatud",
+            "workerCancelled": "Tühistatud",
+            "workerCompleted": "Lõpetatud",
+            "workerFailed": "Nurjus",
+            "workerQueued": "Järjekorras",
+            "workerRunning": "Töötab",
+            "delegateRemoteProfiles": "Valikulised salvestatud S3 profiilid (kuni kaks), igaüks piiratud näidatud juurkaustaga:",
+            "delegateRemoteEmpty": "Sobivaid salvestatud S3 profiile pole saadaval.",
+            "workerStopping": "Peatamine..."
         },
         "archive": {
             "passwordRequired": "See arhiiv on parooliga kaitstud",

@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "cadangan",
                 "fallbackUsedTooltip": "{model} gagal, sehingga model cadangan yang menjawab"
-            }
+            },
+            "delegateLocal": "Pekerja hanya baca",
+            "delegateLocalHint": "Proses terpisah. Pekerja dapat membaca file di bawah {path}.",
+            "worker": "Pekerja",
+            "workerBudgetExhausted": "Anggaran habis",
+            "workerCancelled": "Dibatalkan",
+            "workerCompleted": "Selesai",
+            "workerFailed": "Gagal",
+            "workerQueued": "Dalam antrean",
+            "workerRunning": "Berjalan",
+            "delegateRemoteProfiles": "Profil S3 tersimpan opsional (maksimal dua), masing-masing dibatasi ke folder akar yang ditampilkan:",
+            "delegateRemoteEmpty": "Tidak ada profil S3 tersimpan yang memenuhi syarat.",
+            "workerStopping": "Menghentikan..."
         },
         "archive": {
             "passwordRequired": "Arsip ini dilindungi kata sandi",

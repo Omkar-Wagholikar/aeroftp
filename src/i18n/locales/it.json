@@ -3167,7 +3167,19 @@
             "routing": {
                 "fallbackUsed": "riserva",
                 "fallbackUsedTooltip": "{model} non ha risposto, ha risposto il modello di riserva"
-            }
+            },
+            "delegateLocal": "Worker in sola lettura",
+            "delegateLocalHint": "Esecuzione separata. I worker possono leggere i file sotto {path}.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Budget esaurito",
+            "workerCancelled": "Annullato",
+            "workerCompleted": "Completato",
+            "workerFailed": "Non riuscito",
+            "workerQueued": "In coda",
+            "workerRunning": "In esecuzione",
+            "delegateRemoteProfiles": "Profili S3 salvati facoltativi (fino a due), ciascuno limitato alla radice mostrata:",
+            "delegateRemoteEmpty": "Nessun profilo S3 salvato idoneo disponibile.",
+            "workerStopping": "Arresto..."
         },
         "archive": {
             "passwordRequired": "Questo archivio è protetto da password",

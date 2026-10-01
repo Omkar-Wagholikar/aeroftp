@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "ordezkoa",
                 "fallbackUsedTooltip": "{model} huts egin du, beraz ordezko ereduak erantzun du"
-            }
+            },
+            "delegateLocal": "Irakurtzeko soilik diren langileak",
+            "delegateLocalHint": "Exekuzio bereizia. Langileek {path} azpiko fitxategiak irakur ditzakete.",
+            "worker": "Langilea",
+            "workerBudgetExhausted": "Aurrekontua agortuta",
+            "workerCancelled": "Bertan behera utzita",
+            "workerCompleted": "Osatuta",
+            "workerFailed": "Huts egin du",
+            "workerQueued": "Ilaran",
+            "workerRunning": "Exekutatzen",
+            "delegateRemoteProfiles": "Gordetako aukerako S3 profilak (gehienez bi), bakoitza erakutsitako errora mugatuta:",
+            "delegateRemoteEmpty": "Ez dago gordetako S3 profil egokirik erabilgarri.",
+            "workerStopping": "Gelditzen..."
         },
         "archive": {
             "passwordRequired": "Artxibo hau pasahitzarekin babestuta dago",

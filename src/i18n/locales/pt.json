@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "alternativo",
                 "fallbackUsedTooltip": "{model} falhou, por isso respondeu o modelo alternativo"
-            }
+            },
+            "delegateLocal": "Trabalhadores só de leitura",
+            "delegateLocalHint": "Execução separada. Os trabalhadores podem ler ficheiros sob {path}.",
+            "worker": "Trabalhador",
+            "workerBudgetExhausted": "Orçamento esgotado",
+            "workerCancelled": "Cancelado",
+            "workerCompleted": "Concluído",
+            "workerFailed": "Falhou",
+            "workerQueued": "Em fila",
+            "workerRunning": "Em execução",
+            "delegateRemoteProfiles": "Perfis S3 guardados opcionais (até dois), cada um limitado à raiz apresentada:",
+            "delegateRemoteEmpty": "Não há perfis S3 guardados elegíveis disponíveis.",
+            "workerStopping": "A parar..."
         },
         "archive": {
             "passwordRequired": "Este arquivo é protegido por senha",

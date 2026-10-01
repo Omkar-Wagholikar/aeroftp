@@ -2938,7 +2938,19 @@
             "routing": {
                 "fallbackUsed": "フォールバック",
                 "fallbackUsedTooltip": "{model} が失敗したため、フォールバックのモデルが応答しました"
-            }
+            },
+            "delegateLocal": "読み取り専用ワーカー",
+            "delegateLocalHint": "個別に実行します。ワーカーは {path} 以下のファイルを読み取れます。",
+            "worker": "ワーカー",
+            "workerBudgetExhausted": "予算を使い切りました",
+            "workerCancelled": "キャンセル済み",
+            "workerCompleted": "完了",
+            "workerFailed": "失敗",
+            "workerQueued": "待機中",
+            "workerRunning": "実行中",
+            "delegateRemoteProfiles": "任意の保存済み S3 プロファイル（最大2つ）。各プロファイルは表示されたルートに制限されます：",
+            "delegateRemoteEmpty": "利用可能な対象の保存済み S3 プロファイルはありません。",
+            "workerStopping": "停止中..."
         },
         "archive": {
             "passwordRequired": "このアーカイブはパスワードで保護されています",

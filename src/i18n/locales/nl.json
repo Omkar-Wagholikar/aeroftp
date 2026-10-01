@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "reserve",
                 "fallbackUsedTooltip": "{model} is mislukt, daarom antwoordde het reservemodel"
-            }
+            },
+            "delegateLocal": "Workers met alleen leestoegang",
+            "delegateLocalHint": "Afzonderlijke uitvoering. Workers kunnen bestanden onder {path} lezen.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Budget opgebruikt",
+            "workerCancelled": "Geannuleerd",
+            "workerCompleted": "Voltooid",
+            "workerFailed": "Mislukt",
+            "workerQueued": "In wachtrij",
+            "workerRunning": "Actief",
+            "delegateRemoteProfiles": "Optionele opgeslagen S3-profielen (maximaal twee), elk beperkt tot de getoonde hoofdmap:",
+            "delegateRemoteEmpty": "Er zijn geen geschikte opgeslagen S3-profielen beschikbaar.",
+            "workerStopping": "Stoppen..."
         },
         "archive": {
             "passwordRequired": "Dit archief is beveiligd met een wachtwoord",

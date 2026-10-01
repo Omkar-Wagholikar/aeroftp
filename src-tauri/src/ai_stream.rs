@@ -181,12 +181,10 @@ pub async fn ai_chat_stream_with_sink(
     };
 
     // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
-    let request = AIRequest {
-        top_p: request.top_p.map(|v| v.clamp(0.0, 1.0)),
-        top_k: request.top_k.map(|v| v.clamp(1, 500)),
-        thinking_budget: request.thinking_budget.map(|v| v.clamp(0, 128_000)),
-        ..request
-    };
+    let mut request = request;
+    request.top_p = request.top_p.map(|v| v.clamp(0.0, 1.0));
+    request.top_k = request.top_k.map(|v| v.clamp(1, 500));
+    request.thinking_budget = request.thinking_budget.map(|v| v.clamp(0, 128_000));
 
     let client = &*AI_STREAM_CLIENT;
 

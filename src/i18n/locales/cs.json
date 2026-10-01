@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "záložní",
                 "fallbackUsedTooltip": "{model} selhal, proto odpověděl záložní model"
-            }
+            },
+            "delegateLocal": "Pracovníci pouze pro čtení",
+            "delegateLocalHint": "Samostatné spuštění. Pracovníci mohou číst soubory pod {path}.",
+            "worker": "Pracovník",
+            "workerBudgetExhausted": "Rozpočet vyčerpán",
+            "workerCancelled": "Zrušeno",
+            "workerCompleted": "Dokončeno",
+            "workerFailed": "Selhalo",
+            "workerQueued": "Ve frontě",
+            "workerRunning": "Probíhá",
+            "delegateRemoteProfiles": "Volitelné uložené profily S3 (nejvýše dva), každý omezený na zobrazený kořen:",
+            "delegateRemoteEmpty": "Nejsou dostupné žádné vhodné uložené profily S3.",
+            "workerStopping": "Zastavování..."
         },
         "archive": {
             "passwordRequired": "Tento archiv je chráněn heslem",

@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "panghalili",
                 "fallbackUsedTooltip": "Nabigo ang {model}, kaya ang panghaliling modelo ang sumagot"
-            }
+            },
+            "delegateLocal": "Mga worker na pangbasa lamang",
+            "delegateLocalHint": "Hiwalay na pagpapatakbo. Maaaring magbasa ang mga worker ng mga file sa ilalim ng {path}.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Naubos ang badyet",
+            "workerCancelled": "Kinansela",
+            "workerCompleted": "Nakumpleto",
+            "workerFailed": "Nabigo",
+            "workerQueued": "Nakapila",
+            "workerRunning": "Tumatakbo",
+            "delegateRemoteProfiles": "Opsyonal na mga naka-save na S3 profile (hanggang dalawa), bawat isa ay limitado sa ipinakitang root:",
+            "delegateRemoteEmpty": "Walang available na kwalipikadong naka-save na S3 profile.",
+            "workerStopping": "Humihinto..."
         },
         "archive": {
             "passwordRequired": "Ang archive na ito ay protektado ng password",

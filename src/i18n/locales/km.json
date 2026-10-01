@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "បម្រុង",
                 "fallbackUsedTooltip": "{model} បានបរាជ័យ ដូច្នេះម៉ូដែលបម្រុងបានឆ្លើយតបជំនួស"
-            }
+            },
+            "delegateLocal": "កម្មករសម្រាប់តែអាន",
+            "delegateLocalHint": "ដំណើរការដាច់ដោយឡែក។ កម្មករអាចអានឯកសារក្រោម {path}។",
+            "worker": "កម្មករ",
+            "workerBudgetExhausted": "ថវិកាអស់ហើយ",
+            "workerCancelled": "បានបោះបង់",
+            "workerCompleted": "បានបញ្ចប់",
+            "workerFailed": "បានបរាជ័យ",
+            "workerQueued": "នៅក្នុងជួរ",
+            "workerRunning": "កំពុងដំណើរការ",
+            "delegateRemoteProfiles": "ប្រវត្តិរូប S3 ដែលបានរក្សាទុកជាជម្រើស (រហូតដល់ពីរ) ដោយនីមួយៗកំណត់ត្រឹមថតឫសដែលបានបង្ហាញ៖",
+            "delegateRemoteEmpty": "មិនមានប្រវត្តិរូប S3 ដែលបានរក្សាទុកសមស្របទេ។",
+            "workerStopping": "កំពុងបញ្ឈប់..."
         },
         "archive": {
             "passwordRequired": "បណ្ណសារនេះត្រូវបានការពារដោយពាក្យសម្ងាត់",

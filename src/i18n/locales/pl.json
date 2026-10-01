@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "zapasowy",
                 "fallbackUsedTooltip": "{model} zawiódł, więc odpowiedział model zapasowy"
-            }
+            },
+            "delegateLocal": "Pracownicy tylko do odczytu",
+            "delegateLocalHint": "Oddzielne uruchomienie. Pracownicy mogą czytać pliki w {path}.",
+            "worker": "Pracownik",
+            "workerBudgetExhausted": "Budżet wyczerpany",
+            "workerCancelled": "Anulowano",
+            "workerCompleted": "Ukończono",
+            "workerFailed": "Niepowodzenie",
+            "workerQueued": "W kolejce",
+            "workerRunning": "W trakcie",
+            "delegateRemoteProfiles": "Opcjonalne zapisane profile S3 (maksymalnie dwa), każdy ograniczony do pokazanego katalogu głównego:",
+            "delegateRemoteEmpty": "Brak dostępnych odpowiednich zapisanych profili S3.",
+            "workerStopping": "Zatrzymywanie..."
         },
         "archive": {
             "passwordRequired": "To archiwum jest chronione hasłem",

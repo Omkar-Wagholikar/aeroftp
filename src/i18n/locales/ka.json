@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "სარეზერვო",
                 "fallbackUsedTooltip": "{model} ვერ უპასუხა, ამიტომ სარეზერვო მოდელმა უპასუხა"
-            }
+            },
+            "delegateLocal": "მხოლოდ წაკითხვის მუშაკები",
+            "delegateLocalHint": "ცალკე გაშვება. მუშაკებს შეუძლიათ {path}-ის ქვეშ არსებული ფაილების წაკითხვა.",
+            "worker": "მუშაკი",
+            "workerBudgetExhausted": "ბიუჯეტი ამოიწურა",
+            "workerCancelled": "გაუქმებულია",
+            "workerCompleted": "დასრულებულია",
+            "workerFailed": "ვერ შესრულდა",
+            "workerQueued": "რიგშია",
+            "workerRunning": "მიმდინარეობს",
+            "delegateRemoteProfiles": "არასავალდებულო შენახული S3 პროფილები (მაქსიმუმ ორი), თითოეული შეზღუდულია ნაჩვენები ძირეული საქაღალდით:",
+            "delegateRemoteEmpty": "შესაფერისი შენახული S3 პროფილები ხელმისაწვდომი არ არის.",
+            "workerStopping": "ჩერდება..."
         },
         "archive": {
             "passwordRequired": "ეს არქივი პაროლით არის დაცული",

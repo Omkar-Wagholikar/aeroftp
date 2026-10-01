@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "запасная",
                 "fallbackUsedTooltip": "{model} не ответила, поэтому ответила запасная модель"
-            }
+            },
+            "delegateLocal": "Исполнители только для чтения",
+            "delegateLocalHint": "Отдельный запуск. Исполнители могут читать файлы в {path}.",
+            "worker": "Исполнитель",
+            "workerBudgetExhausted": "Бюджет исчерпан",
+            "workerCancelled": "Отменено",
+            "workerCompleted": "Завершено",
+            "workerFailed": "Ошибка",
+            "workerQueued": "В очереди",
+            "workerRunning": "Выполняется",
+            "delegateRemoteProfiles": "Необязательные сохранённые профили S3 (до двух), каждый ограничен указанной корневой папкой:",
+            "delegateRemoteEmpty": "Нет доступных подходящих сохранённых профилей S3.",
+            "workerStopping": "Остановка..."
         },
         "archive": {
             "passwordRequired": "Этот архив защищён паролем",

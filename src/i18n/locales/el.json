@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "εφεδρικό",
                 "fallbackUsedTooltip": "Το {model} απέτυχε, οπότε απάντησε το εφεδρικό μοντέλο"
-            }
+            },
+            "delegateLocal": "Εργάτες μόνο για ανάγνωση",
+            "delegateLocalHint": "Ξεχωριστή εκτέλεση. Οι εργάτες μπορούν να διαβάζουν αρχεία κάτω από το {path}.",
+            "worker": "Εργάτης",
+            "workerBudgetExhausted": "Εξαντλήθηκε ο προϋπολογισμός",
+            "workerCancelled": "Ακυρώθηκε",
+            "workerCompleted": "Ολοκληρώθηκε",
+            "workerFailed": "Απέτυχε",
+            "workerQueued": "Σε ουρά",
+            "workerRunning": "Εκτελείται",
+            "delegateRemoteProfiles": "Προαιρετικά αποθηκευμένα προφίλ S3 (έως δύο), καθένα περιορισμένο στον εμφανιζόμενο ριζικό φάκελο:",
+            "delegateRemoteEmpty": "Δεν υπάρχουν διαθέσιμα κατάλληλα αποθηκευμένα προφίλ S3.",
+            "workerStopping": "Διακοπή..."
         },
         "archive": {
             "passwordRequired": "Αυτό το αρχείο προστατεύεται με κωδικό",

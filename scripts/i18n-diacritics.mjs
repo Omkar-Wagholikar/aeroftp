@@ -61,6 +61,9 @@ const fold = (word) => [...word.toLowerCase().normalize('NFD')]
 // before looking at words, or every locale reports its own placeholders.
 const words = (s) => s.replace(/\{[^}]*\}/g, ' ').match(/\p{L}+/gu) ?? [];
 const isAscii = (s) => !/[^\x00-\x7F]/.test(s);
+// Pending translations contain English source text by design. They are not
+// evidence about the locale's spelling and belong to the translation gate.
+const isPendingTranslation = (s) => s.startsWith('[NEEDS TRANSLATION]');
 
 function flatten(node, prefix = '', out = {}) {
     for (const [k, v] of Object.entries(node ?? {})) {
@@ -102,6 +105,7 @@ for (const file of readdirSync(LOCALES_DIR).filter((f) => f.endsWith('.json')).s
     // How often each real spelling occurs, grouped by its ASCII fold.
     const byFold = new Map();
     for (const value of Object.values(flat)) {
+        if (isPendingTranslation(value)) continue;
         for (const w of words(value)) {
             if (w.length < MIN_WORD_LEN) continue;
             const key = fold(w);
@@ -114,7 +118,7 @@ for (const file of readdirSync(LOCALES_DIR).filter((f) => f.endsWith('.json')).s
     const hits = [];
     for (const [key, value] of Object.entries(flat)) {
         // A value identical to its English source is untranslated, not stripped.
-        if (!isAscii(value) || english[key] === value) continue;
+        if (!isAscii(value) || english[key] === value || isPendingTranslation(value)) continue;
         // One report per string, on its first suspicious word. A sentence is
         // read and judged whole, so a second hit inside it adds noise and, when
         // the string is already accepted, would count the same acceptance twice.

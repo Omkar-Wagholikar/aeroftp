@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "wrth gefn",
                 "fallbackUsedTooltip": "Methodd {model}, felly atebodd y model wrth gefn"
-            }
+            },
+            "delegateLocal": "Gweithwyr darllen yn unig",
+            "delegateLocalHint": "Rhediad ar wahân. Gall gweithwyr ddarllen ffeiliau o dan {path}.",
+            "worker": "Gweithiwr",
+            "workerBudgetExhausted": "Cyllideb wedi dod i ben",
+            "workerCancelled": "Wedi canslo",
+            "workerCompleted": "Wedi cwblhau",
+            "workerFailed": "Wedi methu",
+            "workerQueued": "Yn y ciw",
+            "workerRunning": "Yn rhedeg",
+            "delegateRemoteProfiles": "Proffiliau S3 wedi'u cadw dewisol (hyd at ddau), pob un wedi'i gyfyngu i'r gwraidd a ddangosir:",
+            "delegateRemoteEmpty": "Nid oes proffiliau S3 wedi'u cadw cymwys ar gael.",
+            "workerStopping": "Yn stopio..."
         },
         "archive": {
             "passwordRequired": "Mae'r archif hwn wedi'i ddiogelu â chyfrinair",

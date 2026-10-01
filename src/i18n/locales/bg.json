@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "резервен",
                 "fallbackUsedTooltip": "{model} не отговори, затова отговори резервният модел"
-            }
+            },
+            "delegateLocal": "Работници само за четене",
+            "delegateLocalHint": "Отделно изпълнение. Работниците могат да четат файлове в {path}.",
+            "worker": "Работник",
+            "workerBudgetExhausted": "Бюджетът е изчерпан",
+            "workerCancelled": "Отменено",
+            "workerCompleted": "Завършено",
+            "workerFailed": "Неуспешно",
+            "workerQueued": "На опашка",
+            "workerRunning": "Изпълнява се",
+            "delegateRemoteProfiles": "Незадължителни запазени S3 профили (до два), всеки ограничен до показаната коренова папка:",
+            "delegateRemoteEmpty": "Няма налични подходящи запазени S3 профили.",
+            "workerStopping": "Спиране..."
         },
         "archive": {
             "passwordRequired": "Този архив е защитен с парола",

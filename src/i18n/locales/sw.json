@@ -2973,7 +2973,19 @@
             "routing": {
                 "fallbackUsed": "mbadala",
                 "fallbackUsedTooltip": "{model} imeshindwa, kwa hivyo modeli mbadala ndiyo iliyojibu"
-            }
+            },
+            "delegateLocal": "Wafanyakazi wa kusoma tu",
+            "delegateLocalHint": "Utekelezaji tofauti. Wafanyakazi wanaweza kusoma faili chini ya {path}.",
+            "worker": "Mfanyakazi",
+            "workerBudgetExhausted": "Bajeti imeisha",
+            "workerCancelled": "Imeghairiwa",
+            "workerCompleted": "Imekamilika",
+            "workerFailed": "Imeshindwa",
+            "workerQueued": "Kwenye foleni",
+            "workerRunning": "Inaendeshwa",
+            "delegateRemoteProfiles": "Wasifu wa S3 uliohifadhiwa wa hiari (hadi miwili), kila mmoja ukizuiwa kwenye folda kuu iliyoonyeshwa:",
+            "delegateRemoteEmpty": "Hakuna wasifu wa S3 uliohifadhiwa unaofaa unaopatikana.",
+            "workerStopping": "Inasimamisha..."
         },
         "archive": {
             "passwordRequired": "Kumbukumbu hii inalindwa na nenosiri",
