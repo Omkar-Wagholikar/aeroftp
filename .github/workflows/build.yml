@@ -695,7 +695,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          appimages=(release-assets/*.AppImage)
+          appimages=(release-assets/appimage/*.AppImage)
           if [ ${#appimages[@]} -eq 0 ]; then exit 0; fi
           if ! gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' > /tmp/published-assets.txt 2>/dev/null; then
             echo "Release $GITHUB_REF_NAME does not exist yet: fresh publish, the pair comes from this build"
@@ -709,7 +709,7 @@ jobs:
               mkdir -p /tmp/published-appimage
               gh release download "$GITHUB_REF_NAME" --pattern "$base" --dir /tmp/published-appimage --clobber
               (cd /tmp/published-appimage && zsyncmake "$base")
-              mv "/tmp/published-appimage/${base}.zsync" "release-assets/${base}.zsync"
+              mv "/tmp/published-appimage/${base}.zsync" "${appimage}.zsync"
             fi
           done
 
