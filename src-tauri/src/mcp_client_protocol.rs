@@ -240,7 +240,8 @@ pub fn classify_probe(
                 Err(ProtocolError::UnsupportedVersion)
             }
         }
-        Reply::Error { .. } => Ok(ProbeVerdict::LegacyHandshakeRequired),
+        Reply::Error { code: -32601, .. } => Ok(ProbeVerdict::LegacyHandshakeRequired),
+        Reply::Error { .. } => Err(ProtocolError::RemoteError),
     }
 }
 
@@ -360,6 +361,18 @@ mod tests {
             classify_probe(ProbeReply::Message(&malformed), 1),
             Err(ProtocolError::InvalidReply)
         ));
+    }
+
+    #[test]
+    fn remote_probe_errors_do_not_trigger_legacy_handshake() {
+        for code in [-32602, -32603, -32000, 42] {
+            let message =
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":code,"message":"remote failure"}});
+            assert_eq!(
+                classify_probe(ProbeReply::Message(&message), 1),
+                Err(ProtocolError::RemoteError)
+            );
+        }
     }
 
     #[test]

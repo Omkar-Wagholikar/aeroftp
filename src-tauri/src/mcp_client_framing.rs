@@ -46,7 +46,7 @@ impl McpLineDecoder {
             let Some(object) = message.as_object() else {
                 return Err(FrameError::InvalidJsonRpc);
             };
-            if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            if !valid_message(object) {
                 return Err(FrameError::InvalidJsonRpc);
             }
             messages.push(message);
@@ -63,6 +63,36 @@ impl McpLineDecoder {
     }
 }
 
+/// The frame size bounds every field; reject ambiguous envelopes before dispatch.
+fn valid_message(object: &serde_json::Map<String, Value>) -> bool {
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return false;
+    }
+    let valid_id = |id: &Value| id.is_null() || id.is_string() || id.is_number();
+    if object.get("id").is_some_and(|id| !valid_id(id)) {
+        return false;
+    }
+    if let Some(method) = object.get("method") {
+        return method.is_string()
+            && !object.contains_key("result")
+            && !object.contains_key("error")
+            && object
+                .get("params")
+                .is_none_or(|params| params.is_object() || params.is_array());
+    }
+    if !object.contains_key("id") || object.contains_key("result") == object.contains_key("error") {
+        return false;
+    }
+    object.get("error").is_none_or(|error| {
+        error.as_object().is_some_and(|error| {
+            error
+                .get("code")
+                .is_some_and(|code| code.is_i64() || code.is_u64())
+                && error.get("message").is_some_and(Value::is_string)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,11 +107,11 @@ mod tests {
             .is_empty());
         assert_eq!(
             decoder
-                .push(b"}\n{\"jsonrpc\":\"2.0\",\"id\":2}\n")
+                .push(b",\"result\":null}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n")
                 .unwrap(),
             vec![
-                json!({"jsonrpc":"2.0","id":1}),
-                json!({"jsonrpc":"2.0","id":2})
+                json!({"jsonrpc":"2.0","id":1,"result":null}),
+                json!({"jsonrpc":"2.0","id":2,"result":{}})
             ]
         );
         assert_eq!(decoder.finish(), Ok(()));
@@ -100,6 +130,46 @@ mod tests {
             McpLineDecoder::default().push(b"{}\n"),
             Err(FrameError::InvalidJsonRpc)
         );
+    }
+
+    #[test]
+    fn invalid_envelopes_never_reach_dispatch() {
+        for message in [
+            json!({"jsonrpc":"2.0"}),
+            json!({"jsonrpc":"2.0","id":1}),
+            json!({"jsonrpc":"2.0","result":null}),
+            json!({"jsonrpc":"2.0","id":1,"result":null,"error":{"code":1,"message":"error"}}),
+            json!({"jsonrpc":"2.0","method":42}),
+            json!({"jsonrpc":"2.0","method":"tools/list","params":null}),
+            json!({"jsonrpc":"2.0","method":"tools/list","id":true}),
+            json!({"jsonrpc":"2.0","method":"tools/list","result":null}),
+            json!({"jsonrpc":"2.0","id":{},"result":null}),
+            json!({"jsonrpc":"2.0","id":1,"error":null}),
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":1.5,"message":"error"}}),
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":1,"message":42}}),
+        ] {
+            let mut bytes = serde_json::to_vec(&message).unwrap();
+            bytes.push(b'\n');
+            assert_eq!(
+                McpLineDecoder::default().push(&bytes),
+                Err(FrameError::InvalidJsonRpc),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_requests_notifications_and_error_responses_are_preserved() {
+        for message in [
+            json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}),
+            json!({"jsonrpc":"2.0","method":"tools/list","params":{},"id":"request"}),
+            json!({"jsonrpc":"2.0","method":"tools/list","params":[],"id":null}),
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error","data":{}}}),
+        ] {
+            let mut bytes = serde_json::to_vec(&message).unwrap();
+            bytes.push(b'\n');
+            assert_eq!(McpLineDecoder::default().push(&bytes), Ok(vec![message]));
+        }
     }
 
     #[test]

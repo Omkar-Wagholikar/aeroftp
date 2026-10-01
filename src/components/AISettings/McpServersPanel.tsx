@@ -173,7 +173,7 @@ export function McpServersPanel() {
             </div>
             <p className="text-xs text-gray-500">Arguments are edited as literal values after adding a server. Shell commands and expansion are rejected.</p>
         </div>
-        {servers.map(server => <ServerCard key={`${server.id}:${server.revision}`} server={server} refresh={refresh} />)}
+        {servers.map(server => <ServerCard key={server.id} server={server} refresh={refresh} />)}
         {servers.length === 0 && <p className="text-sm text-gray-500">No MCP servers configured for this user.</p>}
         {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
     </div>;
