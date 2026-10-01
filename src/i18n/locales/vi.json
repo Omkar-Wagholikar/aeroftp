@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Không có hồ sơ S3 đã lưu phù hợp.",
             "workerStopping": "Đang dừng...",
             "mcpClient": {
-                "notAvailable": "Chưa thể chạy máy khách MCP. Lưu, bật hoặc cấp quyền cho một máy chủ tại đây sẽ không khởi chạy nó và không cấp quyền truy cập công cụ.",
                 "refresh": "Làm mới máy chủ MCP",
                 "serverId": "ID máy chủ",
                 "addServer": "Thêm máy chủ",
                 "enabled": "Đã bật",
                 "removeServer": "Xóa {name}",
                 "saveServer": "Lưu máy chủ",
-                "healthPending": "Tình trạng và công cụ: khả dụng sau khi bật định tuyến mô hình",
                 "stdioTitle": "Máy chủ STDIO cục bộ",
                 "stdioSubtitle": "Cấu hình STDIO thủ công cho người dùng đang hoạt động",
                 "executablePath": "Đường dẫn tuyệt đối của tệp thực thi",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Nhập điểm cuối HTTPS công khai không có thông tin xác thực, truy vấn hoặc đoạn.",
                     "invalidSecret": "Nhập token hợp lệ không có ngắt dòng.",
                     "invalidClient": "Nhập ID máy khách hợp lệ hoặc URL HTTPS siêu dữ liệu máy khách, không phải cả hai.",
-                    "notFound": "Máy chủ này không còn tồn tại. Hãy làm mới danh sách."
-                }
+                    "notFound": "Máy chủ này không còn tồn tại. Hãy làm mới danh sách.",
+                    "configDisabled": "Máy chủ này đã bị tắt.",
+                    "secretUnavailable": "Thiếu khóa bí mật đã lưu cho máy chủ này.",
+                    "invalidCall": "Lệnh gọi công cụ không hợp lệ.",
+                    "approvalRequired": "Lệnh gọi công cụ chưa được chấp thuận.",
+                    "oauthRequired": "Máy chủ này cần được ủy quyền. Hãy ủy quyền trong Cài đặt AI.",
+                    "schemaChanged": "Máy chủ đã thay đổi công cụ này sau khi cung cấp. Hãy thử lại.",
+                    "toolArguments": "Các đối số không khớp với lược đồ của công cụ.",
+                    "toolsUnsupported": "Danh sách công cụ của máy chủ nằm ngoài những gì AeroFTP hỗ trợ.",
+                    "toolCancelled": "Lệnh gọi công cụ đã bị hủy.",
+                    "serverTimeout": "Máy chủ không phản hồi kịp thời.",
+                    "sandboxUnavailable": "Máy chủ MCP cục bộ chưa thể chạy trên hệ thống này.",
+                    "startFailed": "Không thể khởi động máy chủ cục bộ.",
+                    "serverFailed": "Máy chủ đã dừng hoặc gửi phản hồi không hợp lệ.",
+                    "httpUnauthorized": "Máy chủ đã từ chối thông tin xác thực đã lưu.",
+                    "unsupportedVersion": "Máy chủ dùng phiên bản MCP mà AeroFTP không hỗ trợ."
+                },
+                "routingNotice": "Các máy chủ được bật cung cấp công cụ của mình cho AeroAgent. Mỗi lệnh gọi công cụ đều hỏi sự chấp thuận của bạn trước.",
+                "checkNow": "Kiểm tra ngay",
+                "healthChecking": "Đang kiểm tra máy chủ...",
+                "healthDisabled": "Không khởi động khi đang tắt",
+                "healthError": "Không khả dụng: {reason}",
+                "healthReady": "Sẵn sàng, công cụ khả dụng cho AeroAgent: {count}",
+                "healthUnsupported": "Công cụ có lược đồ không được hỗ trợ: {count}",
+                "healthShowTools": "Hiện công cụ"
             }
         },
         "archive": {

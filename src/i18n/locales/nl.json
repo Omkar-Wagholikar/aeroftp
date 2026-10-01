@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Er zijn geen geschikte opgeslagen S3-profielen beschikbaar.",
             "workerStopping": "Stoppen...",
             "mcpClient": {
-                "notAvailable": "Uitvoering van de MCP-client is nog niet beschikbaar. Een server hier opslaan, inschakelen of autoriseren start hem niet en geeft geen toegang tot tools.",
                 "refresh": "MCP-servers vernieuwen",
                 "serverId": "Server-ID",
                 "addServer": "Server toevoegen",
                 "enabled": "Ingeschakeld",
                 "removeServer": "{name} verwijderen",
                 "saveServer": "Server opslaan",
-                "healthPending": "Status en tools: beschikbaar zodra modelroutering is ingeschakeld",
                 "stdioTitle": "Lokale STDIO-servers",
                 "stdioSubtitle": "Handmatige STDIO-configuratie voor de actieve gebruiker",
                 "executablePath": "Absoluut pad van het uitvoerbare bestand",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Voer een openbaar HTTPS-eindpunt in zonder inloggegevens, query of fragment.",
                     "invalidSecret": "Voer een geldig token in zonder regeleinden.",
                     "invalidClient": "Voer een geldige client-ID of HTTPS-URL voor clientmetadata in, niet beide.",
-                    "notFound": "Deze server bestaat niet meer. Vernieuw de lijst."
-                }
+                    "notFound": "Deze server bestaat niet meer. Vernieuw de lijst.",
+                    "configDisabled": "Deze server is uitgeschakeld.",
+                    "secretUnavailable": "Een opgeslagen geheim voor deze server ontbreekt.",
+                    "invalidCall": "De toolaanroep was ongeldig.",
+                    "approvalRequired": "De toolaanroep is niet goedgekeurd.",
+                    "oauthRequired": "Deze server heeft autorisatie nodig. Autoriseer hem in AI-instellingen.",
+                    "schemaChanged": "De server heeft deze tool gewijzigd nadat hij was aangeboden. Probeer het opnieuw.",
+                    "toolArguments": "De argumenten komen niet overeen met het schema van de tool.",
+                    "toolsUnsupported": "De toollijst van de server valt buiten wat AeroFTP ondersteunt.",
+                    "toolCancelled": "De toolaanroep is geannuleerd.",
+                    "serverTimeout": "De server heeft niet op tijd geantwoord.",
+                    "sandboxUnavailable": "Lokale MCP-servers kunnen nog niet op dit systeem draaien.",
+                    "startFailed": "De lokale server kon niet worden gestart.",
+                    "serverFailed": "De server is gestopt of heeft een ongeldig antwoord gestuurd.",
+                    "httpUnauthorized": "De server heeft de opgeslagen inloggegevens geweigerd.",
+                    "unsupportedVersion": "De server gebruikt een MCP-versie die AeroFTP niet ondersteunt."
+                },
+                "routingNotice": "Ingeschakelde servers bieden hun tools aan AeroAgent aan. Elke toolaanroep vraagt eerst om jouw goedkeuring.",
+                "checkNow": "Nu controleren",
+                "healthChecking": "Server controleren...",
+                "healthDisabled": "Niet gestart zolang uitgeschakeld",
+                "healthError": "Niet beschikbaar: {reason}",
+                "healthReady": "Gereed, tools beschikbaar voor AeroAgent: {count}",
+                "healthUnsupported": "Tools met niet-ondersteunde schema's: {count}",
+                "healthShowTools": "Tools tonen"
             }
         },
         "archive": {

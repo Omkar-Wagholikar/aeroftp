@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Sopivia tallennettuja S3-profiileja ei ole saatavilla.",
             "workerStopping": "Pysäytetään...",
             "mcpClient": {
-                "notAvailable": "MCP-asiakkaan suoritus ei ole vielä käytettävissä. Palvelimen tallentaminen, käyttöönotto tai valtuuttaminen täällä ei käynnistä sitä eikä anna pääsyä työkaluihin.",
                 "refresh": "Päivitä MCP-palvelimet",
                 "serverId": "Palvelimen tunnus",
                 "addServer": "Lisää palvelin",
                 "enabled": "Käytössä",
                 "removeServer": "Poista {name}",
                 "saveServer": "Tallenna palvelin",
-                "healthPending": "Tila ja työkalut: saatavilla, kun mallien reititys on otettu käyttöön",
                 "stdioTitle": "Paikalliset STDIO-palvelimet",
                 "stdioSubtitle": "Manuaalinen STDIO-määritys aktiiviselle käyttäjälle",
                 "executablePath": "Suoritettavan tiedoston absoluuttinen polku",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Anna julkinen HTTPS-päätepiste ilman tunnistetietoja, kyselyä tai fragmenttia.",
                     "invalidSecret": "Anna kelvollinen tunniste ilman rivinvaihtoja.",
                     "invalidClient": "Anna kelvollinen asiakastunnus tai asiakkaan metatietojen HTTPS-URL, ei molempia.",
-                    "notFound": "Tätä palvelinta ei enää ole. Päivitä luettelo."
-                }
+                    "notFound": "Tätä palvelinta ei enää ole. Päivitä luettelo.",
+                    "configDisabled": "Tämä palvelin on poistettu käytöstä.",
+                    "secretUnavailable": "Tämän palvelimen tallennettu salaisuus puuttuu.",
+                    "invalidCall": "Työkalukutsu oli virheellinen.",
+                    "approvalRequired": "Työkalukutsua ei hyväksytty.",
+                    "oauthRequired": "Tämä palvelin tarvitsee valtuutuksen. Valtuuta se AI-asetuksissa.",
+                    "schemaChanged": "Palvelin muutti tätä työkalua sen tarjoamisen jälkeen. Yritä uudelleen.",
+                    "toolArguments": "Argumentit eivät vastaa työkalun skeemaa.",
+                    "toolsUnsupported": "Palvelimen työkaluluettelo on AeroFTP:n tuen ulkopuolella.",
+                    "toolCancelled": "Työkalukutsu peruutettiin.",
+                    "serverTimeout": "Palvelin ei vastannut ajoissa.",
+                    "sandboxUnavailable": "Paikallisia MCP-palvelimia ei voi vielä ajaa tässä järjestelmässä.",
+                    "startFailed": "Paikallista palvelinta ei voitu käynnistää.",
+                    "serverFailed": "Palvelin pysähtyi tai lähetti virheellisen vastauksen.",
+                    "httpUnauthorized": "Palvelin hylkäsi tallennetut tunnistetiedot.",
+                    "unsupportedVersion": "Palvelin käyttää MCP-versiota, jota AeroFTP ei tue."
+                },
+                "routingNotice": "Käytössä olevat palvelimet tarjoavat työkalunsa AeroAgentille. Jokainen työkalukutsu pyytää ensin hyväksyntäsi.",
+                "checkNow": "Tarkista nyt",
+                "healthChecking": "Tarkistetaan palvelinta...",
+                "healthDisabled": "Ei käynnistetä, kun pois käytöstä",
+                "healthError": "Ei käytettävissä: {reason}",
+                "healthReady": "Valmis, AeroAgentin käytettävissä olevat työkalut: {count}",
+                "healthUnsupported": "Työkalut, joiden skeemoja ei tueta: {count}",
+                "healthShowTools": "Näytä työkalut"
             }
         },
         "archive": {

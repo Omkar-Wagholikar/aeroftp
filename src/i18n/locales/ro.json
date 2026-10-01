@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Nu sunt disponibile profiluri S3 salvate eligibile.",
             "workerStopping": "Se oprește...",
             "mcpClient": {
-                "notAvailable": "Execuția clientului MCP nu este încă disponibilă. Salvarea, activarea sau autorizarea unui server aici nu îl pornește și nu acordă acces la instrumente.",
                 "refresh": "Reîmprospătează serverele MCP",
                 "serverId": "ID server",
                 "addServer": "Adaugă server",
                 "enabled": "Activat",
                 "removeServer": "Elimină {name}",
                 "saveServer": "Salvează serverul",
-                "healthPending": "Stare și instrumente: disponibile după activarea rutării modelelor",
                 "stdioTitle": "Servere STDIO locale",
                 "stdioSubtitle": "Configurare STDIO manuală pentru utilizatorul activ",
                 "executablePath": "Calea absolută a executabilului",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Introduceți un punct final HTTPS public fără credențiale, interogare sau fragment.",
                     "invalidSecret": "Introduceți un token valid fără întreruperi de rând.",
                     "invalidClient": "Introduceți un ID de client valid sau un URL HTTPS de metadate ale clientului, nu ambele.",
-                    "notFound": "Acest server nu mai există. Reîmprospătați lista."
-                }
+                    "notFound": "Acest server nu mai există. Reîmprospătați lista.",
+                    "configDisabled": "Acest server este dezactivat.",
+                    "secretUnavailable": "Lipsește un secret salvat pentru acest server.",
+                    "invalidCall": "Apelul instrumentului nu a fost valid.",
+                    "approvalRequired": "Apelul instrumentului nu a fost aprobat.",
+                    "oauthRequired": "Acest server necesită autorizare. Autorizați-l în Setări AI.",
+                    "schemaChanged": "Serverul a modificat acest instrument după ce a fost oferit. Încercați din nou.",
+                    "toolArguments": "Argumentele nu se potrivesc cu schema instrumentului.",
+                    "toolsUnsupported": "Lista de instrumente a serverului depășește ce acceptă AeroFTP.",
+                    "toolCancelled": "Apelul instrumentului a fost anulat.",
+                    "serverTimeout": "Serverul nu a răspuns la timp.",
+                    "sandboxUnavailable": "Serverele MCP locale nu pot rula încă pe acest sistem.",
+                    "startFailed": "Serverul local nu a putut fi pornit.",
+                    "serverFailed": "Serverul s-a oprit sau a trimis un răspuns nevalid.",
+                    "httpUnauthorized": "Serverul a refuzat datele de autentificare salvate.",
+                    "unsupportedVersion": "Serverul folosește o versiune MCP pe care AeroFTP nu o acceptă."
+                },
+                "routingNotice": "Serverele activate oferă instrumentele lor lui AeroAgent. Fiecare apel de instrument cere mai întâi aprobarea ta.",
+                "checkNow": "Verifică acum",
+                "healthChecking": "Se verifică serverul...",
+                "healthDisabled": "Nu pornește cât timp este dezactivat",
+                "healthError": "Indisponibil: {reason}",
+                "healthReady": "Pregătit, instrumente disponibile pentru AeroAgent: {count}",
+                "healthUnsupported": "Instrumente cu scheme neacceptate: {count}",
+                "healthShowTools": "Afișează instrumentele"
             }
         },
         "archive": {

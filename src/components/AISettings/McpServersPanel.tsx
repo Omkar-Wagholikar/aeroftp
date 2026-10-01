@@ -10,6 +10,8 @@ import { MODAL_Z } from '../../utils/modalLayers';
 import { useTranslation } from '../../i18n';
 import { describeMcpError } from './mcpErrors';
 import { McpHttpServersPanel } from './McpHttpServersPanel';
+import { McpHealthLine, McpHealthProvider, useMcpHealthState } from './mcpHealth';
+import { notifyMcpServersChanged } from '../DevTools/aiChatMcp';
 
 interface SecretRef { vault_account: string }
 interface ServerConfig {
@@ -49,7 +51,7 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
         finally {
             try { await refresh(); }
             catch (cause) { if (!actionFailed) setError(describeMcpError(t, cause)); }
-            finally { setBusy(false); }
+            finally { setBusy(false); notifyMcpServersChanged(); }
         }
     };
 
@@ -72,7 +74,7 @@ function ServerCard({ server, refresh }: { server: ServerConfig; refresh: () => 
         <div className="flex items-center justify-between gap-3">
             <div>
                 <h3 className="font-medium text-white">{server.id}</h3>
-                <p className="text-xs text-gray-400">{t('ai.mcpClient.healthPending')}</p>
+                <McpHealthLine transport="stdio" id={server.id} />
             </div>
             <div className="flex items-center gap-3">
                 <label className="flex items-center gap-2 text-sm text-gray-300">
@@ -142,6 +144,7 @@ export function McpServersPanel() {
     const [command, setCommand] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
+    const health = useMcpHealthState();
     const refreshSequence = useRef(0);
     const refresh = useCallback(async () => {
         const sequence = ++refreshSequence.current;
@@ -158,13 +161,17 @@ export function McpServersPanel() {
                 id, command, args: [], env: {}, enabled: false, revision: 1,
             } satisfies ServerConfig });
             setId(''); setCommand(''); await refresh();
+            notifyMcpServersChanged();
         } catch (cause) { setError(describeMcpError(t, cause)); }
         finally { setBusy(false); }
     };
 
-    return <div className="space-y-4">
-        <div className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 text-sm text-amber-200">
-            {t('ai.mcpClient.notAvailable')}
+    return <McpHealthProvider value={health}><div className="space-y-4">
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-gray-700 bg-gray-900/40 p-3 text-sm text-gray-300">
+            <span>{t('ai.mcpClient.routingNotice')}</span>
+            <button type="button" disabled={health.checking} onClick={() => void health.check(true)}
+                className="flex shrink-0 items-center gap-1 rounded bg-gray-700 px-3 py-1.5 text-sm disabled:opacity-50">
+                <RefreshCw size={14} /> {t('ai.mcpClient.checkNow')}</button>
         </div>
         <div className="flex items-center justify-between">
             <div><h2 className="font-medium text-white">{t('ai.mcpClient.stdioTitle')}</h2><p className="text-xs text-gray-400">{t('ai.mcpClient.stdioSubtitle')}</p></div>
@@ -187,5 +194,5 @@ export function McpServersPanel() {
         {servers.length === 0 && <p className="text-sm text-gray-500">{t('ai.mcpClient.noServers')}</p>}
         {error && <p role="alert" className="text-xs text-red-400">{error}</p>}
         <McpHttpServersPanel />
-    </div>;
+    </div></McpHealthProvider>;
 }

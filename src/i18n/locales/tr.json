@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Uygun kayıtlı S3 profili yok.",
             "workerStopping": "Durduruluyor...",
             "mcpClient": {
-                "notAvailable": "MCP istemcisini çalıştırma henüz kullanılamıyor. Burada bir sunucuyu kaydetmek, etkinleştirmek veya yetkilendirmek onu başlatmaz ve araçlara erişim vermez.",
                 "refresh": "MCP sunucularını yenile",
                 "serverId": "Sunucu kimliği",
                 "addServer": "Sunucu ekle",
                 "enabled": "Etkin",
                 "removeServer": "{name} öğesini kaldır",
                 "saveServer": "Sunucuyu kaydet",
-                "healthPending": "Sağlık durumu ve araçlar: model yönlendirmesi etkinleştirildikten sonra kullanılabilir",
                 "stdioTitle": "Yerel STDIO sunucuları",
                 "stdioSubtitle": "Etkin kullanıcı için manuel STDIO yapılandırması",
                 "executablePath": "Yürütülebilir dosyanın mutlak yolu",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Kimlik bilgisi, sorgu veya parça içermeyen genel bir HTTPS uç noktası girin.",
                     "invalidSecret": "Satır sonu içermeyen geçerli bir belirteç girin.",
                     "invalidClient": "Geçerli bir istemci kimliği veya HTTPS istemci meta veri URL'si girin, ikisini birden değil.",
-                    "notFound": "Bu sunucu artık yok. Listeyi yenileyin."
-                }
+                    "notFound": "Bu sunucu artık yok. Listeyi yenileyin.",
+                    "configDisabled": "Bu sunucu devre dışı.",
+                    "secretUnavailable": "Bu sunucu için kaydedilmiş bir gizli anahtar eksik.",
+                    "invalidCall": "Araç çağrısı geçerli değildi.",
+                    "approvalRequired": "Araç çağrısı onaylanmadı.",
+                    "oauthRequired": "Bu sunucu yetkilendirme gerektiriyor. Yapay Zeka Ayarları'nda yetkilendirin.",
+                    "schemaChanged": "Sunucu bu aracı sunulduktan sonra değiştirdi. Tekrar deneyin.",
+                    "toolArguments": "Bağımsız değişkenler aracın şemasıyla uyuşmuyor.",
+                    "toolsUnsupported": "Sunucunun araç listesi AeroFTP'nin desteklediklerinin dışında.",
+                    "toolCancelled": "Araç çağrısı iptal edildi.",
+                    "serverTimeout": "Sunucu zamanında yanıt vermedi.",
+                    "sandboxUnavailable": "Yerel MCP sunucuları bu sistemde henüz çalıştırılamıyor.",
+                    "startFailed": "Yerel sunucu başlatılamadı.",
+                    "serverFailed": "Sunucu durdu veya geçersiz bir yanıt gönderdi.",
+                    "httpUnauthorized": "Sunucu kayıtlı kimlik bilgilerini reddetti.",
+                    "unsupportedVersion": "Sunucu, AeroFTP'nin desteklemediği bir MCP sürümü kullanıyor."
+                },
+                "routingNotice": "Etkinleştirilen sunucular araçlarını AeroAgent'a sunar. Her araç çağrısı önce onayınızı ister.",
+                "checkNow": "Şimdi kontrol et",
+                "healthChecking": "Sunucu kontrol ediliyor...",
+                "healthDisabled": "Devre dışıyken başlatılmaz",
+                "healthError": "Kullanılamıyor: {reason}",
+                "healthReady": "Hazır, AeroAgent için kullanılabilir araçlar: {count}",
+                "healthUnsupported": "Desteklenmeyen şemalara sahip araçlar: {count}",
+                "healthShowTools": "Araçları göster"
             }
         },
         "archive": {

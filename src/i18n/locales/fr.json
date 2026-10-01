@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Aucun profil S3 enregistré admissible n'est disponible.",
             "workerStopping": "Arrêt en cours...",
             "mcpClient": {
-                "notAvailable": "L'exécution du client MCP n'est pas encore disponible. Enregistrer, activer ou autoriser un serveur ici ne le démarre pas et n'accorde aucun accès aux outils.",
                 "refresh": "Actualiser les serveurs MCP",
                 "serverId": "ID du serveur",
                 "addServer": "Ajouter un serveur",
                 "enabled": "Activé",
                 "removeServer": "Supprimer {name}",
                 "saveServer": "Enregistrer le serveur",
-                "healthPending": "Santé et outils : disponibles une fois le routage des modèles activé",
                 "stdioTitle": "Serveurs STDIO locaux",
                 "stdioSubtitle": "Configuration STDIO manuelle pour l'utilisateur actif",
                 "executablePath": "Chemin absolu de l'exécutable",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Saisissez un point de terminaison HTTPS public sans identifiants, requête ni fragment.",
                     "invalidSecret": "Saisissez un jeton valide sans saut de ligne.",
                     "invalidClient": "Saisissez un ID client valide ou une URL HTTPS de métadonnées client, pas les deux.",
-                    "notFound": "Ce serveur n'existe plus. Actualisez la liste."
-                }
+                    "notFound": "Ce serveur n'existe plus. Actualisez la liste.",
+                    "configDisabled": "Ce serveur est désactivé.",
+                    "secretUnavailable": "Un secret enregistré pour ce serveur est manquant.",
+                    "invalidCall": "L'appel d'outil n'était pas valide.",
+                    "approvalRequired": "L'appel d'outil n'a pas été approuvé.",
+                    "oauthRequired": "Ce serveur nécessite une autorisation. Autorisez-le dans les Paramètres IA.",
+                    "schemaChanged": "Le serveur a modifié cet outil après l'avoir proposé. Réessayez.",
+                    "toolArguments": "Les arguments ne correspondent pas au schéma de l'outil.",
+                    "toolsUnsupported": "La liste d'outils du serveur dépasse ce qu'AeroFTP prend en charge.",
+                    "toolCancelled": "L'appel de l'outil a été annulé.",
+                    "serverTimeout": "Le serveur n'a pas répondu à temps.",
+                    "sandboxUnavailable": "Les serveurs MCP locaux ne peuvent pas encore s'exécuter sur ce système.",
+                    "startFailed": "Le serveur local n'a pas pu être démarré.",
+                    "serverFailed": "Le serveur s'est arrêté ou a envoyé une réponse non valide.",
+                    "httpUnauthorized": "Le serveur a refusé les identifiants enregistrés.",
+                    "unsupportedVersion": "Le serveur utilise une version de MCP qu'AeroFTP ne prend pas en charge."
+                },
+                "routingNotice": "Les serveurs activés proposent leurs outils à AeroAgent. Chaque appel d'outil demande d'abord votre approbation.",
+                "checkNow": "Vérifier maintenant",
+                "healthChecking": "Vérification du serveur...",
+                "healthDisabled": "Non démarré tant qu'il est désactivé",
+                "healthError": "Indisponible : {reason}",
+                "healthReady": "Prêt, outils disponibles pour AeroAgent : {count}",
+                "healthUnsupported": "Outils avec des schémas non pris en charge : {count}",
+                "healthShowTools": "Afficher les outils"
             }
         },
         "archive": {

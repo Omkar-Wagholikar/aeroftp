@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Sobivaid salvestatud S3 profiile pole saadaval.",
             "workerStopping": "Peatamine...",
             "mcpClient": {
-                "notAvailable": "MCP-kliendi käitamine pole veel saadaval. Serveri salvestamine, lubamine või volitamine siin ei käivita seda ega anna juurdepääsu tööriistadele.",
                 "refresh": "Värskenda MCP-servereid",
                 "serverId": "Serveri ID",
                 "addServer": "Lisa server",
                 "enabled": "Lubatud",
                 "removeServer": "Eemalda {name}",
                 "saveServer": "Salvesta server",
-                "healthPending": "Tervis ja tööriistad: saadaval pärast mudelite marsruutimise lubamist",
                 "stdioTitle": "Kohalikud STDIO-serverid",
                 "stdioSubtitle": "Käsitsi STDIO seadistus aktiivsele kasutajale",
                 "executablePath": "Käivitatava faili absoluutne tee",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Sisestage avalik HTTPS-lõpp-punkt ilma mandaatide, päringu või fragmendita.",
                     "invalidSecret": "Sisestage kehtiv tõend ilma reavahetusteta.",
                     "invalidClient": "Sisestage kehtiv kliendi ID või HTTPS-kliendimetaandmete URL, mitte mõlemat.",
-                    "notFound": "Seda serverit enam ei ole. Värskendage loendit."
-                }
+                    "notFound": "Seda serverit enam ei ole. Värskendage loendit.",
+                    "configDisabled": "See server on keelatud.",
+                    "secretUnavailable": "Selle serveri salvestatud saladus puudub.",
+                    "invalidCall": "Tööriistakutse oli kehtetu.",
+                    "approvalRequired": "Tööriistakutset ei kinnitatud.",
+                    "oauthRequired": "See server vajab autoriseerimist. Autoriseeri see AI seadetes.",
+                    "schemaChanged": "Server muutis seda tööriista pärast selle pakkumist. Proovi uuesti.",
+                    "toolArguments": "Argumendid ei vasta tööriista skeemile.",
+                    "toolsUnsupported": "Serveri tööriistade loend jääb väljapoole seda, mida AeroFTP toetab.",
+                    "toolCancelled": "Tööriista kutse tühistati.",
+                    "serverTimeout": "Server ei vastanud õigel ajal.",
+                    "sandboxUnavailable": "Kohalikke MCP servereid ei saa selles süsteemis veel käitada.",
+                    "startFailed": "Kohalikku serverit ei õnnestunud käivitada.",
+                    "serverFailed": "Server peatus või saatis kehtetu vastuse.",
+                    "httpUnauthorized": "Server lükkas salvestatud mandaadid tagasi.",
+                    "unsupportedVersion": "Server kasutab MCP versiooni, mida AeroFTP ei toeta."
+                },
+                "routingNotice": "Lubatud serverid pakuvad oma tööriistu AeroAgentile. Iga tööriistakutse küsib esmalt sinu kinnitust.",
+                "checkNow": "Kontrolli kohe",
+                "healthChecking": "Serveri kontrollimine...",
+                "healthDisabled": "Ei käivitu, kui on keelatud",
+                "healthError": "Pole saadaval: {reason}",
+                "healthReady": "Valmis, AeroAgentile saadaolevad tööriistad: {count}",
+                "healthUnsupported": "Toetamata skeemidega tööriistad: {count}",
+                "healthShowTools": "Näita tööriistu"
             }
         },
         "archive": {

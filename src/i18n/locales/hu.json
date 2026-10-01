@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Nincsenek elérhető megfelelő mentett S3-profilok.",
             "workerStopping": "Leállítás...",
             "mcpClient": {
-                "notAvailable": "Az MCP-kliens futtatása még nem érhető el. Egy szerver itteni mentése, engedélyezése vagy jogosítása nem indítja el, és nem ad hozzáférést az eszközökhöz.",
                 "refresh": "MCP-szerverek frissítése",
                 "serverId": "Szerverazonosító",
                 "addServer": "Szerver hozzáadása",
                 "enabled": "Engedélyezve",
                 "removeServer": "{name} eltávolítása",
                 "saveServer": "Szerver mentése",
-                "healthPending": "Állapot és eszközök: a modellútválasztás bekapcsolása után érhetők el",
                 "stdioTitle": "Helyi STDIO-szerverek",
                 "stdioSubtitle": "Kézi STDIO-konfiguráció az aktív felhasználóhoz",
                 "executablePath": "A futtatható fájl abszolút útvonala",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Adjon meg nyilvános HTTPS végpontot hitelesítő adatok, lekérdezés és töredék nélkül.",
                     "invalidSecret": "Adjon meg érvényes tokent sortörések nélkül.",
                     "invalidClient": "Adjon meg érvényes kliensazonosítót vagy HTTPS kliens-metaadat URL-t, de ne mindkettőt.",
-                    "notFound": "Ez a kiszolgáló már nem létezik. Frissítse a listát."
-                }
+                    "notFound": "Ez a kiszolgáló már nem létezik. Frissítse a listát.",
+                    "configDisabled": "Ez a szerver le van tiltva.",
+                    "secretUnavailable": "Hiányzik a szerverhez mentett titok.",
+                    "invalidCall": "Az eszközhívás érvénytelen volt.",
+                    "approvalRequired": "Az eszközhívást nem hagyták jóvá.",
+                    "oauthRequired": "Ez a szerver engedélyezést igényel. Engedélyezze az AI-beállításokban.",
+                    "schemaChanged": "A szerver megváltoztatta ezt az eszközt, miután felkínálta. Próbálja újra.",
+                    "toolArguments": "Az argumentumok nem felelnek meg az eszköz sémájának.",
+                    "toolsUnsupported": "A szerver eszközlistája kívül esik az AeroFTP által támogatottakon.",
+                    "toolCancelled": "Az eszközhívás megszakadt.",
+                    "serverTimeout": "A szerver nem válaszolt időben.",
+                    "sandboxUnavailable": "A helyi MCP-szerverek még nem futtathatók ezen a rendszeren.",
+                    "startFailed": "A helyi szervert nem sikerült elindítani.",
+                    "serverFailed": "A szerver leállt, vagy érvénytelen választ küldött.",
+                    "httpUnauthorized": "A szerver elutasította a mentett hitelesítő adatokat.",
+                    "unsupportedVersion": "A szerver olyan MCP-verziót használ, amelyet az AeroFTP nem támogat."
+                },
+                "routingNotice": "Az engedélyezett szerverek felkínálják eszközeiket az AeroAgentnek. Minden eszközhívás előbb a jóváhagyásodat kéri.",
+                "checkNow": "Ellenőrzés most",
+                "healthChecking": "Szerver ellenőrzése...",
+                "healthDisabled": "Letiltott állapotban nem indul el",
+                "healthError": "Nem érhető el: {reason}",
+                "healthReady": "Kész, az AeroAgent számára elérhető eszközök: {count}",
+                "healthUnsupported": "Nem támogatott sémájú eszközök: {count}",
+                "healthShowTools": "Eszközök megjelenítése"
             }
         },
         "archive": {

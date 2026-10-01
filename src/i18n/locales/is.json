@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Engin gjaldgeng vistuð S3-snið eru tiltæk.",
             "workerStopping": "Stöðvar...",
             "mcpClient": {
-                "notAvailable": "Keyrsla MCP-biðlarans er ekki enn í boði. Að vista, virkja eða heimila netþjón hér ræsir hann ekki og veitir ekki aðgang að verkfærum.",
                 "refresh": "Endurnýja MCP-netþjóna",
                 "serverId": "Auðkenni netþjóns",
                 "addServer": "Bæta við netþjóni",
                 "enabled": "Virkt",
                 "removeServer": "Fjarlægja {name}",
                 "saveServer": "Vista netþjón",
-                "healthPending": "Ástand og verkfæri: í boði þegar leiðarval líkana er virkt",
                 "stdioTitle": "Staðbundnir STDIO-netþjónar",
                 "stdioSubtitle": "Handvirk STDIO-stilling fyrir virka notandann",
                 "executablePath": "Algild slóð keyrsluskrár",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Sláðu inn opinberan HTTPS-endapunkt án auðkenna, fyrirspurnar eða brots.",
                     "invalidSecret": "Sláðu inn gilt tákn án línuskila.",
                     "invalidClient": "Sláðu inn gilt auðkenni biðlara eða HTTPS-slóð að lýsigögnum biðlara, ekki hvort tveggja.",
-                    "notFound": "Þessi netþjónn er ekki lengur til. Endurnýjaðu listann."
-                }
+                    "notFound": "Þessi netþjónn er ekki lengur til. Endurnýjaðu listann.",
+                    "configDisabled": "Þessi netþjónn er óvirkur.",
+                    "secretUnavailable": "Vistað leyndarmál fyrir þennan netþjón vantar.",
+                    "invalidCall": "Verkfærakallið var ógilt.",
+                    "approvalRequired": "Verkfærakallið var ekki samþykkt.",
+                    "oauthRequired": "Þessi netþjónn þarfnast heimildar. Veittu heimild í AI stillingum.",
+                    "schemaChanged": "Netþjónninn breytti þessu verkfæri eftir að það var boðið. Reyndu aftur.",
+                    "toolArguments": "Færibreyturnar passa ekki við skema verkfærisins.",
+                    "toolsUnsupported": "Verkfæralisti netþjónsins er utan þess sem AeroFTP styður.",
+                    "toolCancelled": "Verkfærakallið var afturkallað.",
+                    "serverTimeout": "Netþjónninn svaraði ekki í tæka tíð.",
+                    "sandboxUnavailable": "Staðbundnir MCP netþjónar geta ekki enn keyrt á þessu kerfi.",
+                    "startFailed": "Ekki tókst að ræsa staðbundna netþjóninn.",
+                    "serverFailed": "Netþjónninn stöðvaðist eða sendi ógilt svar.",
+                    "httpUnauthorized": "Netþjónninn hafnaði vistuðu auðkennisupplýsingunum.",
+                    "unsupportedVersion": "Netþjónninn notar MCP útgáfu sem AeroFTP styður ekki."
+                },
+                "routingNotice": "Virkir netþjónar bjóða AeroAgent verkfæri sín. Hvert verkfærakall biður fyrst um samþykki þitt.",
+                "checkNow": "Athuga núna",
+                "healthChecking": "Athuga netþjóninn...",
+                "healthDisabled": "Ekki ræstur á meðan hann er óvirkur",
+                "healthError": "Ekki tiltækt: {reason}",
+                "healthReady": "Tilbúið, verkfæri í boði fyrir AeroAgent: {count}",
+                "healthUnsupported": "Verkfæri með óstudd skema: {count}",
+                "healthShowTools": "Sýna verkfæri"
             }
         },
         "archive": {

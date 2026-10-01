@@ -336,6 +336,7 @@ impl StdioSupervisor {
         self.restart_enabled = false;
     }
 
+    #[cfg(test)]
     pub(crate) fn era(&self) -> Era {
         self.era
     }

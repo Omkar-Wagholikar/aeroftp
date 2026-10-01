@@ -29,7 +29,9 @@ import { analyzeToolError } from './aiChatToolRetry';
 import { buildExecutionLevels, executePipeline } from './aiChatToolPipeline';
 import { toolOutputBelongsToActiveTurn } from './aiChatToolOutput';
 import { ToolMacro, resolveMacroSteps, DEFAULT_MACROS, MAX_TOTAL_MACRO_STEPS, createMacroStepCounter, MacroStepCounter } from './aiChatToolMacros';
-import { buildToolRegistry, resolveRegisteredTool, resolveMacroStep, ToolExposure, TOOL_EXPOSURE_GUIDE, assertToolExecutionCurrent, recordToolDispatch } from './aiChatToolRegistry';
+import { buildToolRegistry, resolveRegisteredTool, resolveMacroStep, ToolExposure, TOOL_EXPOSURE_GUIDE, assertToolExecutionCurrent, recordToolDispatch, type McpServerSnapshot } from './aiChatToolRegistry';
+import { MCP_SERVERS_CHANGED, notifyMcpServersChanged, registrySnapshots, runMcpTool } from './aiChatMcp';
+import { describeMcpError } from '../AISettings/mcpErrors';
 import { validateToolArgs } from './aiChatToolValidation';
 import { computeTokenInfo } from './aiChatTokenInfo';
 import { runBudgetedDelegation } from './aiChatDelegationBudget';
@@ -948,6 +950,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
     const sessionApprovedToolsRef = useRef<Set<string>>(new Set());
     const backendApprovalQueueRef = useRef<Promise<void>>(Promise.resolve());
     const [pluginManifests, setPluginManifests] = useState<PluginManifest[]>([]);
+    const [mcpServers, setMcpServers] = useState<McpServerSnapshot[]>([]);
 
     // Phase 3: Context Intelligence
     const projectPath = localPath || remotePath;
@@ -974,6 +977,17 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
             .catch(() => setPluginManifests([]));
     }, []);
 
+    // MCP tools come from live backend snapshots; a failing load offers none.
+    useEffect(() => {
+        let current = true;
+        const load = () => invoke('mcp_client_tool_snapshots')
+            .then(snapshots => { if (current) setMcpServers(registrySnapshots(snapshots)); })
+            .catch(() => { if (current) setMcpServers([]); });
+        void load();
+        window.addEventListener(MCP_SERVERS_CHANGED, load);
+        return () => { current = false; window.removeEventListener(MCP_SERVERS_CHANGED, load); };
+    }, []);
+
     // Phase 4: Init budget manager + load custom templates on mount
     useEffect(() => {
         initBudgetManager();
@@ -982,7 +996,7 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
         });
     }, []);
 
-    const toolRegistry = useMemo(() => buildToolRegistry(pluginManifests, macros), [pluginManifests, macros]);
+    const toolRegistry = useMemo(() => buildToolRegistry(pluginManifests, macros, mcpServers), [pluginManifests, macros, mcpServers]);
     const toolRegistryRef = useRef(toolRegistry);
     toolRegistryRef.current = toolRegistry;
     const allTools = toolRegistry.map(entry => entry.tool);
@@ -1564,6 +1578,31 @@ export const AIChat: React.FC<AIChatProps> = ({ className = '', remotePath, loca
 
                     return await invokePluginTool(grant.grantId);
                 });
+            }
+        }
+
+        if (entry.source.kind === 'mcp') {
+            const mode = agentModeRef.current;
+            dispatchAIStatus('tool-execution');
+            try {
+                return await runMcpTool(invoke, {
+                    source: entry.source,
+                    args,
+                    sessionId: activeConversationId || undefined,
+                    turnId: options.turnScope ?? chatRequestsRef.current.turnId() ?? undefined,
+                    skipNativeDialog: !!options.panelApproved && (mode === 'expert' || mode === 'extreme'),
+                    assertCurrent,
+                    serialize: runSerializedBackendApproval,
+                    notApproved: 'Operation was not approved in the approval window.',
+                });
+            } catch (cause) {
+                const code = typeof cause === 'string' ? cause : cause instanceof Error ? cause.message : '';
+                if (!/^MCP_[A-Z_]+$/.test(code)) throw cause;
+                // A changed binding or schema means the offered snapshot is old.
+                if (['MCP_CONFIG_STALE_REVISION', 'MCP_TOOL_SCHEMA_CHANGED', 'MCP_OAUTH_REQUIRED'].includes(code)) notifyMcpServersChanged();
+                throw new Error(describeMcpError(t, code));
+            } finally {
+                dispatchAIStatus('streaming');
             }
         }
 

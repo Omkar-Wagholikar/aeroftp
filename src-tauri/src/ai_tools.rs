@@ -2130,7 +2130,7 @@ fn prune_cancelled_idle_turns(turns: &mut HashMap<String, TurnTools>) {
 
 /// Enter a tool call of `turn_id`: the turn's token, shared by every call of
 /// the turn, created at the first.
-async fn enter_turn_tool(turn_id: &str) -> CancellationToken {
+pub(crate) async fn enter_turn_tool(turn_id: &str) -> CancellationToken {
     let mut turns = AI_TOOL_TURNS.lock().await;
     prune_cancelled_idle_turns(&mut turns);
     let entry = turns
@@ -2146,7 +2146,7 @@ async fn enter_turn_tool(turn_id: &str) -> CancellationToken {
 
 /// Leave a tool call of `turn_id`: the last call of the turn drops the
 /// entry, cancelled or not, so the map holds only live turns.
-async fn leave_turn_tool(turn_id: &str) {
+pub(crate) async fn leave_turn_tool(turn_id: &str) {
     let mut turns = AI_TOOL_TURNS.lock().await;
     if let Some(entry) = turns.get_mut(turn_id) {
         entry.running = entry.running.saturating_sub(1);

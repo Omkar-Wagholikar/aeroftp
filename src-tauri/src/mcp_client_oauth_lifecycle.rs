@@ -471,6 +471,7 @@ pub(crate) fn cleanup_in_transaction(
     user_partitions::delete_user_setting_for(conn, user, &meta)
         .map_err(|_| OAuthError::StoreUnavailable)
 }
+#[cfg(test)]
 pub(crate) fn cleanup(conn: &mut Connection, user: i64, server: &str) -> Result<(), OAuthError> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

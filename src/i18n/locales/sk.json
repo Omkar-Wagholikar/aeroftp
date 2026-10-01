@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Nie sú dostupné žiadne vhodné uložené profily S3.",
             "workerStopping": "Zastavovanie...",
             "mcpClient": {
-                "notAvailable": "Spúšťanie klienta MCP zatiaľ nie je k dispozícii. Uloženie, povolenie alebo autorizácia servera tu ho nespustí ani neposkytne prístup k nástrojom.",
                 "refresh": "Obnoviť servery MCP",
                 "serverId": "ID servera",
                 "addServer": "Pridať server",
                 "enabled": "Povolené",
                 "removeServer": "Odstrániť {name}",
                 "saveServer": "Uložiť server",
-                "healthPending": "Stav a nástroje: dostupné po zapnutí smerovania modelov",
                 "stdioTitle": "Lokálne servery STDIO",
                 "stdioSubtitle": "Manuálna konfigurácia STDIO pre aktívneho používateľa",
                 "executablePath": "Absolútna cesta k spustiteľnému súboru",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Zadajte verejný koncový bod HTTPS bez prihlasovacích údajov, dotazu alebo fragmentu.",
                     "invalidSecret": "Zadajte platný token bez zalomenia riadkov.",
                     "invalidClient": "Zadajte platné ID klienta alebo HTTPS URL metadát klienta, nie oboje.",
-                    "notFound": "Tento server už neexistuje. Obnovte zoznam."
-                }
+                    "notFound": "Tento server už neexistuje. Obnovte zoznam.",
+                    "configDisabled": "Tento server je vypnutý.",
+                    "secretUnavailable": "Chýba uložené tajomstvo pre tento server.",
+                    "invalidCall": "Volanie nástroja bolo neplatné.",
+                    "approvalRequired": "Volanie nástroja nebolo schválené.",
+                    "oauthRequired": "Tento server vyžaduje autorizáciu. Autorizujte ho v Nastaveniach AI.",
+                    "schemaChanged": "Server tento nástroj po ponúknutí zmenil. Skúste to znova.",
+                    "toolArguments": "Argumenty nezodpovedajú schéme nástroja.",
+                    "toolsUnsupported": "Zoznam nástrojov servera je mimo toho, čo AeroFTP podporuje.",
+                    "toolCancelled": "Volanie nástroja bolo zrušené.",
+                    "serverTimeout": "Server neodpovedal včas.",
+                    "sandboxUnavailable": "Lokálne servery MCP zatiaľ nemožno v tomto systéme spustiť.",
+                    "startFailed": "Lokálny server sa nepodarilo spustiť.",
+                    "serverFailed": "Server sa zastavil alebo poslal neplatnú odpoveď.",
+                    "httpUnauthorized": "Server odmietol uložené prihlasovacie údaje.",
+                    "unsupportedVersion": "Server používa verziu MCP, ktorú AeroFTP nepodporuje."
+                },
+                "routingNotice": "Povolené servery ponúkajú svoje nástroje AeroAgentovi. Každé volanie nástroja najprv vyžaduje vaše schválenie.",
+                "checkNow": "Skontrolovať teraz",
+                "healthChecking": "Kontroluje sa server...",
+                "healthDisabled": "Pri vypnutí sa nespúšťa",
+                "healthError": "Nedostupný: {reason}",
+                "healthReady": "Pripravený, nástroje dostupné pre AeroAgent: {count}",
+                "healthUnsupported": "Nástroje s nepodporovanými schémami: {count}",
+                "healthShowTools": "Zobraziť nástroje"
             }
         },
         "archive": {

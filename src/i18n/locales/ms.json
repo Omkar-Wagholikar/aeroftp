@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Tiada profil S3 tersimpan yang layak tersedia.",
             "workerStopping": "Menghentikan...",
             "mcpClient": {
-                "notAvailable": "Pelaksanaan klien MCP belum tersedia. Menyimpan, mengaktifkan atau membenarkan pelayan di sini tidak memulakannya dan tidak memberi akses kepada alat.",
                 "refresh": "Muat semula pelayan MCP",
                 "serverId": "ID pelayan",
                 "addServer": "Tambah pelayan",
                 "enabled": "Diaktifkan",
                 "removeServer": "Alih keluar {name}",
                 "saveServer": "Simpan pelayan",
-                "healthPending": "Kesihatan dan alat: tersedia selepas penghalaan model diaktifkan",
                 "stdioTitle": "Pelayan STDIO tempatan",
                 "stdioSubtitle": "Konfigurasi STDIO manual untuk pengguna aktif",
                 "executablePath": "Laluan mutlak fail boleh laku",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Masukkan titik akhir HTTPS awam tanpa bukti kelayakan, pertanyaan atau serpihan.",
                     "invalidSecret": "Masukkan token sah tanpa pemisah baris.",
                     "invalidClient": "Masukkan ID klien yang sah atau URL HTTPS metadata klien, bukan kedua-duanya.",
-                    "notFound": "Pelayan ini tidak wujud lagi. Muat semula senarai."
-                }
+                    "notFound": "Pelayan ini tidak wujud lagi. Muat semula senarai.",
+                    "configDisabled": "Pelayan ini dinyahdayakan.",
+                    "secretUnavailable": "Rahsia tersimpan untuk pelayan ini tiada.",
+                    "invalidCall": "Panggilan alat tidak sah.",
+                    "approvalRequired": "Panggilan alat tidak diluluskan.",
+                    "oauthRequired": "Pelayan ini memerlukan kebenaran. Benarkan di Tetapan AI.",
+                    "schemaChanged": "Pelayan mengubah alat ini selepas ia ditawarkan. Cuba lagi.",
+                    "toolArguments": "Argumen tidak sepadan dengan skema alat.",
+                    "toolsUnsupported": "Senarai alat pelayan berada di luar yang disokong AeroFTP.",
+                    "toolCancelled": "Panggilan alat telah dibatalkan.",
+                    "serverTimeout": "Pelayan tidak menjawab tepat pada masanya.",
+                    "sandboxUnavailable": "Pelayan MCP tempatan belum boleh dijalankan pada sistem ini.",
+                    "startFailed": "Pelayan tempatan tidak dapat dimulakan.",
+                    "serverFailed": "Pelayan berhenti atau menghantar balasan yang tidak sah.",
+                    "httpUnauthorized": "Pelayan menolak bukti kelayakan yang disimpan.",
+                    "unsupportedVersion": "Pelayan menggunakan versi MCP yang tidak disokong oleh AeroFTP."
+                },
+                "routingNotice": "Pelayan yang didayakan menawarkan alatnya kepada AeroAgent. Setiap panggilan alat meminta kebenaran anda terlebih dahulu.",
+                "checkNow": "Semak sekarang",
+                "healthChecking": "Menyemak pelayan...",
+                "healthDisabled": "Tidak dimulakan semasa dinyahdayakan",
+                "healthError": "Tidak tersedia: {reason}",
+                "healthReady": "Sedia, alat tersedia untuk AeroAgent: {count}",
+                "healthUnsupported": "Alat dengan skema yang tidak disokong: {count}",
+                "healthShowTools": "Tunjukkan alat"
             }
         },
         "archive": {

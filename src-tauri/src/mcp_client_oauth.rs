@@ -708,6 +708,7 @@ fn parse_token_response(bytes: &[u8], requested_scopes: &[String]) -> Result<Tok
     })
 }
 
+#[cfg(test)]
 fn account_key(prefix: &str, server_id: &str, issuer: &str, resource: &str) -> String {
     let mut hash = blake3::Hasher::new();
     for field in [server_id, issuer, resource] {

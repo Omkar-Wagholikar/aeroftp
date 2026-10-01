@@ -61,8 +61,8 @@ describe('MCP settings drafts and refresh ordering', () => {
 
     it('ignores an older initial response after a newer refresh completes', async () => {
         let initial!: (value: unknown) => void;
-        invoke.mockImplementationOnce(() => new Promise(resolve => { initial = resolve; }))
-            .mockResolvedValueOnce([{ ...saved, id: 'newest' }]);
+        const lists = [() => new Promise(resolve => { initial = resolve; }), async () => [{ ...saved, id: 'newest' }]];
+        invoke.mockImplementation((command: string) => command === 'mcp_client_list_servers' ? lists.shift()!() : Promise.resolve([]));
         await render();
         await click(host.querySelector('[aria-label="Refresh MCP servers"]')!);
         expect(host.textContent).toContain('newest');
@@ -106,4 +106,41 @@ describe('MCP settings drafts and refresh ordering', () => {
         expect(toggle.disabled).toBe(false);
     });
 
+});
+
+describe('MCP live health', () => {
+    const snapshot = (overrides: Record<string, unknown>) => ({
+        id: 'fixture', transport: 'stdio', enabled: true, revision: 'r'.repeat(64), health: 'ready', errorCode: null,
+        tools: [{ name: 'echo', description: 'Echo text', inputSchema: {}, schemaRevision: 'a'.repeat(64) }], unsupportedTools: 2,
+        ...overrides,
+    });
+    const respond = (snapshots: unknown[]) => invoke.mockImplementation(async (command: string) => {
+        if (command === 'mcp_client_list_servers') return [{ ...saved, enabled: true }];
+        if (command === 'mcp_client_tool_snapshots') return snapshots;
+        return undefined;
+    });
+
+    it('shows ready tools, unsupported schemas and a localized failure, never a raw code', async () => {
+        respond([snapshot({})]);
+        await render();
+        expect(host.textContent).toContain('Ready, tools available to AeroAgent: 1');
+        expect(host.textContent).toContain('Tools with unsupported schemas: 2');
+        expect(host.textContent).toContain('echo');
+        expect(invoke).toHaveBeenCalledWith('mcp_client_tool_snapshots', { refresh: false });
+        respond([snapshot({ health: 'error', errorCode: 'MCP_STDIO_SANDBOX_UNAVAILABLE', tools: [], unsupportedTools: 0 })]);
+        await click(Array.from(host.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Check now')!);
+        expect(invoke).toHaveBeenCalledWith('mcp_client_tool_snapshots', { refresh: true });
+        expect(host.textContent).toContain('Unavailable: Local MCP servers cannot run on this system yet.');
+        expect(host.textContent).not.toContain('MCP_STDIO_SANDBOX_UNAVAILABLE');
+        expect(host.textContent).not.toContain('Ready, tools');
+    });
+
+    it('reports a disabled server as not started and rechecks after a change', async () => {
+        respond([snapshot({ enabled: false, health: 'disabled', tools: [], unsupportedTools: 0, revision: '' })]);
+        await render();
+        expect(host.textContent).toContain('Not started while disabled');
+        const before = invoke.mock.calls.filter(([command]) => command === 'mcp_client_tool_snapshots').length;
+        await click(host.querySelector('input[type=checkbox]')!);
+        expect(invoke.mock.calls.filter(([command]) => command === 'mcp_client_tool_snapshots').length).toBeGreaterThan(before);
+    });
 });

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Plus } from 'lucide-react';
 import { useTranslation } from '../../i18n';
+import { notifyMcpServersChanged } from '../DevTools/aiChatMcp';
 import { describeMcpError } from './mcpErrors';
 import { AuthFields, authInput, McpHttpServerCard, type HttpAuthMode, type HttpServerView } from './McpHttpServerCard';
 
@@ -40,6 +41,7 @@ export function McpHttpServersPanel() {
             } });
             setId(''); setEndpoint(''); setClientId(''); setMetadataUrl('');
             await refresh();
+            notifyMcpServersChanged();
         } catch (cause) { setError(describeMcpError(t, cause)); }
         finally { setBusy(false); }
     };

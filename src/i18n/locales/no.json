@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Ingen egnede lagrede S3-profiler er tilgjengelige.",
             "workerStopping": "Stopper...",
             "mcpClient": {
-                "notAvailable": "Kjøring av MCP-klienten er ikke tilgjengelig ennå. Å lagre, aktivere eller autorisere en server her starter den ikke og gir ikke tilgang til verktøy.",
                 "refresh": "Oppdater MCP-servere",
                 "serverId": "Server-ID",
                 "addServer": "Legg til server",
                 "enabled": "Aktivert",
                 "removeServer": "Fjern {name}",
                 "saveServer": "Lagre server",
-                "healthPending": "Status og verktøy: tilgjengelig når modellruting er aktivert",
                 "stdioTitle": "Lokale STDIO-servere",
                 "stdioSubtitle": "Manuell STDIO-konfigurasjon for den aktive brukeren",
                 "executablePath": "Absolutt sti til den kjørbare filen",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Skriv inn et offentlig HTTPS-endepunkt uten legitimasjon, spørring eller fragment.",
                     "invalidSecret": "Skriv inn et gyldig token uten linjeskift.",
                     "invalidClient": "Skriv inn en gyldig klient-ID eller HTTPS-URL for klientmetadata, ikke begge.",
-                    "notFound": "Denne serveren finnes ikke lenger. Oppdater listen."
-                }
+                    "notFound": "Denne serveren finnes ikke lenger. Oppdater listen.",
+                    "configDisabled": "Denne serveren er deaktivert.",
+                    "secretUnavailable": "En lagret hemmelighet for denne serveren mangler.",
+                    "invalidCall": "Verktøykallet var ugyldig.",
+                    "approvalRequired": "Verktøykallet ble ikke godkjent.",
+                    "oauthRequired": "Denne serveren trenger autorisasjon. Autoriser den i AI-innstillinger.",
+                    "schemaChanged": "Serveren endret dette verktøyet etter at det ble tilbudt. Prøv igjen.",
+                    "toolArguments": "Argumentene samsvarer ikke med verktøyets skjema.",
+                    "toolsUnsupported": "Serverens verktøyliste er utenfor det AeroFTP støtter.",
+                    "toolCancelled": "Verktøykallet ble avbrutt.",
+                    "serverTimeout": "Serveren svarte ikke i tide.",
+                    "sandboxUnavailable": "Lokale MCP-servere kan ikke kjøres på dette systemet ennå.",
+                    "startFailed": "Den lokale serveren kunne ikke startes.",
+                    "serverFailed": "Serveren stoppet eller sendte et ugyldig svar.",
+                    "httpUnauthorized": "Serveren avviste den lagrede legitimasjonen.",
+                    "unsupportedVersion": "Serveren bruker en MCP-versjon som AeroFTP ikke støtter."
+                },
+                "routingNotice": "Aktiverte servere gir AeroAgent tilgang til verktøyene sine. Hvert verktøykall ber først om din godkjenning.",
+                "checkNow": "Sjekk nå",
+                "healthChecking": "Sjekker serveren...",
+                "healthDisabled": "Startes ikke mens den er deaktivert",
+                "healthError": "Utilgjengelig: {reason}",
+                "healthReady": "Klar, verktøy tilgjengelige for AeroAgent: {count}",
+                "healthUnsupported": "Verktøy med ustøttede skjemaer: {count}",
+                "healthShowTools": "Vis verktøy"
             }
         },
         "archive": {

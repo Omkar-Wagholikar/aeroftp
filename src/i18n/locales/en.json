@@ -866,14 +866,12 @@
                 "fallbackUsedTooltip": "{model} failed, so the fallback model answered instead"
             },
             "mcpClient": {
-                "notAvailable": "MCP client execution is not available yet. Saving, enabling or authorizing a server here does not start it or grant tool access.",
                 "refresh": "Refresh MCP servers",
                 "serverId": "Server ID",
                 "addServer": "Add server",
                 "enabled": "Enabled",
                 "removeServer": "Remove {name}",
                 "saveServer": "Save server",
-                "healthPending": "Health and tools: available after model routing is enabled",
                 "stdioTitle": "Local STDIO servers",
                 "stdioSubtitle": "Manual STDIO configuration for the active user",
                 "executablePath": "Absolute executable path",
@@ -942,8 +940,31 @@
                     "invalidEndpoint": "Enter a public HTTPS endpoint without credentials, query or fragment.",
                     "invalidSecret": "Enter a valid token without line breaks.",
                     "invalidClient": "Enter a valid client ID or HTTPS client metadata URL, not both.",
-                    "notFound": "This server no longer exists. Refresh the list."
-                }
+                    "notFound": "This server no longer exists. Refresh the list.",
+                    "configDisabled": "This server is disabled.",
+                    "secretUnavailable": "A saved secret for this server is missing.",
+                    "invalidCall": "The tool call was not valid.",
+                    "approvalRequired": "The tool call was not approved.",
+                    "oauthRequired": "This server needs authorization. Authorize it in AI Settings.",
+                    "schemaChanged": "The server changed this tool after it was offered. Try again.",
+                    "toolArguments": "The arguments do not match the tool's schema.",
+                    "toolsUnsupported": "The server's tool list is outside what AeroFTP supports.",
+                    "toolCancelled": "The tool call was cancelled.",
+                    "serverTimeout": "The server did not answer in time.",
+                    "sandboxUnavailable": "Local MCP servers cannot run on this system yet.",
+                    "startFailed": "The local server could not be started.",
+                    "serverFailed": "The server stopped or sent an invalid reply.",
+                    "httpUnauthorized": "The server refused the saved credentials.",
+                    "unsupportedVersion": "The server uses an MCP version AeroFTP does not support."
+                },
+                "routingNotice": "Enabled servers offer their tools to AeroAgent. Every tool call asks for your approval first.",
+                "checkNow": "Check now",
+                "healthChecking": "Checking the server...",
+                "healthDisabled": "Not started while disabled",
+                "healthError": "Unavailable: {reason}",
+                "healthReady": "Ready, tools available to AeroAgent: {count}",
+                "healthUnsupported": "Tools with unsupported schemas: {count}",
+                "healthShowTools": "Show tools"
             }
         },
         "appearance": {

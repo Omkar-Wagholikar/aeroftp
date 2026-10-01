@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Tidak ada profil S3 tersimpan yang memenuhi syarat.",
             "workerStopping": "Menghentikan...",
             "mcpClient": {
-                "notAvailable": "Eksekusi klien MCP belum tersedia. Menyimpan, mengaktifkan, atau mengotorisasi server di sini tidak menjalankannya dan tidak memberi akses ke alat.",
                 "refresh": "Segarkan server MCP",
                 "serverId": "ID server",
                 "addServer": "Tambah server",
                 "enabled": "Aktif",
                 "removeServer": "Hapus {name}",
                 "saveServer": "Simpan server",
-                "healthPending": "Kesehatan dan alat: tersedia setelah perutean model diaktifkan",
                 "stdioTitle": "Server STDIO lokal",
                 "stdioSubtitle": "Konfigurasi STDIO manual untuk pengguna aktif",
                 "executablePath": "Path absolut file eksekusi",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Masukkan endpoint HTTPS publik tanpa kredensial, kueri, atau fragmen.",
                     "invalidSecret": "Masukkan token yang valid tanpa pemisah baris.",
                     "invalidClient": "Masukkan ID klien yang valid atau URL HTTPS metadata klien, bukan keduanya.",
-                    "notFound": "Server ini tidak ada lagi. Muat ulang daftar."
-                }
+                    "notFound": "Server ini tidak ada lagi. Muat ulang daftar.",
+                    "configDisabled": "Server ini dinonaktifkan.",
+                    "secretUnavailable": "Rahasia tersimpan untuk server ini tidak ditemukan.",
+                    "invalidCall": "Panggilan alat tidak valid.",
+                    "approvalRequired": "Panggilan alat tidak disetujui.",
+                    "oauthRequired": "Server ini memerlukan otorisasi. Otorisasi di Pengaturan AI.",
+                    "schemaChanged": "Server mengubah alat ini setelah ditawarkan. Coba lagi.",
+                    "toolArguments": "Argumen tidak sesuai dengan skema alat.",
+                    "toolsUnsupported": "Daftar alat server berada di luar yang didukung AeroFTP.",
+                    "toolCancelled": "Panggilan alat dibatalkan.",
+                    "serverTimeout": "Server tidak menjawab tepat waktu.",
+                    "sandboxUnavailable": "Server MCP lokal belum dapat berjalan di sistem ini.",
+                    "startFailed": "Server lokal tidak dapat dimulai.",
+                    "serverFailed": "Server berhenti atau mengirim balasan yang tidak valid.",
+                    "httpUnauthorized": "Server menolak kredensial yang tersimpan.",
+                    "unsupportedVersion": "Server menggunakan versi MCP yang tidak didukung AeroFTP."
+                },
+                "routingNotice": "Server yang diaktifkan menyediakan alatnya untuk AeroAgent. Setiap panggilan alat meminta persetujuan Anda terlebih dahulu.",
+                "checkNow": "Periksa sekarang",
+                "healthChecking": "Memeriksa server...",
+                "healthDisabled": "Tidak dimulai saat dinonaktifkan",
+                "healthError": "Tidak tersedia: {reason}",
+                "healthReady": "Siap, alat tersedia untuk AeroAgent: {count}",
+                "healthUnsupported": "Alat dengan skema yang tidak didukung: {count}",
+                "healthShowTools": "Tampilkan alat"
             }
         },
         "archive": {

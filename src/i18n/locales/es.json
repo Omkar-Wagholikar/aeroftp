@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "No hay perfiles S3 guardados aptos disponibles.",
             "workerStopping": "Deteniendo...",
             "mcpClient": {
-                "notAvailable": "La ejecución del cliente MCP aún no está disponible. Guardar, activar o autorizar un servidor aquí no lo inicia ni concede acceso a herramientas.",
                 "refresh": "Actualizar servidores MCP",
                 "serverId": "ID del servidor",
                 "addServer": "Añadir servidor",
                 "enabled": "Activado",
                 "removeServer": "Quitar {name}",
                 "saveServer": "Guardar servidor",
-                "healthPending": "Estado y herramientas: disponibles cuando se active el enrutamiento de modelos",
                 "stdioTitle": "Servidores STDIO locales",
                 "stdioSubtitle": "Configuración STDIO manual para el usuario activo",
                 "executablePath": "Ruta absoluta del ejecutable",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Introduce un endpoint HTTPS público sin credenciales, consulta ni fragmento.",
                     "invalidSecret": "Introduce un token válido sin saltos de línea.",
                     "invalidClient": "Introduce un ID de cliente válido o una URL HTTPS de metadatos del cliente, no ambos.",
-                    "notFound": "Este servidor ya no existe. Actualiza la lista."
-                }
+                    "notFound": "Este servidor ya no existe. Actualiza la lista.",
+                    "configDisabled": "Este servidor está desactivado.",
+                    "secretUnavailable": "Falta un secreto guardado para este servidor.",
+                    "invalidCall": "La llamada a la herramienta no era válida.",
+                    "approvalRequired": "La llamada a la herramienta no fue aprobada.",
+                    "oauthRequired": "Este servidor necesita autorización. Autorízalo en Ajustes de IA.",
+                    "schemaChanged": "El servidor cambió esta herramienta después de ofrecerla. Inténtalo de nuevo.",
+                    "toolArguments": "Los argumentos no coinciden con el esquema de la herramienta.",
+                    "toolsUnsupported": "La lista de herramientas del servidor queda fuera de lo que AeroFTP admite.",
+                    "toolCancelled": "Se canceló la llamada a la herramienta.",
+                    "serverTimeout": "El servidor no respondió a tiempo.",
+                    "sandboxUnavailable": "Los servidores MCP locales aún no pueden ejecutarse en este sistema.",
+                    "startFailed": "No se pudo iniciar el servidor local.",
+                    "serverFailed": "El servidor se detuvo o envió una respuesta no válida.",
+                    "httpUnauthorized": "El servidor rechazó las credenciales guardadas.",
+                    "unsupportedVersion": "El servidor usa una versión de MCP que AeroFTP no admite."
+                },
+                "routingNotice": "Los servidores habilitados ofrecen sus herramientas a AeroAgent. Cada llamada a una herramienta pide primero tu aprobación.",
+                "checkNow": "Comprobar ahora",
+                "healthChecking": "Comprobando el servidor...",
+                "healthDisabled": "No se inicia mientras está desactivado",
+                "healthError": "No disponible: {reason}",
+                "healthReady": "Listo, herramientas disponibles para AeroAgent: {count}",
+                "healthUnsupported": "Herramientas con esquemas no compatibles: {count}",
+                "healthShowTools": "Mostrar herramientas"
             }
         },
         "archive": {

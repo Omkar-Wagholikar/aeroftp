@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Ez dago gordetako S3 profil egokirik erabilgarri.",
             "workerStopping": "Gelditzen...",
             "mcpClient": {
-                "notAvailable": "MCP bezeroaren exekuzioa ez dago oraindik erabilgarri. Hemen zerbitzari bat gordetzeak, gaitzeak edo baimentzeak ez du abiarazten eta ez du tresnetarako sarbiderik ematen.",
                 "refresh": "Eguneratu MCP zerbitzariak",
                 "serverId": "Zerbitzariaren IDa",
                 "addServer": "Gehitu zerbitzaria",
                 "enabled": "Gaituta",
                 "removeServer": "Kendu {name}",
                 "saveServer": "Gorde zerbitzaria",
-                "healthPending": "Osasuna eta tresnak: eredu bideratzea gaitu ondoren erabilgarri",
                 "stdioTitle": "STDIO zerbitzari lokalak",
                 "stdioSubtitle": "STDIO konfigurazio eskuzkoa erabiltzaile aktiborako",
                 "executablePath": "Exekutagarriaren bide absolutua",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Sartu HTTPS amaiera-puntu publiko bat kredentzialik, kontsultarik edo zatirik gabe.",
                     "invalidSecret": "Sartu baliozko token bat lerro-jauzirik gabe.",
                     "invalidClient": "Sartu baliozko bezero ID bat edo bezeroaren metadatuen HTTPS URL bat, ez biak.",
-                    "notFound": "Zerbitzari hau ez dago jada. Freskatu zerrenda."
-                }
+                    "notFound": "Zerbitzari hau ez dago jada. Freskatu zerrenda.",
+                    "configDisabled": "Zerbitzari hau desgaituta dago.",
+                    "secretUnavailable": "Zerbitzari honen gordetako sekretu bat falta da.",
+                    "invalidCall": "Tresna-deia ez zen baliozkoa.",
+                    "approvalRequired": "Tresna-deia ez zen onartu.",
+                    "oauthRequired": "Zerbitzari honek baimena behar du. Baimendu IA ezarpenetan.",
+                    "schemaChanged": "Zerbitzariak tresna hau aldatu du eskaini ondoren. Saiatu berriro.",
+                    "toolArguments": "Argumentuak ez datoz bat tresnaren eskemarekin.",
+                    "toolsUnsupported": "Zerbitzariaren tresna-zerrenda AeroFTPk onartzen duenaren kanpoan dago.",
+                    "toolCancelled": "Tresnaren deia bertan behera utzi da.",
+                    "serverTimeout": "Zerbitzariak ez du garaiz erantzun.",
+                    "sandboxUnavailable": "Tokiko MCP zerbitzariak ezin dira oraindik sistema honetan exekutatu.",
+                    "startFailed": "Tokiko zerbitzaria ezin izan da abiarazi.",
+                    "serverFailed": "Zerbitzaria gelditu da edo erantzun baliogabea bidali du.",
+                    "httpUnauthorized": "Zerbitzariak gordetako kredentzialak baztertu ditu.",
+                    "unsupportedVersion": "Zerbitzariak AeroFTPk onartzen ez duen MCP bertsio bat erabiltzen du."
+                },
+                "routingNotice": "Gaitutako zerbitzariek beren tresnak eskaintzen dizkiote AeroAgent-i. Tresna-dei bakoitzak lehenik zure onespena eskatzen du.",
+                "checkNow": "Egiaztatu orain",
+                "healthChecking": "Zerbitzaria egiaztatzen...",
+                "healthDisabled": "Ez da abiarazten desgaituta dagoen bitartean",
+                "healthError": "Ez dago erabilgarri: {reason}",
+                "healthReady": "Prest, AeroAgent-entzat erabilgarri dauden tresnak: {count}",
+                "healthUnsupported": "Onartzen ez diren eskemak dituzten tresnak: {count}",
+                "healthShowTools": "Erakutsi tresnak"
             }
         },
         "archive": {

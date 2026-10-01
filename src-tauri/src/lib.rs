@@ -59,7 +59,6 @@ pub mod app_events;
 mod archive_browse;
 #[cfg(target_os = "linux")]
 mod localhost_security;
-#[allow(dead_code)] // Private until settings/model routing activation.
 mod mcp_client_bridge;
 mod mcp_client_commands;
 pub mod mcp_client_config;
@@ -68,22 +67,17 @@ pub mod mcp_client_config;
 mod mcp_client_dispatch;
 pub mod mcp_client_framing;
 mod mcp_client_http_commands;
-#[allow(dead_code)] // Settings use it; bearer resolution waits for model routing.
 mod mcp_client_http_config;
-#[allow(dead_code)] // Private until HTTP settings and model routing are integrated.
 mod mcp_client_http_transport;
-#[allow(dead_code)] // Settings drive authorization; token resolution waits for model routing.
 mod mcp_client_oauth;
 pub mod mcp_client_protocol;
-#[allow(dead_code)] // Used only by the private outbound STDIO transport.
+mod mcp_client_routing;
 mod mcp_client_sandbox;
-#[allow(dead_code)]
 mod mcp_client_schema;
-// Backend-only gate until approved process isolation and runtime wiring.
+// GateRequest and GateError are live through mcp_client_bridge; the older
+// approval runtime in this module is superseded by the bridge and unused.
 #[allow(dead_code)]
 mod mcp_client_gate;
-// Kept private until backend approval, audit and OS isolation are decided.
-#[allow(dead_code)]
 mod mcp_client_transport;
 mod openai_responses;
 #[cfg(target_os = "linux")]
@@ -20211,6 +20205,9 @@ pub fn run() {
             mcp_client_http_commands::mcp_client_http_oauth_cancel,
             mcp_client_http_commands::mcp_client_http_oauth_refresh,
             mcp_client_http_commands::mcp_client_http_oauth_sign_out,
+            mcp_client_routing::mcp_client_tool_snapshots,
+            mcp_client_routing::mcp_client_tool_prepare,
+            mcp_client_routing::mcp_client_tool_call,
             user_partitions::user_partitions_find_cross_user_dedup,
             // AeroShare P1 (task 4/5): the peer handshake + inventory surface
             peer_commands::peer_identity_get,

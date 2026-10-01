@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Nema dostupnih prikladnih spremljenih S3 profila.",
             "workerStopping": "Zaustavljanje...",
             "mcpClient": {
-                "notAvailable": "Pokretanje MCP klijenta još nije dostupno. Spremanje, omogućavanje ili autoriziranje poslužitelja ovdje ne pokreće ga niti daje pristup alatima.",
                 "refresh": "Osvježi MCP poslužitelje",
                 "serverId": "ID poslužitelja",
                 "addServer": "Dodaj poslužitelj",
                 "enabled": "Omogućeno",
                 "removeServer": "Ukloni {name}",
                 "saveServer": "Spremi poslužitelj",
-                "healthPending": "Stanje i alati: dostupni nakon omogućavanja usmjeravanja modela",
                 "stdioTitle": "Lokalni STDIO poslužitelji",
                 "stdioSubtitle": "Ručna STDIO konfiguracija za aktivnog korisnika",
                 "executablePath": "Apsolutna putanja izvršne datoteke",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Unesite javnu HTTPS krajnju točku bez vjerodajnica, upita ili fragmenta.",
                     "invalidSecret": "Unesite valjani token bez prijeloma redaka.",
                     "invalidClient": "Unesite valjani ID klijenta ili HTTPS URL metapodataka klijenta, ne oboje.",
-                    "notFound": "Ovaj poslužitelj više ne postoji. Osvježite popis."
-                }
+                    "notFound": "Ovaj poslužitelj više ne postoji. Osvježite popis.",
+                    "configDisabled": "Ovaj je poslužitelj onemogućen.",
+                    "secretUnavailable": "Nedostaje spremljena tajna za ovaj poslužitelj.",
+                    "invalidCall": "Poziv alata nije bio valjan.",
+                    "approvalRequired": "Poziv alata nije odobren.",
+                    "oauthRequired": "Ovaj poslužitelj treba autorizaciju. Autorizirajte ga u AI postavkama.",
+                    "schemaChanged": "Poslužitelj je promijenio ovaj alat nakon što je ponuđen. Pokušajte ponovno.",
+                    "toolArguments": "Argumenti se ne podudaraju sa shemom alata.",
+                    "toolsUnsupported": "Popis alata poslužitelja izvan je onoga što AeroFTP podržava.",
+                    "toolCancelled": "Poziv alata je otkazan.",
+                    "serverTimeout": "Poslužitelj nije odgovorio na vrijeme.",
+                    "sandboxUnavailable": "Lokalni MCP poslužitelji još se ne mogu pokrenuti na ovom sustavu.",
+                    "startFailed": "Lokalni poslužitelj nije se mogao pokrenuti.",
+                    "serverFailed": "Poslužitelj se zaustavio ili je poslao neispravan odgovor.",
+                    "httpUnauthorized": "Poslužitelj je odbio spremljene vjerodajnice.",
+                    "unsupportedVersion": "Poslužitelj koristi MCP verziju koju AeroFTP ne podržava."
+                },
+                "routingNotice": "Omogućeni poslužitelji nude svoje alate AeroAgentu. Svaki poziv alata prvo traži vaše odobrenje.",
+                "checkNow": "Provjeri sada",
+                "healthChecking": "Provjera poslužitelja...",
+                "healthDisabled": "Ne pokreće se dok je onemogućen",
+                "healthError": "Nedostupno: {reason}",
+                "healthReady": "Spremno, alati dostupni AeroAgentu: {count}",
+                "healthUnsupported": "Alati s nepodržanim shemama: {count}",
+                "healthShowTools": "Prikaži alate"
             }
         },
         "archive": {

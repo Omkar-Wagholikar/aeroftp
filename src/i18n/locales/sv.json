@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Inga lämpliga sparade S3-profiler är tillgängliga.",
             "workerStopping": "Stoppar...",
             "mcpClient": {
-                "notAvailable": "Körning av MCP-klienten är ännu inte tillgänglig. Att spara, aktivera eller auktorisera en server här startar den inte och ger ingen åtkomst till verktyg.",
                 "refresh": "Uppdatera MCP-servrar",
                 "serverId": "Server-ID",
                 "addServer": "Lägg till server",
                 "enabled": "Aktiverad",
                 "removeServer": "Ta bort {name}",
                 "saveServer": "Spara server",
-                "healthPending": "Status och verktyg: tillgängliga när modellroutning är aktiverad",
                 "stdioTitle": "Lokala STDIO-servrar",
                 "stdioSubtitle": "Manuell STDIO-konfiguration för den aktiva användaren",
                 "executablePath": "Absolut sökväg till körbar fil",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Ange en offentlig HTTPS-slutpunkt utan autentiseringsuppgifter, fråga eller fragment.",
                     "invalidSecret": "Ange en giltig token utan radbrytningar.",
                     "invalidClient": "Ange ett giltigt klient-ID eller en HTTPS-URL för klientmetadata, inte båda.",
-                    "notFound": "Den här servern finns inte längre. Uppdatera listan."
-                }
+                    "notFound": "Den här servern finns inte längre. Uppdatera listan.",
+                    "configDisabled": "Den här servern är inaktiverad.",
+                    "secretUnavailable": "En sparad hemlighet för den här servern saknas.",
+                    "invalidCall": "Verktygsanropet var ogiltigt.",
+                    "approvalRequired": "Verktygsanropet godkändes inte.",
+                    "oauthRequired": "Servern behöver auktorisering. Auktorisera den i AI-inställningar.",
+                    "schemaChanged": "Servern ändrade det här verktyget efter att det erbjudits. Försök igen.",
+                    "toolArguments": "Argumenten stämmer inte med verktygets schema.",
+                    "toolsUnsupported": "Serverns verktygslista ligger utanför vad AeroFTP stöder.",
+                    "toolCancelled": "Verktygsanropet avbröts.",
+                    "serverTimeout": "Servern svarade inte i tid.",
+                    "sandboxUnavailable": "Lokala MCP-servrar kan ännu inte köras på det här systemet.",
+                    "startFailed": "Den lokala servern kunde inte startas.",
+                    "serverFailed": "Servern stoppades eller skickade ett ogiltigt svar.",
+                    "httpUnauthorized": "Servern avvisade de sparade inloggningsuppgifterna.",
+                    "unsupportedVersion": "Servern använder en MCP-version som AeroFTP inte stöder."
+                },
+                "routingNotice": "Aktiverade servrar erbjuder sina verktyg till AeroAgent. Varje verktygsanrop ber först om ditt godkännande.",
+                "checkNow": "Kontrollera nu",
+                "healthChecking": "Kontrollerar servern...",
+                "healthDisabled": "Startas inte medan den är inaktiverad",
+                "healthError": "Otillgänglig: {reason}",
+                "healthReady": "Redo, verktyg tillgängliga för AeroAgent: {count}",
+                "healthUnsupported": "Verktyg med scheman som inte stöds: {count}",
+                "healthShowTools": "Visa verktyg"
             }
         },
         "archive": {

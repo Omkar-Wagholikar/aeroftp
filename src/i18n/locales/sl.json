@@ -2991,14 +2991,12 @@
             "delegateRemoteEmpty": "Ni razpoložljivih ustreznih shranjenih profilov S3.",
             "workerStopping": "Ustavljanje...",
             "mcpClient": {
-                "notAvailable": "Izvajanje odjemalca MCP še ni na voljo. Shranjevanje, omogočanje ali pooblastitev strežnika tukaj ga ne zažene in ne odobri dostopa do orodij.",
                 "refresh": "Osveži strežnike MCP",
                 "serverId": "ID strežnika",
                 "addServer": "Dodaj strežnik",
                 "enabled": "Omogočeno",
                 "removeServer": "Odstrani {name}",
                 "saveServer": "Shrani strežnik",
-                "healthPending": "Stanje in orodja: na voljo po vklopu usmerjanja modelov",
                 "stdioTitle": "Lokalni strežniki STDIO",
                 "stdioSubtitle": "Ročna konfiguracija STDIO za aktivnega uporabnika",
                 "executablePath": "Absolutna pot do izvedljive datoteke",
@@ -3067,8 +3065,31 @@
                     "invalidEndpoint": "Vnesite javno končno točko HTTPS brez poverilnic, poizvedbe ali fragmenta.",
                     "invalidSecret": "Vnesite veljaven žeton brez prelomov vrstic.",
                     "invalidClient": "Vnesite veljaven ID odjemalca ali HTTPS URL metapodatkov odjemalca, ne obeh.",
-                    "notFound": "Tega strežnika ni več. Osvežite seznam."
-                }
+                    "notFound": "Tega strežnika ni več. Osvežite seznam.",
+                    "configDisabled": "Ta strežnik je onemogočen.",
+                    "secretUnavailable": "Manjka shranjena skrivnost za ta strežnik.",
+                    "invalidCall": "Klic orodja ni bil veljaven.",
+                    "approvalRequired": "Klic orodja ni bil odobren.",
+                    "oauthRequired": "Ta strežnik potrebuje pooblastitev. Pooblastite ga v Nastavitvah AI.",
+                    "schemaChanged": "Strežnik je to orodje spremenil po ponudbi. Poskusite znova.",
+                    "toolArguments": "Argumenti se ne ujemajo s shemo orodja.",
+                    "toolsUnsupported": "Seznam orodij strežnika presega to, kar AeroFTP podpira.",
+                    "toolCancelled": "Klic orodja je bil preklican.",
+                    "serverTimeout": "Strežnik ni odgovoril pravočasno.",
+                    "sandboxUnavailable": "Lokalni strežniki MCP v tem sistemu še ne morejo delovati.",
+                    "startFailed": "Lokalnega strežnika ni bilo mogoče zagnati.",
+                    "serverFailed": "Strežnik se je ustavil ali poslal neveljaven odgovor.",
+                    "httpUnauthorized": "Strežnik je zavrnil shranjena poverila.",
+                    "unsupportedVersion": "Strežnik uporablja različico MCP, ki je AeroFTP ne podpira."
+                },
+                "routingNotice": "Omogočeni strežniki svoja orodja ponujajo AeroAgentu. Vsak klic orodja najprej zahteva vašo odobritev.",
+                "checkNow": "Preveri zdaj",
+                "healthChecking": "Preverjanje strežnika...",
+                "healthDisabled": "Ne zažene se, dokler je onemogočen",
+                "healthError": "Ni na voljo: {reason}",
+                "healthReady": "Pripravljen, orodja na voljo AeroAgentu: {count}",
+                "healthUnsupported": "Orodja z nepodprtimi shemami: {count}",
+                "healthShowTools": "Pokaži orodja"
             }
         },
         "archive": {
