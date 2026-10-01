@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Virkja Responses fyrir samhæf OpenAI-líkön",
                 "routingPreferred": "Valið",
                 "routingFallback": "Varalíkan",
-                "routingNoFallback": "Ekkert"
+                "routingNoFallback": "Ekkert",
+                "bedrockNeedsModel": "Bættu við og virkjaðu Bedrock-líkan á flipanum Líkön áður en þú prófar.",
+                "bedrockSetup": "Stilltu Runtime URL fyrir AWS-svæðið þitt. Í Líkön skaltu bæta við ID sem styður Chat Completions í Bedrock Runtime. Runtime birtir ekki lista yfir líkön. Prófunin sendir litla ályktunarbeiðni sem getur valdið AWS-gjöldum."
             },
             "copy": "Afrita",
             "attachImage": "Hengja mynd við",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-veitendumarkaðstorg",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Líkön hýst hjá AWS með aðgangi um svæðisbundinn API-lykil. Bættu model ID við handvirkt.",
+                "bedrockHighlight": "Svæðisbundinn AWS-endapunktur"
             },
             "history": {
                 "cancel": "Hætta við",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "varalíkan",
                 "fallbackUsedTooltip": "{model} brást, svo varalíkanið svaraði í staðinn"
-            }
+            },
+            "delegateLocal": "Vinnuþjónar með lesaðgangi",
+            "delegateLocalHint": "Aðskilin keyrsla. Vinnuþjónar mega lesa skrár undir {path}.",
+            "worker": "Vinnuþjónn",
+            "workerBudgetExhausted": "Fjárheimild uppurin",
+            "workerCancelled": "Hætt við",
+            "workerCompleted": "Lokið",
+            "workerFailed": "Mistókst",
+            "workerQueued": "Í biðröð",
+            "workerRunning": "Í gangi",
+            "delegateRemoteProfiles": "Valfrjáls vistuð S3-snið (allt að tvö), hvert takmarkað við sýnda rótarmöppu:",
+            "delegateRemoteEmpty": "Engin gjaldgeng vistuð S3-snið eru tiltæk.",
+            "workerStopping": "Stöðvar..."
         },
         "archive": {
             "passwordRequired": "Þessi skjalasafn er varið með lykilorði",

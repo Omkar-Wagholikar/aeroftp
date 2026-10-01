@@ -2,17 +2,196 @@
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
 import { describe, expect, it, vi } from 'vitest';
-import { AGENT_TOOLS, generateToolsPrompt } from '../../types/tools';
+import { AGENT_TOOLS, generateToolsPrompt, toJSONSchema } from '../../types/tools';
 import type { PluginManifest } from '../../types/plugins';
 import { DEFAULT_MACROS } from './aiChatToolMacros';
 import { appendAssistantTurn, appendToolResult, assertToolResultsComplete } from './aiChatNativeTurn';
-import { recordToolDispatch, assertToolExecutionCurrent, buildToolRegistry, resolveMacroStep, resolveRegisteredTool, ToolExposure } from './aiChatToolRegistry';
+import { recordToolDispatch, assertToolExecutionCurrent, buildToolRegistry, resolveMacroStep, resolveRegisteredTool, ToolExposure, type McpServerSnapshot } from './aiChatToolRegistry';
 
 const STALE = { turnExpired: 'fixture: turn expired', identityChanged: 'fixture: identity changed' };
 
 const plugin = (id: string, name = 'local_read'): PluginManifest => ({
     id, name: id, author: 'test', version: '1', enabled: true,
     tools: [{ name, description: 'Read sample plugin data', parameters: [], dangerLevel: 'safe', command: 'private executable --secret-path' }],
+});
+
+const mcp = (id: string, name = 'remote.read'): McpServerSnapshot => ({
+    id, revision: 'rev-1', enabled: true, tools: [{ name, description: 'Fetch remote data', enabled: true,
+        dangerLevel: 'safe', inputSchema: { type: 'object', properties: {
+            path: { type: 'string', description: 'Remote path' }, limit: { type: 'number' },
+        }, required: ['path'], additionalProperties: false } }],
+});
+
+describe('untrusted MCP registry snapshot', () => {
+    it('namespaces equal tool names by server, keeps the alias stable and never trusts a safe claim', () => {
+        const registry = buildToolRegistry([], [], [mcp('alpha'), mcp('beta')]);
+        const tools = registry.filter(entry => entry.source.kind === 'mcp');
+        expect(tools).toHaveLength(2);
+        expect(new Set(tools.map(entry => entry.tool.name)).size).toBe(2);
+        for (const entry of tools) {
+            expect(entry.identity).toContain('remote.read');
+            expect(entry.tool.name).toMatch(/^mcp_[a-zA-Z0-9_-]+_[a-f0-9]{16}$/);
+            expect(entry.tool.dangerLevel).toBe('high');
+            expect(entry.tool.parameters.find(parameter => parameter.name === 'path')?.required).toBe(true);
+        }
+        expect(buildToolRegistry([], [], [mcp('beta'), mcp('alpha')])).toEqual(registry);
+        const similarlySanitized = buildToolRegistry([], [], [mcp('alpha', 'remote.read'), mcp('beta', 'remote/read')]);
+        expect(new Set(similarlySanitized.filter(entry => entry.source.kind === 'mcp').map(entry => entry.tool.name)).size).toBe(2);
+        const updated = buildToolRegistry([], [], [{ ...mcp('alpha'), revision: 'rev-2' }]);
+        expect(updated.find(entry => entry.source.kind === 'mcp')?.tool.name).toBe(tools[0].tool.name);
+    });
+
+    it('rejects duplicate server IDs, tool names, disabled entries and unsafe identifiers', () => {
+        expect(buildToolRegistry([], [], [mcp('same'), mcp('same')]).some(entry => entry.source.kind === 'mcp')).toBe(false);
+        const duplicate = mcp('one'); duplicate.tools.push({ ...duplicate.tools[0] });
+        expect(buildToolRegistry([], [], [duplicate]).some(entry => entry.source.kind === 'mcp')).toBe(false);
+        for (const server of [
+            { ...mcp('off'), enabled: false }, { ...mcp('bad id'), id: '../escape' },
+            { ...mcp('empty'), revision: '' },
+            { ...mcp('tool-off'), tools: [{ ...mcp('tool-off').tools[0], enabled: false }] },
+            { ...mcp('bad-name'), tools: [{ ...mcp('bad-name').tools[0], name: 'bad\nname' }] },
+            { ...mcp('too-many'), tools: Array.from({ length: 129 }, (_, i) => ({ ...mcp('too-many').tools[0], name: `tool${i}` })) },
+        ]) expect(buildToolRegistry([], [], [server]).some(entry => entry.source.kind === 'mcp')).toBe(false);
+        expect(buildToolRegistry([], [], Array.from({ length: 33 }, (_, i) => mcp(`server${i}`)))
+            .some(entry => entry.source.kind === 'mcp')).toBe(false);
+        expect(buildToolRegistry([], [], [null, { ...mcp('malformed'), tools: [null] }] as unknown as McpServerSnapshot[])
+            .some(entry => entry.source.kind === 'mcp')).toBe(false);
+    });
+
+    it('accepts a bounded catalog containing native and compatibility tool names', () => {
+        for (const count of [77, 128]) {
+            const server = mcp('native');
+            server.tools = Array.from({ length: count }, (_, index) => ({ ...server.tools[0], name: `native_${index}` }));
+            const entries = buildToolRegistry([], [], [server]).filter(entry => entry.source.kind === 'mcp');
+            expect(entries).toHaveLength(count);
+        }
+    });
+
+    it('rejects schemas that cannot be represented without losing constraints', () => {
+        const schema = (inputSchema: unknown) => buildToolRegistry([], [], [{ ...mcp('schema'),
+            tools: [{ ...mcp('schema').tools[0], inputSchema }] }]).some(entry => entry.source.kind === 'mcp');
+        const base = { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] };
+        expect(schema(base)).toBe(true);
+        for (const invalid of [
+            { ...base, properties: { path: { type: 'object', properties: {} } } },
+            { ...base, properties: { path: { type: 'string', enum: ['yes'] } } },
+            { ...base, properties: { path: { type: 'array', items: { type: 'object' } } } },
+            { ...base, oneOf: [base] }, { ...base, required: ['unknown'] },
+            { ...base, properties: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`p${i}`, { type: 'string' }])) },
+            { ...base, properties: { path: { type: 'string', description: 'x'.repeat(8192) } } },
+            { ...base, properties: { path: { type: 'array', items: { type: 'string', extra: true } } } },
+            { ...base, description: 'x'.repeat(8192) },
+            { ...base, properties: { path: { type: 'array', items: { type: 'array', items: { type: 'string' } } } } },
+        ]) expect(schema(invalid)).toBe(false);
+    });
+
+    it('exposes supported string arrays without admitting nested arrays', () => {
+        const server = mcp('arrays');
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            paths: { type: 'array', items: { type: 'string' } },
+        }, required: ['paths'], additionalProperties: false };
+        const entry = buildToolRegistry([], [], [server]).find(tool => tool.source.kind === 'mcp');
+        expect(entry?.tool.parameters).toEqual([{ name: 'paths', type: 'array', description: '', required: true }]);
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            paths: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
+        } };
+        expect(buildToolRegistry([], [], [server]).some(tool => tool.source.kind === 'mcp')).toBe(false);
+    });
+
+    it('preserves flat header annotations and integer types without granting approval', () => {
+        const server = mcp('headers');
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            region: { type: 'string', 'x-mcp-header': 'Region' },
+            retries: { type: 'integer', 'x-mcp-header': 'Retry-Count' },
+            enabled: { type: 'boolean', 'x-mcp-header': 'X_Feature' },
+            fraction: { type: 'number' },
+        }, required: ['region'], additionalProperties: false };
+        const entry = buildToolRegistry([], [], [server]).find(tool => tool.source.kind === 'mcp');
+        expect(entry?.tool.dangerLevel).toBe('high');
+        expect(entry?.tool.parameters.map(p => [p.name, p.type])).toEqual([
+            ['region', 'string'], ['retries', 'integer'], ['enabled', 'boolean'], ['fraction', 'number'],
+        ]);
+        expect(toJSONSchema(entry!.tool).properties).toMatchObject({ retries: { type: 'integer' } });
+        expect(toJSONSchema(entry!.tool).additionalProperties).toBe(false);
+    });
+
+    it('rejects malformed, duplicate, nested or unrepresentable header annotations', () => {
+        const accepted = (inputSchema: unknown) => buildToolRegistry([], [], [{ ...mcp('headers'),
+            tools: [{ ...mcp('headers').tools[0], inputSchema }] }]).some(entry => entry.source.kind === 'mcp');
+        const field = (annotation: unknown, type = 'string') => ({ type: 'object', properties: {
+            region: { type, 'x-mcp-header': annotation },
+        } });
+        expect(accepted(field('X.Region_1'))).toBe(true);
+        for (const invalid of [
+            field(''), field('x'.repeat(65)), field('bad name'), field('bad\rname'),
+            field(42), field(undefined), field('Region', 'number'), field('Region', 'array'),
+            { type: 'object', properties: { a: { type: 'string', 'x-mcp-header': 'Region' },
+                b: { type: 'boolean', 'x-mcp-header': 'region' } } },
+            { type: 'object', 'x-mcp-header': 'Root', properties: {} },
+            { type: 'object', properties: { nested: { type: 'object', properties: {
+                region: { type: 'string', 'x-mcp-header': 'Region' },
+            } } } },
+            { type: 'object', properties: { a: { type: 'array', items: {
+                type: 'string', 'x-mcp-header': 'Region',
+            } } } },
+            { type: 'object', properties: { region: {
+                type: 'string', 'x-mcp-header': 'Region', enum: ['eu'],
+            } } },
+        ]) expect(accepted(invalid)).toBe(false);
+    });
+
+    it('invalidates exposure when only the original header annotation changes', () => {
+        const server = mcp('headers');
+        server.tools[0].inputSchema = { type: 'object', properties: {
+            region: { type: 'string', 'x-mcp-header': 'Region' },
+        } };
+        const before = buildToolRegistry([], [], [server]);
+        const entry = before.find(tool => tool.source.kind === 'mcp')!;
+        const exposure = new ToolExposure('turn', before);
+        exposure.search(entry.tool.name);
+        expect(exposure.permits('turn', entry.tool.name, before)).toBe(true);
+        const changed = mcp('headers');
+        changed.tools[0].inputSchema = { type: 'object', properties: {
+            region: { type: 'string', 'x-mcp-header': 'Other-Region' },
+        } };
+        const after = buildToolRegistry([], [], [changed]);
+        const replacement = after.find(tool => tool.source.kind === 'mcp')!;
+        expect(replacement.tool).toEqual(entry.tool);
+        expect(replacement.revision).not.toBe(entry.revision);
+        expect(exposure.permits('turn', entry.tool.name, after)).toBe(false);
+        expect(() => assertToolExecutionCurrent(entry, after, 'turn', 'turn', STALE)).toThrow(STALE.identityChanged);
+    });
+
+    it('invalidates exposure after revision, schema or enablement changes, without shadowing builtins', () => {
+        const server = mcp('alpha', 'local_delete');
+        const before = buildToolRegistry([], [], [server]);
+        const entry = before.find(tool => tool.source.kind === 'mcp')!;
+        expect(resolveRegisteredTool(before, 'local_delete')?.source.kind).toBe('builtin');
+        const exposure = new ToolExposure('turn', before);
+        exposure.search(entry.tool.name);
+        expect(exposure.permits('turn', entry.tool.name, before)).toBe(true);
+        for (const changed of [
+            { ...server, revision: 'rev-2' },
+            { ...server, enabled: false },
+            { ...server, tools: [{ ...server.tools[0], inputSchema: { type: 'object', properties: {} } }] },
+        ]) {
+            const after = buildToolRegistry([], [], [changed]);
+            expect(exposure.permits('turn', entry.tool.name, after)).toBe(false);
+            expect(() => assertToolExecutionCurrent(entry, after, 'turn', 'turn', STALE)).toThrow(STALE.identityChanged);
+        }
+    });
+
+    it('keeps metadata out of initial tool definitions and bounds discovery', () => {
+        const server = mcp('alpha'); server.tools[0].description = 'x'.repeat(512);
+        const registry = buildToolRegistry([], [], [server]);
+        const exposure = new ToolExposure('turn', registry);
+        expect(exposure.definitions().some(tool => tool.name.startsWith('mcp_'))).toBe(false);
+        expect(exposure.search('remote.read').tools.find(tool => tool.source === 'mcp')?.approval).toBe('high');
+        expect(exposure.definitions().some(tool => tool.name.startsWith('mcp_'))).toBe(true);
+        server.tools[0].description = 'changed';
+        expect(registry.find(entry => entry.source.kind === 'mcp')?.tool.description).not.toContain('changed');
+        expect(buildToolRegistry([], [], [mcp('oversized', 'a'.repeat(129))]).some(entry => entry.source.kind === 'mcp')).toBe(false);
+    });
 });
 
 describe('namespaced tool registry and scoped exposure', () => {

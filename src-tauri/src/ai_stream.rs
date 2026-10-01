@@ -168,6 +168,8 @@ pub async fn ai_chat_stream_with_sink(
     request: AIRequest,
     stream_id: &str,
 ) -> Result<(), String> {
+    crate::ai::validate_provider_endpoint(&request.provider_type, &request.base_url)
+        .map_err(|e| e.to_string())?;
     crate::ai_native::validate_history(&request).map_err(|e| e.to_string())?;
     // Register a cancellation flag for this stream
     let cancel = Arc::new(AtomicBool::new(false));
@@ -181,12 +183,10 @@ pub async fn ai_chat_stream_with_sink(
     };
 
     // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
-    let request = AIRequest {
-        top_p: request.top_p.map(|v| v.clamp(0.0, 1.0)),
-        top_k: request.top_k.map(|v| v.clamp(1, 500)),
-        thinking_budget: request.thinking_budget.map(|v| v.clamp(0, 128_000)),
-        ..request
-    };
+    let mut request = request;
+    request.top_p = request.top_p.map(|v| v.clamp(0.0, 1.0));
+    request.top_k = request.top_k.map(|v| v.clamp(1, 500));
+    request.thinking_budget = request.thinking_budget.map(|v| v.clamp(0, 128_000));
 
     let client = &*AI_STREAM_CLIENT;
 
@@ -381,7 +381,10 @@ async fn stream_openai(
     stream_id: &str,
     cancel: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/chat/completions", request.base_url);
+    let url = format!(
+        "{}/chat/completions",
+        request.base_url.trim_end_matches('/')
+    );
     let api_key = request.api_key.as_ref().ok_or("Missing API key")?;
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -467,7 +470,7 @@ async fn stream_openai(
     // Note: some providers (Cohere, Perplexity) reject unknown fields like stream_options
     let supports_stream_options = !matches!(
         request.provider_type,
-        AIProviderType::Cohere | AIProviderType::Perplexity
+        AIProviderType::Cohere | AIProviderType::Perplexity | AIProviderType::Bedrock
     );
     if supports_stream_options {
         body["stream_options"] = serde_json::json!({ "include_usage": true });

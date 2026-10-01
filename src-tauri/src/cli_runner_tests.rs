@@ -315,3 +315,29 @@ fn cli_history_trim_falls_back_to_the_latest_user_turn() {
     agent_trim_history(&mut history, 3);
     assert_eq!(history.len(), 9);
 }
+
+#[tokio::test]
+async fn cli_tty_step_limit_returns_failure_after_streamed_answer() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = config(format!("http://{}", listener.local_addr().unwrap()));cfg.max_steps = 1;
+        let server = async {
+            for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();read_request(&mut socket).await;
+            let response = json!({"choices":[{"delta":{"role":"assistant","content":"Partial streamed answer","tool_calls":[{
+                "index":0,"id":"limit-call","type":"function","function":{"name":"local_read","arguments":"{\"path\":\"/never-open\"}"}
+            }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":2}});
+            respond(&mut socket,"200 OK",&format!("data: {response}\n\ndata: [DONE]\n\n")).await;
+            }
+        };
+        let client = async {
+            let adapter = CliRunnerAdapter { cfg: &cfg, is_tty: true, streamed: Arc::default() };
+            let mut messages = vec![serde_json::from_value(json!({"role":"user","content":"fixture"})).unwrap()];
+            let outcome = agent_run(&adapter,&mut messages,&tokio_util::sync::CancellationToken::new()).await;
+            assert!(matches!(&outcome,Err(AgentRunError::Failed(error)) if error.contains("limit")));
+            let mut out = Vec::new();assert_eq!(report_agent_oneshot(&mut out,outcome,OutputFormat::Json,false),1);
+            let status: Value = serde_json::from_slice(&out).unwrap();assert_eq!(status["status"],"error");
+        };
+        tokio::join!(client,server);
+    }).await.unwrap();
+}

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Responses inschakelen voor compatibele OpenAI-modellen",
                 "routingPreferred": "Voorkeur",
                 "routingFallback": "Reserve",
-                "routingNoFallback": "Geen"
+                "routingNoFallback": "Geen",
+                "bedrockNeedsModel": "Voeg vóór het testen een Bedrock-model toe en schakel het in op het tabblad Modellen.",
+                "bedrockSetup": "Stel de Runtime URL voor uw AWS-regio in. Voeg onder Modellen een ID toe die Chat Completions op Bedrock Runtime ondersteunt. Runtime geeft geen modellenlijst weer. De test verstuurt een kleine inferentieaanvraag waarvoor AWS kosten in rekening kan brengen."
             },
             "copy": "Kopiëren",
             "attachImage": "Afbeelding bijvoegen",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-aanbieder Marktplaats",
                 "tools": "Gereedschappen",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modellen gehost op AWS met toegang via een regionale API-sleutel. Voeg uw model ID handmatig toe.",
+                "bedrockHighlight": "Regionaal AWS-eindpunt"
             },
             "history": {
                 "cancel": "Annuleren",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "reserve",
                 "fallbackUsedTooltip": "{model} is mislukt, daarom antwoordde het reservemodel"
-            }
+            },
+            "delegateLocal": "Workers met alleen leestoegang",
+            "delegateLocalHint": "Afzonderlijke uitvoering. Workers kunnen bestanden onder {path} lezen.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Budget opgebruikt",
+            "workerCancelled": "Geannuleerd",
+            "workerCompleted": "Voltooid",
+            "workerFailed": "Mislukt",
+            "workerQueued": "In wachtrij",
+            "workerRunning": "Actief",
+            "delegateRemoteProfiles": "Optionele opgeslagen S3-profielen (maximaal twee), elk beperkt tot de getoonde hoofdmap:",
+            "delegateRemoteEmpty": "Er zijn geen geschikte opgeslagen S3-profielen beschikbaar.",
+            "workerStopping": "Stoppen..."
         },
         "archive": {
             "passwordRequired": "Dit archief is beveiligd met een wachtwoord",

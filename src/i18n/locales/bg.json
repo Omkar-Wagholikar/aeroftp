@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Активиране на Responses за съвместими модели на OpenAI",
                 "routingPreferred": "Предпочитан",
                 "routingFallback": "Резервен",
-                "routingNoFallback": "Няма"
+                "routingNoFallback": "Няма",
+                "bedrockNeedsModel": "Добавете и активирайте модел на Bedrock в раздела Модели, преди да тествате.",
+                "bedrockSetup": "Задайте Runtime URL за вашия регион на AWS. В Модели добавете ID, който поддържа Chat Completions в Bedrock Runtime. Runtime не показва списък с модели. Тестът изпраща малка заявка за извод, която може да доведе до такси от AWS."
             },
             "copy": "Копиране",
             "attachImage": "Прикачване на изображение",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Маркетплейс за AI доставчици",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Модели, хоствани в AWS, с достъп чрез регионален API ключ. Добавете ръчно своя model ID.",
+                "bedrockHighlight": "Регионална крайна точка на AWS"
             },
             "history": {
                 "cancel": "Отказ",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "резервен",
                 "fallbackUsedTooltip": "{model} не отговори, затова отговори резервният модел"
-            }
+            },
+            "delegateLocal": "Работници само за четене",
+            "delegateLocalHint": "Отделно изпълнение. Работниците могат да четат файлове в {path}.",
+            "worker": "Работник",
+            "workerBudgetExhausted": "Бюджетът е изчерпан",
+            "workerCancelled": "Отменено",
+            "workerCompleted": "Завършено",
+            "workerFailed": "Неуспешно",
+            "workerQueued": "На опашка",
+            "workerRunning": "Изпълнява се",
+            "delegateRemoteProfiles": "Незадължителни запазени S3 профили (до два), всеки ограничен до показаната коренова папка:",
+            "delegateRemoteEmpty": "Няма налични подходящи запазени S3 профили.",
+            "workerStopping": "Спиране..."
         },
         "archive": {
             "passwordRequired": "Този архив е защитен с парола",

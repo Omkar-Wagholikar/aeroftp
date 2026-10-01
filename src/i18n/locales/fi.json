@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Ota Responses käyttöön yhteensopiville OpenAI-malleille",
                 "routingPreferred": "Ensisijainen",
                 "routingFallback": "Varamalli",
-                "routingNoFallback": "Ei mitään"
+                "routingNoFallback": "Ei mitään",
+                "bedrockNeedsModel": "Lisää ja ota Bedrock-malli käyttöön Mallit-välilehdellä ennen testausta.",
+                "bedrockSetup": "Määritä AWS-alueesi Runtime URL. Lisää Mallit-välilehdellä ID, joka tukee Chat Completions -toimintoa Bedrock Runtimessa. Runtime ei listaa malleja. Testi lähettää pienen päättelypyynnön, josta AWS voi veloittaa."
             },
             "copy": "Kopioi",
             "attachImage": "Liitä kuva",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-tarjoajien markkinapaikka",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS:ssä isännöidyt mallit, joita käytetään alueellisella API-avaimella. Lisää model ID käsin.",
+                "bedrockHighlight": "AWS:n alueellinen päätepiste"
             },
             "history": {
                 "cancel": "Peruuta",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "varamalli",
                 "fallbackUsedTooltip": "{model} epäonnistui, joten varamalli vastasi"
-            }
+            },
+            "delegateLocal": "Vain lukuun sallitut työntekijät",
+            "delegateLocalHint": "Erillinen suoritus. Työntekijät voivat lukea tiedostoja polun {path} alta.",
+            "worker": "Työntekijä",
+            "workerBudgetExhausted": "Budjetti käytetty",
+            "workerCancelled": "Peruutettu",
+            "workerCompleted": "Valmis",
+            "workerFailed": "Epäonnistui",
+            "workerQueued": "Jonossa",
+            "workerRunning": "Käynnissä",
+            "delegateRemoteProfiles": "Valinnaiset tallennetut S3-profiilit (enintään kaksi), kukin rajattu näytettyyn juurikansioon:",
+            "delegateRemoteEmpty": "Sopivia tallennettuja S3-profiileja ei ole saatavilla.",
+            "workerStopping": "Pysäytetään..."
         },
         "archive": {
             "passwordRequired": "Tämä arkisto on salasanasuojattu",

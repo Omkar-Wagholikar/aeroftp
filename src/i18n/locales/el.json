@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Ενεργοποίηση Responses για συμβατά μοντέλα OpenAI",
                 "routingPreferred": "Προτιμώμενο",
                 "routingFallback": "Εφεδρικό",
-                "routingNoFallback": "Κανένα"
+                "routingNoFallback": "Κανένα",
+                "bedrockNeedsModel": "Προσθέστε και ενεργοποιήστε ένα μοντέλο Bedrock στην καρτέλα Μοντέλα πριν από τη δοκιμή.",
+                "bedrockSetup": "Ορίστε το Runtime URL για την περιοχή AWS σας. Στην καρτέλα Μοντέλα, προσθέστε ένα ID που υποστηρίζει Chat Completions στο Bedrock Runtime. Το Runtime δεν παραθέτει μοντέλα. Η δοκιμή στέλνει ένα μικρό αίτημα συμπερασμού που ενδέχεται να επιφέρει χρεώσεις AWS."
             },
             "copy": "Αντιγραφή",
             "attachImage": "Επισύναψη εικόνας",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Αγορά παρόχων AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Μοντέλα που φιλοξενούνται στο AWS με πρόσβαση μέσω περιφερειακού κλειδιού API. Προσθέστε χειροκίνητα το model ID σας.",
+                "bedrockHighlight": "Περιφερειακό τελικό σημείο AWS"
             },
             "history": {
                 "cancel": "Ακύρωση",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "εφεδρικό",
                 "fallbackUsedTooltip": "Το {model} απέτυχε, οπότε απάντησε το εφεδρικό μοντέλο"
-            }
+            },
+            "delegateLocal": "Εργάτες μόνο για ανάγνωση",
+            "delegateLocalHint": "Ξεχωριστή εκτέλεση. Οι εργάτες μπορούν να διαβάζουν αρχεία κάτω από το {path}.",
+            "worker": "Εργάτης",
+            "workerBudgetExhausted": "Εξαντλήθηκε ο προϋπολογισμός",
+            "workerCancelled": "Ακυρώθηκε",
+            "workerCompleted": "Ολοκληρώθηκε",
+            "workerFailed": "Απέτυχε",
+            "workerQueued": "Σε ουρά",
+            "workerRunning": "Εκτελείται",
+            "delegateRemoteProfiles": "Προαιρετικά αποθηκευμένα προφίλ S3 (έως δύο), καθένα περιορισμένο στον εμφανιζόμενο ριζικό φάκελο:",
+            "delegateRemoteEmpty": "Δεν υπάρχουν διαθέσιμα κατάλληλα αποθηκευμένα προφίλ S3.",
+            "workerStopping": "Διακοπή..."
         },
         "archive": {
             "passwordRequired": "Αυτό το αρχείο προστατεύεται με κωδικό",

@@ -136,6 +136,7 @@ mod anthropic_messages_url_tests {
 pub enum AIProviderType {
     Google,
     OpenAI,
+    Bedrock,
     Anthropic,
     Xai,
     OpenRouter,
@@ -227,7 +228,7 @@ fn provider_test_path(provider_type: &AIProviderType) -> &'static str {
 }
 
 // AI Request from frontend
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AIRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_scope: Option<String>,
@@ -265,6 +266,25 @@ pub struct AIRequest {
     /// own Chat Completions transports until they have dedicated adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_responses_api: Option<bool>,
+}
+
+impl std::fmt::Debug for AIRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AIRequest")
+            .field("provider_type", &self.provider_type)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AIRequest {
+    fn drop(&mut self) {
+        if let Some(key) = &mut self.api_key {
+            use zeroize::Zeroize;
+            key.zeroize();
+        }
+    }
 }
 
 // AI Response to frontend
@@ -844,7 +864,7 @@ mod openai_compat {
         request: &AIRequest,
         endpoint: &str,
     ) -> Result<AIResponse, AIError> {
-        let url = format!("{}{}", request.base_url, endpoint);
+        let url = format!("{}{}", request.base_url.trim_end_matches('/'), endpoint);
 
         let mut headers = reqwest::header::HeaderMap::new();
 
@@ -1382,16 +1402,39 @@ mod anthropic {
     }
 }
 
-// Main AI call function
-pub async fn call_ai(request: AIRequest) -> Result<AIResponse, AIError> {
-    // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
-    let request = AIRequest {
-        top_p: request.top_p.map(|v| v.clamp(0.0, 1.0)),
-        top_k: request.top_k.map(|v| v.clamp(1, 500)),
-        thinking_budget: request.thinking_budget.map(|v| v.clamp(0, 128_000)),
-        ..request
-    };
+/// Reject unsafe Bedrock endpoints before constructing credentialed requests.
+pub(crate) fn validate_provider_endpoint(
+    provider_type: &AIProviderType,
+    base_url: &str,
+) -> Result<(), AIError> {
+    if *provider_type != AIProviderType::Bedrock {
+        return Ok(());
+    }
+    let invalid =
+        || AIError::Api("Amazon Bedrock requires an HTTPS endpoint without URL credentials".into());
+    let url = reqwest::Url::parse(base_url).map_err(|_| invalid())?;
+    if url.host_str().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid());
+    }
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    // Plaintext is available only to in-process fixtures, never production.
+    #[cfg(test)]
+    if url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]")) {
+        return Ok(());
+    }
+    Err(invalid())
+}
 
+// Main AI call function
+pub async fn call_ai(mut request: AIRequest) -> Result<AIResponse, AIError> {
+    // Clamp top_p to [0.0, 1.0], top_k to [1, 500], and thinking_budget to [0, 128000]
+    request.top_p = request.top_p.map(|v| v.clamp(0.0, 1.0));
+    request.top_k = request.top_k.map(|v| v.clamp(1, 500));
+    request.thinking_budget = request.thinking_budget.map(|v| v.clamp(0, 128_000));
+
+    validate_provider_endpoint(&request.provider_type, &request.base_url)?;
     crate::ai_native::validate_history(&request)?;
     let client = &*AI_HTTP_CLIENT;
     if crate::ai_native::modern_anthropic(&request) || crate::ai_native::modern_chat(&request) {
@@ -1418,11 +1461,38 @@ pub async fn test_provider(
     provider_type: AIProviderType,
     base_url: String,
     api_key: Option<String>,
+    model: Option<String>,
 ) -> Result<bool, AIError> {
+    validate_provider_endpoint(&provider_type, &base_url)?;
     let client = &*AI_HTTP_CLIENT;
     let api_key = clean_api_key(api_key);
 
     match provider_type {
+        AIProviderType::Bedrock => {
+            let api_key = api_key.ok_or(AIError::MissingApiKey)?;
+            let model = model.filter(|m| !m.trim().is_empty()).ok_or_else(|| {
+                AIError::Api("Add an Amazon Bedrock model ID before testing the connection".into())
+            })?;
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            let response = client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Reply OK."}],
+                    "max_tokens": 1
+                }))
+                .send()
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(AIError::Api(format!(
+                    "Amazon Bedrock returned HTTP {}; check the Region, API key, and model access",
+                    status
+                )));
+            }
+            Ok(true)
+        }
         AIProviderType::Ollama => {
             // Just check if Ollama is running
             let url = format!("{}/api/tags", base_url);
@@ -1460,10 +1530,14 @@ pub async fn list_models(
     base_url: String,
     api_key: Option<String>,
 ) -> Result<Vec<String>, AIError> {
+    validate_provider_endpoint(&provider_type, &base_url)?;
     let client = &*AI_HTTP_CLIENT;
     let api_key = clean_api_key(api_key);
 
     match provider_type {
+        AIProviderType::Bedrock if base_url.contains("bedrock-runtime.") => Err(AIError::Api(
+            "Amazon Bedrock Runtime does not provide GET /models; add a model ID manually".into(),
+        )),
         AIProviderType::Ollama => {
             let url = format!("{}/api/tags", base_url);
             let response = client.get(&url).send().await?;
@@ -2025,6 +2099,7 @@ mod api_key_tests {
         let json = r#"{"provider_type":"openrouter","model":"m","api_key":" sk-or-v1-abc ","base_url":"https://openrouter.ai/api/v1","messages":[],"max_tokens":null,"temperature":null}"#;
         let req: AIRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.api_key.as_deref(), Some("sk-or-v1-abc"));
+        assert!(!format!("{req:?}").contains("sk-or-v1-abc"));
     }
 
     #[test]
@@ -2033,5 +2108,156 @@ mod api_key_tests {
         // reported success for a key the chat then saw rejected with 401.
         assert_eq!(provider_test_path(&AIProviderType::OpenRouter), "/key");
         assert_eq!(provider_test_path(&AIProviderType::OpenAI), "/models");
+    }
+
+    #[test]
+    fn bedrock_endpoint_validation_rejects_plaintext_and_url_credentials() {
+        for url in [
+            "http://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1",
+            "http://localhost/openai/v1",
+            "https://user:secret@example.com/v1",
+            "https://user@example.com/v1",
+            "file:///tmp/bedrock",
+            "invalid url",
+        ] {
+            assert!(validate_provider_endpoint(&AIProviderType::Bedrock, url).is_err());
+        }
+        assert!(validate_provider_endpoint(
+            &AIProviderType::Bedrock,
+            "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1"
+        )
+        .is_ok());
+        assert!(validate_provider_endpoint(&AIProviderType::Custom, "http://localhost/v1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn bedrock_public_entrypoints_reject_before_network_or_stream_registration() {
+        let base = "http://plaintext.invalid/openai/v1".to_string();
+        let request: AIRequest = serde_json::from_value(serde_json::json!({
+            "provider_type": "bedrock", "model": "fixture-model",
+            "base_url": base, "api_key": "fixture-key", "messages": []
+        }))
+        .unwrap();
+        assert!(call_ai(request.clone())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("HTTPS endpoint"));
+        assert!(test_provider(
+            AIProviderType::Bedrock,
+            base.clone(),
+            Some("fixture-key".into()),
+            Some("fixture-model".into())
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS endpoint"));
+        assert!(
+            list_models(AIProviderType::Bedrock, base, Some("fixture-key".into()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS endpoint")
+        );
+        let sink = crate::ai_core::cli_impl::StdioEventSink;
+        assert!(crate::ai_stream::ai_chat_stream_with_sink(
+            &sink,
+            request.clone(),
+            "bedrock-unsafe"
+        )
+        .await
+        .unwrap_err()
+        .contains("HTTPS endpoint"));
+        let client = reqwest::Client::new();
+        assert!(crate::ai_native::call(&client, &request)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("HTTPS endpoint"));
+        assert!(crate::ai_native::stream(
+            &client,
+            &request,
+            &sink,
+            "bedrock-unsafe-native",
+            &std::sync::atomic::AtomicBool::new(false)
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS endpoint"));
+    }
+
+    #[tokio::test]
+    async fn bedrock_runtime_requires_a_model_and_never_lists_models() {
+        let base = "https://bedrock-runtime.eu-north-1.amazonaws.com/openai/v1".to_string();
+        let missing = test_provider(
+            AIProviderType::Bedrock,
+            base.clone(),
+            Some("fixture-key".into()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(missing.to_string().contains("model ID"));
+
+        let catalog = list_models(AIProviderType::Bedrock, base, None)
+            .await
+            .unwrap_err();
+        assert!(catalog.to_string().contains("does not provide GET /models"));
+    }
+
+    #[tokio::test]
+    async fn bedrock_test_sends_a_bounded_chat_completion_to_the_selected_model() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut headers = String::new();
+            let length = loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(!line.is_empty());
+                if line == "\r\n" {
+                    break headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|n| n.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                }
+                headers.push_str(&line);
+            };
+            assert!(headers.starts_with("POST /openai/v1/chat/completions HTTP/1.1"));
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-key"));
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "openai.gpt-oss-120b-1:0");
+            assert_eq!(body["max_tokens"], 1);
+            let mut socket = reader.into_inner();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let ok = test_provider(
+            AIProviderType::Bedrock,
+            format!("http://{addr}/openai/v1/"),
+            Some("fixture-key".into()),
+            Some("openai.gpt-oss-120b-1:0".into()),
+        )
+        .await
+        .unwrap();
+        assert!(ok);
+        peer.await.unwrap();
     }
 }

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Aktiver Responses for kompatible OpenAI-modeller",
                 "routingPreferred": "Foretrukket",
                 "routingFallback": "Reserve",
-                "routingNoFallback": "Ingen"
+                "routingNoFallback": "Ingen",
+                "bedrockNeedsModel": "Legg til og aktiver en Bedrock-modell i fanen Modeller før du tester.",
+                "bedrockSetup": "Angi Runtime URL for AWS-regionen din. Under Modeller legger du til en ID som støtter Chat Completions på Bedrock Runtime. Runtime viser ikke en liste over modeller. Testen sender en liten inferensforespørsel som kan medføre AWS-kostnader."
             },
             "copy": "Kopier",
             "attachImage": "Legg ved bilde",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI-leverandørmarkedsplass",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modeller som er driftet på AWS, med tilgang via regional API-nøkkel. Legg til din model ID manuelt.",
+                "bedrockHighlight": "Regional AWS-endepunkt"
             },
             "history": {
                 "cancel": "Avbryt",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "reserve",
                 "fallbackUsedTooltip": "{model} feilet, så reservemodellen svarte i stedet"
-            }
+            },
+            "delegateLocal": "Arbeidere med lesetilgang",
+            "delegateLocalHint": "Separat kjøring. Arbeidere kan lese filer under {path}.",
+            "worker": "Arbeider",
+            "workerBudgetExhausted": "Budsjett brukt opp",
+            "workerCancelled": "Avbrutt",
+            "workerCompleted": "Fullført",
+            "workerFailed": "Mislyktes",
+            "workerQueued": "I kø",
+            "workerRunning": "Kjører",
+            "delegateRemoteProfiles": "Valgfrie lagrede S3-profiler (opptil to), hver begrenset til den viste rotmappen:",
+            "delegateRemoteEmpty": "Ingen egnede lagrede S3-profiler er tilgjengelige.",
+            "workerStopping": "Stopper..."
         },
         "archive": {
             "passwordRequired": "Dette arkivet er passordbeskyttet",

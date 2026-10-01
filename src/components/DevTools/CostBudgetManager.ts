@@ -74,12 +74,23 @@ export async function initBudgetManager(): Promise<void> {
         if (spendingJson) {
             const records: SpendingRecord[] = JSON.parse(spendingJson);
             records.forEach(r => {
-                spendingCache.set(spendingKey(r.providerId, r.month), r);
+                // Admission runs before recordSpending: normalize persisted cost
+                // now, and fail closed when the prior spend cannot be trusted.
+                spendingCache.set(spendingKey(r.providerId, r.month), {
+                    ...r, totalCost: persistedCost(r.totalCost),
+                });
             });
         }
     } catch {
         // No spending data yet
     }
+}
+
+function persistedCost(value: unknown): number {
+    const parsed = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+    return typeof parsed === 'number' && Number.isFinite(parsed) && parsed >= 0
+        ? Math.min(parsed, Number.MAX_SAFE_INTEGER)
+        : Number.MAX_SAFE_INTEGER;
 }
 
 /**
@@ -130,6 +141,14 @@ export function checkBudget(providerId: string): BudgetCheckResult {
     };
 }
 
+/** Keep persisted counters finite; positive overflow saturates to fail closed. */
+function addBoundedCounter(current: number, delta: number): number {
+    const bounded = (value: number): number => typeof value !== 'number' || Number.isNaN(value) || value < 0
+        ? 0
+        : Math.min(value, Number.MAX_SAFE_INTEGER);
+    return Math.min(Number.MAX_SAFE_INTEGER, bounded(current) + bounded(delta));
+}
+
 /**
  * Record spending after a request completes
  */
@@ -150,9 +169,9 @@ export async function recordSpending(
         requestCount: 0,
         tokenCount: 0,
     };
-    existing.totalCost += cost;
-    existing.requestCount += 1;
-    existing.tokenCount += tokens;
+    existing.totalCost = addBoundedCounter(existing.totalCost, cost);
+    existing.requestCount = addBoundedCounter(existing.requestCount, 1);
+    existing.tokenCount = addBoundedCounter(existing.tokenCount, tokens);
     spendingCache.set(key, existing);
 
     // Update conversation cost
@@ -164,9 +183,9 @@ export async function recordSpending(
             requestCount: 0,
             lastUpdated: new Date().toISOString(),
         };
-        convCost.totalCost += cost;
-        convCost.totalTokens += tokens;
-        convCost.requestCount += 1;
+        convCost.totalCost = addBoundedCounter(convCost.totalCost, cost);
+        convCost.totalTokens = addBoundedCounter(convCost.totalTokens, tokens);
+        convCost.requestCount = addBoundedCounter(convCost.requestCount, 1);
         convCost.lastUpdated = new Date().toISOString();
         conversationCosts.set(conversationId, convCost);
     }

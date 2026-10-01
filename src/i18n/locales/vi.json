@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Bật Responses cho các mô hình OpenAI tương thích",
                 "routingPreferred": "Ưu tiên",
                 "routingFallback": "Dự phòng",
-                "routingNoFallback": "Không có"
+                "routingNoFallback": "Không có",
+                "bedrockNeedsModel": "Thêm và bật mô hình Bedrock trong thẻ Mô hình trước khi kiểm tra.",
+                "bedrockSetup": "Đặt Runtime URL cho Khu vực AWS của bạn. Trong Mô hình, thêm ID hỗ trợ Chat Completions trên Bedrock Runtime. Runtime không liệt kê các mô hình. Bài kiểm tra gửi một yêu cầu suy luận nhỏ và có thể phát sinh phí AWS."
             },
             "copy": "Sao chép",
             "attachImage": "Đính kèm hình ảnh",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Chợ nhà cung cấp AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Các mô hình lưu trữ trên AWS, truy cập bằng khóa API theo khu vực. Thêm model ID của bạn theo cách thủ công.",
+                "bedrockHighlight": "Điểm cuối AWS theo khu vực"
             },
             "history": {
                 "cancel": "Hủy",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "dự phòng",
                 "fallbackUsedTooltip": "{model} đã thất bại, nên mô hình dự phòng đã trả lời thay"
-            }
+            },
+            "delegateLocal": "Worker chỉ đọc",
+            "delegateLocalHint": "Chạy riêng biệt. Worker có thể đọc tệp trong {path}.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Đã hết ngân sách",
+            "workerCancelled": "Đã hủy",
+            "workerCompleted": "Đã hoàn tất",
+            "workerFailed": "Thất bại",
+            "workerQueued": "Đang xếp hàng",
+            "workerRunning": "Đang chạy",
+            "delegateRemoteProfiles": "Hồ sơ S3 đã lưu tùy chọn (tối đa hai), mỗi hồ sơ chỉ giới hạn trong thư mục gốc được hiển thị:",
+            "delegateRemoteEmpty": "Không có hồ sơ S3 đã lưu phù hợp.",
+            "workerStopping": "Đang dừng..."
         },
         "archive": {
             "passwordRequired": "Tệp lưu trữ này được bảo vệ bằng mật khẩu",

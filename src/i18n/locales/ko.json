@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "호환되는 OpenAI 모델에 Responses 사용",
                 "routingPreferred": "선호 모델",
                 "routingFallback": "대체",
-                "routingNoFallback": "없음"
+                "routingNoFallback": "없음",
+                "bedrockNeedsModel": "테스트하기 전에 모델 탭에서 Bedrock 모델을 추가하고 활성화하세요.",
+                "bedrockSetup": "AWS 리전의 Runtime URL을 설정하세요. 모델에서 Bedrock Runtime의 Chat Completions를 지원하는 ID를 추가하세요. Runtime은 모델 목록을 제공하지 않습니다. 테스트는 작은 추론 요청을 보내며 AWS 요금이 발생할 수 있습니다."
             },
             "copy": "복사",
             "attachImage": "이미지 첨부",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI 공급자 마켓플레이스",
                 "tools": "도구",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "지역별 API 키로 접근하는 AWS 호스팅 모델입니다. model ID를 수동으로 추가하세요.",
+                "bedrockHighlight": "AWS 리전 엔드포인트"
             },
             "history": {
                 "cancel": "취소",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "대체",
                 "fallbackUsedTooltip": "{model}이(가) 실패하여 대체 모델이 대신 응답했습니다"
-            }
+            },
+            "delegateLocal": "읽기 전용 작업자",
+            "delegateLocalHint": "별도로 실행합니다. 작업자는 {path} 아래의 파일을 읽을 수 있습니다.",
+            "worker": "작업자",
+            "workerBudgetExhausted": "예산 소진",
+            "workerCancelled": "취소됨",
+            "workerCompleted": "완료됨",
+            "workerFailed": "실패함",
+            "workerQueued": "대기 중",
+            "workerRunning": "실행 중",
+            "delegateRemoteProfiles": "선택적 저장된 S3 프로필(최대 2개). 각 프로필은 표시된 루트로 제한됩니다:",
+            "delegateRemoteEmpty": "사용 가능한 적격 저장된 S3 프로필이 없습니다.",
+            "workerStopping": "중지 중..."
         },
         "archive": {
             "passwordRequired": "이 압축 파일은 비밀번호로 보호되어 있습니다",

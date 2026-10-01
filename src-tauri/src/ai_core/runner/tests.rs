@@ -2,7 +2,91 @@ use super::*;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+
+fn shared_ledger(requests: u64) -> Ledger {
+    Ledger::new(ledger::Limits {
+        input_tokens: 50_000,
+        output_tokens: 1_000,
+        requests,
+        tool_steps: 4,
+        result_bytes: 4_096,
+        concurrent_children: 2,
+        deadline: Instant::now() + Duration::from_secs(30),
+    })
+}
+
+#[tokio::test]
+async fn participating_parent_reserves_each_continuation_and_tool_step() {
+    let ledger = shared_ledger(3);
+    let script = Script::with(vec![response("read", &["A"]), response("done", &[])]);
+    let mut request = template();
+    request.max_tokens = Some(64);
+    let mut history = vec![message("user", "go".into())];
+    let result = run_with_ledger(
+        &script,
+        &request,
+        &mut history,
+        RunnerOptions {
+            max_steps: 2,
+            plan_only: false,
+            fail_on_step_limit: false,
+        },
+        &CancellationToken::new(),
+        &ledger,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, "done");
+    let (usage, requests, steps, bytes, _) = ledger.snapshot().unwrap();
+    assert_eq!((requests, steps), (2, 1));
+    assert_eq!(
+        usage,
+        Usage {
+            input_tokens: 20,
+            output_tokens: 4
+        }
+    );
+    assert!(bytes >= "fixture text".len() as u64 + "done".len() as u64);
+    assert_eq!(
+        ledger.finish(ledger::Terminal::Completed).unwrap(),
+        ledger::Terminal::Completed
+    );
+}
+
+#[tokio::test]
+async fn shared_request_limit_blocks_parent_continuation_without_losing_tool_audit() {
+    let ledger = shared_ledger(1);
+    let script = Script::with(vec![response("read", &["A"])]);
+    let mut request = template();
+    request.max_tokens = Some(64);
+    let mut history = vec![message("user", "go".into())];
+    assert!(run_with_ledger(
+        &script,
+        &request,
+        &mut history,
+        RunnerOptions {
+            max_steps: 2,
+            plan_only: false,
+            fail_on_step_limit: false
+        },
+        &CancellationToken::new(),
+        &ledger,
+    )
+    .await
+    .unwrap_err()
+    .contains("budget"));
+    assert_eq!(script.requests.lock().unwrap().len(), 1);
+    assert!(history
+        .iter()
+        .any(|message| message.role == "tool" && message.content == "fixture text"));
+    assert_eq!(ledger.snapshot().unwrap().1, 1);
+    assert_eq!(
+        ledger.finish(ledger::Terminal::Failed).unwrap(),
+        ledger::Terminal::BudgetExhausted
+    );
+}
 
 fn template() -> AIRequest {
     serde_json::from_value(json!({
@@ -125,6 +209,7 @@ async fn invoke(
         RunnerOptions {
             max_steps,
             plan_only,
+            fail_on_step_limit: false,
         },
         cancel,
     )
@@ -403,4 +488,24 @@ async fn pending_http_is_dropped_but_tool_work_is_awaited_to_quiescence() {
         );
         assert!(*adapter.dropped.lock().unwrap());
     }
+}
+
+#[test]
+fn parent_conservative_admission_excludes_api_key_bytes() {
+    let mut request = template();
+    request.max_tokens = Some(64);
+    request.api_key = None;
+    request.messages = vec![message("user", "UTF-8 evidence: è界".into())];
+    let without_key = shared_ledger(1);
+    let first = ParentRequestReservation::new(&without_key, &request).unwrap();
+    let baseline = without_key.snapshot().unwrap().0.input_tokens;
+    request.api_key = Some("secret-key".repeat(10_000));
+    let with_key = shared_ledger(1);
+    let second = ParentRequestReservation::new(&with_key, &request).unwrap();
+    assert_eq!(with_key.snapshot().unwrap().0.input_tokens, baseline);
+    assert!(baseline >= request.messages[0].content.len() as u64);
+    drop(first);
+    drop(second);
+    without_key.finish(ledger::Terminal::Completed).unwrap();
+    with_key.finish(ledger::Terminal::Completed).unwrap();
 }

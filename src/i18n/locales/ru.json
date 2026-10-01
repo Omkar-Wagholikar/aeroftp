@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Включить Responses для совместимых моделей OpenAI",
                 "routingPreferred": "Предпочтительная",
                 "routingFallback": "Запасная",
-                "routingNoFallback": "Нет"
+                "routingNoFallback": "Нет",
+                "bedrockNeedsModel": "Перед проверкой добавьте и включите модель Bedrock на вкладке Модели.",
+                "bedrockSetup": "Укажите Runtime URL для вашего региона AWS. На вкладке Модели добавьте ID, поддерживающий Chat Completions в Bedrock Runtime. Runtime не показывает список моделей. Тест отправляет небольшой запрос на вывод, за который AWS может взимать плату."
             },
             "copy": "Копировать",
             "attachImage": "Прикрепить изображение",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Маркетплейс провайдеров ИИ",
                 "tools": "Инструменты",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Модели, размещённые в AWS, с доступом по региональному ключу API. Добавьте свой model ID вручную.",
+                "bedrockHighlight": "Региональная конечная точка AWS"
             },
             "history": {
                 "cancel": "Отмена",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "запасная",
                 "fallbackUsedTooltip": "{model} не ответила, поэтому ответила запасная модель"
-            }
+            },
+            "delegateLocal": "Исполнители только для чтения",
+            "delegateLocalHint": "Отдельный запуск. Исполнители могут читать файлы в {path}.",
+            "worker": "Исполнитель",
+            "workerBudgetExhausted": "Бюджет исчерпан",
+            "workerCancelled": "Отменено",
+            "workerCompleted": "Завершено",
+            "workerFailed": "Ошибка",
+            "workerQueued": "В очереди",
+            "workerRunning": "Выполняется",
+            "delegateRemoteProfiles": "Необязательные сохранённые профили S3 (до двух), каждый ограничен указанной корневой папкой:",
+            "delegateRemoteEmpty": "Нет доступных подходящих сохранённых профилей S3.",
+            "workerStopping": "Остановка..."
         },
         "archive": {
             "passwordRequired": "Этот архив защищён паролем",

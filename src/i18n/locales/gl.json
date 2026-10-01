@@ -2614,7 +2614,9 @@
                 "openAIResponsesEnable": "Activar Responses para modelos de OpenAI compatibles",
                 "routingPreferred": "Preferido",
                 "routingFallback": "Alternativo",
-                "routingNoFallback": "Ningún"
+                "routingNoFallback": "Ningún",
+                "bedrockNeedsModel": "Engade e activa un modelo de Bedrock na lapela Modelos antes de probar.",
+                "bedrockSetup": "Define a Runtime URL da túa rexión de AWS. En Modelos, engade un ID compatible con Chat Completions en Bedrock Runtime. Runtime non mostra a lista de modelos. A proba envía unha pequena solicitude de inferencia que pode xerar cargos de AWS."
             },
             "rag": {
                 "indexing": "Indexando ficheiros...",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Mercado de provedores de AI",
                 "tools": "Tools",
-                "vision": "Visión"
+                "vision": "Visión",
+                "bedrockDescription": "Modelos aloxados en AWS con acceso mediante unha chave API rexional. Engade o teu model ID manualmente.",
+                "bedrockHighlight": "Punto de conexión rexional de AWS"
             },
             "history": {
                 "cancel": "Cancelar",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "alternativo",
                 "fallbackUsedTooltip": "{model} fallou, así que respondeu o modelo alternativo"
-            }
+            },
+            "delegateLocal": "Traballadores de só lectura",
+            "delegateLocalHint": "Execución separada. Os traballadores poden ler ficheiros baixo {path}.",
+            "worker": "Traballador",
+            "workerBudgetExhausted": "Orzamento esgotado",
+            "workerCancelled": "Cancelado",
+            "workerCompleted": "Completado",
+            "workerFailed": "Fallou",
+            "workerQueued": "Na cola",
+            "workerRunning": "En execución",
+            "delegateRemoteProfiles": "Perfís S3 gardados opcionais (ata dous), cada un limitado á raíz amosada:",
+            "delegateRemoteEmpty": "Non hai perfís S3 gardados aptos dispoñibles.",
+            "workerStopping": "Detendo..."
         },
         "archive": {
             "passwordRequired": "Arquivo protexido con contrasinal",

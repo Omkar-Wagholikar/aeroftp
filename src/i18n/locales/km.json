@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "បើក Responses សម្រាប់ម៉ូដែល OpenAI ដែលត្រូវគ្នា",
                 "routingPreferred": "ដែលពេញចិត្ត",
                 "routingFallback": "បម្រុង",
-                "routingNoFallback": "គ្មាន"
+                "routingNoFallback": "គ្មាន",
+                "bedrockNeedsModel": "បន្ថែម និងបើកម៉ូដែល Bedrock នៅផ្ទាំង ម៉ូដែល មុនពេលសាកល្បង។",
+                "bedrockSetup": "កំណត់ Runtime URL សម្រាប់តំបន់ AWS របស់អ្នក។ នៅក្នុង ម៉ូដែល បន្ថែម ID ដែលគាំទ្រ Chat Completions លើ Bedrock Runtime។ Runtime មិនបង្ហាញបញ្ជីម៉ូដែលទេ។ ការសាកល្បងផ្ញើសំណើអនុមានតូចមួយ ដែលអាចបណ្តាលឱ្យមានការគិតថ្លៃពី AWS។"
             },
             "copy": "ចម្លង",
             "attachImage": "ភ្ជប់រូបភាព",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "ស្តុកអ្នកផ្តល់ AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "ម៉ូដែលដែលបង្ហោះលើ AWS អាចចូលប្រើដោយសោ API តាមតំបន់។ បន្ថែម model ID របស់អ្នកដោយដៃ។",
+                "bedrockHighlight": "ចំណុចបញ្ចប់តាមតំបន់ AWS"
             },
             "history": {
                 "cancel": "បោះបង់",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "បម្រុង",
                 "fallbackUsedTooltip": "{model} បានបរាជ័យ ដូច្នេះម៉ូដែលបម្រុងបានឆ្លើយតបជំនួស"
-            }
+            },
+            "delegateLocal": "កម្មករសម្រាប់តែអាន",
+            "delegateLocalHint": "ដំណើរការដាច់ដោយឡែក។ កម្មករអាចអានឯកសារក្រោម {path}។",
+            "worker": "កម្មករ",
+            "workerBudgetExhausted": "ថវិកាអស់ហើយ",
+            "workerCancelled": "បានបោះបង់",
+            "workerCompleted": "បានបញ្ចប់",
+            "workerFailed": "បានបរាជ័យ",
+            "workerQueued": "នៅក្នុងជួរ",
+            "workerRunning": "កំពុងដំណើរការ",
+            "delegateRemoteProfiles": "ប្រវត្តិរូប S3 ដែលបានរក្សាទុកជាជម្រើស (រហូតដល់ពីរ) ដោយនីមួយៗកំណត់ត្រឹមថតឫសដែលបានបង្ហាញ៖",
+            "delegateRemoteEmpty": "មិនមានប្រវត្តិរូប S3 ដែលបានរក្សាទុកសមស្របទេ។",
+            "workerStopping": "កំពុងបញ្ឈប់..."
         },
         "archive": {
             "passwordRequired": "បណ្ណសារនេះត្រូវបានការពារដោយពាក្យសម្ងាត់",

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Washa Responses kwa miundo ya OpenAI inayooana",
                 "routingPreferred": "Inayopendelewa",
                 "routingFallback": "Mbadala",
-                "routingNoFallback": "Hakuna"
+                "routingNoFallback": "Hakuna",
+                "bedrockNeedsModel": "Ongeza na uwashe muundo wa Bedrock kwenye kichupo cha Modeli kabla ya kujaribu.",
+                "bedrockSetup": "Weka Runtime URL ya eneo lako la AWS. Katika Modeli, ongeza ID inayotumia Chat Completions kwenye Bedrock Runtime. Runtime haionyeshi orodha ya miundo. Jaribio hutuma ombi dogo la utoaji makisio ambalo linaweza kusababisha gharama za AWS."
             },
             "copy": "Nakili",
             "attachImage": "Ambatanisha picha",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Soko la watoa huduma wa AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Miundo inayopangishwa kwenye AWS yenye ufikiaji kupitia ufunguo wa API wa eneo. Ongeza model ID yako mwenyewe.",
+                "bedrockHighlight": "Sehemu ya mwisho ya AWS ya eneo"
             },
             "history": {
                 "cancel": "Ghairi",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "mbadala",
                 "fallbackUsedTooltip": "{model} imeshindwa, kwa hivyo modeli mbadala ndiyo iliyojibu"
-            }
+            },
+            "delegateLocal": "Wafanyakazi wa kusoma tu",
+            "delegateLocalHint": "Utekelezaji tofauti. Wafanyakazi wanaweza kusoma faili chini ya {path}.",
+            "worker": "Mfanyakazi",
+            "workerBudgetExhausted": "Bajeti imeisha",
+            "workerCancelled": "Imeghairiwa",
+            "workerCompleted": "Imekamilika",
+            "workerFailed": "Imeshindwa",
+            "workerQueued": "Kwenye foleni",
+            "workerRunning": "Inaendeshwa",
+            "delegateRemoteProfiles": "Wasifu wa S3 uliohifadhiwa wa hiari (hadi miwili), kila mmoja ukizuiwa kwenye folda kuu iliyoonyeshwa:",
+            "delegateRemoteEmpty": "Hakuna wasifu wa S3 uliohifadhiwa unaofaa unaopatikana.",
+            "workerStopping": "Inasimamisha..."
         },
         "archive": {
             "passwordRequired": "Kumbukumbu hii inalindwa na nenosiri",

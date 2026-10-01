@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "সামঞ্জস্যপূর্ণ OpenAI মডেলের জন্য Responses চালু করুন",
                 "routingPreferred": "পছন্দসই",
                 "routingFallback": "বিকল্প",
-                "routingNoFallback": "কোনোটি নয়"
+                "routingNoFallback": "কোনোটি নয়",
+                "bedrockNeedsModel": "পরীক্ষার আগে মডেল ট্যাবে একটি Bedrock মডেল যোগ করে সক্রিয় করুন।",
+                "bedrockSetup": "আপনার AWS অঞ্চলের জন্য Runtime URL সেট করুন। মডেল ট্যাবে Bedrock Runtime-এ Chat Completions সমর্থন করে এমন একটি ID যোগ করুন। Runtime মডেলের তালিকা দেখায় না। পরীক্ষা একটি ছোট ইনফারেন্স অনুরোধ পাঠায়, যার জন্য AWS চার্জ নিতে পারে।"
             },
             "copy": "অনুলিপি",
             "attachImage": "ছবি সংযুক্ত করুন",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI প্রদানকারী মার্কেটপ্লেস",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS-এ হোস্ট করা মডেল, আঞ্চলিক API কী দিয়ে অ্যাক্সেসযোগ্য। আপনার model ID নিজে যোগ করুন।",
+                "bedrockHighlight": "AWS আঞ্চলিক এন্ডপয়েন্ট"
             },
             "history": {
                 "cancel": "বাতিল",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "বিকল্প",
                 "fallbackUsedTooltip": "{model} ব্যর্থ হয়েছে, তাই বিকল্প মডেল উত্তর দিয়েছে"
-            }
+            },
+            "delegateLocal": "শুধু পাঠযোগ্য কর্মী",
+            "delegateLocalHint": "পৃথকভাবে চালানো হবে। কর্মীরা {path}-এর অধীনে ফাইল পড়তে পারবে।",
+            "worker": "কর্মী",
+            "workerBudgetExhausted": "বাজেট শেষ",
+            "workerCancelled": "বাতিল হয়েছে",
+            "workerCompleted": "সম্পন্ন",
+            "workerFailed": "ব্যর্থ",
+            "workerQueued": "সারিতে আছে",
+            "workerRunning": "চলছে",
+            "delegateRemoteProfiles": "ঐচ্ছিক সংরক্ষিত S3 প্রোফাইল (সর্বোচ্চ দুটি), প্রতিটি দেখানো মূল ফোল্ডারে সীমাবদ্ধ:",
+            "delegateRemoteEmpty": "কোনো উপযুক্ত সংরক্ষিত S3 প্রোফাইল উপলব্ধ নেই।",
+            "workerStopping": "থামানো হচ্ছে..."
         },
         "archive": {
             "passwordRequired": "এই আর্কাইভটি পাসওয়ার্ড দ্বারা সুরক্ষিত",

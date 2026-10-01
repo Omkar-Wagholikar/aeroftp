@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Activați Responses pentru modelele OpenAI compatibile",
                 "routingPreferred": "Preferat",
                 "routingFallback": "Rezervă",
-                "routingNoFallback": "Niciunul"
+                "routingNoFallback": "Niciunul",
+                "bedrockNeedsModel": "Adăugați și activați un model Bedrock în fila Modele înainte de testare.",
+                "bedrockSetup": "Setați Runtime URL pentru regiunea dvs. AWS. În fila Modele, adăugați un ID care acceptă Chat Completions pe Bedrock Runtime. Runtime nu afișează o listă de modele. Testul trimite o mică solicitare de inferență care poate genera costuri AWS."
             },
             "copy": "Copiază",
             "attachImage": "Atașează imagine",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marketplace Furnizori AI",
                 "tools": "Instrumente",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modele găzduite pe AWS, cu acces prin cheie API regională. Adăugați manual model ID.",
+                "bedrockHighlight": "Punct final regional AWS"
             },
             "history": {
                 "cancel": "Anulează",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "rezervă",
                 "fallbackUsedTooltip": "{model} a eșuat, așa că a răspuns modelul de rezervă"
-            }
+            },
+            "delegateLocal": "Lucrători doar pentru citire",
+            "delegateLocalHint": "Execuție separată. Lucrătorii pot citi fișiere sub {path}.",
+            "worker": "Lucrător",
+            "workerBudgetExhausted": "Buget epuizat",
+            "workerCancelled": "Anulat",
+            "workerCompleted": "Finalizat",
+            "workerFailed": "Eșuat",
+            "workerQueued": "În coadă",
+            "workerRunning": "În execuție",
+            "delegateRemoteProfiles": "Profiluri S3 salvate opționale (cel mult două), fiecare limitat la rădăcina afișată:",
+            "delegateRemoteEmpty": "Nu sunt disponibile profiluri S3 salvate eligibile.",
+            "workerStopping": "Se oprește..."
         },
         "archive": {
             "passwordRequired": "Această arhivă este protejată cu parolă",

@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Įjungti Responses suderinamiems OpenAI modeliams",
                 "routingPreferred": "Pageidaujamas",
                 "routingFallback": "Atsarginis",
-                "routingNoFallback": "Nėra"
+                "routingNoFallback": "Nėra",
+                "bedrockNeedsModel": "Prieš bandydami pridėkite ir įjunkite Bedrock modelį skirtuke Modeliai.",
+                "bedrockSetup": "Nustatykite savo AWS regiono Runtime URL. Skirtuke Modeliai pridėkite ID, kuris palaiko Chat Completions sistemoje Bedrock Runtime. Runtime nerodo modelių sąrašo. Bandymas siunčia nedidelę išvadų užklausą, už kurią AWS gali taikyti mokestį."
             },
             "copy": "Kopijuoti",
             "attachImage": "Pridėti vaizdą",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI teikėjų rinka",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS talpinami modeliai, pasiekiami naudojant regioninį API raktą. Pridėkite savo model ID rankiniu būdu.",
+                "bedrockHighlight": "AWS regioninis galinis taškas"
             },
             "history": {
                 "cancel": "Atšaukti",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "atsarginis",
                 "fallbackUsedTooltip": "{model} nepavyko, todėl atsakė atsarginis modelis"
-            }
+            },
+            "delegateLocal": "Tik skaitymo vykdytojai",
+            "delegateLocalHint": "Atskiras vykdymas. Vykdytojai gali skaityti failus po {path}.",
+            "worker": "Vykdytojas",
+            "workerBudgetExhausted": "Biudžetas išnaudotas",
+            "workerCancelled": "Atšaukta",
+            "workerCompleted": "Baigta",
+            "workerFailed": "Nepavyko",
+            "workerQueued": "Eilėje",
+            "workerRunning": "Vykdoma",
+            "delegateRemoteProfiles": "Pasirenkami išsaugoti S3 profiliai (iki dviejų), kiekvienas apribotas rodomu šakniniu aplanku:",
+            "delegateRemoteEmpty": "Tinkamų išsaugotų S3 profilių nėra.",
+            "workerStopping": "Stabdoma..."
         },
         "archive": {
             "passwordRequired": "Šis archyvas apsaugotas slaptažodžiu",

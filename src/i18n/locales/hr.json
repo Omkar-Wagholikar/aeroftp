@@ -2614,7 +2614,9 @@
                 "openAIResponsesEnable": "Omogući Responses za kompatibilne modele OpenAI",
                 "routingPreferred": "Preferirani",
                 "routingFallback": "Pričuvni",
-                "routingNoFallback": "Nijedan"
+                "routingNoFallback": "Nijedan",
+                "bedrockNeedsModel": "Prije testiranja dodajte i omogućite model Bedrock na kartici Modeli.",
+                "bedrockSetup": "Postavite Runtime URL za svoju AWS regiju. Na kartici Modeli dodajte ID koji podržava Chat Completions na Bedrock Runtime. Runtime ne prikazuje popis modela. Test šalje mali zahtjev za zaključivanje koji može uzrokovati AWS troškove."
             },
             "rag": {
                 "indexing": "Indeksiranje datoteka...",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI tržište pružatelja",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modeli smješteni na AWS-u s pristupom putem regionalnog API ključa. Ručno dodajte svoj model ID.",
+                "bedrockHighlight": "Regionalna krajnja točka AWS-a"
             },
             "history": {
                 "cancel": "Odustani",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "pričuvni",
                 "fallbackUsedTooltip": "{model} nije uspio, pa je odgovorio pričuvni model"
-            }
+            },
+            "delegateLocal": "Radnici samo za čitanje",
+            "delegateLocalHint": "Zasebno pokretanje. Radnici mogu čitati datoteke pod {path}.",
+            "worker": "Radnik",
+            "workerBudgetExhausted": "Proračun iscrpljen",
+            "workerCancelled": "Otkazano",
+            "workerCompleted": "Dovršeno",
+            "workerFailed": "Neuspješno",
+            "workerQueued": "U redu čekanja",
+            "workerRunning": "U tijeku",
+            "delegateRemoteProfiles": "Neobavezni spremljeni S3 profili (najviše dva), svaki ograničen na prikazanu korijensku mapu:",
+            "delegateRemoteEmpty": "Nema dostupnih prikladnih spremljenih S3 profila.",
+            "workerStopping": "Zaustavljanje..."
         },
         "archive": {
             "passwordRequired": "Arhiva je zaštićena lozinkom",

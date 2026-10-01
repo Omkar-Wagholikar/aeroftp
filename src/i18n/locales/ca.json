@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Activa Responses per als models d'OpenAI compatibles",
                 "routingPreferred": "Preferit",
                 "routingFallback": "Alternatiu",
-                "routingNoFallback": "Cap"
+                "routingNoFallback": "Cap",
+                "bedrockNeedsModel": "Afegiu i activeu un model de Bedrock a la pestanya Models abans de fer la prova.",
+                "bedrockSetup": "Configureu la Runtime URL de la vostra regió d'AWS. A Models, afegiu un ID compatible amb Chat Completions a Bedrock Runtime. Runtime no mostra cap llista de models. La prova envia una petita sol·licitud d'inferència que pot generar càrrecs d'AWS."
             },
             "copy": "Copiar",
             "attachImage": "Adjuntar imatge",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Mercat de proveïdors d'AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Models allotjats a AWS amb accés mitjançant una clau API regional. Afegiu el vostre model ID manualment.",
+                "bedrockHighlight": "Punt de connexió regional d'AWS"
             },
             "history": {
                 "cancel": "Cancel·la",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "alternatiu",
                 "fallbackUsedTooltip": "{model} ha fallat, així que ha respost el model alternatiu"
-            }
+            },
+            "delegateLocal": "Treballadors de només lectura",
+            "delegateLocalHint": "Execució separada. Els treballadors poden llegir fitxers sota {path}.",
+            "worker": "Treballador",
+            "workerBudgetExhausted": "Pressupost esgotat",
+            "workerCancelled": "Cancel·lat",
+            "workerCompleted": "Completat",
+            "workerFailed": "Ha fallat",
+            "workerQueued": "En cua",
+            "workerRunning": "En execució",
+            "delegateRemoteProfiles": "Perfils S3 desats opcionals (fins a dos), cadascun limitat a l'arrel mostrada:",
+            "delegateRemoteEmpty": "No hi ha perfils S3 desats aptes disponibles.",
+            "workerStopping": "S'està aturant..."
         },
         "archive": {
             "passwordRequired": "Aquest arxiu està protegit amb contrasenya",

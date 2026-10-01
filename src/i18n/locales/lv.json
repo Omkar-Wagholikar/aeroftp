@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Iespējot Responses saderīgiem OpenAI modeļiem",
                 "routingPreferred": "Vēlamais",
                 "routingFallback": "Rezerves",
-                "routingNoFallback": "Nav"
+                "routingNoFallback": "Nav",
+                "bedrockNeedsModel": "Pirms testēšanas cilnē Modeļi pievienojiet un iespējojiet Bedrock modeli.",
+                "bedrockSetup": "Iestatiet Runtime URL savam AWS reģionam. Cilnē Modeļi pievienojiet ID, kas atbalsta Chat Completions pakalpojumā Bedrock Runtime. Runtime nerāda modeļu sarakstu. Pārbaude nosūta nelielu inferenču pieprasījumu, par kuru AWS var piemērot maksu."
             },
             "copy": "Kopēt",
             "attachImage": "Pievienot attēlu",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI pakalpojumu sniedzēju tirgus",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS mitināti modeļi ar piekļuvi, izmantojot reģionālu API atslēgu. Pievienojiet savu model ID manuāli.",
+                "bedrockHighlight": "AWS reģionālais galapunkts"
             },
             "history": {
                 "cancel": "Atcelt",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "rezerves",
                 "fallbackUsedTooltip": "{model} neizdevās, tāpēc atbildēja rezerves modelis"
-            }
+            },
+            "delegateLocal": "Tikai lasīšanas izpildītāji",
+            "delegateLocalHint": "Atsevišķa izpilde. Izpildītāji var lasīt failus zem {path}.",
+            "worker": "Izpildītājs",
+            "workerBudgetExhausted": "Budžets izsmelts",
+            "workerCancelled": "Atcelts",
+            "workerCompleted": "Pabeigts",
+            "workerFailed": "Neizdevās",
+            "workerQueued": "Rindā",
+            "workerRunning": "Darbojas",
+            "delegateRemoteProfiles": "Neobligāti saglabāti S3 profili (līdz diviem), katrs ierobežots ar parādīto saknes mapi:",
+            "delegateRemoteEmpty": "Nav pieejamu piemērotu saglabātu S3 profilu.",
+            "workerStopping": "Apturēšana..."
         },
         "archive": {
             "passwordRequired": "Šis arhīvs ir aizsargāts ar paroli",

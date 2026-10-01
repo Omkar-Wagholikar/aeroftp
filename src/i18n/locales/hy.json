@@ -2607,7 +2607,9 @@
                 "openAIResponsesEnable": "Միացնել Responses-ը համատեղելի OpenAI մոդելների համար",
                 "routingPreferred": "Նախընտրելի",
                 "routingFallback": "Պահեստային",
-                "routingNoFallback": "Չկա"
+                "routingNoFallback": "Չկա",
+                "bedrockNeedsModel": "Փորձարկելուց առաջ Մոդելներ ներդիրում ավելացրեք և միացրեք Bedrock մոդել։",
+                "bedrockSetup": "Սահմանեք ձեր AWS տարածաշրջանի Runtime URL-ը։ Մոդելներ ներդիրում ավելացրեք ID, որն աջակցում է Chat Completions-ին Bedrock Runtime-ում։ Runtime-ը չի ցուցադրում մոդելների ցանկը։ Փորձարկումն ուղարկում է փոքր եզրահանգման հարցում, որի համար AWS-ը կարող է վճար գանձել։"
             },
             "rag": {
                 "indexing": "Ֆայլերի ինդեքսավորում...",
@@ -2930,7 +2932,9 @@
                 "thinking": "Thinking",
                 "title": "AI Մատակարարների շուկա",
                 "tools": "Գործիքներ",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS-ում տեղակայված մոդելներ՝ տարածաշրջանային API բանալիով հասանելիությամբ։ Ձեռքով ավելացրեք ձեր model ID-ն։",
+                "bedrockHighlight": "AWS տարածաշրջանային վերջնակետ"
             },
             "history": {
                 "cancel": "Չեղարկել",
@@ -2966,7 +2970,19 @@
             "routing": {
                 "fallbackUsed": "պահեստային",
                 "fallbackUsedTooltip": "{model}-ը ձախողվեց, ուստի պատասխանեց պահեստային մոդելը"
-            }
+            },
+            "delegateLocal": "Միայն կարդալու աշխատողներ",
+            "delegateLocalHint": "Առանձին գործարկում։ Աշխատողները կարող են կարդալ {path}-ի ներքո գտնվող ֆայլերը։",
+            "worker": "Աշխատող",
+            "workerBudgetExhausted": "Բյուջեն սպառված է",
+            "workerCancelled": "Չեղարկված է",
+            "workerCompleted": "Ավարտված է",
+            "workerFailed": "Ձախողվել է",
+            "workerQueued": "Հերթում է",
+            "workerRunning": "Ընթացքի մեջ է",
+            "delegateRemoteProfiles": "Ընտրովի պահպանված S3 պրոֆիլներ (մինչև երկու), յուրաքանչյուրը սահմանափակված ցուցադրված արմատային պանակով․",
+            "delegateRemoteEmpty": "Համապատասխան պահպանված S3 պրոֆիլներ հասանելի չեն։",
+            "workerStopping": "Կանգնեցվում է..."
         },
         "archive": {
             "passwordRequired": "Արխիվը պաշտպանված է գաղտնաբառով",

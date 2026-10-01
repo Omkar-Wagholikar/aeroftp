@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "เปิดใช้ Responses สำหรับโมเดล OpenAI ที่เข้ากันได้",
                 "routingPreferred": "ที่ต้องการ",
                 "routingFallback": "สำรอง",
-                "routingNoFallback": "ไม่มี"
+                "routingNoFallback": "ไม่มี",
+                "bedrockNeedsModel": "เพิ่มและเปิดใช้งานโมเดล Bedrock ในแท็บ โมเดล ก่อนทดสอบ",
+                "bedrockSetup": "ตั้งค่า Runtime URL สำหรับภูมิภาค AWS ของคุณ ใน โมเดล ให้เพิ่ม ID ที่รองรับ Chat Completions บน Bedrock Runtime Runtime ไม่แสดงรายการโมเดล การทดสอบจะส่งคำขออนุมานขนาดเล็กซึ่งอาจมีค่าใช้จ่ายจาก AWS"
             },
             "copy": "คัดลอก",
             "attachImage": "แนบรูปภาพ",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "ตลาดผู้ให้บริการ AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "โมเดลที่โฮสต์บน AWS และเข้าถึงด้วยคีย์ API ประจำภูมิภาค เพิ่ม model ID ด้วยตนเอง",
+                "bedrockHighlight": "ปลายทาง AWS ประจำภูมิภาค"
             },
             "history": {
                 "cancel": "ยกเลิก",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "สำรอง",
                 "fallbackUsedTooltip": "{model} ล้มเหลว โมเดลสำรองจึงตอบแทน"
-            }
+            },
+            "delegateLocal": "เวิร์กเกอร์แบบอ่านอย่างเดียว",
+            "delegateLocalHint": "ทำงานแยกกัน เวิร์กเกอร์สามารถอ่านไฟล์ภายใต้ {path} ได้",
+            "worker": "เวิร์กเกอร์",
+            "workerBudgetExhausted": "งบประมาณหมด",
+            "workerCancelled": "ยกเลิกแล้ว",
+            "workerCompleted": "เสร็จสิ้น",
+            "workerFailed": "ล้มเหลว",
+            "workerQueued": "อยู่ในคิว",
+            "workerRunning": "กำลังทำงาน",
+            "delegateRemoteProfiles": "โปรไฟล์ S3 ที่บันทึกไว้แบบไม่บังคับ (สูงสุดสองรายการ) แต่ละรายการจำกัดอยู่ในโฟลเดอร์รากที่แสดง:",
+            "delegateRemoteEmpty": "ไม่มีโปรไฟล์ S3 ที่บันทึกไว้ที่เข้าเกณฑ์",
+            "workerStopping": "กำลังหยุด..."
         },
         "archive": {
             "passwordRequired": "ไฟล์เก็บถาวรนี้มีรหัสผ่านป้องกัน",

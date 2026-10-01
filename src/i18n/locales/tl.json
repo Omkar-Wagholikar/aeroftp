@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "I-enable ang Responses para sa tugmang mga modelo ng OpenAI",
                 "routingPreferred": "Piniling modelo",
                 "routingFallback": "Panghalili",
-                "routingNoFallback": "Wala"
+                "routingNoFallback": "Wala",
+                "bedrockNeedsModel": "Magdagdag at paganahin ang isang Bedrock model sa tab na Mga Model bago subukan.",
+                "bedrockSetup": "Itakda ang Runtime URL para sa iyong rehiyon sa AWS. Sa Mga Model, idagdag ang ID na sumusuporta sa Chat Completions sa Bedrock Runtime. Hindi inililista ng Runtime ang mga modelo. Nagpapadala ang pagsubok ng maliit na inference request na maaaring magkaroon ng singil sa AWS."
             },
             "copy": "Kopyahin",
             "attachImage": "Mag-attach ng larawan",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI Provider Marketplace",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Mga modelong naka-host sa AWS na maa-access gamit ang panrehiyong API key. Idagdag nang manu-mano ang iyong model ID.",
+                "bedrockHighlight": "Panrehiyong endpoint ng AWS"
             },
             "history": {
                 "cancel": "Kanselahin",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "panghalili",
                 "fallbackUsedTooltip": "Nabigo ang {model}, kaya ang panghaliling modelo ang sumagot"
-            }
+            },
+            "delegateLocal": "Mga worker na pangbasa lamang",
+            "delegateLocalHint": "Hiwalay na pagpapatakbo. Maaaring magbasa ang mga worker ng mga file sa ilalim ng {path}.",
+            "worker": "Worker",
+            "workerBudgetExhausted": "Naubos ang badyet",
+            "workerCancelled": "Kinansela",
+            "workerCompleted": "Nakumpleto",
+            "workerFailed": "Nabigo",
+            "workerQueued": "Nakapila",
+            "workerRunning": "Tumatakbo",
+            "delegateRemoteProfiles": "Opsyonal na mga naka-save na S3 profile (hanggang dalawa), bawat isa ay limitado sa ipinakitang root:",
+            "delegateRemoteEmpty": "Walang available na kwalipikadong naka-save na S3 profile.",
+            "workerStopping": "Humihinto..."
         },
         "archive": {
             "passwordRequired": "Ang archive na ito ay protektado ng password",

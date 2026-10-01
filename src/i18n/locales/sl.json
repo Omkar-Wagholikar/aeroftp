@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Omogoči Responses za združljive modele OpenAI",
                 "routingPreferred": "Prednostni",
                 "routingFallback": "Rezervni",
-                "routingNoFallback": "Brez"
+                "routingNoFallback": "Brez",
+                "bedrockNeedsModel": "Pred preizkusom dodajte in omogočite model Bedrock na zavihku Modeli.",
+                "bedrockSetup": "Nastavite Runtime URL za svojo regijo AWS. Na zavihku Modeli dodajte ID, ki podpira Chat Completions v Bedrock Runtime. Runtime ne prikaže seznama modelov. Preizkus pošlje majhno zahtevo za sklepanje, ki lahko povzroči stroške AWS."
             },
             "copy": "Kopiraj",
             "attachImage": "Priloži sliko",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Tržnica ponudnikov AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modeli, gostovani v AWS, z dostopom prek regionalnega ključa API. Svoj model ID dodajte ročno.",
+                "bedrockHighlight": "Regionalna končna točka AWS"
             },
             "history": {
                 "cancel": "Preklic",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "rezervni",
                 "fallbackUsedTooltip": "{model} ni uspel, zato je odgovoril rezervni model"
-            }
+            },
+            "delegateLocal": "Delavci samo za branje",
+            "delegateLocalHint": "Ločen zagon. Delavci lahko berejo datoteke pod {path}.",
+            "worker": "Delavec",
+            "workerBudgetExhausted": "Proračun izčrpan",
+            "workerCancelled": "Preklicano",
+            "workerCompleted": "Dokončano",
+            "workerFailed": "Neuspešno",
+            "workerQueued": "V čakalni vrsti",
+            "workerRunning": "Se izvaja",
+            "delegateRemoteProfiles": "Izbirni shranjeni profili S3 (največ dva), vsak omejen na prikazano korensko mapo:",
+            "delegateRemoteEmpty": "Ni razpoložljivih ustreznih shranjenih profilov S3.",
+            "workerStopping": "Ustavljanje..."
         },
         "archive": {
             "passwordRequired": "Ta arhiv je zaščiten z geslom",

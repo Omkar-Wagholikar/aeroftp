@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Galluogi Responses ar gyfer modelau OpenAI cydnaws",
                 "routingPreferred": "A ffefrir",
                 "routingFallback": "Wrth gefn",
-                "routingNoFallback": "Dim"
+                "routingNoFallback": "Dim",
+                "bedrockNeedsModel": "Ychwanegwch ac actifadwch fodel Bedrock yn y tab Modelau cyn profi.",
+                "bedrockSetup": "Gosodwch y Runtime URL ar gyfer eich rhanbarth AWS. Yn Modelau, ychwanegwch ID sy'n cefnogi Chat Completions ar Bedrock Runtime. Nid yw Runtime yn rhestru modelau. Mae'r prawf yn anfon cais casgliad bach a all achosi taliadau AWS."
             },
             "copy": "Copïo",
             "attachImage": "Atodi delwedd",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marchnadfa darparwyr AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Modelau sy'n cael eu lletya gan AWS gyda mynediad drwy allwedd API ranbarthol. Ychwanegwch eich model ID â llaw.",
+                "bedrockHighlight": "Pwynt terfyn rhanbarthol AWS"
             },
             "history": {
                 "cancel": "Canslo",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "wrth gefn",
                 "fallbackUsedTooltip": "Methodd {model}, felly atebodd y model wrth gefn"
-            }
+            },
+            "delegateLocal": "Gweithwyr darllen yn unig",
+            "delegateLocalHint": "Rhediad ar wahân. Gall gweithwyr ddarllen ffeiliau o dan {path}.",
+            "worker": "Gweithiwr",
+            "workerBudgetExhausted": "Cyllideb wedi dod i ben",
+            "workerCancelled": "Wedi canslo",
+            "workerCompleted": "Wedi cwblhau",
+            "workerFailed": "Wedi methu",
+            "workerQueued": "Yn y ciw",
+            "workerRunning": "Yn rhedeg",
+            "delegateRemoteProfiles": "Proffiliau S3 wedi'u cadw dewisol (hyd at ddau), pob un wedi'i gyfyngu i'r gwraidd a ddangosir:",
+            "delegateRemoteEmpty": "Nid oes proffiliau S3 wedi'u cadw cymwys ar gael.",
+            "workerStopping": "Yn stopio..."
         },
         "archive": {
             "passwordRequired": "Mae'r archif hwn wedi'i ddiogelu â chyfrinair",

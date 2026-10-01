@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Luba Responses ühilduvate OpenAI mudelite jaoks",
                 "routingPreferred": "Eelistatud",
                 "routingFallback": "Varumudel",
-                "routingNoFallback": "Puudub"
+                "routingNoFallback": "Puudub",
+                "bedrockNeedsModel": "Lisa ja luba enne testimist vahekaardil Mudelid Bedrocki mudel.",
+                "bedrockSetup": "Määra oma AWS-i piirkonna Runtime URL. Lisa vahekaardil Mudelid ID, mis toetab Chat Completions teenuses Bedrock Runtime. Runtime ei kuva mudelite loendit. Test saadab väikese järelduspäringu, millega võivad kaasneda AWS-i tasud."
             },
             "copy": "Kopeeri",
             "attachImage": "Lisa pilt",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "AI pakkujate turg",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "AWS-is majutatud mudelid piirkondliku API-võtmega juurdepääsuks. Lisa oma model ID käsitsi.",
+                "bedrockHighlight": "AWS-i piirkondlik lõpp-punkt"
             },
             "history": {
                 "cancel": "Tühista",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "varumudel",
                 "fallbackUsedTooltip": "{model} ebaõnnestus, seetõttu vastas varumudel"
-            }
+            },
+            "delegateLocal": "Ainult lugemisõigusega töötajad",
+            "delegateLocalHint": "Eraldi käivitus. Töötajad võivad lugeda faile asukohas {path}.",
+            "worker": "Töötaja",
+            "workerBudgetExhausted": "Eelarve ammendatud",
+            "workerCancelled": "Tühistatud",
+            "workerCompleted": "Lõpetatud",
+            "workerFailed": "Nurjus",
+            "workerQueued": "Järjekorras",
+            "workerRunning": "Töötab",
+            "delegateRemoteProfiles": "Valikulised salvestatud S3 profiilid (kuni kaks), igaüks piiratud näidatud juurkaustaga:",
+            "delegateRemoteEmpty": "Sobivaid salvestatud S3 profiile pole saadaval.",
+            "workerStopping": "Peatamine..."
         },
         "archive": {
             "passwordRequired": "See arhiiv on parooliga kaitstud",

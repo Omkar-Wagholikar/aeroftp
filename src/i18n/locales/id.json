@@ -2595,7 +2595,9 @@
                 "openAIResponsesEnable": "Aktifkan Responses untuk model OpenAI yang kompatibel",
                 "routingPreferred": "Pilihan",
                 "routingFallback": "Cadangan",
-                "routingNoFallback": "Tidak ada"
+                "routingNoFallback": "Tidak ada",
+                "bedrockNeedsModel": "Tambahkan dan aktifkan model Bedrock di tab Model sebelum menguji.",
+                "bedrockSetup": "Atur Runtime URL untuk Wilayah AWS Anda. Di Model, tambahkan ID yang mendukung Chat Completions pada Bedrock Runtime. Runtime tidak mencantumkan model. Pengujian mengirim permintaan inferensi kecil yang mungkin dikenai biaya AWS."
             },
             "copy": "Salin",
             "attachImage": "Lampirkan Gambar",
@@ -2937,7 +2939,9 @@
                 "thinking": "Thinking",
                 "title": "Marketplace Penyedia AI",
                 "tools": "Tools",
-                "vision": "Vision"
+                "vision": "Vision",
+                "bedrockDescription": "Model yang dihosting di AWS dengan akses kunci API regional. Tambahkan model ID Anda secara manual.",
+                "bedrockHighlight": "Endpoint regional AWS"
             },
             "history": {
                 "cancel": "Batal",
@@ -2973,7 +2977,19 @@
             "routing": {
                 "fallbackUsed": "cadangan",
                 "fallbackUsedTooltip": "{model} gagal, sehingga model cadangan yang menjawab"
-            }
+            },
+            "delegateLocal": "Pekerja hanya baca",
+            "delegateLocalHint": "Proses terpisah. Pekerja dapat membaca file di bawah {path}.",
+            "worker": "Pekerja",
+            "workerBudgetExhausted": "Anggaran habis",
+            "workerCancelled": "Dibatalkan",
+            "workerCompleted": "Selesai",
+            "workerFailed": "Gagal",
+            "workerQueued": "Dalam antrean",
+            "workerRunning": "Berjalan",
+            "delegateRemoteProfiles": "Profil S3 tersimpan opsional (maksimal dua), masing-masing dibatasi ke folder akar yang ditampilkan:",
+            "delegateRemoteEmpty": "Tidak ada profil S3 tersimpan yang memenuhi syarat.",
+            "workerStopping": "Menghentikan..."
         },
         "archive": {
             "passwordRequired": "Arsip ini dilindungi kata sandi",
