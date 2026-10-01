@@ -1333,7 +1333,12 @@ mod tests {
                 &mut || Ok(()),
             )
             .await;
-        assert_eq!(result, Err(HttpError::Connect));
+        // A refused localhost connection can exhaust the request deadline on
+        // Windows. Both are terminal network errors, never legacy evidence.
+        assert!(matches!(
+            result,
+            Err(HttpError::Connect | HttpError::Timeout)
+        ));
         assert_eq!(state.era, Era::Modern);
         assert!(state.failed);
     }

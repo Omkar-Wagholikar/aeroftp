@@ -47,6 +47,16 @@ fn fixture_command(config: &McpServerConfig) -> Result<Command, SandboxError> {
     Ok(command)
 }
 
+/// Clear inherited secrets. Windows' Node fixture needs its OS directory for
+/// libuv initialization; production non-Linux launches still fail closed.
+pub(crate) fn clear_peer_environment(command: &mut Command) {
+    command.env_clear();
+    #[cfg(all(test, target_os = "windows"))]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+}
+
 /// A binary on disk does not prove its required flags/user namespaces work.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn fixture_sandbox_available() -> bool {
@@ -226,13 +236,15 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_fixture.mjs");
         let mut config = fixture(vec![script.to_string_lossy().into_owned(), "exit".into()]);
         config.command = node.to_string_lossy().into_owned();
-        let output = fixture_command(&config)
-            .unwrap()
-            .env_clear()
-            .output()
-            .await
-            .unwrap();
-        assert_eq!(output.status.code(), Some(17));
+        let mut command = fixture_command(&config).unwrap();
+        clear_peer_environment(&mut command);
+        let output = command.output().await.unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(17),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         config.args[0] = "untrusted-other-script.mjs".into();
         assert_eq!(
             fixture_command(&config).err(),

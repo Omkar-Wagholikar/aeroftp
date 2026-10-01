@@ -94,7 +94,7 @@ impl Peer {
                 SandboxError::Unavailable => TransportError::SandboxUnavailable,
                 SandboxError::InvalidPath => TransportError::InvalidConfig,
             })?;
-        command.env_clear();
+        mcp_client_sandbox::clear_peer_environment(&mut command);
         #[cfg(target_os = "linux")]
         command
             .env("HOME", "/tmp")
