@@ -870,6 +870,7 @@ impl CredentialStore {
             }
             *cache = None;
         }
+        crate::mcp_client_oauth::lifecycle::shared().invalidate_all();
     }
 
     // ---- Master Password Management ----

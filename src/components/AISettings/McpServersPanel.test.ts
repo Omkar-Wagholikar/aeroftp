@@ -6,6 +6,15 @@ import { McpServersPanel } from './McpServersPanel';
 
 const invoke = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+vi.mock('./McpHttpServersPanel', () => ({ McpHttpServersPanel: () => null }));
+vi.mock('../../i18n', async () => {
+    const { translations } = (await import('../../i18n/locales/en.json')).default as { translations: Record<string, unknown> };
+    const t = (key: string, params?: Record<string, string | number>) => {
+        const value = key.split('.').reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], translations);
+        return typeof value === 'string' ? value.replace(/\{(\w+)\}/g, (_, name: string) => String(params?.[name] ?? name)) : key;
+    };
+    return { useTranslation: () => t };
+});
 
 let root: Root;
 let host: HTMLDivElement;

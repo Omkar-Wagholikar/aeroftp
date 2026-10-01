@@ -1,5 +1,6 @@
 //! Private, active-user configuration contract for outbound MCP HTTPS servers.
-//! No network request, Tauri command, or model tool is exposed here.
+//! No network request or model tool is exposed here; settings commands live in
+//! `mcp_client_http_commands`.
 
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
@@ -21,6 +22,7 @@ pub(crate) enum McpHttpAuth {
     Bearer {
         vault_account: String,
     },
+    #[serde(rename = "oauth")]
     OAuth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
