@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aeroftp"
-version = "4.2.0"
+version = "4.2.1"
 dependencies = [
  "acl-sys",
  "aeroftp-peer-l0",
