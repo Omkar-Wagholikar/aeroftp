@@ -413,6 +413,16 @@ fn validate_request(request: &BridgeRequest) -> Result<(), BridgeError> {
     }
     Ok(())
 }
+/// What the approval window shows: the supplying server, its transport and
+/// the tool. The arguments are bound by the approval key, not displayed.
+fn approval_message(request: &BridgeRequest) -> String {
+    format!(
+        "AeroAgent wants to: Run MCP Tool\n\n  server: {}\n  transport: {}\n  tool: {}",
+        request.call.server_id,
+        request.transport.label(),
+        request.call.tool_name
+    )
+}
 fn check_cancel(cancel: &CancellationToken) -> Result<(), BridgeError> {
     if cancel.is_cancelled() {
         return Err(TransportError::Cancelled.into());
@@ -564,10 +574,7 @@ async fn with_backend(
                             approval_key.clone(),
                             approval_key,
                             false,
-                            format!(
-                                "AeroAgent wants to: Run MCP Tool\n\n  server: {}\n  tool: {}",
-                                request.call.server_id, request.call.tool_name
-                            ),
+                            approval_message(request),
                         )
                         .await,
                     );
@@ -674,6 +681,17 @@ mod tests {
                 BridgeError::Schema(SchemaError::Unavailable)
             );
         }
+    }
+
+    #[test]
+    fn the_approval_names_server_transport_and_tool() {
+        let mut req = request();
+        assert_eq!(
+            approval_message(&req),
+            "AeroAgent wants to: Run MCP Tool\n\n  server: fixture\n  transport: http\n  tool: echo"
+        );
+        req.transport = Transport::Stdio;
+        assert!(approval_message(&req).contains("\n  transport: stdio\n"));
     }
 
     #[test]
