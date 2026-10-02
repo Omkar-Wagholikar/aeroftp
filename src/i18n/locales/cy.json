@@ -6093,6 +6093,23 @@
             "approve": "Cymeradwyo",
             "rememberForChat": "Caniatáu'r offeryn hwn am weddill y sgwrs hon"
         },
+        "s3": {
+            "storageClass": "Dosbarth Storio",
+            "storageClassChanged": "Newidiwyd y dosbarth storio i {storageClass}",
+            "restoreFromGlacier": "Adfer o Glacier",
+            "restoreTier": "Haen adfer",
+            "restoreDays": "Diwrnodau i gadw'r copi a adferwyd",
+            "restoreStarted": "Gofynnwyd am adfer: unwaith y bydd yn barod, bydd y copi'n ddarllenadwy am {days} diwrnod",
+            "objectTags": "Tagiau Gwrthrych",
+            "noTags": "Dim tagiau",
+            "tagKey": "Allwedd",
+            "tagValue": "Gwerth",
+            "tagsSaved": "Tagiau wedi'u cadw"
+        },
+        "azure": {
+            "accessTier": "Haen Mynediad",
+            "accessTierChanged": "Gosodwyd yr haen mynediad i {tier}"
+        },
         "fileComments": {
             "title": "Sylwadau",
             "empty": "Dim sylwadau eto"

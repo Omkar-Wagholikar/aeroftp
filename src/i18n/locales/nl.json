@@ -6074,6 +6074,23 @@
             "approve": "Goedkeuren",
             "rememberForChat": "Dit hulpmiddel toestaan voor de rest van deze chat"
         },
+        "s3": {
+            "storageClass": "Opslagklasse",
+            "storageClassChanged": "Opslagklasse gewijzigd naar {storageClass}",
+            "restoreFromGlacier": "Herstellen uit Glacier",
+            "restoreTier": "Ophaalniveau",
+            "restoreDays": "Dagen om de herstelde kopie te bewaren",
+            "restoreStarted": "Herstel aangevraagd: zodra de kopie gereed is, blijft ze {days} dagen leesbaar",
+            "objectTags": "Objecttags",
+            "noTags": "Geen tags",
+            "tagKey": "Sleutel",
+            "tagValue": "Waarde",
+            "tagsSaved": "Tags opgeslagen"
+        },
+        "azure": {
+            "accessTier": "Toegangsniveau",
+            "accessTierChanged": "Toegangsniveau ingesteld op {tier}"
+        },
         "fileComments": {
             "title": "Opmerkingen",
             "empty": "Nog geen opmerkingen"

@@ -6074,6 +6074,23 @@
             "approve": "Odobri",
             "rememberForChat": "Dopusti ovaj alat do kraja ovog chata"
         },
+        "s3": {
+            "storageClass": "Klasa pohrane",
+            "storageClassChanged": "Klasa pohrane promijenjena u {storageClass}",
+            "restoreFromGlacier": "Vrati iz Glacier",
+            "restoreTier": "Razina dohvaćanja",
+            "restoreDays": "Dani čuvanja vraćene kopije",
+            "restoreStarted": "Zatraženo je vraćanje: kad bude spremna, kopija ostaje čitljiva {days} dana",
+            "objectTags": "Oznake objekta",
+            "noTags": "Nema oznaka",
+            "tagKey": "Ključ",
+            "tagValue": "Vrijednost",
+            "tagsSaved": "Oznake spremljene"
+        },
+        "azure": {
+            "accessTier": "Razina pristupa",
+            "accessTierChanged": "Razina pristupa postavljena na {tier}"
+        },
         "fileComments": {
             "title": "Komentari",
             "empty": "Još nema komentara"
