@@ -1466,6 +1466,7 @@
             "extracted": "Izdvojeno!",
             "extractedTo": "Datoteke izdvojene u {dest}",
             "fileLocked": "Datoteka zaključana",
+            "cutPartial": "Premješteno {moved} od {total} stavki; ostale ostaju na mjestu",
             "fileSkipped": "{count} datoteka preskočeno",
             "fileUnlocked": "Datoteka otključana",
             "loadTrashFailed": "Učitavanje koša nije uspjelo",

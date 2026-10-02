@@ -1466,6 +1466,7 @@
             "extracted": "Lahtipakitud!",
             "extractedTo": "Failid lahtipakitud asukohta {dest}",
             "fileLocked": "Fail lukustatud",
+            "cutPartial": "Teisaldatud {moved}/{total} üksust; ülejäänud jäävad paigale",
             "fileSkipped": "{count} fail(i) vahele jäetud",
             "fileUnlocked": "Fail lukust avatud",
             "loadTrashFailed": "Prügikasti laadimine ebaõnnestus",
