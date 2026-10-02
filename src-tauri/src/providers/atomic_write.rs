@@ -1135,6 +1135,10 @@ mod tests {
             Some(std::io::ErrorKind::AlreadyExists),
             "a live part was taken"
         );
+        // tokio hands a write to a blocking thread: without a flush the drop
+        // can come before the bytes reach the file, and the read below then
+        // sees an empty part (seen on a loaded CI runner).
+        part.file_mut().flush().await.unwrap();
         drop(part);
         assert_eq!(
             std::fs::read(dir.path().join("f.bin.aerotmp")).unwrap(),
