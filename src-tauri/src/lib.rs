@@ -62,10 +62,8 @@ mod localhost_security;
 mod mcp_client_bridge;
 mod mcp_client_commands;
 pub mod mcp_client_config;
-#[allow(dead_code)] // Private entry point; model dispatch is gated by a later integration slice.
-#[cfg(test)] // Superseded by the schema-bound private bridge.
-mod mcp_client_dispatch;
 pub mod mcp_client_framing;
+mod mcp_client_gate;
 mod mcp_client_http_commands;
 mod mcp_client_http_config;
 mod mcp_client_http_transport;
@@ -74,10 +72,6 @@ pub mod mcp_client_protocol;
 mod mcp_client_routing;
 mod mcp_client_sandbox;
 mod mcp_client_schema;
-// GateRequest and GateError are live through mcp_client_bridge; the older
-// approval runtime in this module is superseded by the bridge and unused.
-#[allow(dead_code)]
-mod mcp_client_gate;
 mod mcp_client_transport;
 mod openai_responses;
 #[cfg(target_os = "linux")]
