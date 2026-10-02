@@ -4763,7 +4763,14 @@
             "participants": "participanți",
             "saving": "Se salvează...",
             "saved": "Salvat",
-            "saveNow": "Salvează acum"
+            "saveNow": "Salvează acum",
+            "noteType": "Tip de notiță",
+            "addTag": "Adaugă etichetă",
+            "newTag": "Etichetă nouă...",
+            "tagName": "Numele etichetei",
+            "removeTag": "Elimină eticheta",
+            "manageTags": "Gestionează etichetele",
+            "deleteTagConfirm": "Ștergi eticheta „{name}”? Notițele își păstrează textul."
         },
         "shareLinkModal": {
             "title": "Link de partajare",
