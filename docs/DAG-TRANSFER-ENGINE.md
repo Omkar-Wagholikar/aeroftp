@@ -49,6 +49,13 @@ typed nodes. A node runs only after its dependencies complete and its
   budget, not an AIMD congestion class);
 - `DagObserver` lifecycle hooks and the executor summary.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/dag-engine-2-dispatch-dark.png">
+  <img alt="Dispatch: a ready node passes the resource budget and the AIMD target before it reaches the fixed channels of the session pool; congestion from the endpoint halves the width, quiet windows add one back" src="images/dag-engine-2-dispatch-light.png" width="900">
+</picture>
+
+*Dispatch. A ready node starts only when the operation's resource budget and the AIMD target for its class both have room. The channels behind them are fixed by the provider's session ceiling. When the endpoint signals congestion the width halves; quiet stretches add one back, and nothing raises it past the ceiling.*
+
 The executor's ready frontier is not a second process-wide scheduler. It is
 dispatch-window bounded (`DEFAULT_DISPATCH_WINDOW = 256`, overridable via
 `execute_dag_with_dispatch_window`), while the separate `DAG-P2-01` governor
@@ -104,10 +111,12 @@ Four production wrappers call the core:
 
 - `transfer_dag_single_file` builds `shaped_file` and binds real single-file
   provider operations;
-- `transfer_dag_batch` builds `from_batch_shaped` and adapts each file to the
-  existing `TransferExecutor` session contract;
+- `transfer_dag_batch` builds one `shaped_file` subgraph per admitted file
+  (streaming frontier, DAG-P2-04) and adapts each file to the existing
+  `TransferExecutor` session contract;
 - `transfer_dag_sync` snapshots live capabilities after scan/planning, builds
-  `from_sync_plan_shaped`, and owns clone workers, primary delta session,
+  one `shaped_file` subgraph per admitted planned transfer through the same
+  frontier, and owns clone workers, primary delta session,
   report aggregation, and progress replay explicitly.
 - `transfer_dag_single_file::execute_copy_dag` builds `shaped_copy` for GUI,
   CLI `cp`, and the CLI WebDAV bridge.
@@ -121,8 +130,8 @@ concurrent range orchestrator always consumes that shape in production.
 |---|---|---|
 | Single-file core | `shaped_file(Download\|Upload, caps, size)` | Active in normal GUI/CLI single-file network paths, with router and provider exceptions |
 | Multipart single-file | `shaped_file(Upload, caps, size)` → `UploadPart × N` | Active when the single-file runner receives multipart capabilities; independent wire workers only for the provider set listed below |
-| Batch | `from_batch_shaped(items, caps)` | Active graph wrapper; caps from `TransferExecutor::transfer_capabilities()`. Multipart files run real per-part wire I/O (DAG-P1-03); plain upload/download stay whole-file |
-| Sync | `from_sync_plan_shaped(plan, live caps)` | Active for non-dry-run sync; normal files use the clone-backed cap, while delta is an exclusive primary-session lane |
+| Batch | `shaped_file` per admitted file (streaming frontier, DAG-P2-04) | Active; caps from `TransferExecutor::transfer_capabilities()`. Multipart files run real per-part wire I/O (DAG-P1-03); plain upload/download stay whole-file. The whole-job `from_batch_shaped` has no production caller |
+| Sync | `shaped_file` per admitted planned transfer (streaming frontier) | Active for non-dry-run sync; normal files use the clone-backed cap, while delta is an exclusive primary-session lane. The whole-job `from_sync_plan_shaped` has no production caller |
 | Copy | `shaped_copy(caps)` | Active for GUI copy, CLI `cp`, and CLI WebDAV `COPY`; native rejection fallback is observed and then runs an explicit two-node payload core |
 | Segmented download | `shaped_ranges(N)` | Active for every shared concurrent range download; legacy `JoinSet` retained only in the equivalence test harness |
 
@@ -131,6 +140,13 @@ each node performs I/O on every path:
 
 `Discover` → `AcquireResource` → *transfer core* → `VerifyChecksum` →
 `PreserveMetadata` → `CommitTemp` → `EmitProgress`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/dag-engine-1-shapes-dark.png">
+  <img alt="Shaping: the seven-node envelope with the transfer-core slot, and the six shapes the builder can put in it" src="images/dag-engine-1-shapes-light.png" width="900">
+</picture>
+
+*Shaping. Before the first byte moves, the builder reads the provider's capabilities and the object size and fills the transfer-core slot with one of six shapes. The envelope around it is the same for every shape, and only the blue nodes move payload. The grey dots stand for the envelope nodes on either side of the core (Acquire before it, Verify after it).*
 
 In the current single-file runner, `Discover*`, `AcquireResource`, and
 `EmitProgress` are structural no-ops. After DAG-P2-03, `VerifyChecksum` is a
@@ -169,6 +185,13 @@ This is the most complete DAG path. `execute_single_file_dag` binds
 7. a failed or cancelled durable upload keeps its session and valid receipts for
    restart, while a conservative TTL scavenger aborts only an expired matching
    session and removes its record only after that abort succeeds.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/dag-engine-5-completion-dark.png">
+  <img alt="Completion on the durable single-file multipart path: receipts reach the checkpoint, VerifyChecksum records Verified, CommitTemp completes only after it, and a failure keeps the session and receipts for a restart" src="images/dag-engine-5-completion-light.png" width="900">
+</picture>
+
+*Completion, durable single-file multipart. Each part's receipt reaches the checkpoint before the part completes. VerifyChecksum records Verified only when every receipt is present and the local source is unchanged, and CommitTemp completes the upload only after that fact exists. A failure keeps the session and the receipts, so a restart sends only the missing parts. Multipart inside a batch follows its own begin, complete and abort lifecycle without this checkpoint.*
 
 Part buffer sizing is shared: builder and runner use
 `multipart_part_byte_len(file_size, part_index, part_count,
@@ -268,11 +291,11 @@ When `max_chunk_slots > 1`, parts fan out from acquire:
 AcquireResource -> {part 1, part 2, ... part N}
 ```
 
-Single-file (`shaped_file`), batch (`from_batch_shaped`), and sync
-(`from_sync_plan_shaped`) share one internal transfer-core helper
-(`append_transfer_core`) so the topology cannot drift (DAG-P0-07). Different
-files in a batch/sync graph stay independent: cap=1 serialises parts within
-each file, not the whole job across files. This is protocol correctness for
+Every shaped builder goes through one internal transfer-core helper
+(`append_transfer_core`), so the topology cannot drift (DAG-P0-07). In
+production, batch and sync build one `shaped_file` subgraph per admitted file
+(see the streaming frontier below), so different files stay independent:
+cap=1 serialises parts within each file, not the whole job across files. This is protocol correctness for
 ordering-sensitive upload sessions.
 
 After `DAG-P1-03`, the batch runner executes real per-part wire I/O for shaped
@@ -364,6 +387,13 @@ job-wide resource manager, AIMD controller, and session pool, then dropped. Peak
 resident nodes are therefore `O(active_file_cap x nodes_per_file)`, not
 `O(total_files x nodes_per_file)`.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/dag-engine-4-frontier-dark.png">
+  <img alt="Many files: work source, bounded backlog, bounded active set of per-file subgraphs, done; every job draws from the process-wide governor" src="images/dag-engine-4-frontier-light.png" width="900">
+</picture>
+
+*Many files. Only files admitted into the active set exist as graphs: each subgraph is built on admission and dropped when the file is done, so resident graph memory follows the active window, not the size of the job. Every job also draws from one process-wide governor, so concurrent jobs share endpoint slots, the speed limit, part memory and disk.*
+
 - **Batch** streams the known entry list (`BatchEntriesWorkSource`); every
   existing behavior is preserved because the per-file node runners
   (`run_whole_file_node`, `run_multipart_part_node`, `run_multipart_commit_node`)
@@ -444,6 +474,13 @@ token bucket), not AIMD. Batch file-level failures use the typed, non-fatal
 `FileFailedButGraphContinues` outcome: D2 congestion reduces the File-class
 target while unrelated file subgraphs continue. Sync still uses one file slot
 and does not yet expose this batch feedback contract.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/dag-engine-3-aimd-dark.png">
+  <img alt="AIMD over time, schematic: start at the ceiling, halve on congestion, add one per quiet window, a guard band one below the failed level, no regrowth during a Retry-After cooldown" src="images/dag-engine-3-aimd-light.png" width="900">
+</picture>
+
+*Adapting, schematic. The controller starts at the effective ceiling and only moves below it. A congestion signal halves the width and each quiet window adds one back. Regrowth stops one below the level that failed until the recovery window has passed, and a server's Retry-After holds regrowth for its cooldown.*
 
 `DAG-P2-06` makes the controller endpoint and workload aware across successive
 jobs in one process. A bounded, process-local `AdaptiveProfileRegistry` caches
