@@ -190,27 +190,28 @@ function callersOf(command: string, files: ScannedFile[] = appFiles): string[] {
  * dead surface waiting for the same treatment the `user_partitions_*` seven got.
  */
 const INHERITED_UNCALLED: string[] = [
-    'debug_panic_command',
-    'delete_sync_profile_cmd',
-    'delta_sync_analyze',
-    'detect_renames_cmd',
-    'enable_aerocloud',
     'file_tags_delete_all_for_file',
     'file_tags_update_path',
-    'get_compare_options_default',
-    'get_default_retry_policy',
-    'get_parallel_scan_files',
-    'load_sync_snapshot_cmd',
-    'native_rsync_enabled_get',
-    'native_rsync_enabled_set',
-    'parallel_sync_execute',
-    'read_export_metadata',
-    'sign_sync_journal',
-    'sync_canary_approve',
-    'transfer_queue_scan_remote_tree',
-    'update_cloud_pair',
-    'update_conflict_strategy',
 ];
+
+/**
+ * Audited and kept without a frontend caller, each with the reason and the
+ * owner of the decision. Unlike `INHERITED_UNCALLED` this is not a backlog:
+ * every entry was looked at and stays on purpose. It is checked both ways
+ * like the inherited list: an entry that gains a caller or is unregistered
+ * fails until it is removed here.
+ */
+const AUDITED_UNCALLED: Record<string, string> = {
+    debug_panic_command:
+        'Debug builds only (#[cfg(debug_assertions)]): panics on purpose so a developer can check from the ' +
+        'devtools console that invoke() rejects instead of hanging (panic_safe.rs). No screen is meant to call it.',
+    parallel_sync_execute:
+        'Parallel FTP sync over transfer_pool.rs. No sync ever called it, and fd10ff6f0 left it in tree for ' +
+        'APPENDIX-DAG-ENGINE Fase 2 to adopt or retire: that appendix decides, not this list.',
+    transfer_queue_scan_remote_tree:
+        'Lazy per-level remote scan built for the staged transfer queue (TQ-2, a0e7a9c1, 884efb56); the panel ' +
+        '(TQ-4) shipped without folder expansion. APPENDIX-TRANSFER-QUEUE decides whether it is wired or dropped.',
+};
 
 const registered = registeredCommands(libRs);
 const uncalled = registered.filter((c) => callersOf(c).length === 0);
@@ -256,8 +257,14 @@ describe('registered Tauri commands have a frontend caller', () => {
     });
 
     it('registers no new command that nothing in src/ invokes', () => {
-        const inherited = new Set(INHERITED_UNCALLED);
-        expect(uncalled.filter((c) => !inherited.has(c))).toEqual([]);
+        const known = new Set([...INHERITED_UNCALLED, ...Object.keys(AUDITED_UNCALLED)]);
+        expect(uncalled.filter((c) => !known.has(c))).toEqual([]);
+    });
+
+    it('keeps the audited list exact: every entry is registered and still uncalled', () => {
+        const stale = Object.keys(AUDITED_UNCALLED).filter((c) => !uncalled.includes(c));
+        expect(stale, 'now called or no longer registered: drop it from AUDITED_UNCALLED').toEqual([]);
+        expect(Object.keys(AUDITED_UNCALLED).filter((c) => INHERITED_UNCALLED.includes(c))).toEqual([]);
     });
 
     it('keeps the inherited list exact: it only shrinks', () => {
