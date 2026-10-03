@@ -681,9 +681,9 @@ struct Cli {
     /// per-provider routing table: the shaped-graph DAG engine for network
     /// transfers, except plain WebDAV and Nextcloud downloads, which take the
     /// provider-direct path. `dag` forces the DAG engine and `legacy` forces
-    /// the provider-direct path for single-file transfers; multi-file batches
-    /// and sync keep their own runners. Reads default from
-    /// `AEROFTP_TRANSFER_ENGINE`.
+    /// the provider-direct path for plain single-file transfers; completed SFTP
+    /// delta transfers, `--partial` resumes, multi-file batches and sync keep
+    /// their own paths. Reads default from `AEROFTP_TRANSFER_ENGINE`.
     #[arg(
         long,
         global = true, hide_short_help = true, help_heading = "Tuning options",
