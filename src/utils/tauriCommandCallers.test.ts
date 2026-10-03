@@ -190,16 +190,9 @@ function callersOf(command: string, files: ScannedFile[] = appFiles): string[] {
  * dead surface waiting for the same treatment the `user_partitions_*` seven got.
  */
 const INHERITED_UNCALLED: string[] = [
-    'agent_memory_delete',
-    'ai_execute_tool',
     'app_master_password_status',
-    'chat_history_delete_sessions_bulk',
-    'chat_history_export_session',
-    'chat_history_import',
-    'chat_history_init',
     'clear_file_badge',
     'debug_panic_command',
-    'deepseek_fim_complete',
     'delete_sync_profile_cmd',
     'delta_sync_analyze',
     'detect_renames_cmd',
@@ -211,15 +204,11 @@ const INHERITED_UNCALLED: string[] = [
     'file_tags_delete_all_for_file',
     'file_tags_get_files_by_label',
     'file_tags_update_path',
-    'gemini_create_cache',
     'get_badge_status',
     'get_compare_options_default',
     'get_default_retry_policy',
     'get_parallel_scan_files',
-    'install_plugin',
     'is_running_as_snap',
-    'kimi_create_cache',
-    'kimi_upload_file',
     'load_sync_snapshot_cmd',
     'mtp_backend_status',
     'native_rsync_enabled_get',
@@ -230,7 +219,6 @@ const INHERITED_UNCALLED: string[] = [
     'rclone_crypt_decrypt_file',
     'rclone_crypt_encrypt_file_path',
     'rclone_crypt_encrypt_name',
-    'read_agent_memory',
     'read_export_metadata',
     'set_file_badge',
     'sign_sync_journal',
@@ -242,11 +230,9 @@ const INHERITED_UNCALLED: string[] = [
     'totp_load_secret',
     'totp_verify',
     'transfer_queue_scan_remote_tree',
-    'trigger_plugin_hooks',
     'update_cloud_pair',
     'update_conflict_strategy',
     'update_tray_badge_cmd',
-    'write_agent_memory',
 ];
 
 const registered = registeredCommands(libRs);

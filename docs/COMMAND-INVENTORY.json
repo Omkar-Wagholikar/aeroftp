@@ -558,7 +558,7 @@
     "mcp_tools_aliases": 38,
     "mcp_tools_primary": 39,
     "mcp_tools_total": 77,
-    "tauri_commands": 819
+    "tauri_commands": 805
   },
   "mcp": {
     "count": 77,
@@ -951,7 +951,7 @@
     ]
   },
   "parity": {
-    "name_matched_count": 468,
+    "name_matched_count": 461,
     "name_unmatched": [
       "app_ready",
       "set_close_to_tray",
@@ -1078,7 +1078,6 @@
       "ai_delegate_local",
       "ai_cancel_delegation",
       "ai_test_provider",
-      "ai_execute_tool",
       "validate_tool_args",
       "prepare_ai_tool_approval",
       "grant_ai_tool_approval",
@@ -1132,9 +1131,6 @@
       "ai_chat_stream",
       "ai_cancel_stream",
       "ollama_pull_model",
-      "gemini_create_cache",
-      "kimi_create_cache",
-      "deepseek_fim_complete",
       "provider_discover_targets",
       "cancel_connection",
       "cancel_remote_listing",
@@ -1237,9 +1233,7 @@
       "sftp_accept_host_key",
       "sftp_remove_host_key",
       "execute_plugin_tool",
-      "install_plugin",
       "remove_plugin",
-      "trigger_plugin_hooks",
       "fetch_plugin_registry",
       "install_plugin_from_registry",
       "get_user_directories",
@@ -1274,7 +1268,6 @@
       "totp_enable",
       "totp_disable",
       "totp_load_secret",
-      "chat_history_init",
       "chat_history_get_session",
       "chat_history_create_session",
       "chat_history_save_message",
@@ -1305,7 +1298,7 @@
       "checkpoint_endpoints",
       "checkpoint_forget_endpoint"
     ],
-    "name_unmatched_count": 351,
+    "name_unmatched_count": 344,
     "note": "Name-based structural diff, not a semantic one. `name_matched` are Tauri commands whose token set matches a CLI/MCP/agent command (a LOWER bound on real coverage, since differently-named equivalents are missed). `name_unmatched` is the remainder: an UPPER bound for manual triage, dominated by GUI, OS-integration and internal commands with no command-line meaning, plus real capabilities named differently. Neither figure is a capability-gap count; curating genuine gaps stays manual (tracker #9)."
   },
   "schema_version": 1,
@@ -1614,7 +1607,6 @@
       "ai_cancel_delegation",
       "ai_test_provider",
       "ai_list_models",
-      "ai_execute_tool",
       "validate_tool_args",
       "prepare_ai_tool_approval",
       "grant_ai_tool_approval",
@@ -1629,11 +1621,8 @@
       "detect_project_context",
       "scan_file_imports",
       "get_git_context",
-      "read_agent_memory",
-      "write_agent_memory",
       "agent_memory_store",
       "agent_memory_search",
-      "agent_memory_delete",
       "start_health_scan",
       "speech_model_status",
       "download_speech_model",
@@ -1759,11 +1748,7 @@
       "ai_chat_stream",
       "ai_cancel_stream",
       "ollama_pull_model",
-      "gemini_create_cache",
       "ollama_list_running",
-      "kimi_create_cache",
-      "kimi_upload_file",
-      "deepseek_fim_complete",
       "provider_connect",
       "provider_discover_targets",
       "cancel_connection",
@@ -2011,9 +1996,7 @@
       "sftp_remove_host_key",
       "list_plugins",
       "execute_plugin_tool",
-      "install_plugin",
       "remove_plugin",
-      "trigger_plugin_hooks",
       "fetch_plugin_registry",
       "install_plugin_from_registry",
       "get_user_directories",
@@ -2066,20 +2049,16 @@
       "totp_enable",
       "totp_disable",
       "totp_load_secret",
-      "chat_history_init",
       "chat_history_list_sessions",
       "chat_history_get_session",
       "chat_history_create_session",
       "chat_history_save_message",
       "chat_history_update_session_title",
       "chat_history_delete_session",
-      "chat_history_delete_sessions_bulk",
       "chat_history_clear_all",
       "chat_history_search",
       "chat_history_cleanup",
       "chat_history_stats",
-      "chat_history_export_session",
-      "chat_history_import",
       "chat_history_create_branch",
       "chat_history_switch_branch",
       "chat_history_delete_branch",
@@ -2131,6 +2110,6 @@
       "checkpoint_endpoints",
       "checkpoint_forget_endpoint"
     ],
-    "count": 819
+    "count": 805
   }
 }
