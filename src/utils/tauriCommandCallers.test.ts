@@ -190,8 +190,6 @@ function callersOf(command: string, files: ScannedFile[] = appFiles): string[] {
  * dead surface waiting for the same treatment the `user_partitions_*` seven got.
  */
 const INHERITED_UNCALLED: string[] = [
-    'file_tags_delete_all_for_file',
-    'file_tags_update_path',
 ];
 
 /**
