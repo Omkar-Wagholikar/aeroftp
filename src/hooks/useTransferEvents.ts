@@ -437,9 +437,10 @@ export function useTransferEvents(options: UseTransferEventsOptions) {
           i.filename === data.filename && (i.status === 'pending' || i.status === 'transferring'));
         if (queueItem) {
           transferIdToQueueId.current.set(data.transfer_id, queueItem.id);
-          // Only a folder command's start describes a folder row; the
-          // single-file commands (pdl-/pul-) send `start` too, and a file row
-          // they matched by name used to be shown as a folder (#591).
+          // Only a folder command's start describes a folder row. The
+          // single-file commands (pdl-/pul-), an AeroSync file and a file
+          // batch (-files-) send `start` too, and a file row they matched by
+          // name used to be shown as a folder (#591).
           if (data.transfer_id.includes('-folder-')) transferQueue.markAsFolder(queueItem.id);
           if (queueItem.status === 'pending') transferQueue.startTransfer(queueItem.id);
         }
