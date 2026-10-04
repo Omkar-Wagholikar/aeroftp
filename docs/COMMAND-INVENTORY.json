@@ -160,7 +160,7 @@
       }
     ]
   },
-  "app_version": "4.2.1",
+  "app_version": "4.2.2",
   "cli": {
     "count": 95,
     "subcommands": [

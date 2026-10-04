@@ -94,7 +94,7 @@ Production command-line client with direct URL mode for core protocols plus vaul
 
 ## AeroAgent
 
-AeroAgent provides a broad built-in tool catalog across local files, remote operations, archives, search, sync control, clipboard, shell execution, and persistent memory, with support for 24 AI providers. It also includes a Command Palette, plugin registry, tool execution safety system, and CLI/MCP integration paths.
+AeroAgent provides a broad built-in tool catalog across local files, remote operations, archives, search, sync control, clipboard, shell execution, and persistent memory, with support for 26 AI providers. It also includes a Command Palette, plugin registry, tool execution safety system, and CLI/MCP integration paths.
 
 ## Transfer Engine (DAG)
 

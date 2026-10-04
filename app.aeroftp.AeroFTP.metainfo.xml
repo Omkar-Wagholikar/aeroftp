@@ -29,7 +29,7 @@
     <p>AI Assistant:</p>
     <ul>
       <li>AeroAgent Pro: AI-powered assistant with 65 tools, shell command execution, server exec, RAG indexing, plugin system, streaming markdown, prompt templates, and cost budget tracking</li>
-      <li>24 AI providers: OpenAI, Anthropic, Google Gemini, xAI Grok, OpenRouter, Ollama, Kimi, Alibaba Model Studio, DeepSeek, Mistral, Groq, Perplexity, Cohere, Together AI, AI21 Labs, Cerebras, SambaNova, Fireworks AI, Nvidia NIM, Z.AI, Hyperbolic, Novita, Yi, Custom</li>
+      <li>26 AI providers: OpenAI, Anthropic, Google Gemini, xAI Grok, OpenRouter, Ollama, Kimi, Alibaba Model Studio, DeepSeek, Mistral, Groq, Perplexity, Cohere, Together AI, AI21 Labs, Cerebras, SambaNova, Fireworks AI, Nvidia NIM, Z.AI, Hyperbolic, Novita, Yi, Kilo Gateway, Amazon Bedrock, Custom</li>
       <li>Vision/multimodal: Attach images for analysis with GPT-4o, Claude, Gemini</li>
       <li>Native function calling with streaming responses and cost tracking</li>
     </ul>
@@ -146,6 +146,12 @@
   </languages>
 
   <releases>
+    <release version="4.2.2" date="2026-10-05">
+      <description>
+        <p>MCP Servers for AeroAgent, Faster SFTP, and Parallel Selections. AeroAgent reaches 1.6: it can use the tools of MCP servers, local ones in a sandbox on Linux and remote ones over HTTP, with every call approved in its own window, it can hand read-only work to up to two scoped workers, and Amazon Bedrock joins its providers. SFTP is much faster: uploads send whole write requests, downloads read each chunk in one request with Nagle's algorithm turned off, and a segmented download shares one memory budget across its connections. Selecting several files now transfers them in parallel on every protocol, and segmented downloads show real progress and stop when asked.</p>
+        <p>Providers gained the actions their services offer in the context menu: S3 storage classes, object tags and Glacier restore, Azure access tiers, Box and Google Drive comments, GitLab links and Filen note tags. Folders can be renamed on B2 and ImageKit, AeroSync compares only when asked and a compare can be stopped, WebDAV works behind an HTTPS reverse proxy, and the main window has rounded corners on Linux. Calculating used storage updates its figure as it runs and lists several folders at once, as every walk of a WebDAV tree now does, and an AeroImage crop reaches the whole image. On the security side, deleting a file from an AeroVault v2 vault removes its encrypted data, a developer test tool shipped by mistake in the 4.2.1 Windows and macOS installers is gone, more than a hundred backend commands nothing called are removed, and the Linux build pins the AppImage tools it downloads. Linux AppImages now carry their update information for delta updates. Translated into all 47 languages.</p>
+      </description>
+    </release>
     <release version="4.2.1" date="2026-09-30">
       <description>
         <p>Four New Ways to Connect, and a Round of Repairs. IBM Cloud Object Storage and Mail.ru Cloud join as ready presets, Twake Drive as a native provider in the app, the CLI and AeroCloud, and Proton Drive through the official Proton Drive CLI with a browser sign-in. AeroAgent reaches 1.5: reasoning models keep their provider-native state across tool calls, approvals open in their own window and fail closed for dangerous tools, and Stop reaches the tools still running. A keystore import can be previewed profile by profile, and AeroSync gains versioned backup on remote destinations and warns about files the remote cannot store.</p>

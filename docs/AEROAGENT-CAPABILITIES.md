@@ -8,7 +8,7 @@ AeroAgent is AeroFTP's integrated AI assistant with **60+ agent tools (35+ expos
 
 ## Supported AI Providers
 
-AeroAgent works with **24 AI providers** - choose your preferred model:
+AeroAgent works with **26 AI providers** - choose your preferred model:
 
 | Provider | Tool Calling | Streaming | Vision | Thinking |
 |----------|:---:|:---:|:---:|:---:|
@@ -35,6 +35,8 @@ AeroAgent works with **24 AI providers** - choose your preferred model:
 | Hyperbolic | Yes | Yes | - | - |
 | Novita | Yes | Yes | - | - |
 | Yi (01.AI) | Yes | Yes | - | - |
+| Kilo (Gateway) | Yes | Yes | Yes | - |
+| Amazon Bedrock | - | Yes | - | - |
 | Custom (OpenAI-compatible) | Yes | Yes | - | - |
 
 ## Tool Categories

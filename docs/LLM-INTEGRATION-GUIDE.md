@@ -16,7 +16,7 @@ AeroFTP exposes 3 integration points for LLMs:
 |---------|----------|----------|
 | **CLI** (`aeroftp-cli`) | stdin/stdout + exit codes | Tool use / function calling (any LLM) |
 | **MCP Server** (`aeroftp-cli mcp`) | JSON-RPC over stdin/stdout | Claude Desktop, Cursor, VS Code Copilot |
-| **AeroAgent** (built-in) | Tauri IPC | Desktop app users (24 AI providers) |
+| **AeroAgent** (built-in) | Tauri IPC | Desktop app users (26 AI providers) |
 
 ---
 
