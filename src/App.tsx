@@ -477,7 +477,8 @@ import { runRemoteSync, filesFromJournal, type RemoteSyncConfig, type SyncRunRep
 import { syncRunQueueBridge } from './utils/syncRunQueueBridge';
 import { buildRemoteSyncInput, buildMirrorSyncInput } from './utils/presetToSyncRun';
 import { adaptFileComparisons } from './utils/recursiveCompare';
-import { describeScanIncompleteError, isScanIncompleteError } from './utils/scanCompleteness';
+import { describeScanIncompleteError, isCompareCancelled, isScanIncompleteError } from './utils/scanCompleteness';
+import { useCancelStaleCompare } from './hooks/useCancelStaleCompare';
 import { useTranslation } from './i18n';
 
 // Components
@@ -11015,6 +11016,10 @@ const App: React.FC = () => {
     initialTab: AeroSyncTab = 'compare',
     userExcludes: string[] = [],
     backupDir: string = AEROSYNC_DEFAULT_BACKUP_DIR,
+    // A recursive compare reads both trees in full, so opening AeroSync never
+    // starts one: the Compare and Plan tabs offer it, and Start and Rescan
+    // pass true here.
+    startScan = false,
   ) => {
     // Bump the compare token: any recursive scan still in flight from a
     // previous open is now stale and will discard its own result.
@@ -11050,8 +11055,9 @@ const App: React.FC = () => {
           compareResult: canRecurse
             ? null
             : compareEntries(localFiles.map(toCompareEntry), localFiles2.map(toCompareEntry)),
-          compareLoading: canRecurse,
-          scanProgressId: canRecurse ? scanProgressId : undefined,
+          compareLoading: canRecurse && startScan,
+          scanProgressId: canRecurse && startScan ? scanProgressId : undefined,
+          compareIdle: canRecurse && !startScan,
           leftLabel: leftPath || 'Local',
           rightLabel: rightPath || currentLocalPath || 'Local (right)',
           pairKind: 'local-local',
@@ -11062,7 +11068,7 @@ const App: React.FC = () => {
       });
 
       if (canRecurse) {
-        void (async () => {
+        if (startScan) void (async () => {
           let resolved: CompareResult;
           // The flat fallback below classifies panel listings and applies no
           // exclusions and no backup folder, so it must not be reported as
@@ -11079,6 +11085,8 @@ const App: React.FC = () => {
             // Both sides are local: local_info = left, remote_info = right.
             resolved = adaptFileComparisons(report.differences, true, report.summary);
           } catch (err) {
+            // Stopped from the dialog, which already shows it as stopped.
+            if (isCompareCancelled(err)) return;
             if (isScanIncompleteError(err)) {
               // CLAUDE-AV-B3-13: one of the two local walks did not see its
               // whole tree. A dual-local pair deletes in BOTH directions, so
@@ -11156,8 +11164,9 @@ const App: React.FC = () => {
         initialTab,
         context: {
           compareResult: null,
-          compareLoading: true,
-          scanProgressId,
+          compareLoading: startScan,
+          scanProgressId: startScan ? scanProgressId : undefined,
+          compareIdle: !startScan,
           leftLabel: leftLocal ? (currentLocalPath || 'Local') : remoteLabel,
           rightLabel: leftLocal ? remoteLabel : (currentLocalPath || 'Local'),
           pairKind: leftLocal ? 'local-remote' : 'remote-local',
@@ -11175,7 +11184,7 @@ const App: React.FC = () => {
         },
       });
 
-      void (async () => {
+      if (startScan) void (async () => {
         let resolved: CompareResult;
         // See the local-local branch: the flat fallback applies no exclusions.
         let applied = appliedCompareFilters('recursive', userExcludes, backupDir);
@@ -11195,6 +11204,8 @@ const App: React.FC = () => {
           );
           resolved = adaptFileComparisons(report.differences, leftLocal, report.summary);
         } catch (err) {
+          // Stopped from the dialog, which already shows it as stopped.
+          if (isCompareCancelled(err)) return;
           if (isProviderConn && cryptCompareActive) {
             // Crypt overlay active: the backend failed closed (vault missing,
             // wrong overlay key, or zero rows decrypted). Do NOT fall back to a
@@ -11285,6 +11296,11 @@ const App: React.FC = () => {
     notify,
     t,
   ]);
+
+  // The compare the dialog is waiting for is stopped as soon as it is not
+  // waited for any more (Stop, close, a new open, a session teardown): see
+  // useCancelStaleCompare.
+  useCancelStaleCompare(aeroSync?.context.compareLoading ? aeroSync.context.scanProgressId : undefined);
 
   // GAP-5: shared connected-remote sync launcher. Builds the RemoteSyncConfig,
   // runs the CO-5 SFTP delta-eligibility probe (informational, never blocks),
@@ -16412,7 +16428,29 @@ const App: React.FC = () => {
             onExecutePreset={executeSyncPresetPlan}
             onResumeJournal={handleResumeJournal}
             onDismissJournal={handleDismissJournal}
-            onRescan={({ userExcludes, backupDir }) => openAeroSync('plan', userExcludes, backupDir)}
+            onRescan={({ userExcludes, backupDir }) => openAeroSync('plan', userExcludes, backupDir, true)}
+            onStartCompare={() => openAeroSync(
+              aeroSync.initialTab,
+              aeroSync.context.compareExcludes ?? [],
+              aeroSync.context.compareBackupDir ?? AEROSYNC_DEFAULT_BACKUP_DIR,
+              true,
+            )}
+            onStopCompare={() => {
+              // The result still on its way is stale; the hook cancels the scan.
+              aeroSyncCompareSeqRef.current += 1;
+              setAeroSync((prev) => (prev
+                ? {
+                  ...prev,
+                  context: {
+                    ...prev.context,
+                    compareLoading: false,
+                    compareIdle: true,
+                    compareStopped: true,
+                    scanProgressId: undefined,
+                  },
+                }
+                : prev));
+            }}
           />
         )}
         <DeltaEligibilityDialog
