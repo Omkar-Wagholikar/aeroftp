@@ -7,6 +7,7 @@
 
 import * as React from 'react';
 import { getCurrentWindow, LogicalSize, LogicalPosition } from '@tauri-apps/api/window';
+import { guardedUnlisten } from '../hooks/useTauriListener';
 
 const EDGE = 6;
 const CORNER = 12;
@@ -118,7 +119,42 @@ const ResizeEdge: React.FC<EdgeProps> = ({ dir, style }) => {
   );
 };
 
+/**
+ * Round the window corners on Linux while the window is neither maximized nor
+ * fullscreen. The backend makes the main window transparent, and says so
+ * with `__AEROFTP_ROUNDED_CORNERS__`, only on a composited screen; anywhere
+ * else this does nothing and the corners stay square.
+ */
+export function useRoundedWindowCorners(): void {
+  React.useEffect(() => {
+    if (!(window as { __AEROFTP_ROUNDED_CORNERS__?: boolean }).__AEROFTP_ROUNDED_CORNERS__) return;
+    const win = getCurrentWindow();
+    const root = document.documentElement;
+    let live = true;
+    // Resize events come in bursts and each asks the window again: only the
+    // latest answer counts, or an earlier "not maximized" arriving last would
+    // round a maximized window.
+    let asked = 0;
+    const update = () => {
+      const ask = ++asked;
+      Promise.all([win.isMaximized(), win.isFullscreen()])
+        .then(([maximized, fullscreen]) => {
+          if (live && ask === asked) root.classList.toggle('rounded-window', !maximized && !fullscreen);
+        })
+        .catch(() => {});
+    };
+    update();
+    const stop = guardedUnlisten(win.onResized(update));
+    return () => {
+      live = false;
+      stop();
+      root.classList.remove('rounded-window');
+    };
+  }, []);
+}
+
 export const WindowResizeEdges: React.FC = React.memo(() => {
+  useRoundedWindowCorners();
   if (!isLinux) return null;
   return (
     <>
