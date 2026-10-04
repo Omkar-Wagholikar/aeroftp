@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Pratetap penyegerakan",
             "nothingToDo": "Tiada apa-apa untuk disegerakkan",
-            "allSkipped": "Tiada entri boleh dilaksanakan untuk pratetap ini."
+            "allSkipped": "Tiada entri boleh dilaksanakan untuk pratetap ini.",
+            "builtinModesGroup": "Mod terbina dalam",
+            "savedPresetsGroup": "Pratetap tersimpan anda"
         },
         "aerosync": {
             "title": "AeroSync",

@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Profile synchronizacji",
             "nothingToDo": "Nie ma nic do synchronizacji",
-            "allSkipped": "Brak wykonywalnych wpisów dla tego profilu."
+            "allSkipped": "Brak wykonywalnych wpisów dla tego profilu.",
+            "builtinModesGroup": "Wbudowane tryby",
+            "savedPresetsGroup": "Twoje zapisane presety"
         },
         "aerosync": {
             "title": "AeroSync",

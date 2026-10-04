@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "同步预设",
             "nothingToDo": "没有需要同步的内容",
-            "allSkipped": "此预设没有可执行的条目。"
+            "allSkipped": "此预设没有可执行的条目。",
+            "builtinModesGroup": "内置模式",
+            "savedPresetsGroup": "你保存的预设"
         },
         "aerosync": {
             "title": "AeroSync",

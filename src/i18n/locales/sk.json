@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Predvoľby synchronizácie",
             "nothingToDo": "Nie je čo synchronizovať",
-            "allSkipped": "Žiadne vykonateľné položky pre túto predvoľbu."
+            "allSkipped": "Žiadne vykonateľné položky pre túto predvoľbu.",
+            "builtinModesGroup": "Vstavané režimy",
+            "savedPresetsGroup": "Vaše uložené predvoľby"
         },
         "aerosync": {
             "title": "AeroSync",

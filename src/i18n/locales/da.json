@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Synkroniseringspresets",
             "nothingToDo": "Intet at synkronisere",
-            "allSkipped": "Ingen handlingsbare poster for denne preset."
+            "allSkipped": "Ingen handlingsbare poster for denne preset.",
+            "builtinModesGroup": "Indbyggede tilstande",
+            "savedPresetsGroup": "Dine gemte forudindstillinger"
         },
         "aerosync": {
             "title": "AeroSync",

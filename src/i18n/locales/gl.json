@@ -5255,7 +5255,9 @@
         "syncPresets": {
             "title": "Predefinicións de sincronización",
             "nothingToDo": "Nada que sincronizar",
-            "allSkipped": "Non hai entradas accionables para esta predefinición."
+            "allSkipped": "Non hai entradas accionables para esta predefinición.",
+            "builtinModesGroup": "Modos integrados",
+            "savedPresetsGroup": "As túas predefinicións gardadas"
         },
         "aerosync": {
             "title": "AeroSync",

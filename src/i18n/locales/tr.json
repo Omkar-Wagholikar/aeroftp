@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Senkronizasyon önayarları",
             "nothingToDo": "Eşitlenecek bir şey yok",
-            "allSkipped": "Bu önayar için yürütülebilir giriş yok."
+            "allSkipped": "Bu önayar için yürütülebilir giriş yok.",
+            "builtinModesGroup": "Yerleşik modlar",
+            "savedPresetsGroup": "Kayıtlı hazır ayarlarınız"
         },
         "aerosync": {
             "title": "AeroSync",

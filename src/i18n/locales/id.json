@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Preset sinkronisasi",
             "nothingToDo": "Tidak ada yang perlu disinkronkan",
-            "allSkipped": "Tidak ada entri yang dapat dieksekusi untuk preset ini."
+            "allSkipped": "Tidak ada entri yang dapat dieksekusi untuk preset ini.",
+            "builtinModesGroup": "Mode bawaan",
+            "savedPresetsGroup": "Preset tersimpan Anda"
         },
         "aerosync": {
             "title": "AeroSync",

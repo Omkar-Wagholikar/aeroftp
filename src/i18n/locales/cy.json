@@ -5255,7 +5255,9 @@
         "syncPresets": {
             "title": "Rhag-osodiadau cysoni",
             "nothingToDo": "Dim byd i'w gysoni",
-            "allSkipped": "Dim cofnodion gweithredadwy ar gyfer y rhag-osodiad hwn."
+            "allSkipped": "Dim cofnodion gweithredadwy ar gyfer y rhag-osodiad hwn.",
+            "builtinModesGroup": "Moddau adeiledig",
+            "savedPresetsGroup": "Eich rhagosodedigion wedi'u cadw"
         },
         "aerosync": {
             "title": "AeroSync",

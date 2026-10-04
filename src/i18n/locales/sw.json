@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Mipangilio ya usawazishaji",
             "nothingToDo": "Hakuna cha kusawazisha",
-            "allSkipped": "Hakuna ingizo linaloweza kutekelezwa kwa mpangilio huu."
+            "allSkipped": "Hakuna ingizo linaloweza kutekelezwa kwa mpangilio huu.",
+            "builtinModesGroup": "Hali zilizojengewa ndani",
+            "savedPresetsGroup": "Mipangilio yako iliyohifadhiwa"
         },
         "aerosync": {
             "title": "AeroSync",

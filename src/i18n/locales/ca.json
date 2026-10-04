@@ -5255,7 +5255,9 @@
         "syncPresets": {
             "title": "Predefinits de sincronització",
             "nothingToDo": "Res per sincronitzar",
-            "allSkipped": "No hi ha entrades accionables per a aquest predefinit."
+            "allSkipped": "No hi ha entrades accionables per a aquest predefinit.",
+            "builtinModesGroup": "Modes integrats",
+            "savedPresetsGroup": "Les vostres predefinicions desades"
         },
         "aerosync": {
             "title": "AeroSync",

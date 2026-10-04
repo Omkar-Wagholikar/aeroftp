@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Пресеты синхронизации",
             "nothingToDo": "Нечего синхронизировать",
-            "allSkipped": "Для этого пресета нет выполнимых записей."
+            "allSkipped": "Для этого пресета нет выполнимых записей.",
+            "builtinModesGroup": "Встроенные режимы",
+            "savedPresetsGroup": "Ваши сохранённые пресеты"
         },
         "aerosync": {
             "title": "AeroSync",

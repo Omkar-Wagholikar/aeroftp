@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Sünkroonimise eelseaded",
             "nothingToDo": "Pole midagi sünkroonida",
-            "allSkipped": "Selle eelseade jaoks pole täidetavaid kirjeid."
+            "allSkipped": "Selle eelseade jaoks pole täidetavaid kirjeid.",
+            "builtinModesGroup": "Sisseehitatud režiimid",
+            "savedPresetsGroup": "Teie salvestatud eelseaded"
         },
         "aerosync": {
             "title": "AeroSync",

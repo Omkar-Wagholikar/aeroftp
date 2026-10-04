@@ -5453,7 +5453,9 @@
         "syncPresets": {
             "title": "Preset di sincronizzazione",
             "nothingToDo": "Niente da sincronizzare",
-            "allSkipped": "Nessuna voce eseguibile per questo preset."
+            "allSkipped": "Nessuna voce eseguibile per questo preset.",
+            "builtinModesGroup": "Modalità integrate",
+            "savedPresetsGroup": "I tuoi preset salvati"
         },
         "aerosync": {
             "title": "AeroSync",

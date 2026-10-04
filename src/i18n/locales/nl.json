@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Synchronisatievoorinstellingen",
             "nothingToDo": "Niets te synchroniseren",
-            "allSkipped": "Geen uitvoerbare items voor deze voorinstelling."
+            "allSkipped": "Geen uitvoerbare items voor deze voorinstelling.",
+            "builtinModesGroup": "Ingebouwde modi",
+            "savedPresetsGroup": "Je opgeslagen presets"
         },
         "aerosync": {
             "title": "AeroSync",

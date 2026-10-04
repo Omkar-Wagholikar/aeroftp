@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Sinhronizācijas iepriekšiestatījumi",
             "nothingToDo": "Nav ko sinhronizēt",
-            "allSkipped": "Šim iepriekšiestatījumam nav izpildāmu ierakstu."
+            "allSkipped": "Šim iepriekšiestatījumam nav izpildāmu ierakstu.",
+            "builtinModesGroup": "Iebūvētie režīmi",
+            "savedPresetsGroup": "Jūsu saglabātie iepriekšiestatījumi"
         },
         "aerosync": {
             "title": "AeroSync",

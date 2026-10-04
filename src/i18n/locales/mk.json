@@ -5255,7 +5255,9 @@
         "syncPresets": {
             "title": "Поставки за синхронизација",
             "nothingToDo": "Нема што да се синхронизира",
-            "allSkipped": "Нема извршливи ставки за оваа поставка."
+            "allSkipped": "Нема извршливи ставки за оваа поставка.",
+            "builtinModesGroup": "Вградени режими",
+            "savedPresetsGroup": "Вашите зачувани пресети"
         },
         "aerosync": {
             "title": "AeroSync",

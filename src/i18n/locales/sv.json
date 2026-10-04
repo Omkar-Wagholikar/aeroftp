@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Synkroniseringsförinställningar",
             "nothingToDo": "Inget att synkronisera",
-            "allSkipped": "Inga utförbara poster för denna förinställning."
+            "allSkipped": "Inga utförbara poster för denna förinställning.",
+            "builtinModesGroup": "Inbyggda lägen",
+            "savedPresetsGroup": "Dina sparade förinställningar"
         },
         "aerosync": {
             "title": "AeroSync",

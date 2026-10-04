@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Sinchronizavimo išankstiniai nustatymai",
             "nothingToDo": "Nėra ką sinchronizuoti",
-            "allSkipped": "Šiam išankstiniam nustatymui nėra vykdomų įrašų."
+            "allSkipped": "Šiam išankstiniam nustatymui nėra vykdomų įrašų.",
+            "builtinModesGroup": "Integruoti režimai",
+            "savedPresetsGroup": "Jūsų išsaugoti išankstiniai nustatymai"
         },
         "aerosync": {
             "title": "AeroSync",

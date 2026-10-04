@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Szinkronizációs beállítások",
             "nothingToDo": "Nincs mit szinkronizálni",
-            "allSkipped": "Nincs végrehajtható bejegyzés ehhez a beállításhoz."
+            "allSkipped": "Nincs végrehajtható bejegyzés ehhez a beállításhoz.",
+            "builtinModesGroup": "Beépített módok",
+            "savedPresetsGroup": "Mentett előbeállításai"
         },
         "aerosync": {
             "title": "AeroSync",

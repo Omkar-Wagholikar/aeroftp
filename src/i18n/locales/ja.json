@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "同期プリセット",
             "nothingToDo": "同期するものはありません",
-            "allSkipped": "このプリセットには実行可能なエントリがありません。"
+            "allSkipped": "このプリセットには実行可能なエントリがありません。",
+            "builtinModesGroup": "組み込みモード",
+            "savedPresetsGroup": "保存済みプリセット"
         },
         "aerosync": {
             "title": "AeroSync",

@@ -5236,7 +5236,9 @@
         "syncPresets": {
             "title": "Préréglages de synchronisation",
             "nothingToDo": "Rien à synchroniser",
-            "allSkipped": "Aucune entrée exploitable pour ce préréglage."
+            "allSkipped": "Aucune entrée exploitable pour ce préréglage.",
+            "builtinModesGroup": "Modes intégrés",
+            "savedPresetsGroup": "Vos préréglages enregistrés"
         },
         "aerosync": {
             "title": "AeroSync",

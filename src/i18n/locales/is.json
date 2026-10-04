@@ -5255,7 +5255,9 @@
         "syncPresets": {
             "title": "Forstillingar samstillingar",
             "nothingToDo": "Ekkert til að samstilla",
-            "allSkipped": "Engar framkvæmanlegar færslur fyrir þessa forstillingu."
+            "allSkipped": "Engar framkvæmanlegar færslur fyrir þessa forstillingu.",
+            "builtinModesGroup": "Innbyggðir hamir",
+            "savedPresetsGroup": "Vistaðar forstillingar þínar"
         },
         "aerosync": {
             "title": "AeroSync",
