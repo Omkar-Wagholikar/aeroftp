@@ -27,6 +27,7 @@ interface MyServersTableProps {
     servers: ServerProfile[];
     allServers: ServerProfile[];
     columns: MyServersTableColumnsResult;
+    breakdown: boolean;
     favorites: Set<string>;
     connectingId: string | null;
     /** Profile id whose connect is in flight incl. the post-2FA retry (#128-C). */
@@ -120,6 +121,7 @@ export function MyServersTable({
     servers,
     allServers: _allServers,
     columns,
+    breakdown,
     favorites,
     connectingId,
     connectingProfileId,
@@ -341,9 +343,10 @@ export function MyServersTable({
                             />
                         );
                     })}
-                    {protocolRows.map((row, idx) => (
+                    {breakdown && protocolRows.map((row, idx) => (
                         <tr
                             key={`protocol-${row.protocolClass}`}
+                            data-protocol-summary={row.protocolClass}
                             className="bg-blue-50/50 dark:bg-blue-900/10"
                         >
                             {orderedVisibleColumns.map(col => renderProtocolSummaryCell(col.id, row, idx))}

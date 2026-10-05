@@ -68,6 +68,8 @@ export interface UseTableColumnsOpts<TColId extends string> {
     columns: TableColumnDef<TColId>[];
     /** Vault sub-key, e.g. 'my_servers_table'. */
     storageKey: string;
+    /** Re-read after vault initialization/unlock, when the startup cache may be stale. */
+    refreshKey?: number;
     /** Override defaultVisible per-column at runtime (e.g. compact vs detailed). */
     overrideDefaultVisibility?: (id: TColId, def: TableColumnDef<TColId>) => boolean;
     /** Restrict which sort col ids are accepted from the persisted blob. */
@@ -240,7 +242,7 @@ const computeOrderedColumns = <TColId extends string>(
 export function useTableColumns<TColId extends string>(
     opts: UseTableColumnsOpts<TColId>,
 ): UseTableColumnsResult<TColId> {
-    const { columns, storageKey, overrideDefaultVisibility, sortableColIds } = opts;
+    const { columns, storageKey, refreshKey, overrideDefaultVisibility, sortableColIds } = opts;
     const sortableIds = useMemo<TColId[]>(
         () => sortableColIds ?? columns.filter(col => col.sortable).map(col => col.id),
         [columns, sortableColIds],
@@ -274,7 +276,7 @@ export function useTableColumns<TColId extends string>(
 
     useEffect(() => {
         let cancelled = false;
-        (async () => {
+        const load = async () => {
             try {
                 const blob = await secureGetWithFallback<Record<string, unknown>>(VAULT_ACCOUNT, VAULT_KEY);
                 const rawSettings = readSettingsBlob(blob, storageKey);
@@ -285,7 +287,9 @@ export function useTableColumns<TColId extends string>(
             } catch {
                 /* defaults already applied */
             }
-        })();
+        };
+        void load();
+        const onFocus = () => { void load(); };
 
         const onChanged = (e: Event) => {
             const detail = (e as CustomEvent<Record<string, unknown> | null>).detail;
@@ -296,12 +300,14 @@ export function useTableColumns<TColId extends string>(
             }
         };
         window.addEventListener(EVENT_NAME, onChanged);
+        window.addEventListener('focus', onFocus);
         return () => {
             cancelled = true;
             window.removeEventListener(EVENT_NAME, onChanged);
+            window.removeEventListener('focus', onFocus);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [storageKey]);
+    }, [storageKey, refreshKey]);
 
     const persist = useCallback((next: TableColumnsConfig<TColId>) => {
         setConfig(next);
@@ -317,7 +323,18 @@ export function useTableColumns<TColId extends string>(
                     : {};
                 const updated = {
                     ...base,
-                    [SETTINGS_GROUP]: { ...uiSettings, [storageKey]: next },
+                    [SETTINGS_GROUP]: {
+                        ...uiSettings,
+                        [storageKey]: {
+                            ...readSettingsBlob(existing, storageKey) as Record<string, unknown>,
+                            ...next,
+                            // Keep columns used only by the CLI (e.g. groups).
+                            visibility: {
+                                ...(readSettingsBlob(existing, storageKey) as TableColumnsConfig<TColId> | undefined)?.visibility,
+                                ...next.visibility,
+                            },
+                        },
+                    },
                 };
                 await secureStoreAndClean(VAULT_ACCOUNT, VAULT_KEY, updated);
                 window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: updated }));
