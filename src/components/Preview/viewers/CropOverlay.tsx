@@ -7,6 +7,13 @@
  * Renders a Photoshop-style crop rectangle with darkened surrounds,
  * 8 resize handles, and a dimension badge. Supports free and
  * fixed-aspect-ratio cropping via mouse interaction.
+ *
+ * The selection starts from the crop already chosen, or else as the whole
+ * image with its handles on the image edges, as in other image editors. Every coordinate is relative to the image's own
+ * box, and the drawing sits in a frame placed over that box: the overlay
+ * itself covers the whole viewer, where the image is centred with margins,
+ * and drawing in the overlay's frame shifted the selection by the margin, so
+ * part of the image could not be reached.
  */
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
@@ -16,6 +23,8 @@ import { useI18n } from '../../../i18n';
 interface CropOverlayProps {
     imageRef: React.RefObject<HTMLImageElement | null>;
     aspectRatio: number | null;
+    /** The crop already chosen (natural pixels), to start from; none: the whole image. */
+    initialCrop?: CropRect | null;
     onCropChange: (natural: CropRect) => void;
     onCancel: () => void;
 }
@@ -30,7 +39,12 @@ const HANDLE_CURSORS: Record<HandleId, string> = {
 
 const MIN_SIZE = 10;
 
-export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio, onCropChange, onCancel }) => {
+/** A selection of the whole image, which is no crop at all. */
+export function cropCoversWholeImage(c: CropRect, naturalWidth: number, naturalHeight: number): boolean {
+    return c.x <= 0 && c.y <= 0 && c.x + c.width >= naturalWidth && c.y + c.height >= naturalHeight;
+}
+
+export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio, initialCrop, onCropChange, onCancel }) => {
     useI18n(); // keep hook call even if not used for keys yet
 
     // Screen-space crop rect (relative to image bounding rect)
@@ -38,6 +52,9 @@ export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio,
     const dragMode = useRef<DragMode>({ kind: 'none' });
     const cropRef = useRef(crop);
     cropRef.current = crop;
+    const overlayRef = useRef<HTMLDivElement>(null);
+    // Bumped when the image box changes size, so the frame is placed again.
+    const [, setLayout] = useState(0);
 
     // --- coordinate helpers ---------------------------------------------------
 
@@ -164,6 +181,57 @@ export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio,
         return () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
     }, [imgRect, clampScreen, enforce, emitCrop]);
 
+    // Start from the crop already chosen, or else the whole image, and keep
+    // the selection on the same part of the image when the viewer changes.
+    useEffect(() => {
+        const img = imageRef.current;
+        if (!img) return undefined;
+        let last = img.getBoundingClientRect();
+        let started = false;
+        // On the first box with a size: the image can still be laid out at
+        // zero size when the overlay mounts, and then the first observation
+        // is where the selection starts.
+        const start = (box: DOMRect) => {
+            if (started || box.width <= 0 || box.height <= 0) return;
+            started = true;
+            const kx = img.naturalWidth > 0 ? box.width / img.naturalWidth : 1;
+            const ky = img.naturalHeight > 0 ? box.height / img.naturalHeight : 1;
+            const first = initialCrop
+                ? { x: initialCrop.x * kx, y: initialCrop.y * ky, w: initialCrop.width * kx, h: initialCrop.height * ky }
+                : { x: 0, y: 0, w: box.width, h: box.height };
+            setCrop(first);
+            emitCrop(first);
+        };
+        start(last);
+        if (typeof ResizeObserver === 'undefined') return undefined;
+        // The image is centred in the viewer: the viewer can change width while
+        // the image, limited by its height, keeps its size and only moves. So
+        // the overlay (which covers the viewer) is watched too, and every
+        // change places the frame again.
+        const observer = new ResizeObserver(() => {
+            const now = img.getBoundingClientRect();
+            if (now.width <= 0 || now.height <= 0) return;
+            if (!started) {
+                start(now);
+                last = now;
+                setLayout((n) => n + 1);
+                return;
+            }
+            const sx = last.width > 0 ? now.width / last.width : 1;
+            const sy = last.height > 0 ? now.height / last.height : 1;
+            last = now;
+            if (sx !== 1 || sy !== 1) {
+                setCrop((c) => (c ? { x: c.x * sx, y: c.y * sy, w: c.w * sx, h: c.h * sy } : c));
+            }
+            setLayout((n) => n + 1);
+        });
+        observer.observe(img);
+        if (overlayRef.current) observer.observe(overlayRef.current);
+        return () => observer.disconnect();
+        // Once per crop session: emitCrop changes with its parent's callback.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [imageRef]);
+
     // Escape key
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel(); };
@@ -224,16 +292,24 @@ export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio,
     const r = imgRect();
     const cw = r?.width ?? 0;
     const ch = r?.height ?? 0;
+    // Where the image box sits inside the overlay: the drawing frame.
+    const o = overlayRef.current?.getBoundingClientRect();
+    const frame = r && o ? { left: r.left - o.left, top: r.top - o.top } : { left: 0, top: 0 };
 
     return (
         <div
+            ref={overlayRef}
             className="absolute inset-0 select-none"
             style={{ cursor }}
             onMouseDown={onPointerDown}
             onMouseMove={onMouseMoveLocal}
         >
             {crop && (
-                <>
+                <div
+                    data-crop-frame
+                    className="absolute pointer-events-none"
+                    style={{ left: frame.left, top: frame.top, width: cw, height: ch }}
+                >
                     {/* Darkening panels */}
                     <div className="absolute bg-black/50" style={{ top: 0, left: 0, width: cw, height: crop.y }} />
                     <div className="absolute bg-black/50" style={{ top: crop.y, left: 0, width: crop.x, height: crop.h }} />
@@ -242,6 +318,7 @@ export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio,
 
                     {/* Crop border */}
                     <div
+                        data-crop-border
                         className="absolute border-2 border-dashed border-white pointer-events-none"
                         style={{ left: crop.x, top: crop.y, width: crop.w, height: crop.h }}
                     />
@@ -270,7 +347,7 @@ export const CropOverlay: React.FC<CropOverlayProps> = ({ imageRef, aspectRatio,
                             </span>
                         </div>
                     )}
-                </>
+                </div>
             )}
         </div>
     );
