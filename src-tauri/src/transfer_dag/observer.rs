@@ -65,6 +65,15 @@ pub trait DagObserver: Send + Sync {
     /// 1:1 onto the existing `sync_scan_progress` event. Default: no-op.
     fn on_scan_progress(&self, _scanned: usize, _in_flight: usize) {}
 
+    /// Running totals of a remote walk that lists directory by directory:
+    /// `files` kept so far, the `dirs` the listings have named, and the sum
+    /// of the kept files' sizes in `bytes`. Called beside
+    /// [`Self::on_scan_progress`], with the same cadence, and once more when
+    /// the walk ends, so the last call carries the final totals. The flat
+    /// recursive listing a provider may answer with instead does not report
+    /// here. Default: no-op.
+    fn on_scan_totals(&self, _files: usize, _dirs: usize, _bytes: u64) {}
+
     /// Final accumulated metrics for a graph run. Default: no-op.
     fn on_metrics(&self, _metrics: &TransferDagMetrics) {}
 }
@@ -104,6 +113,12 @@ impl DagObserver for OrderedDagObserver {
     fn on_scan_progress(&self, scanned: usize, in_flight: usize) {
         for observer in &self.observers {
             observer.on_scan_progress(scanned, in_flight);
+        }
+    }
+
+    fn on_scan_totals(&self, files: usize, dirs: usize, bytes: u64) {
+        for observer in &self.observers {
+            observer.on_scan_totals(files, dirs, bytes);
         }
     }
 

@@ -10027,8 +10027,10 @@ pub struct UsedScanProgress {
 /// (item 4b). The fast path uses `used_scan::reduce_fastpath_listing` so
 /// it cannot drift from `scan_used_bytes` on the cap or a listing the
 /// provider itself cut; a cancel drops the whole future in `run_used_scan`.
-/// The GUI BFS stays inline so it can
-/// re-lock the provider per directory. NEVER called automatically: the GUI
+/// The walk is `used_scan::walk_used_bytes`, the same one the CLI runs,
+/// which locks the provider per step rather than for the whole tree and
+/// lists several folders at once where the provider allows it (#958).
+/// NEVER called automatically: the GUI
 /// "Calculate used storage" action invokes it. Persisting the figure into
 /// the profile's lastQuota is done frontend-side, and only when the scan
 /// is complete (`truncated` and `cancelled` both false).
@@ -10059,19 +10061,19 @@ pub async fn provider_scan_used(
     .await
 }
 
-/// Body of [`provider_scan_used`]. `dir_limit` bounds each BFS directory
-/// listing; the single-shot fast path gets no wall clock (see below).
+/// Body of [`provider_scan_used`]. `dir_limit` bounds each directory listing
+/// of the walk; the single-shot fast path gets no wall clock (see below).
 async fn provider_scan_used_inner(
     state: &ProviderState,
     path: String,
     dir_limit: Duration,
-    emit_progress: impl Fn(u64, u64, bool),
+    emit_progress: impl Fn(u64, u64, bool) + Send + Sync,
 ) -> Result<UsedScanResult, String> {
     // Cancellation drops this whole future in `run_used_scan`, so the
     // reducer's own cancel flag is never raised on this path.
     let never_cancelled = AtomicBool::new(false);
 
-    const MAX_DEPTH: usize = 100;
+    // The depth parachute is the walker's own (`DEFAULT_SCAN_DEPTH`, 100).
     const MAX_ENTRIES: u64 = 500_000;
     let root = if path.trim().is_empty() {
         "/".to_string()
@@ -10112,102 +10114,38 @@ async fn provider_scan_used_inner(
         }
     }
 
-    // --- Generic BFS: re-lock the provider per directory ---------------
-    // Mirrors provider_calculate_folder_size so cancel stays responsive
-    // and other remote operations on this session can interleave instead
-    // of blocking for the whole (possibly huge) walk.
-    let mut used = 0u64;
-    let mut file_count = 0u64;
-    let mut dir_count = 0u64;
-    let mut truncated = false;
-    let mut unreadable_dirs = 0u64;
-    let mut hit_cap = false;
-    let mut queue: Vec<(String, usize)> = {
+    // --- Shared walker: several directories at once on a provider that
+    // lists on independent clones, one at a time under the provider lock
+    // otherwise. Either way the provider is locked per step, never for the
+    // whole walk, so other remote operations on this session interleave
+    // with it. `dir_limit` bounds each listing; a folder past it is
+    // unreadable and its siblings are still walked (#958, #960).
+    let roots = {
         let guard = state.provider.lock().await;
-        let provider = guard
+        guard
             .as_ref()
-            .ok_or_else(|| "Not connected to any provider".to_string())?;
-        provider
+            .ok_or_else(|| "Not connected to any provider".to_string())?
             .used_scan_roots(&root)
-            .into_iter()
-            .map(|r| (r, 0))
-            .collect()
     };
-    let mut last_emit = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_millis(400))
-        .unwrap_or_else(std::time::Instant::now);
-
-    while let Some((dir, depth)) = queue.pop() {
-        if depth >= MAX_DEPTH || (file_count + dir_count) >= MAX_ENTRIES {
-            truncated = true;
-            hit_cap = true;
-            continue;
-        }
-        let entries = {
-            let mut guard = state.provider.lock().await;
-            let provider = guard
-                .as_mut()
-                .ok_or_else(|| "Not connected to any provider".to_string())?;
-            match storage_metadata_read(dir_limit, provider.list(&dir)).await {
-                Ok(Ok(e)) => e,
-                Ok(Err(e)) => {
-                    // A single unreadable directory must not abort the
-                    // whole figure: the result is a lower bound.
-                    tracing::warn!("[provider_scan_used] failed to list {}: {}", dir, e);
-                    truncated = true;
-                    unreadable_dirs += 1;
-                    continue;
-                }
-                Err(e) => {
-                    // A timeout is also an unreadable directory, not a reason
-                    // to discard prior counts or skip the remaining siblings.
-                    tracing::warn!("[provider_scan_used] timed out listing {}: {}", dir, e);
-                    truncated = true;
-                    unreadable_dirs += 1;
-                    continue;
-                }
+    let last_emit = std::sync::Mutex::new(None::<std::time::Instant>);
+    let scan = crate::used_scan::walk_used_bytes(
+        &state.provider,
+        &roots,
+        None,
+        MAX_ENTRIES as usize,
+        Some(dir_limit),
+        None,
+        &|files, bytes| {
+            let mut last = last_emit.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_none_or(|at| at.elapsed() >= Duration::from_millis(250)) {
+                emit_progress(files, bytes, true);
+                *last = Some(std::time::Instant::now());
             }
-        };
-        for entry in entries {
-            // Skip symlinks: a symlink-to-dir is reported with both is_dir
-            // and is_symlink (sftp.rs), so following it lets cur->. / up->..
-            // cycles inflate the figure and exhaust the budget. Matches the
-            // MCP scan, used_scan.rs and the sftp rmdir_recursive precedent.
-            if entry.is_symlink {
-                continue;
-            }
-            // Cap inside the loop (not only between directories) so one
-            // hostile listing cannot grow the queue past MAX_ENTRIES.
-            if (file_count + dir_count) >= MAX_ENTRIES {
-                truncated = true;
-                hit_cap = true;
-                break;
-            }
-            if entry.is_dir {
-                dir_count += 1;
-                queue.push((entry.path.clone(), depth + 1));
-            } else {
-                used = used.saturating_add(entry.size);
-                file_count += 1;
-            }
-        }
-        if last_emit.elapsed() >= std::time::Duration::from_millis(250) {
-            emit_progress(file_count, used, true);
-            last_emit = std::time::Instant::now();
-        }
-    }
-
-    emit_progress(file_count, used, false);
-    Ok(UsedScanResult {
-        used,
-        file_count,
-        dir_count,
-        truncated,
-        cancelled: false,
-        unreadable_dirs,
-        hit_cap,
-        method: "bfs".to_string(),
-    })
+        },
+    )
+    .await;
+    emit_progress(scan.file_count, scan.used_bytes, false);
+    Ok(UsedScanResult::from(&scan))
 }
 
 /// Cancel an in-progress used-storage scan.
@@ -14875,10 +14813,71 @@ mod tests {
             "partial totals must never be persisted as complete"
         );
         assert!(!result.cancelled && !result.hit_cap);
-        assert_eq!(result.method, "bfs");
+        // WebDAV lists on the clone pool (#958): the slow folder times out on
+        // its own worker while the others are listed.
+        assert_eq!(result.method, "bfs-parallel");
         let progress = progress.lock().unwrap();
         assert_eq!(progress.first(), Some(&(1, 5, true)));
         assert_eq!(progress.last(), Some(&(2, 12, false)));
+        assert!(state.provider.try_lock().is_ok());
+    }
+
+    /// #958: a WebDAV used-storage scan lists several folders at once. Each
+    /// sub-folder answers only once all four are being listed together, so
+    /// the one-folder-at-a-time walk WebDAV had before never finishes.
+    #[tokio::test]
+    async fn ehud_webdav_used_scan_lists_folders_at_once() {
+        use axum::{http::StatusCode, routing::any, Router};
+        let rendezvous = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let rendezvous = rendezvous.clone();
+            async move {
+                if request
+                    .headers()
+                    .get("depth")
+                    .is_some_and(|v| v == "infinity")
+                {
+                    return (StatusCode::FORBIDDEN, String::new()); // Walk folder by folder.
+                }
+                let folder = request.uri().path().trim_end_matches('/').to_string();
+                let body = if folder.is_empty() {
+                    dav_listing(&[
+                        ("/", None),
+                        ("/a/", None),
+                        ("/b/", None),
+                        ("/c/", None),
+                        ("/d/", None),
+                    ])
+                } else {
+                    rendezvous.wait().await;
+                    let own = format!("{folder}/");
+                    let file = format!("{folder}/f.bin");
+                    dav_listing(&[(own.as_str(), None), (file.as_str(), Some(10))])
+                };
+                (StatusCode::MULTI_STATUS, body)
+            }
+        }));
+        let (state, server) = dav_state(app, |_| {}).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::provider_scan_used_inner(
+                &state,
+                "/".into(),
+                Duration::from_secs(5),
+                |_, _, _| {},
+            ),
+        )
+        .await;
+        server.abort();
+        let result = result
+            .expect("four folders are listed together; one at a time never finishes")
+            .expect("the scan answers");
+        assert_eq!(
+            (result.used, result.file_count, result.dir_count),
+            (40, 4, 4)
+        );
+        assert!(!result.truncated && result.unreadable_dirs == 0);
+        assert_eq!(result.method, "bfs-parallel");
         assert!(state.provider.try_lock().is_ok());
     }
 
@@ -15855,9 +15854,11 @@ mod tests {
         let result = result
             .expect("a stalled Depth: infinity must fall back within the header cap")
             .unwrap();
+        // The fallback is the folder-by-folder walk, on the list clone pool
+        // since #958.
         assert_eq!(
             (result.method.as_str(), result.used, result.file_count),
-            ("bfs", 12, 2)
+            ("bfs-parallel", 12, 2)
         );
         assert_eq!(result.unreadable_dirs, 0);
     }

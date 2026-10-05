@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use super::{
-    sanitize_api_error, MultipartHandle, ProviderError, ProviderTransferExecutorKind, ProviderType,
-    RemoteEntry, ShareLinkCapabilities, ShareLinkOptions, ShareLinkResult, StorageProvider,
-    UploadedPart, WebDavConfig,
+    sanitize_api_error, MultipartHandle, ProviderError, ProviderListExecutorKind,
+    ProviderTransferExecutorKind, ProviderType, RemoteEntry, ShareLinkCapabilities,
+    ShareLinkOptions, ShareLinkResult, StorageProvider, UploadedPart, WebDavConfig,
 };
 
 /// Encode one untrusted Nextcloud trash identifier as exactly one URL segment.
@@ -591,6 +591,9 @@ const WEBDAV_MULTI_THREAD_MAX_STREAMS: usize = 16;
 /// knob (issue #591): independent WebDAV GET/PUT of distinct files is safe
 /// on a cloned `reqwest::Client`.
 const WEBDAV_TRANSFER_MAX_SESSIONS: u16 = 8;
+/// Directories a walk lists at once (#958): the shared walker's default
+/// checkers, and rclone's `--checkers`, which lists WebDAV the same way.
+const WEBDAV_LIST_MAX_SESSIONS: u16 = 8;
 
 impl WebDavProvider {
     /// Create a new WebDAV provider with the given configuration
@@ -5028,6 +5031,32 @@ impl StorageProvider for WebDavProvider {
         WEBDAV_TRANSFER_MAX_SESSIONS
     }
 
+    fn list_executor_kind(&self) -> ProviderListExecutorKind {
+        ProviderListExecutorKind::HttpClonePool
+    }
+
+    fn list_executor_max_sessions(&self) -> u16 {
+        WEBDAV_LIST_MAX_SESSIONS
+    }
+
+    /// Mint an independent worker for a directory walk that lists several
+    /// folders at once (#958): the used-storage scan, AeroSync Compare, the
+    /// CLI and MCP walks. A `PROPFIND Depth: 1` on one collection shares no
+    /// state with one on another, and the clone shares the `reqwest::Client`
+    /// and the Digest challenge exactly as [`Self::clone_for_transfer`] does,
+    /// so a nonce rotation seen by one worker repairs the pool.
+    ///
+    /// A single-file profile (#264) has one resource and no tree: every path
+    /// maps to the configured URL, so it keeps walking on the one session.
+    fn clone_for_list(&self) -> Result<Box<dyn StorageProvider>, ProviderError> {
+        if self.single_file_mode.is_some() {
+            return Err(ProviderError::NotSupported(
+                "a single-file WebDAV profile has no tree to list in parallel".to_string(),
+            ));
+        }
+        Ok(Box::new(self.clone()))
+    }
+
     /// Mint an independent worker for file-level parallelism and Nextcloud
     /// chunked-upload parts.
     ///
@@ -6882,11 +6911,47 @@ mod tests {
             crate::transfer_dag::Capability::Supported
         );
         assert_eq!(caps.max_file_slots, Some(WEBDAV_TRANSFER_MAX_SESSIONS));
-        // List stays locked: this promotion is file-transfer only.
+        // #958: a walk lists several collections at once as well.
+        assert_eq!(
+            caps.list_parallel,
+            crate::transfer_dag::Capability::Supported
+        );
+        assert_eq!(caps.max_checker_slots, Some(WEBDAV_LIST_MAX_SESSIONS));
+        assert_eq!(
+            p.list_executor_kind(),
+            ProviderListExecutorKind::HttpClonePool
+        );
+        assert!(p.clone_for_list().is_ok());
+    }
+
+    /// #958: a single-file profile (#264) maps every path to its one URL, so
+    /// a parallel walk would list the same resource N times. It keeps the
+    /// single locked session.
+    #[test]
+    fn single_file_webdav_profile_lists_on_one_session() {
+        let mut p =
+            WebDavProvider::new(test_config("https://dav.example.com/file.bin")).expect("provider");
+        p.single_file_mode = Some(RemoteEntry {
+            name: "file.bin".to_string(),
+            path: "/file.bin".to_string(),
+            is_dir: false,
+            size: 1,
+            modified: None,
+            permissions: None,
+            owner: None,
+            group: None,
+            is_symlink: false,
+            link_target: None,
+            mime_type: None,
+            metadata: Default::default(),
+        });
+        assert!(p.clone_for_list().is_err());
+        let caps = p.transfer_capabilities();
         assert_eq!(
             caps.list_parallel,
             crate::transfer_dag::Capability::Unsupported
         );
+        assert_eq!(caps.max_checker_slots, Some(1));
     }
 
     /// Issue #591 — Nextcloud still clones for chunked-v2 parts, and now also

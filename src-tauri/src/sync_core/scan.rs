@@ -83,6 +83,19 @@ pub struct ScanOptions {
     /// overlay so encrypted path segments are gathered in the same shape as
     /// the regular provider browser.
     pub disable_recursive_fastpath: bool,
+    /// Upper bound on listing one directory, the transport retry included
+    /// (`None` = no bound beyond the provider's own timeouts). A listing that
+    /// runs past it is a directory the walk could not list: counted in
+    /// `list_errors` like any other failure, its siblings still walked. The
+    /// used-storage scan sets it so one server that stops answering on one
+    /// folder costs that folder, not the figure (#958, #960).
+    pub dir_list_timeout: Option<std::time::Duration>,
+    /// Leave symbolic links out entirely, files and directories alike, and
+    /// record no skipped link for them. A used-storage figure counts what the
+    /// tree itself occupies, and a link's target is counted where it lives:
+    /// following one lets a link to `.` or `..` inflate the figure. A sync
+    /// keeps the default, since it needs the links it does not follow named.
+    pub skip_symlinks: bool,
 }
 
 impl ScanOptions {
@@ -1078,6 +1091,10 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
 
     let mut results = Vec::new();
     let mut boundaries = ScanBoundaries::default();
+    // Running totals for `DagObserver::on_scan_totals`: the directories the
+    // listings named and the bytes of the files kept.
+    let mut dirs_seen = 0usize;
+    let mut bytes_seen = 0u64;
     let mut queue = VecDeque::from([RemoteScanDir {
         abs_dir: remote_root.to_string(),
         rel_prefix: String::new(),
@@ -1085,7 +1102,11 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
     }]);
     let mut join_set = JoinSet::new();
     let mut in_flight = 0usize;
-    let mut last_progress = std::time::Instant::now();
+    // Back-dated by one interval, so the first listing to land is reported at
+    // once instead of after the throttle.
+    let mut last_progress = std::time::Instant::now()
+        .checked_sub(SCAN_PROGRESS_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
 
     while (!queue.is_empty() || in_flight > 0) && results.len() + boundaries.len() < cap {
         if scan_cancelled(&cancel) {
@@ -1155,6 +1176,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                         completeness.truncated = true;
                         break;
                     }
+                    bytes_seen = bytes_seen.saturating_add(file.size);
                     results.push(file);
                 }
                 for dir in batch.dirs {
@@ -1163,6 +1185,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                         completeness.truncated = true;
                         break;
                     }
+                    dirs_seen += 1;
                     queue.push_back(dir);
                 }
             }
@@ -1202,6 +1225,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
         if let Some(obs) = observer {
             if last_progress.elapsed() >= SCAN_PROGRESS_INTERVAL {
                 obs.on_scan_progress(results.len(), in_flight);
+                obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
                 last_progress = std::time::Instant::now();
             }
         }
@@ -1221,6 +1245,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
 
     if let Some(obs) = observer {
         obs.on_scan_progress(results.len(), 0);
+        obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
     }
     (results, completeness, boundaries)
 }
@@ -1248,6 +1273,9 @@ async fn scan_remote_tree_locked(
     let mut results = Vec::new();
     let mut boundaries = ScanBoundaries::default();
     let mut completeness = ScanCompleteness::default();
+    // Running totals for `DagObserver::on_scan_totals`, as on the pooled walk.
+    let mut dirs_seen = 0usize;
+    let mut bytes_seen = 0u64;
     let resource_manager = TransferResourceManager::new(TransferBudget {
         checker_slots: 1,
         ..TransferBudget::from_file_slots(1)
@@ -1341,8 +1369,10 @@ async fn scan_remote_tree_locked(
                         boundaries.unbounded.get_or_insert("entry_cap");
                         break;
                     }
+                    bytes_seen = bytes_seen.saturating_add(file.size);
                     results.push(file);
                 }
+                dirs_seen += batch.dirs.len();
                 for dir in batch.dirs {
                     queue.push_back(dir);
                 }
@@ -1373,6 +1403,7 @@ async fn scan_remote_tree_locked(
         // pre-clone-pool path produced (no throttle needed here).
         if let Some(obs) = observer {
             obs.on_scan_progress(results.len(), usize::from(!queue.is_empty()));
+            obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
         }
     }
 
@@ -1383,6 +1414,7 @@ async fn scan_remote_tree_locked(
     }
     if let Some(obs) = observer {
         obs.on_scan_progress(results.len(), 0);
+        obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
     }
     (results, completeness, boundaries)
 }
@@ -1591,7 +1623,27 @@ async fn scan_remote_dir(
     cancel: &Option<Arc<std::sync::atomic::AtomicBool>>,
     link_budget: usize,
 ) -> Result<RemoteScanBatch, RemoteScanFailure> {
-    let entries = match list_with_transport_retry(provider, &dir.abs_dir).await {
+    let listed = match opts.dir_list_timeout {
+        Some(limit) => {
+            match tokio::time::timeout(limit, list_with_transport_retry(provider, &dir.abs_dir))
+                .await
+            {
+                Ok(listed) => listed,
+                // A directory that never answered is unreadable, not absent:
+                // asking the same server whether the root exists could stall
+                // as long again, so the timeout skips that question.
+                Err(_) => {
+                    return Err(RemoteScanFailure {
+                        rel_prefix: dir.rel_prefix.clone(),
+                        root_absent: false,
+                        message: format!("timed out listing {} after {limit:?}", dir.abs_dir),
+                    })
+                }
+            }
+        }
+        None => list_with_transport_retry(provider, &dir.abs_dir).await,
+    };
+    let entries = match listed {
         Ok(entries) => entries,
         Err(error) => {
             return Err(RemoteScanFailure {
@@ -1611,6 +1663,9 @@ async fn scan_remote_dir(
         if scan_cancelled(cancel) {
             cancelled = true;
             break;
+        }
+        if opts.skip_symlinks && entry.is_symlink {
+            continue;
         }
         let entry_rel = if dir.rel_prefix.is_empty() {
             entry.name.clone()
