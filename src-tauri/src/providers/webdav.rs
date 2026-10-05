@@ -1238,20 +1238,6 @@ impl WebDavProvider {
         }
     }
 
-    /// Send a PROPFIND and, on a `401` that carries a fresh
-    /// `WWW-Authenticate: Digest` challenge, re-negotiate the Digest state
-    /// once and retry the request.
-    ///
-    /// Long recursive scans (`check` / `tree` right after `sync`) issue many
-    /// sequential PROPFIND requests reusing one cached `nonce`. Servers and
-    /// reverse proxies expire that nonce by TTL or by use count and answer
-    /// `401 ... stale=true` with a brand-new nonce, expecting the client to
-    /// re-handshake (RFC 2617 section 3.3). Without this, the first stale
-    /// `401` was surfaced as `Session expired` even though the credentials
-    /// were still valid: the WebDAV recursive-scan defect reproduced against
-    /// `dav.lab.example.test`. Basic-auth servers never emit a Digest challenge,
-    /// so a genuine `401` there still propagates unchanged for the caller to
-    /// map.
     /// One `PROPFIND` of a collection (`Depth: 0` or `1`), paced for a server
     /// that limits concurrency (#958). A 429 or 503 is sent again after the
     /// pause the server asks for (`Retry-After`) or an exponential one (1, 2,
@@ -1314,6 +1300,20 @@ impl WebDavProvider {
         }
     }
 
+    /// Send a PROPFIND and, on a `401` that carries a fresh
+    /// `WWW-Authenticate: Digest` challenge, re-negotiate the Digest state
+    /// once and retry the request.
+    ///
+    /// Long recursive scans (`check` / `tree` right after `sync`) issue many
+    /// sequential PROPFIND requests reusing one cached `nonce`. Servers and
+    /// reverse proxies expire that nonce by TTL or by use count and answer
+    /// `401 ... stale=true` with a brand-new nonce, expecting the client to
+    /// re-handshake (RFC 2617 section 3.3). Without this, the first stale
+    /// `401` was surfaced as `Session expired` even though the credentials
+    /// were still valid: the WebDAV recursive-scan defect reproduced against
+    /// `dav.lab.example.test`. Basic-auth servers never emit a Digest challenge,
+    /// so a genuine `401` there still propagates unchanged for the caller to
+    /// map.
     async fn send_propfind(
         &mut self,
         path: &str,
