@@ -1268,6 +1268,11 @@ impl WebDavProvider {
         // providers that use the helper. Every attempt is built afresh, so a
         // Digest session spends a new nonce count on each. `Depth: infinity`
         // stays one attempt: on any failure its callers walk folder by folder.
+        //
+        // The nonce this request goes out with, for the 401 below: on a walk
+        // several clones share one Digest challenge, so a sibling may already
+        // have adopted the rotated nonce this request was refused for.
+        let nonce_used = self.digest_nonce_snapshot();
         let response = if depth == "infinity" {
             self.request(webdav_methods::propfind(), path)
                 .header("Depth", depth)
@@ -1308,17 +1313,16 @@ impl WebDavProvider {
         // pointing at the old challenge and the repair would reach exactly one
         // of them: the same defect sharing the challenge exists to prevent.
         match self.digest_auth.as_ref() {
-            Some(existing) => {
-                if !existing.renegotiate(&www_auth) {
-                    // Not a usable Digest challenge (Basic auth, or a genuine
-                    // credential failure): let the caller map the 401.
+            Some(_) => {
+                // Replay once when this worker adopts the rotated nonce, or when
+                // a sibling already did and the nonce held now is not the one
+                // this request carried (#1080 review): `renegotiate` alone
+                // refused that second case, and the folder was reported
+                // unreadable while the pool was already repaired. Anything else
+                // (Basic auth, a genuine credential failure) goes to the caller.
+                if !self.should_replay_after_401(&response, &nonce_used) {
                     return Ok(response);
                 }
-                tracing::debug!(
-                    "[WebDAV] PROPFIND 401, adopted rotated nonce for every worker (realm={}, nonce={}...)",
-                    existing.realm(),
-                    existing.nonce_prefix()
-                );
             }
             None => {
                 let Some(state) = DigestState::parse(&www_auth) else {

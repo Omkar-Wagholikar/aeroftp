@@ -14951,6 +14951,104 @@ mod tests {
         assert_eq!(limited_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// #1080 review: the clones of a parallel walk share one Digest challenge.
+    /// Two folders go out with the same nonce and are both refused
+    /// `stale=true` for a rotated one; whichever worker reads its 401 second
+    /// finds the rotation already adopted by its sibling. It must replay its
+    /// listing, not report a healthy folder unreadable.
+    #[tokio::test]
+    async fn ehud_webdav_parallel_walk_survives_a_digest_nonce_rotation() {
+        use crate::providers::{webdav::WebDavProvider, StorageProvider, WebDavConfig};
+        use axum::{http::StatusCode, response::IntoResponse, routing::any, Router};
+        let both_refused = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let both_refused = both_refused.clone();
+            async move {
+                let challenge = |nonce: &str, stale: bool| {
+                    let stale = if stale { ", stale=true" } else { "" };
+                    format!(r#"Digest realm="fixture", nonce="{nonce}", qop="auth"{stale}"#)
+                };
+                let auth = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                if !auth.starts_with("Digest ") {
+                    let header = [("www-authenticate", challenge("N1", false))];
+                    return (StatusCode::UNAUTHORIZED, header, String::new()).into_response();
+                }
+                if request
+                    .headers()
+                    .get("depth")
+                    .is_some_and(|v| v == "infinity")
+                {
+                    return StatusCode::FORBIDDEN.into_response(); // Walk folder by folder.
+                }
+                let folder = request.uri().path().trim_end_matches('/').to_string();
+                let first_nonce = auth.contains(r#"nonce="N1""#);
+                match folder.as_str() {
+                    "" => (
+                        StatusCode::MULTI_STATUS,
+                        dav_listing(&[("/", None), ("/a/", None), ("/b/", None)]),
+                    )
+                        .into_response(),
+                    "/a" | "/b" if first_nonce => {
+                        // Both listings are in flight with N1 before either is
+                        // refused, the way a rotation lands mid-walk.
+                        both_refused.wait().await;
+                        let header = [("www-authenticate", challenge("N2", true))];
+                        (StatusCode::UNAUTHORIZED, header, String::new()).into_response()
+                    }
+                    "/a" | "/b" => {
+                        let own = format!("{folder}/");
+                        let file = format!("{folder}/f.bin");
+                        let body = dav_listing(&[(own.as_str(), None), (file.as_str(), Some(10))]);
+                        (StatusCode::MULTI_STATUS, body).into_response()
+                    }
+                    path => panic!("unexpected path: {path}"),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut provider = WebDavProvider::new(WebDavConfig {
+            url: format!("http://{addr}"),
+            username: "fixture".into(),
+            password: secrecy::SecretString::from("fixture".to_string()),
+            initial_path: None,
+            provider_id: None,
+            verify_cert: true,
+            anonymous: false,
+        })
+        .unwrap();
+        provider.connect().await.unwrap();
+        let state = ProviderState::new();
+        *state.provider.lock().await = Some(Box::new(provider));
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::provider_scan_used_inner(
+                &state,
+                "/".into(),
+                Duration::from_secs(5),
+                |_, _, _| {},
+            ),
+        )
+        .await;
+        server.abort();
+        let result = result.expect("the walk ends").expect("the scan answers");
+        assert_eq!(
+            (result.used, result.file_count, result.unreadable_dirs),
+            (20, 2, 0),
+            "the worker whose sibling adopted the new nonce replays its listing"
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.method, "bfs-parallel");
+    }
+
     #[tokio::test]
     async fn ehud_cancel_interrupts_a_stalled_webdav_infinity_request() {
         use crate::providers::{webdav::WebDavProvider, StorageProvider, WebDavConfig};
