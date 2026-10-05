@@ -152,6 +152,20 @@ way: an importer reads whatever connection types it recognizes in the file.)
   AeroFTP returns an actionable message asking you to add a file inside the
   folder first, or to use the native Filen API or the WebDAV bridge for that
   operation.
+- Creating a folder on `filen-desktop-s3` does not write a directory marker.
+  Filen Desktop 3.x serves the bucket with `rclone serve s3`, which stored
+  `PUT <name>/` as a zero-byte file and then answered 500 for a folder created
+  inside it (the `aeroftp-bench` file left by a benchmark on 4.2.2 and earlier).
+  Uploading a file under the name creates the folders. An empty folder is not
+  kept until a file is uploaded into it, so it does not appear in a listing
+  made straight after mkdir. A file that already has that name is left in
+  place and mkdir says so. A download of a file just uploaded on this preset
+  waits up to 30 seconds if the first GET answers 404, and returns as soon
+  as the object is visible. `rclone serve s3 --vfs-write-back 5s` hides it
+  for about 5 seconds and then copies it onto Filen. A zero-byte file
+  that is already gone from the account but still in Filen Desktop's cache
+  is invisible to that check: HEAD answers 404 and the upload PUT answers 500.
+  Delete the file in Filen and clear the desktop cache before a retest.
 
 ---
 
