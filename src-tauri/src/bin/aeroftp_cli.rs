@@ -44082,9 +44082,12 @@ async fn cmd_speed(
         }
     }
 
-    let remote_test_path = remote_path
-        .map(|path| path.to_string())
-        .unwrap_or_else(|| format!("/.aeroftp-speedtest-{}.bin", uuid::Uuid::new_v4()));
+    let remote_test_path = remote_path.map(|path| path.to_string()).unwrap_or_else(|| {
+        ftp_client_gui_lib::speed_payload::name(&format!(
+            "/.aeroftp-speedtest-{}",
+            uuid::Uuid::new_v4()
+        ))
+    });
 
     let outcome = run_single_speed_test(
         url,
@@ -44445,7 +44448,10 @@ async fn cmd_speed_compare(
     let test_futures = urls.iter().map(|url| async move {
         let raw_url = url.clone();
         let display_url = redact_url_for_display(&raw_url);
-        let remote_test_path = format!("/.aeroftp-speedtest-{}.bin", uuid::Uuid::new_v4());
+        let remote_test_path = ftp_client_gui_lib::speed_payload::name(&format!(
+            "/.aeroftp-speedtest-{}",
+            uuid::Uuid::new_v4()
+        ));
         let result = run_single_speed_test(
             &raw_url,
             size,
@@ -44873,7 +44879,8 @@ async fn run_many_files_workload(
     }
 
     let size = mf.file_size_bytes;
-    let remote_name = |i: u32| format!("{}/f{:06}.bin", many_dir, i);
+    let remote_name =
+        |i: u32| ftp_client_gui_lib::speed_payload::name(&format!("{}/f{:06}", many_dir, i));
 
     if !cli.quiet && matches!(format, OutputFormat::Text) {
         eprintln!(
@@ -45400,6 +45407,29 @@ fn benchmark_remote_roots_from_prefix(prefix: &str, report_id: &str) -> (String,
 /// `AlreadyExists` as success. Returns the error of the deepest component that
 /// still failed (so the caller can decide whether to hard-fail), or `Ok` when
 /// the full path now exists.
+/// The benchmark's word on the trash purge of `path`: announced when it purged,
+/// a line in `errors` when the provider refused or failed, nothing when there
+/// was nothing to purge.
+fn note_trash_purge(
+    path: &str,
+    outcome: Result<bool, ProviderError>,
+    announce: bool,
+    errors: &mut Vec<String>,
+) {
+    match outcome {
+        Ok(true) => {
+            if announce {
+                eprintln!("trash purge: {} hard-deleted", path);
+            }
+        }
+        Ok(false) => {}
+        Err(e) => errors.push(format!(
+            "trash purge of {} failed, check the provider's trash: {}",
+            path, e
+        )),
+    }
+}
+
 async fn benchmark_mkdir_p(
     provider: &mut Box<dyn StorageProvider>,
     path: &str,
@@ -45860,7 +45890,8 @@ async fn cmd_benchmark(
             }
         };
 
-        let remote_path = format!("{}/payload-{}.bin", test_root, size);
+        let remote_path =
+            ftp_client_gui_lib::speed_payload::name(&format!("{}/payload-{}", test_root, size));
 
         if !cli.quiet && matches!(format, OutputFormat::Text) {
             eprintln!("running benchmark with payload {}", format_size(size));
@@ -46286,19 +46317,10 @@ async fn cmd_benchmark(
     // pCloud, Jottacloud, OpenDrive) is a soft delete and the test root ends
     // up in the recycle bin. Hard-purge it so quotas do not silently fill up
     // across repeated benchmark runs. No-op for FTP/SFTP/S3/plain WebDAV.
+    let announce_purge = !cli.quiet && matches!(format, OutputFormat::Text);
     if rmdir_ok {
-        match provider.delete_permanent(&test_root).await {
-            Ok(true) => {
-                if !cli.quiet && matches!(format, OutputFormat::Text) {
-                    eprintln!("trash purge: {} hard-deleted", test_root);
-                }
-            }
-            Ok(false) => {}
-            Err(e) => errors.push(format!(
-                "trash purge of {} failed (item still in trash, will be auto-deleted by provider retention): {}",
-                test_root, e
-            )),
-        }
+        let outcome = provider.delete_permanent(&test_root).await;
+        note_trash_purge(&test_root, outcome, announce_purge, &mut errors);
     }
 
     // Remove the shared `aeroftp-bench` base dir too (issue #368: the reporter
@@ -46323,8 +46345,10 @@ async fn cmd_benchmark(
         if base_empty {
             if provider.rmdir_recursive(&bench_base).await.is_ok() {
                 // Hard-purge the soft-deleted base on consumer clouds, mirroring
-                // the test_root trash purge above.
-                let _ = provider.delete_permanent(&bench_base).await;
+                // the test_root trash purge above, refusal included: its result
+                // used to be dropped, so a base left in the bin said nothing (#368).
+                let outcome = provider.delete_permanent(&bench_base).await;
+                note_trash_purge(&bench_base, outcome, announce_purge, &mut errors);
             } else {
                 errors.push(format!(
                     "note: empty scratch folder '{}' could not be removed automatically; delete it manually",
@@ -74270,7 +74294,7 @@ mod tests {
             // The auto-generated scratch path is exempt: it cannot be user data,
             // so a provider with a flaky or unsupported stat still gets to run.
             assert!(
-                ensure_speed_path_is_free(Err(&opaque), "/.aeroftp-speedtest-x.bin", false).is_ok(),
+                ensure_speed_path_is_free(Err(&opaque), "/.aeroftp-speedtest-x.dat", false).is_ok(),
                 "the scratch path must not be blocked by {opaque}"
             );
         }
@@ -79636,6 +79660,42 @@ mod tests {
         assert_eq!(cfg.runs_per_size, 1);
         assert_eq!(cfg.warmup_runs, 0);
         assert_eq!(cfg.operations, vec!["upload", "download"]);
+    }
+
+    #[test]
+    fn a_refused_trash_purge_is_reported() {
+        let mut errors = Vec::new();
+        note_trash_purge("aeroftp-bench", Ok(false), false, &mut errors);
+        note_trash_purge("aeroftp-bench", Ok(true), false, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        note_trash_purge(
+            "aeroftp-bench",
+            Err(ProviderError::Other("2 items named 'aeroftp-bench'".into())),
+            false,
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].starts_with("trash purge of aeroftp-bench failed")
+                && errors[0].ends_with("2 items named 'aeroftp-bench'"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn benchmark_overrides_apply_at_a_preset_level() {
+        // The MCP tool describes `sizes`, `runs` and `operations` as applying at
+        // any level; this is the behaviour that description rests on (#368).
+        let cfg = resolve_benchmark_config(
+            BenchmarkLevel::Quick,
+            Some("1M,4M"),
+            Some(2),
+            Some("upload"),
+        )
+        .unwrap();
+        assert_eq!(cfg.sizes_bytes, vec![1024 * 1024, 4 * 1024 * 1024]);
+        assert_eq!(cfg.runs_per_size, 2);
+        assert_eq!(cfg.operations, vec!["upload"]);
     }
 
     #[test]
