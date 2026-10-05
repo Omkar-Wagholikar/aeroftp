@@ -594,8 +594,14 @@ const WEBDAV_TRANSFER_MAX_SESSIONS: u16 = 8;
 /// Directories a walk lists at once (#958): the shared walker's default
 /// checkers, the same count as rclone's `--checkers`. Like rclone's pacer, a
 /// listing the server answers 429 or 503 is retried after a pause rather than
-/// counted as failed (see `send_propfind`); `--checkers` lowers it in the CLI.
+/// counted as failed (see `send_propfind_paced`); `--checkers` lowers it in
+/// the CLI.
 const WEBDAV_LIST_MAX_SESSIONS: u16 = 8;
+/// The most one collection listing waits, all its retry pauses together,
+/// before it gives up on a 429 or 503 (#958 review). The listing holds the
+/// provider lock while it waits, so a `Retry-After` of minutes would freeze
+/// the file browser; past this budget the refusal is returned at once.
+const LIST_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl WebDavProvider {
     /// Create a new WebDAV provider with the given configuration
@@ -1246,6 +1252,68 @@ impl WebDavProvider {
     /// `dav.lab.example.test`. Basic-auth servers never emit a Digest challenge,
     /// so a genuine `401` there still propagates unchanged for the caller to
     /// map.
+    /// One `PROPFIND` of a collection (`Depth: 0` or `1`), paced for a server
+    /// that limits concurrency (#958). A 429 or 503 is sent again after the
+    /// pause the server asks for (`Retry-After`) or an exponential one (1, 2,
+    /// 4 s), three times at most, as long as the pauses together stay within
+    /// [`LIST_RETRY_BUDGET`]: a pause that would pass it ends the retries and
+    /// returns the refusal. Every `list` goes through here, the file
+    /// browser's included, and it waits holding the provider lock, so the
+    /// budget is what keeps a long `Retry-After` from freezing the browser.
+    /// Every other status comes back as it came, a 500 or a gateway error
+    /// included. Each attempt is built afresh, so a Digest session spends a
+    /// new nonce count on each, and each pays the CLI's `--tpslimit` toll.
+    async fn send_propfind_paced(
+        &self,
+        path: &str,
+        depth: &str,
+        body: &'static str,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let config = super::http_retry::HttpRetryConfig::default();
+        let mut waited = std::time::Duration::ZERO;
+        let mut attempt = 0u32;
+        loop {
+            super::tpslimit::maybe_acquire().await;
+            let response = self
+                .request(webdav_methods::propfind(), path)
+                .header("Depth", depth)
+                .header("Content-Type", "application/xml")
+                .body(body)
+                .send()
+                .await
+                .map_err(send_error)?;
+            let throttled = matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            );
+            if !throttled || attempt >= config.max_retries {
+                return Ok(response);
+            }
+            let pause = super::http_retry::parse_retry_after(&response)
+                .unwrap_or_else(|| super::http_retry::calculate_delay(attempt, &config));
+            if waited + pause > LIST_RETRY_BUDGET {
+                tracing::debug!(
+                    "[WebDAV] PROPFIND {} answered {}: a pause of {:?} would pass the {:?} listing budget, not retrying",
+                    path,
+                    response.status(),
+                    pause,
+                    LIST_RETRY_BUDGET
+                );
+                return Ok(response);
+            }
+            tracing::debug!(
+                "[WebDAV] PROPFIND {} answered {}, retry {} after {:?}",
+                path,
+                response.status(),
+                attempt + 1,
+                pause
+            );
+            tokio::time::sleep(pause).await;
+            waited += pause;
+            attempt += 1;
+        }
+    }
+
     async fn send_propfind(
         &mut self,
         path: &str,
@@ -1259,15 +1327,9 @@ impl WebDavProvider {
         let path = dir_path.as_str();
 
         // A walk lists several collections at once (#958), and a server that
-        // limits concurrency answers the extra requests 429 or 503: those, a
-        // gateway's 502 or 504, and a 500, are sent again after the pause the
-        // server asks for (`Retry-After`) or an exponential one (1, 2, 4 s),
-        // three times at most, before they count as a folder that did not
-        // list (the shared helper's `is_retryable_status`). Every `list` takes
-        // this path, the file browser's included, as on the other HTTP
-        // providers that use the helper. Every attempt is built afresh, so a
-        // Digest session spends a new nonce count on each. `Depth: infinity`
-        // stays one attempt: on any failure its callers walk folder by folder.
+        // limits concurrency answers the extra requests 429 or 503: those are
+        // paced by `send_propfind_paced`. `Depth: infinity` stays one attempt:
+        // on any failure its callers walk folder by folder.
         //
         // The nonce this request goes out with, for the 401 below: on a walk
         // several clones share one Digest challenge, so a sibling may already
@@ -1282,18 +1344,7 @@ impl WebDavProvider {
                 .await
                 .map_err(send_error)?
         } else {
-            super::http_retry::send_with_retry_replayable(
-                &self.client,
-                || {
-                    self.request(webdav_methods::propfind(), path)
-                        .header("Depth", depth)
-                        .header("Content-Type", "application/xml")
-                        .body(body)
-                },
-                &super::http_retry::HttpRetryConfig::default(),
-            )
-            .await
-            .map_err(send_error)?
+            self.send_propfind_paced(path, depth, body).await?
         };
 
         if response.status() != StatusCode::UNAUTHORIZED {

@@ -14951,6 +14951,92 @@ mod tests {
         assert_eq!(limited_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// #1080 review: a listing waits holding the provider lock, so its retry
+    /// pauses have a budget. A 503 asking for two minutes is returned at once
+    /// instead of freezing the browser or the walk, and a 500 is not retried
+    /// at all: only 429 and 503 are paced.
+    #[tokio::test]
+    async fn ehud_webdav_listing_retry_stays_within_its_budget() {
+        use axum::{http::StatusCode, response::IntoResponse, routing::any, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slow_down = std::sync::Arc::new(AtomicUsize::new(0));
+        let broken = std::sync::Arc::new(AtomicUsize::new(0));
+        let (slow_down_seen, broken_seen) = (slow_down.clone(), broken.clone());
+        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let (slow_down, broken) = (slow_down.clone(), broken.clone());
+            async move {
+                if request
+                    .headers()
+                    .get("depth")
+                    .is_some_and(|v| v == "infinity")
+                {
+                    return StatusCode::FORBIDDEN.into_response(); // Walk folder by folder.
+                }
+                let folder = request.uri().path().trim_end_matches('/').to_string();
+                match folder.as_str() {
+                    "" => (
+                        StatusCode::MULTI_STATUS,
+                        dav_listing(&[
+                            ("/", None),
+                            ("/slow-down/", None),
+                            ("/broken/", None),
+                            ("/ok/", None),
+                        ]),
+                    )
+                        .into_response(),
+                    "/slow-down" => {
+                        slow_down.fetch_add(1, Ordering::SeqCst);
+                        let header = [("retry-after", "120")];
+                        (StatusCode::SERVICE_UNAVAILABLE, header, String::new()).into_response()
+                    }
+                    "/broken" if broken.fetch_add(1, Ordering::SeqCst) == 0 => {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                    folder => {
+                        let own = format!("{folder}/");
+                        let file = format!("{folder}/f.bin");
+                        let body = dav_listing(&[(own.as_str(), None), (file.as_str(), Some(10))]);
+                        (StatusCode::MULTI_STATUS, body).into_response()
+                    }
+                }
+            }
+        }));
+        let (state, server) = dav_state(app, |_| {}).await;
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            super::provider_scan_used_inner(
+                &state,
+                "/".into(),
+                Duration::from_secs(10),
+                |_, _, _| {},
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+        let result = result.expect("the walk ends").expect("the scan answers");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a two-minute Retry-After was waited on: {elapsed:?}"
+        );
+        assert_eq!(
+            slow_down_seen.load(Ordering::SeqCst),
+            1,
+            "no retry past the budget"
+        );
+        assert_eq!(
+            broken_seen.load(Ordering::SeqCst),
+            1,
+            "a 500 is not retried"
+        );
+        assert_eq!(
+            (result.used, result.file_count, result.unreadable_dirs),
+            (10, 1, 2)
+        );
+        assert!(result.truncated);
+    }
+
     /// #1080 review: the clones of a parallel walk share one Digest challenge.
     /// Two folders go out with the same nonce and are both refused
     /// `stale=true` for a rotated one; whichever worker reads its 401 second
