@@ -1259,10 +1259,13 @@ impl WebDavProvider {
         let path = dir_path.as_str();
 
         // A walk lists several collections at once (#958), and a server that
-        // limits concurrency answers the extra requests 429 or 503: those, and
-        // a gateway's 502 or 504, are sent again after the pause the server
-        // asks for (`Retry-After`) or an exponential one, before they count as
-        // a folder that did not list. Every attempt is built afresh, so a
+        // limits concurrency answers the extra requests 429 or 503: those, a
+        // gateway's 502 or 504, and a 500, are sent again after the pause the
+        // server asks for (`Retry-After`) or an exponential one (1, 2, 4 s),
+        // three times at most, before they count as a folder that did not
+        // list (the shared helper's `is_retryable_status`). Every `list` takes
+        // this path, the file browser's included, as on the other HTTP
+        // providers that use the helper. Every attempt is built afresh, so a
         // Digest session spends a new nonce count on each. `Depth: infinity`
         // stays one attempt: on any failure its callers walk folder by folder.
         let response = if depth == "infinity" {
