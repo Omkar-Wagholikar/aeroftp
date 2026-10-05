@@ -93,7 +93,7 @@ export type MyServersTableColumnsResult = UseTableColumnsResult<MyServersTableCo
     setColVisible: (id: MyServersTableColId, visible: boolean) => void;
 };
 
-export function useMyServersColumns(cardLayout: 'compact' | 'detailed'): MyServersTableColumnsResult {
+export function useMyServersColumns(cardLayout: 'compact' | 'detailed', refreshKey?: number): MyServersTableColumnsResult {
     const overrideDefaultVisibility = useMemo(
         () => (id: MyServersTableColId, def: TableColumnDef<MyServersTableColId>) => {
             if (def.detailedOnly) return cardLayout === 'detailed' && def.defaultVisible;
@@ -105,6 +105,7 @@ export function useMyServersColumns(cardLayout: 'compact' | 'detailed'): MyServe
     const result = useTableColumns<MyServersTableColId>({
         columns: TABLE_COLUMN_DEFS,
         storageKey: 'my_servers_table',
+        refreshKey,
         overrideDefaultVisibility,
         sortableColIds: SORTABLE_IDS,
     });

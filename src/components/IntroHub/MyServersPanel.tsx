@@ -34,6 +34,7 @@ import { useCardLayout } from '../../hooks/useCardLayout';
 import { useStorageThresholds } from '../../hooks/useStorageThresholds';
 import { useMyServersDensity } from '../../hooks/useMyServersDensity';
 import { useMyServersColumns } from '../../hooks/useMyServersColumns';
+import { useMyServersBreakdown } from '../../hooks/useMyServersBreakdown';
 import { useResponsiveColumns } from '../../hooks/useResponsiveColumns';
 import { PROVIDER_HEALTH_URLS } from './discoverData';
 import { mergeSavedServerProfile } from '../../utils/serverProfileStore';
@@ -658,7 +659,8 @@ export function MyServersPanel({
     // for the per-card health-radial gating; both readers share state via the
     // global `aeroftp-settings-changed` event.
     const cardLayout = useCardLayout();
-    const tableColumns = useMyServersColumns(cardLayout);
+    const tableColumns = useMyServersColumns(cardLayout, lastUpdate);
+    const { breakdown, setBreakdown } = useMyServersBreakdown(lastUpdate);
 
     // Grid column count derived from the *container* width (not the viewport),
     // so it tracks the space actually available once the filter sidebar is
@@ -1848,6 +1850,7 @@ export function MyServersPanel({
                         servers={filteredServers}
                         allServers={servers}
                         columns={tableColumns}
+                        breakdown={breakdown}
                         favorites={favorites}
                         connectingId={connectingId}
                         connectingProfileId={connectingProfileId}
@@ -1895,6 +1898,8 @@ export function MyServersPanel({
                     </div>
                     <MyServersTableFooter
                         servers={filteredServers}
+                        breakdown={breakdown}
+                        onBreakdownChange={setBreakdown}
                     />
                 </div>
             )}

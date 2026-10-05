@@ -5,6 +5,8 @@ import { useTranslation } from '../../i18n';
 
 interface MyServersTableFooterProps {
     servers: ServerProfile[];
+    breakdown: boolean;
+    onBreakdownChange: (enabled: boolean) => void;
 }
 
 /**
@@ -18,6 +20,8 @@ interface MyServersTableFooterProps {
  */
 export function MyServersTableFooter({
     servers,
+    breakdown,
+    onBreakdownChange,
 }: MyServersTableFooterProps) {
     const t = useTranslation();
     const aggregate = aggregateByDedupKey(servers);
@@ -42,8 +46,17 @@ export function MyServersTableFooter({
         <div
             className="flex-none border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-[0_-1px_3px_rgba(0,0,0,0.05)] transition-colors"
         >
-            <div className="flex items-center gap-2 px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs text-gray-500 dark:text-gray-400">
                 <span title={t('introHub.table.footerDedupExplained')}>{summary}</span>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                    <input
+                        type="checkbox"
+                        checked={breakdown}
+                        onChange={event => onBreakdownChange(event.target.checked)}
+                        className="accent-blue-500"
+                    />
+                    {t('introHub.breakdown.title')}
+                </label>
             </div>
         </div>
     );

@@ -4,7 +4,7 @@
 
 | Row | Assessment and evidence | Bundle |
 |---|---|---|
-| 31 | Partially stale: CLI `Profiles` already honors GUI visibility/sort and accepts `--show=*`. Its flags explicitly override one run only. Remaining: persistent CLI choices and GUI breakdown checkbox (`useMyServersColumns`). | Profile preferences |
+| 31 | Initial code inspection suggested GUI visibility/sort already worked. Subsequent live testing reproduced a wrong vault-key read and a Saved % id mismatch, in addition to missing persistent CLI choices and the GUI breakdown checkbox. See [the row 31 verification](V423-PROFILE-PREFERENCES.md). | Profile preferences |
 | 30 | Reproduced: `clone_for_list` mints an unconnected SFTP worker, `list` calls `get_sftp` without dialing. v4.2.2 live scan emits eight cold-worker reconnect warnings. | **Storage walker, selected** |
 | 29 | Reproduced: `walk_used_bytes` sums the vector the walker retains. v4.2.2 lab WebDAV: 60,800 files, 875 folders, 4,704,965,753 bytes, 102,672 KiB peak RSS. | **Storage walker, selected** |
 | 28 | Open: build pins appimagetool/runtime, but Tauri obtains linuxdeploy helpers outside those pins. Needs bundler override/cache controls and verified digests. | Linux packaging |
@@ -32,14 +32,14 @@
 ## Proposed bundles and sequence
 
 1. **30 + 29, storage walker:** selected; shared scanner, live CLI/GUI proofs, no new UI strings. Keep totals, progress, caps, cancellation, unreadable-folder handling and ordinary sync rows.
-2. **31, profile preferences:** implement only missing persisted choices and breakdown UI, with one cross-process preference contract.
+2. **31, profile preferences:** fix the live-reproduced settings reader, implement persisted choices and breakdown UI, with one cross-process preference contract.
 3. **28 + 27 + 17, Linux packaging:** helper pinning and real delta verification; runtime waits for a dated upstream release.
 4. **24 + 23 + 22 + 21, provider live contracts:** split account-dependent subcases; ordinary Swift short-page listing merits a regression fixture.
 5. **20 + 19, archive/vault lengths:** upstream crate fixes may be needed; bounded-length and RAR5 fixture proofs.
 6. **16 + 15 + 12 + 11, source consistency**, then **14 + 13, reporting:** related investigation, distinct publication/refusal semantics.
 7. Keep **26, 25, 18, 10, 9, 8** separate: installers, Windows UI, vault migration, multipart lifetime, crypto recovery and deletion need different gates.
 
-No whole requested row is established as done on main by this triage. Narrow the already implemented parts of 31 and 18; keep 21/23/24 as live verification work.
+No whole requested row is established as done on main by this triage. Narrow the already implemented parts of 18; keep 21/23/24 as live verification work. The later row 31 live investigation corrects its initial assessment above.
 
 ## Selected bundle: verification
 

@@ -3147,9 +3147,10 @@ enum Commands {
     /// List saved server profiles from the encrypted vault
     ///
     /// Mirrors the My Servers Table view in the GUI: the same column visibility
-    /// and sort persisted by `useMyServersColumns` are honoured here. The flags
-    /// below override the GUI-persisted settings for this run only (no vault
-    /// write) so scripts and pipes stay deterministic.
+    /// and sort persisted by `useMyServersColumns` are honoured here. Column
+    /// choices and breakdown are saved for later CLI and GUI runs. `--sort`
+    /// overrides only this run; JSON stays a flat array unless `--breakdown`
+    /// is explicitly enabled.
     Profiles {
         /// Optional `list` keyword for parity with `<tool> profiles list` muscle memory; ignored.
         #[arg(hide = true)]
@@ -3161,25 +3162,25 @@ enum Commands {
         #[arg(long, value_name = "COL[:DIR]")]
         sort: Option<String>,
 
-        /// Comma-separated columns to hide for this run only (not persisted).
+        /// Comma-separated columns to hide, saved for later CLI and GUI runs.
         /// Available (case-insensitive): name, type, host, used, total, pct,
         /// path, last, fav (also accepts `favorite`/`favourite`). `*` or `all`
         /// hides every optional column (`#` and Name always stay pinned).
         #[arg(long, value_name = "COLS")]
         hide: Option<String>,
 
-        /// Show only these columns for this run only (not persisted). This is
+        /// Show only these columns, saved for later CLI and GUI runs. This is
         /// an exclusive allowlist: every other optional column is hidden, like
         /// the My Servers Table view in the GUI. `#` and Name always stay
         /// pinned. `*` or `all` shows every column. Same names as `--hide`.
         #[arg(long, value_name = "COLS")]
         show: Option<String>,
 
-        /// Append a per-protocol-class breakdown after the main listing.
-        /// In JSON mode, wrap the output in `{ profiles, summary, breakdown }`
-        /// (the default JSON shape: a flat array: stays back-compatible).
-        #[arg(long)]
-        breakdown: bool,
+        /// Remember whether to append a per-protocol-class breakdown.
+        /// Use `--breakdown=false` to turn it off. In JSON mode only an explicit
+        /// `--breakdown` wraps the array in `{ profiles, summary, breakdown }`.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        breakdown: Option<bool>,
 
         /// Drop into an interactive prompt after the table (rclone-config-style).
         /// Drop into an interactive prompt after the table (rclone-config-style):
@@ -13671,20 +13672,20 @@ fn cmd_users(cli: &Cli, command: &UsersCommands, format: OutputFormat) -> i32 {
 //
 // The text branch of `aeroftp-cli profiles` mirrors the columns, sort and
 // visibility persisted by the GUI under
-// `app_settings.aeroftp_settings.{storage_thresholds, ui_settings.my_servers_table}`
+// `config_app_settings.{storage_thresholds, ui_settings.my_servers_table}`
 // (see `src/hooks/useMyServersColumns.ts` + `useStorageThresholds.tsx`).
-// Toggling columns or sort in either surface is reflected in the other.
+// GUI column/sort choices are read by the CLI; CLI column choices write back.
 //
-// The CLI flags `--sort`, `--hide`, `--show` override the vault-persisted view
-// for one run only: they never write back. The JSON branch is left untouched
-// because external agents and CI scripts depend on its schema.
+// Column choices and breakdown share config_app_settings with the GUI.
+// `--sort` overrides one run only. Saved breakdown never changes the default
+// JSON array schema: JSON wrapping still requires an explicit CLI request.
 
 #[derive(Clone, Debug, Default)]
 struct ProfilesViewOverrides {
     sort: Option<String>,
     hide: Option<String>,
     show: Option<String>,
-    breakdown: bool,
+    breakdown: Option<bool>,
     /// When true and stdin/stderr are TTYs, drop into a rclone-config-style
     /// prompt loop after rendering the table: `<n>l` lists a profile,
     /// `<n>t` trees it, `<n>d` deletes it from the vault, `q` quits.
@@ -13734,6 +13735,24 @@ impl ProfileColId {
             ProfileColId::Time => "Last",
             ProfileColId::Favorite => "Fav",
             ProfileColId::Groups => "Groups",
+        }
+    }
+
+    fn gui_key(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Name => "name",
+            Self::Badges => "badges",
+            Self::Subtitle => "subtitle",
+            Self::Used => "used",
+            Self::Total => "total",
+            Self::Pct => "pct",
+            Self::Saved => "saved",
+            Self::SavedPct => "savedpct",
+            Self::Paths => "paths",
+            Self::Time => "time",
+            Self::Favorite => "favorite",
+            Self::Groups => "groups",
         }
     }
 
@@ -16157,32 +16176,57 @@ struct UiTableSettings {
     thresholds: CliThresholds,
     hidden: std::collections::HashSet<ProfileColId>,
     sort: Option<ProfileSort>,
+    breakdown: bool,
 }
 
-/// Read the GUI-persisted table settings from
-/// `app_settings.aeroftp_settings`. Missing or malformed fields fall back to
-/// the same defaults the GUI uses.
+/// Prefer the GUI's canonical vault account, retaining the legacy fallback.
+/// Invalid canonical settings are never replaced by a preferences write.
+fn read_profile_preferences_blob(
+    store: &CredentialStore,
+) -> Result<Option<serde_json::Value>, String> {
+    use ftp_client_gui_lib::credential_store::CredentialError;
+    for key in ["config_app_settings", "aeroftp_settings"] {
+        match store.get(key) {
+            Ok(raw) => {
+                let blob: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|_| "Saved application settings are not valid JSON".to_string())?;
+                if !blob.is_object() {
+                    return Err("Saved application settings must be an object".to_string());
+                }
+                return Ok(Some(blob));
+            }
+            Err(CredentialError::NotFound(_)) => continue,
+            Err(e) => return Err(format!("Cannot read application settings: {e}")),
+        }
+    }
+    Ok(None)
+}
+
 fn read_ui_table_settings(store: &CredentialStore) -> UiTableSettings {
+    let blob = read_profile_preferences_blob(store)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    ui_table_settings_from_blob(&blob)
+}
+
+fn ui_table_settings_from_blob(blob: &serde_json::Value) -> UiTableSettings {
     let mut out = UiTableSettings {
         thresholds: CliThresholds::default(),
         hidden: [
             ProfileColId::Paths,
             ProfileColId::Saved,
             ProfileColId::SavedPct,
+            ProfileColId::Groups,
         ]
-        .iter()
-        .copied()
+        .into_iter()
         .collect(),
         sort: None,
-    };
-
-    let raw = match store.get("aeroftp_settings") {
-        Ok(s) => s,
-        Err(_) => return out,
-    };
-    let blob: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return out,
+        breakdown: blob
+            .get("ui_settings")
+            .and_then(|v| v.get("my_servers_breakdown"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     };
 
     if let Some(t) = blob.get("storage_thresholds") {
@@ -16215,22 +16259,14 @@ fn read_ui_table_settings(store: &CredentialStore) -> UiTableSettings {
             // Match GUI ids: `paths` (CLI alias `path`), `subtitle` (CLI alias
             // `host`), `time` (CLI alias `last`), `favorite` (CLI alias `fav`).
             // The visibility blob is keyed by the GUI ids.
-            let key = match col {
-                ProfileColId::Index => "index",
-                ProfileColId::Name => "name",
-                ProfileColId::Badges => "badges",
-                ProfileColId::Subtitle => "subtitle",
-                ProfileColId::Used => "used",
-                ProfileColId::Total => "total",
-                ProfileColId::Pct => "pct",
-                ProfileColId::Saved => "saved",
-                ProfileColId::SavedPct => "savedPct",
-                ProfileColId::Paths => "paths",
-                ProfileColId::Time => "time",
-                ProfileColId::Favorite => "favorite",
-                ProfileColId::Groups => "groups",
-            };
-            match vis.get(key).and_then(|v| v.as_bool()) {
+            let key = col.gui_key();
+            let value = vis.get(key).or_else(|| {
+                // Older CLI versions used the label spelling instead of the GUI id.
+                matches!(col, ProfileColId::SavedPct)
+                    .then(|| vis.get("savedPct"))
+                    .flatten()
+            });
+            match value.and_then(|v| v.as_bool()) {
                 Some(false) => {
                     out.hidden.insert(*col);
                 }
@@ -16285,6 +16321,82 @@ fn read_ui_table_settings(store: &CredentialStore) -> UiTableSettings {
     }
 
     out
+}
+
+/// Merge only explicitly requested preferences. Other GUI table fields and
+/// unknown columns survive; a malformed blob fails instead of being replaced.
+fn merge_profile_preferences(
+    mut blob: serde_json::Value,
+    overrides: &ProfilesViewOverrides,
+) -> Result<serde_json::Value, String> {
+    let hide = overrides.hide.as_deref().map(parse_col_spec).transpose()?;
+    let show = overrides.show.as_deref().map(parse_col_spec).transpose()?;
+    let base = blob
+        .as_object_mut()
+        .ok_or("Application settings must be an object")?;
+    let legacy = base.get("my_servers_table").cloned();
+    let ui = base
+        .entry("ui_settings")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Saved ui_settings must be an object")?;
+    if hide.is_some() || show.is_some() {
+        let table = ui
+            .entry("my_servers_table")
+            .or_insert_with(|| legacy.unwrap_or_else(|| serde_json::json!({})))
+            .as_object_mut()
+            .ok_or("Saved table settings must be an object")?;
+        let visibility = table
+            .entry("visibility")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("Saved column visibility must be an object")?;
+        if let Some(hide) = hide {
+            for &col in PROFILE_COL_ORDER {
+                let selected = match &hide {
+                    ColSpec::All => true,
+                    ColSpec::List(cols) => cols.contains(&col),
+                };
+                if selected && !PINNED_COLS.contains(&col) {
+                    visibility.insert(col.gui_key().into(), serde_json::json!(false));
+                }
+            }
+        }
+        if let Some(show) = show {
+            for &col in PROFILE_COL_ORDER {
+                let visible = PINNED_COLS.contains(&col)
+                    || match &show {
+                        ColSpec::All => true,
+                        ColSpec::List(cols) => cols.contains(&col),
+                    };
+                visibility.insert(col.gui_key().into(), serde_json::json!(visible));
+            }
+        }
+        base.remove("my_servers_table");
+    }
+    // Reborrow after the table migration above.
+    if let Some(breakdown) = overrides.breakdown {
+        base.get_mut("ui_settings")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("my_servers_breakdown".into(), serde_json::json!(breakdown));
+    }
+    Ok(blob)
+}
+
+fn persist_profile_preferences(
+    store: &CredentialStore,
+    overrides: &ProfilesViewOverrides,
+) -> Result<(), String> {
+    if overrides.hide.is_none() && overrides.show.is_none() && overrides.breakdown.is_none() {
+        return Ok(());
+    }
+    let blob = read_profile_preferences_blob(store)?.unwrap_or_else(|| serde_json::json!({}));
+    let updated = merge_profile_preferences(blob, overrides)?;
+    store
+        .store("config_app_settings", &updated.to_string())
+        .map_err(|e| format!("Cannot save profile view preferences: {e}"))
 }
 
 enum SortOverride {
@@ -17497,6 +17609,11 @@ fn list_vault_profiles(cli: &Cli, format: OutputFormat, overrides: ProfilesViewO
         }
     };
 
+    if let Err(e) = persist_profile_preferences(&store, &overrides) {
+        print_error(format, &e, 5);
+        return 5;
+    }
+
     // --group filter (#320): keep only profiles that belong to the named group
     // (case-insensitive). The CLI analogue of selecting a GUI group chip.
     if let Some(group_name) = overrides.group.as_deref() {
@@ -17609,7 +17726,7 @@ fn list_vault_profiles(cli: &Cli, format: OutputFormat, overrides: ProfilesViewO
             })
             .collect();
 
-        if overrides.breakdown {
+        if overrides.breakdown == Some(true) {
             // Wrap in object with summary + breakdown when explicitly requested.
             // Default flat array shape stays back-compatible.
             let views = build_profile_views(&profiles);
@@ -19547,53 +19664,6 @@ fn render_profiles_text(
         }
     };
 
-    // Apply --hide / --show overrides for this run only. `--hide` is
-    // subtractive (add columns to the hidden set). `--show` is an exclusive
-    // allowlist: when present, only the pinned columns plus the listed ones
-    // stay visible, matching the My Servers Table view in the GUI (issue
-    // #180). When both are given, `--show` defines the final visible set.
-    match overrides.hide.as_deref().map(parse_col_spec) {
-        Some(Ok(ColSpec::All)) => {
-            for c in PROFILE_COL_ORDER {
-                if !PINNED_COLS.contains(c) {
-                    settings.hidden.insert(*c);
-                }
-            }
-        }
-        Some(Ok(ColSpec::List(cols))) => {
-            for c in cols {
-                if !PINNED_COLS.contains(&c) {
-                    settings.hidden.insert(c);
-                }
-            }
-        }
-        Some(Err(e)) => {
-            eprintln!("Warning: invalid --hide value ({}). Ignored.", e);
-        }
-        None => {}
-    }
-    match overrides.show.as_deref().map(parse_col_spec) {
-        Some(Ok(ColSpec::All)) => {
-            settings.hidden.clear();
-        }
-        Some(Ok(ColSpec::List(cols))) => {
-            let keep: std::collections::HashSet<ProfileColId> = cols
-                .into_iter()
-                .chain(PINNED_COLS.iter().copied())
-                .collect();
-            settings.hidden.clear();
-            for c in PROFILE_COL_ORDER {
-                if !keep.contains(c) {
-                    settings.hidden.insert(*c);
-                }
-            }
-        }
-        Some(Err(e)) => {
-            eprintln!("Warning: invalid --show value ({}). Ignored.", e);
-        }
-        None => {}
-    }
-
     // Apply --sort override.
     if let Some(raw) = overrides.sort.as_deref() {
         match parse_sort_override(raw) {
@@ -19947,7 +20017,7 @@ fn render_profiles_text(
         )
     };
 
-    if overrides.breakdown && !summary.by_protocol_class.is_empty() {
+    if settings.breakdown && !summary.by_protocol_class.is_empty() {
         // Unified layout when --breakdown is on (issue #129):
         // 1) main profile rows
         // 2) horizontal separator
@@ -20130,8 +20200,12 @@ fn profiles_view_args(ov: &ProfilesViewOverrides) -> Vec<String> {
     if let Some(s) = &ov.show {
         args.push(format!("--show={}", s));
     }
-    if ov.breakdown {
-        args.push("--breakdown".to_string());
+    if let Some(breakdown) = ov.breakdown {
+        args.push(if breakdown {
+            "--breakdown".to_string()
+        } else {
+            "--breakdown=false".to_string()
+        });
     }
     if let Some(g) = &ov.group {
         args.push(format!("--group={}", g));
@@ -76379,7 +76453,7 @@ mod tests {
                 sort: None,
                 hide: None,
                 show: None,
-                breakdown: false,
+                breakdown: None,
                 interactive: false,
                 group: None,
                 health: false,
@@ -81093,6 +81167,169 @@ mod tests {
     }
 
     #[test]
+    fn profile_preferences_remember_columns_and_breakdown_without_replacing_gui_layout() {
+        let blob = serde_json::json!({
+            "theme": "dark", "storage_thresholds": { "warn": 70, "critical": 90 },
+            "ui_settings": {
+                "other_table": { "width": 99 },
+                "my_servers_table": {
+                    "visibility": { "subtitle": true, "icon": false, "future": true },
+                    "order": ["name", "used"], "widths": {"name": 321},
+                    "aligns": {"name": "right"}, "sort": {"colId": "used", "dir": "desc"}
+                }
+            }
+        });
+        let ov = ProfilesViewOverrides {
+            hide: Some("host".into()),
+            breakdown: Some(true),
+            ..Default::default()
+        };
+        let next = merge_profile_preferences(blob.clone(), &ov).unwrap();
+        assert_eq!(next["theme"], blob["theme"]);
+        assert_eq!(next["storage_thresholds"], blob["storage_thresholds"]);
+        assert_eq!(
+            next["ui_settings"]["other_table"],
+            blob["ui_settings"]["other_table"]
+        );
+        for key in ["order", "widths", "aligns", "sort"] {
+            assert_eq!(
+                next["ui_settings"]["my_servers_table"][key],
+                blob["ui_settings"]["my_servers_table"][key]
+            );
+        }
+        let view = ui_table_settings_from_blob(&next);
+        assert!(view.hidden.contains(&ProfileColId::Subtitle));
+        assert!(view.breakdown);
+        assert_eq!(view.sort.unwrap().col, ProfileColId::Used);
+        assert_eq!(
+            next["ui_settings"]["my_servers_table"]["visibility"]["icon"],
+            false
+        );
+        assert_eq!(
+            next["ui_settings"]["my_servers_table"]["visibility"]["future"],
+            true
+        );
+        let next = merge_profile_preferences(
+            next,
+            &ProfilesViewOverrides {
+                show: Some("*".into()),
+                breakdown: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let view = ui_table_settings_from_blob(&next);
+        assert!(view.hidden.is_empty());
+        assert!(!view.breakdown);
+        assert_eq!(
+            next["ui_settings"]["my_servers_table"]["visibility"]["savedpct"],
+            true
+        );
+    }
+
+    #[test]
+    fn profile_preferences_migrate_legacy_placement_and_keep_pinned_columns() {
+        let blob = serde_json::json!({"my_servers_table": { "visibility": {"subtitle": true}, "widths": {"used": 123} }});
+        let next = merge_profile_preferences(
+            blob,
+            &ProfilesViewOverrides {
+                hide: Some("*".into()),
+                show: Some("used".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(next.get("my_servers_table").is_none());
+        assert_eq!(
+            next["ui_settings"]["my_servers_table"]["widths"]["used"],
+            123
+        );
+        let view = ui_table_settings_from_blob(&next);
+        for col in PROFILE_COL_ORDER {
+            assert_eq!(
+                view.hidden.contains(col),
+                ![ProfileColId::Index, ProfileColId::Name, ProfileColId::Used].contains(col)
+            );
+        }
+    }
+
+    #[test]
+    fn profile_preferences_reject_invalid_flags_and_malformed_settings() {
+        for ov in [
+            ProfilesViewOverrides {
+                hide: Some("unknown".into()),
+                ..Default::default()
+            },
+            ProfilesViewOverrides {
+                show: Some("unknown".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(merge_profile_preferences(serde_json::json!({}), &ov).is_err());
+        }
+        let ov = ProfilesViewOverrides {
+            hide: Some("host".into()),
+            ..Default::default()
+        };
+        for blob in [
+            serde_json::json!([]),
+            serde_json::json!({"ui_settings": false}),
+            serde_json::json!({"ui_settings": {"my_servers_table": []}}),
+            serde_json::json!({"ui_settings": {"my_servers_table": {"visibility": "invalid"}}}),
+        ] {
+            assert!(merge_profile_preferences(blob, &ov).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_preferences_read_gui_compression_id_and_sort_defaults() {
+        let blob = serde_json::json!({"ui_settings": {"my_servers_table": {"visibility": {"savedpct": true}, "sort": {"colId": "name", "dir": "desc"}}}});
+        let view = ui_table_settings_from_blob(&blob);
+        assert!(!view.hidden.contains(&ProfileColId::SavedPct));
+        assert!(view.hidden.contains(&ProfileColId::Groups));
+        assert_eq!(view.sort.unwrap().dir, ProfileSortDir::Desc);
+        assert!(!view.breakdown);
+        assert!(!ui_table_settings_from_blob(
+            &serde_json::json!({"my_servers_table": {"visibility": {"savedPct": true}}})
+        )
+        .hidden
+        .contains(&ProfileColId::SavedPct));
+    }
+
+    #[test]
+    fn profile_preferences_breakdown_flag_is_tristate_and_refresh_can_disable_it() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                for (flag, expected) in [
+                    (None, None),
+                    (Some("--breakdown"), Some(true)),
+                    (Some("--breakdown=false"), Some(false)),
+                ] {
+                    let mut args = vec!["aeroftp-cli", "profiles"];
+                    if let Some(flag) = flag {
+                        args.push(flag);
+                    }
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    let Commands::Profiles { breakdown, .. } = cli.command else {
+                        panic!("profiles")
+                    };
+                    assert_eq!(breakdown, expected);
+                }
+                assert_eq!(
+                    profiles_view_args(&ProfilesViewOverrides {
+                        breakdown: Some(false),
+                        ..Default::default()
+                    }),
+                    vec!["profiles", "--breakdown=false"]
+                );
+            })
+            .expect("spawn CLI parser thread")
+            .join()
+            .expect("profile flags parse");
+    }
+
+    #[test]
     fn profiles_view_args_reconstructs_the_view_flags() {
         // The `refresh` command (discussion #266) reprints the table by
         // re-running `profiles` with the original view flags, never `-i`.
@@ -81102,7 +81339,7 @@ mod tests {
             sort: None,
             hide: None,
             show: None,
-            breakdown: false,
+            breakdown: None,
             interactive: true,
             group: None,
             health: false,
@@ -81117,7 +81354,7 @@ mod tests {
             sort: Some("used:desc".to_string()),
             hide: Some("host".to_string()),
             show: Some("name".to_string()),
-            breakdown: true,
+            breakdown: Some(true),
             interactive: true,
             group: Some("Production".to_string()),
             health: true,
