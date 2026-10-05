@@ -770,7 +770,8 @@ struct Cli {
 
     /// KE-A2: Concurrency cap for metadata-only operations during sync
     /// (rclone `--checkers`). Default `8`, range 1-64. Bounds the remote
-    /// directory walk of `sync`, `reconcile`, `check` and `cryptcheck`: a provider that
+    /// directory walk of `sync`, `reconcile`, `check`, `cryptcheck`, `df --scan`
+    /// and `size`: a provider that
     /// lists on independent clones (SFTP, S3, WebDAV, B2, the HTTP clouds)
     /// lists up to this many directories at once, capped by the provider's
     /// own list pool; single-session providers walk one directory at a
@@ -42919,11 +42920,12 @@ async fn cmd_df(url: &str, scan: bool, full: bool, cli: &Cli, format: OutputForm
         let mut last_tick = Instant::now()
             .checked_sub(std::time::Duration::from_millis(400))
             .unwrap_or_else(Instant::now);
-        let result = ftp_client_gui_lib::used_scan::scan_used_bytes(
+        let result = ftp_client_gui_lib::used_scan::scan_used_bytes_with_checkers(
             &mut provider,
             &root,
             scan_depth,
             MAX_SCAN_ENTRIES,
+            effective_checkers(cli),
             &cancel,
             |files, bytes| {
                 if last_tick.elapsed() >= std::time::Duration::from_millis(300) {
@@ -43164,11 +43166,12 @@ async fn cmd_size(url: &str, path: &str, cli: &Cli, format: OutputFormat) -> i32
     let mut last_tick = Instant::now()
         .checked_sub(std::time::Duration::from_millis(400))
         .unwrap_or_else(Instant::now);
-    let result = ftp_client_gui_lib::used_scan::scan_used_bytes(
+    let result = ftp_client_gui_lib::used_scan::scan_used_bytes_with_checkers(
         &mut provider,
         &root,
         scan_depth,
         MAX_SCAN_ENTRIES,
+        effective_checkers(cli),
         &cancel,
         |files, bytes| {
             if last_tick.elapsed() >= std::time::Duration::from_millis(300) {

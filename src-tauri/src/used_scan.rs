@@ -16,13 +16,17 @@
 //! the per-directory round-trips where the protocol offers a single-shot
 //! recursive listing: S3 `list_recursive` (flat ListObjectsV2) and WebDAV
 //! `PROPFIND Depth: infinity` (with automatic BFS fallback when the server
-//! rejects or limits it). Everything else uses the shared BFS.
+//! rejects or limits it). Everything else uses the shared BFS, which is the
+//! walker of the sync core: a provider that lists on independent clones
+//! lists several directories at once there (#958).
 //!
 //! NEVER called automatically on connect: the caller (CLI `df --scan`, GUI
 //! "Calculate used storage" action) triggers it explicitly.
 
 use crate::providers::{ProviderError, S3Provider, StorageProvider, WebDavProvider};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Outcome of a used-storage scan.
 #[derive(Debug, Clone)]
@@ -63,7 +67,9 @@ pub struct UsedScan {
     /// way; the scan falls through to the BFS so the bound is walked.
     pub depth_limited: bool,
     /// Which method produced the figure: "s3-list-recursive",
-    /// "webdav-infinity" or "bfs". Surfaced for the tooltip/logs.
+    /// "webdav-infinity", "bfs" (one directory at a time) or "bfs-parallel"
+    /// (several directories at once on independent clones). Surfaced for the
+    /// tooltip/logs.
     pub method: &'static str,
 }
 
@@ -309,7 +315,30 @@ pub async fn scan_used_bytes(
     max_depth: Option<usize>,
     max_entries: usize,
     cancel: &AtomicBool,
-    mut on_progress: impl FnMut(u64, u64),
+    on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<UsedScan, ProviderError> {
+    scan_used_bytes_with_checkers(
+        provider,
+        root,
+        max_depth,
+        max_entries,
+        crate::sync_core::scan::DEFAULT_SCAN_CHECKERS,
+        cancel,
+        on_progress,
+    )
+    .await
+}
+
+/// [`scan_used_bytes`] with the number of folders the walk may list at once on
+/// a provider that lists on independent clones: the CLI passes `--checkers`.
+pub async fn scan_used_bytes_with_checkers(
+    provider: &mut Box<dyn StorageProvider>,
+    root: &str,
+    max_depth: Option<usize>,
+    max_entries: usize,
+    checkers: usize,
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<UsedScan, ProviderError> {
     // --- Provider-native single-shot recursive listing -----------------
     // S3 / WebDAV collapse the per-directory BFS round-trips. The shared
@@ -333,125 +362,246 @@ pub async fn scan_used_bytes(
         root,
         max_depth,
         max_entries,
+        checkers,
         cancel,
         &mut on_progress,
     )
     .await
 }
 
-/// Provider-agnostic breadth-first sum. One `list()` per directory; size
-/// comes inline with each entry for every backend, so this never issues a
-/// per-file metadata call.
+/// Provider-agnostic breadth-first sum on the walker of the sync core. The
+/// provider is parked in a holder for the walk and handed back before this
+/// returns; `cancel` is mirrored into the walk, which reads its own flag.
+///
+/// The hand-back happens when the walk ends. A caller that drops this future
+/// part way is left holding the parked placeholder, which refuses every call,
+/// instead of its provider: cancel through `cancel`, as the CLI does, not by
+/// dropping. (The GUI path drops its future, but it calls
+/// [`walk_used_bytes`] on its own holder and parks nothing.)
 async fn bfs_used_bytes(
     provider: &mut Box<dyn StorageProvider>,
     root: &str,
     max_depth: Option<usize>,
     max_entries: usize,
+    checkers: usize,
     cancel: &AtomicBool,
-    on_progress: &mut impl FnMut(u64, u64),
+    on_progress: &mut (impl FnMut(u64, u64) + Send),
 ) -> Result<UsedScan, ProviderError> {
+    let roots = provider.used_scan_roots(root);
+    let parked: Box<dyn StorageProvider> =
+        Box::new(crate::crypt_overlay_provider::DetachedProvider);
+    let real = std::mem::replace(provider, parked);
+    let holder = Arc::new(tokio::sync::Mutex::new(Some(real)));
+    let flag = Arc::new(AtomicBool::new(cancel.load(Ordering::Relaxed)));
+    let progress = std::sync::Mutex::new(on_progress);
+    let report = |files: u64, bytes: u64| {
+        let mut on_progress = progress.lock().unwrap_or_else(|e| e.into_inner());
+        (*on_progress)(files, bytes);
+    };
+    let walk = walk_used_bytes(
+        &holder,
+        &roots,
+        max_depth,
+        max_entries,
+        checkers,
+        None,
+        Some(Arc::clone(&flag)),
+        &report,
+    );
+    tokio::pin!(walk);
+    let mut scan = loop {
+        tokio::select! {
+            scan = &mut walk => break scan,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    *provider = holder
+        .lock()
+        .await
+        .take()
+        .expect("the used-storage walk hands the provider back");
+    // A cancel raised while the last directory was listed has no turn of the
+    // walk left to be seen in. The sums already in hand are kept.
+    if cancel.load(Ordering::Relaxed) {
+        scan.cancelled = true;
+        scan.truncated = true;
+    }
+    Ok(scan)
+}
+
+/// What a [`walk_used_bytes`] walk of one root reports through the walker's
+/// observer: every running total goes to `on_progress` on top of the roots
+/// already walked, and the last one is kept, since the walker returns the
+/// files it kept but not the directories it saw.
+struct UsedScanObserver<'a> {
+    base_files: u64,
+    base_bytes: u64,
+    on_progress: &'a (dyn Fn(u64, u64) + Send + Sync),
+    last: std::sync::Mutex<(usize, usize, u64)>,
+}
+
+impl crate::transfer_dag::DagObserver for UsedScanObserver<'_> {
+    fn on_scan_totals(&self, files: usize, dirs: usize, bytes: u64) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = (files, dirs, bytes);
+        (self.on_progress)(
+            self.base_files.saturating_add(files as u64),
+            self.base_bytes.saturating_add(bytes),
+        );
+    }
+}
+
+/// Sum the bytes under `roots` (see [`StorageProvider::used_scan_roots`]) with
+/// the walker of the sync core,
+/// [`crate::sync_core::scan::scan_remote_tree_with_provider_lock_checked`].
+///
+/// A provider that lists on independent clones (SFTP, S3, Azure, WebDAV)
+/// lists up to [`crate::sync_core::scan::DEFAULT_SCAN_CHECKERS`] directories
+/// at once and holds the provider lock only to mint a worker; any other walks
+/// one directory at a time and takes the lock per directory, so other work on
+/// the session interleaves either way. This walk used to be a serial loop of
+/// its own beside the walker, which is why a used-storage scan of a large
+/// tree took minutes where a sync scan of the same tree took seconds (#958).
+///
+/// `checkers` is how many folders may be listed at once on such a provider
+/// ([`crate::sync_core::scan::DEFAULT_SCAN_CHECKERS`] in the GUI, `--checkers`
+/// in the CLI); a provider without clones lists one whatever the value.
+///
+/// The figure keeps the meaning it had: symbolic links are left out, a folder
+/// that fails or times out (`dir_limit`) is counted in `unreadable_dirs` while
+/// its siblings are still walked, and a depth the caller asked for is a
+/// complete answer to that depth (`depth_limited`) while the depth parachute
+/// is a cap. `max_entries` bounds files plus folders, inside each root as
+/// across them ([`crate::sync_core::scan::ScanOptions::count_dirs_against_cap`]):
+/// a tree made only of folders, or a listing of millions of them, stops at
+/// the cap with `hit_cap` set instead of growing the walk's queue without
+/// bound. Cancel by raising `cancel`, or by dropping the future: the walk's
+/// tasks are aborted with it.
+#[allow(clippy::too_many_arguments)]
+pub async fn walk_used_bytes(
+    provider: &Arc<tokio::sync::Mutex<Option<Box<dyn StorageProvider>>>>,
+    roots: &[String],
+    max_depth: Option<usize>,
+    max_entries: usize,
+    checkers: usize,
+    dir_limit: Option<Duration>,
+    cancel: Option<Arc<AtomicBool>>,
+    on_progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> UsedScan {
+    use crate::sync_core::scan::{
+        scan_remote_tree_with_provider_lock_checked, ScanOptions, DEFAULT_SCAN_DEPTH,
+    };
+    let list_model = crate::provider_transfer_executor::resolve_provider_list_session_model(
+        provider,
+        checkers.max(1),
+    )
+    .await;
+    let depth_requested = max_depth.is_some();
+    let raised = |cancel: &Option<Arc<AtomicBool>>| {
+        cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    };
+
     let mut used = 0u64;
     let mut files = 0u64;
     let mut dirs = 0u64;
     let mut truncated = false;
-    let mut unreadable_dirs: u64 = 0;
+    let mut unreadable_dirs = 0u64;
     let mut hit_cap = false;
     let mut cancelled = false;
     let mut depth_limited = false;
-    // None = the caller asked for the whole tree; the parachute is the
-    // walk's safety net and hitting it is a truncation. Some = the caller
-    // asked for this many levels; stopping there is a complete answer.
-    let depth_limit = max_depth.unwrap_or(crate::sync_core::scan::DEFAULT_SCAN_DEPTH);
-    let depth_requested = max_depth.is_some();
-    // (absolute path, depth). LIFO is fine: we only sum, order is irrelevant.
-    let mut queue: Vec<(String, usize)> = provider
-        .used_scan_roots(root)
-        .into_iter()
-        .map(|r| (r, 0))
-        .collect();
 
-    while let Some((dir, depth)) = queue.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            truncated = true;
+    for root in roots {
+        if raised(&cancel) {
             cancelled = true;
             break;
         }
-        if depth >= depth_limit {
+        let room = (max_entries as u64).saturating_sub(files.saturating_add(dirs));
+        if room == 0 {
+            hit_cap = true;
+            break;
+        }
+        let opts = ScanOptions {
+            max_depth: Some(max_depth.unwrap_or(DEFAULT_SCAN_DEPTH)),
+            max_entries: Some(usize::try_from(room).unwrap_or(usize::MAX)),
+            // The provider's flat listing was already tried by the callers,
+            // with a reduction of its own; this is the per-directory walk.
+            disable_recursive_fastpath: true,
+            dir_list_timeout: dir_limit,
+            skip_symlinks: true,
+            count_dirs_against_cap: true,
+            ..Default::default()
+        };
+        let observer = UsedScanObserver {
+            base_files: files,
+            base_bytes: used,
+            on_progress,
+            last: std::sync::Mutex::new((0, 0, 0)),
+        };
+        let (entries, completeness, boundaries) = scan_remote_tree_with_provider_lock_checked(
+            Arc::clone(provider),
+            root,
+            &opts,
+            &list_model,
+            cancel.clone(),
+            Some(&observer),
+        )
+        .await;
+        let (_, root_dirs, _) = *observer.last.lock().unwrap_or_else(|e| e.into_inner());
+
+        files = files.saturating_add(entries.len() as u64);
+        used = entries
+            .iter()
+            .fold(used, |sum, entry| sum.saturating_add(entry.size));
+        dirs = dirs.saturating_add(root_dirs as u64);
+        unreadable_dirs = unreadable_dirs.saturating_add(completeness.list_errors as u64);
+
+        // The walker names why it did not see a part of the tree; the figure
+        // sorts those reasons into the flags it has always reported.
+        let depth_cut = boundaries.unbounded == Some("depth_limit")
+            || boundaries
+                .unseen
+                .iter()
+                .any(|unseen| unseen.reason == "depth_limit");
+        if depth_cut {
             if depth_requested {
-                // Complete answer to the depth that was asked. The figure
-                // excludes what sits under this directory, so it is a lower
-                // bound of the full tree, declared by `depth_limited`.
                 depth_limited = true;
             } else {
-                truncated = true;
                 hit_cap = true;
             }
-            continue;
         }
-        if (files + dirs) >= max_entries as u64 {
+        match boundaries.unbounded {
+            Some("entry_cap") => hit_cap = true,
+            Some("cancelled") => cancelled = true,
+            Some("depth_limit") | None => {}
+            // A lost session or a failed task: part of the tree went unseen.
+            Some(_) => truncated = true,
+        }
+        if completeness.list_errors > 0 || (completeness.truncated && !depth_cut) {
             truncated = true;
-            hit_cap = true;
-            continue;
-        }
-        match provider.list(&dir).await {
-            Ok(entries) => {
-                for entry in entries {
-                    // Skip symlinks: a symlink-to-dir is reported with both
-                    // is_dir and is_symlink (sftp.rs), so following it allows
-                    // cur->. / up->.. cycles to inflate the figure and burn
-                    // the depth/entry budget. Matches the MCP scan and the
-                    // sftp rmdir_recursive GAP-A02 precedent.
-                    if entry.is_symlink {
-                        continue;
-                    }
-                    // Cap is enforced inside the loop (not only between
-                    // directories) so one hostile listing with millions of
-                    // subdir entries cannot grow the queue past max_entries.
-                    if (files + dirs) >= max_entries as u64 {
-                        truncated = true;
-                        hit_cap = true;
-                        break;
-                    }
-                    if entry.is_dir {
-                        dirs += 1;
-                        queue.push((entry.path.clone(), depth + 1));
-                        continue;
-                    }
-                    used = used.saturating_add(entry.size);
-                    files += 1;
-                }
-                on_progress(files, used);
-            }
-            Err(e) => {
-                // A single unreadable directory should not abort the whole
-                // figure: log and keep going (the result is a lower bound).
-                tracing::warn!("[used_scan] failed to list {}: {}", dir, e);
-                truncated = true;
-                unreadable_dirs += 1;
-            }
         }
     }
 
-    // A cancel raised while the last directory was listed never sees
-    // another turn of this loop: the queue is empty and we would leave
-    // cancelled=false. The fast path already polls on the way out (#801);
-    // this walk has to do the same, keeping the sums already in hand.
-    let cancelled = cancelled || cancel.load(Ordering::Relaxed);
-    if cancelled {
-        truncated = true;
-    }
-
-    Ok(UsedScan {
+    let cancelled = cancelled || raised(&cancel);
+    UsedScan {
         used_bytes: used,
         file_count: files,
         dir_count: dirs,
-        truncated,
+        truncated: truncated || hit_cap || cancelled,
         unreadable_dirs,
         hit_cap,
         cancelled,
         depth_limited,
-        method: "bfs",
-    })
+        method: if list_model.is_clone_pool() {
+            "bfs-parallel"
+        } else {
+            "bfs"
+        },
+    }
 }
 
 #[cfg(test)]
@@ -634,16 +784,19 @@ mod tests {
             dirs,
             cancel: None,
             raise_cancel_on: None,
+            hang_on: None,
         }
     }
 
     /// In-memory tree for the BFS: `list` answers from a map.
     /// `raise_cancel_on` stores `cancel` when that path is listed, so a test
-    /// can raise the flag while the last directory is in flight.
+    /// can raise the flag while the last directory is in flight; listing
+    /// `hang_on` never answers, like a server that stopped on one folder.
     struct TreeProvider {
         dirs: std::collections::HashMap<String, Vec<crate::providers::RemoteEntry>>,
         cancel: Option<std::sync::Arc<AtomicBool>>,
         raise_cancel_on: Option<String>,
+        hang_on: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -674,6 +827,9 @@ mod tests {
                 if let Some(flag) = &self.cancel {
                     flag.store(true, Ordering::Relaxed);
                 }
+            }
+            if self.hang_on.as_deref() == Some(path) {
+                std::future::pending::<()>().await;
             }
             self.dirs
                 .get(path)
@@ -845,6 +1001,7 @@ mod tests {
             dirs,
             cancel: Some(cancel.clone()),
             raise_cancel_on: Some("/".to_string()),
+            hang_on: None,
         });
         let scan = scan_used_bytes(
             &mut provider,
@@ -998,5 +1155,155 @@ mod tests {
             "a flattened path is not dropped as if it were depth 1: {scan:?}"
         );
         assert!(!scan.depth_limited);
+    }
+
+    /// #958: the used-storage walk is the walker of the sync core, so a
+    /// provider that lists on independent clones has several folders listed
+    /// at once. The fixture answers a sub-folder only when all eight are being
+    /// listed together: the serial loop this walk used to be never got past
+    /// the first one.
+    #[tokio::test]
+    async fn the_used_storage_walk_lists_folders_at_once_on_a_clone_pool() {
+        let tree = crate::sync_core::scan::tests::PoolTreeProvider::fan(8, 8);
+        let peak = std::sync::Arc::clone(&tree.peak);
+        let mut provider: Box<dyn StorageProvider> = Box::new(tree);
+        let cancel = AtomicBool::new(false);
+        let scan = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            scan_used_bytes(&mut provider, "/root", None, 500_000, &cancel, |_, _| {}),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the walk listed at most {} folders at once, 8 needed",
+                peak.load(Ordering::SeqCst)
+            )
+        })
+        .expect("the walk answers");
+        assert_eq!(
+            (scan.file_count, scan.used_bytes, scan.dir_count),
+            (8, 8, 8),
+            "{scan:?}"
+        );
+        assert!(
+            !scan.truncated && !scan.hit_cap && !scan.cancelled,
+            "{scan:?}"
+        );
+        assert_eq!(scan.method, "bfs-parallel");
+        assert_eq!(
+            provider.display_name(),
+            "pool-tree",
+            "the caller gets its own provider back, not the placeholder"
+        );
+    }
+
+    /// #958, #960 on a provider that lists on one session: a folder that
+    /// never answers costs that folder, which is counted unreadable, and the
+    /// walk goes on to its siblings instead of waiting on it.
+    #[tokio::test]
+    async fn a_folder_past_the_listing_limit_is_unreadable_on_one_session_too() {
+        let mut dirs = std::collections::HashMap::new();
+        dirs.insert(
+            "/".to_string(),
+            vec![
+                file("a.txt", "/a.txt", 3),
+                dir("slow", "/slow"),
+                dir("ok", "/ok"),
+            ],
+        );
+        dirs.insert("/ok".to_string(), vec![file("b.txt", "/ok/b.txt", 4)]);
+        let provider: Box<dyn StorageProvider> = Box::new(TreeProvider {
+            dirs,
+            cancel: None,
+            raise_cancel_on: None,
+            hang_on: Some("/slow".to_string()),
+        });
+        let holder = Arc::new(tokio::sync::Mutex::new(Some(provider)));
+        let scan = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            walk_used_bytes(
+                &holder,
+                &["/".to_string()],
+                None,
+                500_000,
+                crate::sync_core::scan::DEFAULT_SCAN_CHECKERS,
+                Some(std::time::Duration::from_millis(100)),
+                None,
+                &|_, _| {},
+            ),
+        )
+        .await
+        .expect("the stalled folder is given up at its limit");
+        assert_eq!(
+            (scan.used_bytes, scan.file_count, scan.dir_count),
+            (7, 2, 2),
+            "the siblings are still counted: {scan:?}"
+        );
+        assert_eq!(scan.unreadable_dirs, 1, "{scan:?}");
+        assert!(
+            scan.truncated && !scan.hit_cap && !scan.cancelled,
+            "{scan:?}"
+        );
+        assert_eq!(scan.method, "bfs");
+        assert!(holder.try_lock().is_ok(), "the provider lock is released");
+    }
+
+    /// A tree of 50 folders holding 50 folders each, and not one file.
+    fn folders_only_tree() -> std::collections::HashMap<String, Vec<crate::providers::RemoteEntry>>
+    {
+        let mut dirs = std::collections::HashMap::new();
+        dirs.insert(
+            "/".to_string(),
+            (0..50)
+                .map(|i| dir(&format!("d{i}"), &format!("/d{i}")))
+                .collect(),
+        );
+        for i in 0..50 {
+            dirs.insert(
+                format!("/d{i}"),
+                (0..50)
+                    .map(|j| dir(&format!("e{j}"), &format!("/d{i}/e{j}")))
+                    .collect(),
+            );
+            for j in 0..50 {
+                dirs.insert(format!("/d{i}/e{j}"), Vec::new());
+            }
+        }
+        dirs
+    }
+
+    /// #1080 review: the cap counts folders, not only files. A tree made only
+    /// of folders used to walk all 2,550 of them under a cap of 100 and call
+    /// the figure complete; it now stops at the cap and says so.
+    #[tokio::test]
+    async fn a_tree_of_folders_only_stops_at_the_entry_cap_on_one_session() {
+        let mut provider: Box<dyn StorageProvider> = Box::new(tree_provider(folders_only_tree()));
+        let cancel = AtomicBool::new(false);
+        let scan = scan_used_bytes(&mut provider, "/", None, 100, &cancel, |_, _| {})
+            .await
+            .expect("the walk answers");
+        assert!(scan.hit_cap && scan.truncated, "{scan:?}");
+        assert!(
+            scan.dir_count <= 100,
+            "the queue stopped at the cap: {scan:?}"
+        );
+        assert_eq!(scan.method, "bfs");
+    }
+
+    /// The same bound on the pooled walk, which takes another code path.
+    #[tokio::test]
+    async fn a_tree_of_folders_only_stops_at_the_entry_cap_on_a_clone_pool() {
+        let tree = crate::sync_core::scan::tests::WalkTreeProvider::new(folders_only_tree(), true);
+        let mut provider: Box<dyn StorageProvider> = Box::new(tree);
+        let cancel = AtomicBool::new(false);
+        let scan = scan_used_bytes(&mut provider, "/", None, 100, &cancel, |_, _| {})
+            .await
+            .expect("the walk answers");
+        assert!(scan.hit_cap && scan.truncated, "{scan:?}");
+        assert!(
+            scan.dir_count <= 100,
+            "the queue stopped at the cap: {scan:?}"
+        );
+        assert_eq!(scan.method, "bfs-parallel");
     }
 }

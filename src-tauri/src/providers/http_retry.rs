@@ -42,7 +42,7 @@ fn is_retryable_status(status: u16) -> bool {
 }
 
 /// Parse Retry-After header value (supports both seconds and HTTP-date)
-fn parse_retry_after(response: &Response) -> Option<Duration> {
+pub(crate) fn parse_retry_after(response: &Response) -> Option<Duration> {
     let value = response.headers().get("retry-after")?.to_str().ok()?;
 
     // Try parsing as seconds first (most common)
@@ -56,7 +56,7 @@ fn parse_retry_after(response: &Response) -> Option<Duration> {
 }
 
 /// Calculate delay for a given retry attempt with jitter
-fn calculate_delay(attempt: u32, config: &HttpRetryConfig) -> Duration {
+pub(crate) fn calculate_delay(attempt: u32, config: &HttpRetryConfig) -> Duration {
     let base = config.base_delay_ms as f64 * config.backoff_multiplier.powi(attempt as i32);
     let capped = base.min(config.max_delay_ms as f64);
     // Add 10-30% jitter to prevent thundering herd

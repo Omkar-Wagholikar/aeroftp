@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use super::{
-    sanitize_api_error, MultipartHandle, ProviderError, ProviderTransferExecutorKind, ProviderType,
-    RemoteEntry, ShareLinkCapabilities, ShareLinkOptions, ShareLinkResult, StorageProvider,
-    UploadedPart, WebDavConfig,
+    sanitize_api_error, MultipartHandle, ProviderError, ProviderListExecutorKind,
+    ProviderTransferExecutorKind, ProviderType, RemoteEntry, ShareLinkCapabilities,
+    ShareLinkOptions, ShareLinkResult, StorageProvider, UploadedPart, WebDavConfig,
 };
 
 /// Encode one untrusted Nextcloud trash identifier as exactly one URL segment.
@@ -591,6 +591,17 @@ const WEBDAV_MULTI_THREAD_MAX_STREAMS: usize = 16;
 /// knob (issue #591): independent WebDAV GET/PUT of distinct files is safe
 /// on a cloned `reqwest::Client`.
 const WEBDAV_TRANSFER_MAX_SESSIONS: u16 = 8;
+/// Directories a walk lists at once (#958): the shared walker's default
+/// checkers, the same count as rclone's `--checkers`. Like rclone's pacer, a
+/// listing the server answers 429 or 503 is retried after a pause rather than
+/// counted as failed (see `send_propfind_paced`); `--checkers` lowers it in
+/// the CLI.
+const WEBDAV_LIST_MAX_SESSIONS: u16 = 8;
+/// The most one collection listing waits, all its retry pauses together,
+/// before it gives up on a 429 or 503 (#958 review). The listing holds the
+/// provider lock while it waits, so a `Retry-After` of minutes would freeze
+/// the file browser; past this budget the refusal is returned at once.
+const LIST_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl WebDavProvider {
     /// Create a new WebDAV provider with the given configuration
@@ -1227,6 +1238,68 @@ impl WebDavProvider {
         }
     }
 
+    /// One `PROPFIND` of a collection (`Depth: 0` or `1`), paced for a server
+    /// that limits concurrency (#958). A 429 or 503 is sent again after the
+    /// pause the server asks for (`Retry-After`) or an exponential one (1, 2,
+    /// 4 s), three times at most, as long as the pauses together stay within
+    /// [`LIST_RETRY_BUDGET`]: a pause that would pass it ends the retries and
+    /// returns the refusal. Every `list` goes through here, the file
+    /// browser's included, and it waits holding the provider lock, so the
+    /// budget is what keeps a long `Retry-After` from freezing the browser.
+    /// Every other status comes back as it came, a 500 or a gateway error
+    /// included. Each attempt is built afresh, so a Digest session spends a
+    /// new nonce count on each, and each pays the CLI's `--tpslimit` toll.
+    async fn send_propfind_paced(
+        &self,
+        path: &str,
+        depth: &str,
+        body: &'static str,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let config = super::http_retry::HttpRetryConfig::default();
+        let mut waited = std::time::Duration::ZERO;
+        let mut attempt = 0u32;
+        loop {
+            super::tpslimit::maybe_acquire().await;
+            let response = self
+                .request(webdav_methods::propfind(), path)
+                .header("Depth", depth)
+                .header("Content-Type", "application/xml")
+                .body(body)
+                .send()
+                .await
+                .map_err(send_error)?;
+            let throttled = matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            );
+            if !throttled || attempt >= config.max_retries {
+                return Ok(response);
+            }
+            let pause = super::http_retry::parse_retry_after(&response)
+                .unwrap_or_else(|| super::http_retry::calculate_delay(attempt, &config));
+            if waited + pause > LIST_RETRY_BUDGET {
+                tracing::debug!(
+                    "[WebDAV] PROPFIND {} answered {}: a pause of {:?} would pass the {:?} listing budget, not retrying",
+                    path,
+                    response.status(),
+                    pause,
+                    LIST_RETRY_BUDGET
+                );
+                return Ok(response);
+            }
+            tracing::debug!(
+                "[WebDAV] PROPFIND {} answered {}, retry {} after {:?}",
+                path,
+                response.status(),
+                attempt + 1,
+                pause
+            );
+            tokio::time::sleep(pause).await;
+            waited += pause;
+            attempt += 1;
+        }
+    }
+
     /// Send a PROPFIND and, on a `401` that carries a fresh
     /// `WWW-Authenticate: Digest` challenge, re-negotiate the Digest state
     /// once and retry the request.
@@ -1253,14 +1326,26 @@ impl WebDavProvider {
         let dir_path = Self::collection_path(path);
         let path = dir_path.as_str();
 
-        let response = self
-            .request(webdav_methods::propfind(), path)
-            .header("Depth", depth)
-            .header("Content-Type", "application/xml")
-            .body(body)
-            .send()
-            .await
-            .map_err(send_error)?;
+        // A walk lists several collections at once (#958), and a server that
+        // limits concurrency answers the extra requests 429 or 503: those are
+        // paced by `send_propfind_paced`. `Depth: infinity` stays one attempt:
+        // on any failure its callers walk folder by folder.
+        //
+        // The nonce this request goes out with, for the 401 below: on a walk
+        // several clones share one Digest challenge, so a sibling may already
+        // have adopted the rotated nonce this request was refused for.
+        let nonce_used = self.digest_nonce_snapshot();
+        let response = if depth == "infinity" {
+            self.request(webdav_methods::propfind(), path)
+                .header("Depth", depth)
+                .header("Content-Type", "application/xml")
+                .body(body)
+                .send()
+                .await
+                .map_err(send_error)?
+        } else {
+            self.send_propfind_paced(path, depth, body).await?
+        };
 
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
@@ -1279,17 +1364,16 @@ impl WebDavProvider {
         // pointing at the old challenge and the repair would reach exactly one
         // of them: the same defect sharing the challenge exists to prevent.
         match self.digest_auth.as_ref() {
-            Some(existing) => {
-                if !existing.renegotiate(&www_auth) {
-                    // Not a usable Digest challenge (Basic auth, or a genuine
-                    // credential failure): let the caller map the 401.
+            Some(_) => {
+                // Replay once when this worker adopts the rotated nonce, or when
+                // a sibling already did and the nonce held now is not the one
+                // this request carried (#1080 review): `renegotiate` alone
+                // refused that second case, and the folder was reported
+                // unreadable while the pool was already repaired. Anything else
+                // (Basic auth, a genuine credential failure) goes to the caller.
+                if !self.should_replay_after_401(&response, &nonce_used) {
                     return Ok(response);
                 }
-                tracing::debug!(
-                    "[WebDAV] PROPFIND 401, adopted rotated nonce for every worker (realm={}, nonce={}...)",
-                    existing.realm(),
-                    existing.nonce_prefix()
-                );
             }
             None => {
                 let Some(state) = DigestState::parse(&www_auth) else {
@@ -5028,6 +5112,32 @@ impl StorageProvider for WebDavProvider {
         WEBDAV_TRANSFER_MAX_SESSIONS
     }
 
+    fn list_executor_kind(&self) -> ProviderListExecutorKind {
+        ProviderListExecutorKind::HttpClonePool
+    }
+
+    fn list_executor_max_sessions(&self) -> u16 {
+        WEBDAV_LIST_MAX_SESSIONS
+    }
+
+    /// Mint an independent worker for a directory walk that lists several
+    /// folders at once (#958): the used-storage scan, AeroSync Compare, the
+    /// CLI and MCP walks. A `PROPFIND Depth: 1` on one collection shares no
+    /// state with one on another, and the clone shares the `reqwest::Client`
+    /// and the Digest challenge exactly as [`Self::clone_for_transfer`] does,
+    /// so a nonce rotation seen by one worker repairs the pool.
+    ///
+    /// A single-file profile (#264) has one resource and no tree: every path
+    /// maps to the configured URL, so it keeps walking on the one session.
+    fn clone_for_list(&self) -> Result<Box<dyn StorageProvider>, ProviderError> {
+        if self.single_file_mode.is_some() {
+            return Err(ProviderError::NotSupported(
+                "a single-file WebDAV profile has no tree to list in parallel".to_string(),
+            ));
+        }
+        Ok(Box::new(self.clone()))
+    }
+
     /// Mint an independent worker for file-level parallelism and Nextcloud
     /// chunked-upload parts.
     ///
@@ -6882,11 +6992,47 @@ mod tests {
             crate::transfer_dag::Capability::Supported
         );
         assert_eq!(caps.max_file_slots, Some(WEBDAV_TRANSFER_MAX_SESSIONS));
-        // List stays locked: this promotion is file-transfer only.
+        // #958: a walk lists several collections at once as well.
+        assert_eq!(
+            caps.list_parallel,
+            crate::transfer_dag::Capability::Supported
+        );
+        assert_eq!(caps.max_checker_slots, Some(WEBDAV_LIST_MAX_SESSIONS));
+        assert_eq!(
+            p.list_executor_kind(),
+            ProviderListExecutorKind::HttpClonePool
+        );
+        assert!(p.clone_for_list().is_ok());
+    }
+
+    /// #958: a single-file profile (#264) maps every path to its one URL, so
+    /// a parallel walk would list the same resource N times. It keeps the
+    /// single locked session.
+    #[test]
+    fn single_file_webdav_profile_lists_on_one_session() {
+        let mut p =
+            WebDavProvider::new(test_config("https://dav.example.com/file.bin")).expect("provider");
+        p.single_file_mode = Some(RemoteEntry {
+            name: "file.bin".to_string(),
+            path: "/file.bin".to_string(),
+            is_dir: false,
+            size: 1,
+            modified: None,
+            permissions: None,
+            owner: None,
+            group: None,
+            is_symlink: false,
+            link_target: None,
+            mime_type: None,
+            metadata: Default::default(),
+        });
+        assert!(p.clone_for_list().is_err());
+        let caps = p.transfer_capabilities();
         assert_eq!(
             caps.list_parallel,
             crate::transfer_dag::Capability::Unsupported
         );
+        assert_eq!(caps.max_checker_slots, Some(1));
     }
 
     /// Issue #591 — Nextcloud still clones for chunked-v2 parts, and now also
