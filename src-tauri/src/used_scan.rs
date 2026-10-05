@@ -435,8 +435,8 @@ async fn bfs_used_bytes(
 
 /// What a [`walk_used_bytes`] walk of one root reports through the walker's
 /// observer: every running total goes to `on_progress` on top of the roots
-/// already walked, and the last one is kept, since the walker returns the
-/// files it kept but not the directories it saw.
+/// already walked, and the last one is kept, since this walk reports totals without retaining
+/// individual file entries.
 struct UsedScanObserver<'a> {
     base_files: u64,
     base_bytes: u64,
@@ -534,6 +534,7 @@ pub async fn walk_used_bytes(
             dir_list_timeout: dir_limit,
             skip_symlinks: true,
             count_dirs_against_cap: true,
+            remote_totals_only: true,
             ..Default::default()
         };
         let observer = UsedScanObserver {
@@ -542,7 +543,7 @@ pub async fn walk_used_bytes(
             on_progress,
             last: std::sync::Mutex::new((0, 0, 0)),
         };
-        let (entries, completeness, boundaries) = scan_remote_tree_with_provider_lock_checked(
+        let (_entries, completeness, boundaries) = scan_remote_tree_with_provider_lock_checked(
             Arc::clone(provider),
             root,
             &opts,
@@ -551,12 +552,11 @@ pub async fn walk_used_bytes(
             Some(&observer),
         )
         .await;
-        let (_, root_dirs, _) = *observer.last.lock().unwrap_or_else(|e| e.into_inner());
+        let (root_files, root_dirs, root_bytes) =
+            *observer.last.lock().unwrap_or_else(|e| e.into_inner());
 
-        files = files.saturating_add(entries.len() as u64);
-        used = entries
-            .iter()
-            .fold(used, |sum, entry| sum.saturating_add(entry.size));
+        files = files.saturating_add(root_files as u64);
+        used = used.saturating_add(root_bytes);
         dirs = dirs.saturating_add(root_dirs as u64);
         unreadable_dirs = unreadable_dirs.saturating_add(completeness.list_errors as u64);
 
