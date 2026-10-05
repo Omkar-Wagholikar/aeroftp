@@ -2097,6 +2097,10 @@ impl StorageProvider for SftpProvider {
     }
 
     async fn list(&mut self, path: &str) -> Result<Vec<RemoteEntry>, ProviderError> {
+        // A list clone starts without a channel, like a transfer clone. Dial
+        // through the pinned connection spec before the first READDIR instead
+        // of manufacturing a transport failure for the walker's retry path.
+        self.ensure_connected().await?;
         let sftp = self.get_sftp()?;
         let full_path = self.normalize_path(path);
 

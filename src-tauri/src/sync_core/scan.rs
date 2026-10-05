@@ -102,6 +102,11 @@ pub struct ScanOptions {
     /// without bound. The used-storage scan sets it, as its own loop always
     /// counted files plus folders; a sync keeps the default, files only.
     pub count_dirs_against_cap: bool,
+    /// Report remote BFS totals through `DagObserver::on_scan_totals` without
+    /// retaining file entries across directories. Used-storage scans need only
+    /// sums; sync/compare callers keep the default and receive every file.
+    /// This mode bypasses the recursive fast path to keep the same contract.
+    pub remote_totals_only: bool,
 }
 
 impl ScanOptions {
@@ -1096,6 +1101,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
     };
 
     let mut results = Vec::new();
+    let mut files_seen = 0usize;
     let mut boundaries = ScanBoundaries::default();
     // Running totals for `DagObserver::on_scan_totals`: the directories the
     // listings named and the bytes of the files kept.
@@ -1116,7 +1122,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
 
     let count_dirs = opts.count_dirs_against_cap;
     while (!queue.is_empty() || in_flight > 0)
-        && cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) < cap
+        && cap_spent(files_seen, boundaries.len(), dirs_seen, count_dirs) < cap
     {
         if scan_cancelled(&cancel) {
             record_cancelled(&mut completeness, &mut boundaries);
@@ -1141,7 +1147,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                     "depth_limit",
                     // A queued walk entry is a directory the walk meant to list.
                     Some(true),
-                    cap.saturating_sub(results.len()),
+                    cap.saturating_sub(files_seen),
                 );
                 continue;
             }
@@ -1157,7 +1163,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                 want_remote_checksum,
                 cancel.clone(),
                 cap.saturating_sub(cap_spent(
-                    results.len(),
+                    files_seen,
                     boundaries.len(),
                     dirs_seen,
                     count_dirs,
@@ -1183,18 +1189,21 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                     &mut completeness,
                     batch.skipped_links,
                     batch.links_over_budget,
-                    cap.saturating_sub(results.len()),
+                    cap.saturating_sub(files_seen),
                 );
                 for file in batch.files {
-                    if cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) >= cap {
+                    if cap_spent(files_seen, boundaries.len(), dirs_seen, count_dirs) >= cap {
                         completeness.truncated = true;
                         break;
                     }
                     bytes_seen = bytes_seen.saturating_add(file.size);
-                    results.push(file);
+                    files_seen += 1;
+                    if !opts.remote_totals_only {
+                        results.push(file);
+                    }
                 }
                 for dir in batch.dirs {
-                    if cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) >= cap {
+                    if cap_spent(files_seen, boundaries.len(), dirs_seen, count_dirs) >= cap {
                         // Dropping a queued directory drops its whole subtree.
                         completeness.truncated = true;
                         break;
@@ -1221,7 +1230,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                         // Only a directory is listed, so only a directory can
                         // fail to list.
                         Some(true),
-                        cap.saturating_sub(results.len()),
+                        cap.saturating_sub(files_seen),
                     );
                 }
                 eprintln!("[scan_remote_tree] warning: {}", failure.message);
@@ -1238,8 +1247,8 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
 
         if let Some(obs) = observer {
             if last_progress.elapsed() >= SCAN_PROGRESS_INTERVAL {
-                obs.on_scan_progress(results.len(), in_flight);
-                obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
+                obs.on_scan_progress(files_seen, in_flight);
+                obs.on_scan_totals(files_seen, dirs_seen, bytes_seen);
                 last_progress = std::time::Instant::now();
             }
         }
@@ -1247,7 +1256,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
 
     // The loop also exits when the cap is hit, which is a truncated tree whose
     // missing part has no name.
-    if cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) >= cap {
+    if cap_spent(files_seen, boundaries.len(), dirs_seen, count_dirs) >= cap {
         completeness.truncated = true;
         boundaries.unbounded.get_or_insert("entry_cap");
     }
@@ -1258,8 +1267,8 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
     }
 
     if let Some(obs) = observer {
-        obs.on_scan_progress(results.len(), 0);
-        obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
+        obs.on_scan_progress(files_seen, 0);
+        obs.on_scan_totals(files_seen, dirs_seen, bytes_seen);
     }
     (results, completeness, boundaries)
 }
@@ -1285,6 +1294,7 @@ async fn scan_remote_tree_locked(
     };
 
     let mut results = Vec::new();
+    let mut files_seen = 0usize;
     let mut boundaries = ScanBoundaries::default();
     let mut completeness = ScanCompleteness::default();
     // Running totals for `DagObserver::on_scan_totals`, as on the pooled walk.
@@ -1310,7 +1320,7 @@ async fn scan_remote_tree_locked(
         // comes first: a directory at the depth limit is still recorded, and a
         // full scan has no room left to record it in.
         if cap_spent(
-            results.len(),
+            files_seen,
             boundaries.len(),
             dirs_seen,
             opts.count_dirs_against_cap,
@@ -1329,7 +1339,7 @@ async fn scan_remote_tree_locked(
                 "depth_limit",
                 // A queued entry is a directory the walk meant to list.
                 Some(true),
-                cap.saturating_sub(results.len()),
+                cap.saturating_sub(files_seen),
             );
             continue;
         }
@@ -1350,7 +1360,7 @@ async fn scan_remote_tree_locked(
             break;
         };
         let link_budget = cap.saturating_sub(cap_spent(
-            results.len(),
+            files_seen,
             boundaries.len(),
             dirs_seen,
             opts.count_dirs_against_cap,
@@ -1386,11 +1396,11 @@ async fn scan_remote_tree_locked(
                     &mut completeness,
                     batch.skipped_links,
                     batch.links_over_budget,
-                    cap.saturating_sub(results.len()),
+                    cap.saturating_sub(files_seen),
                 );
                 for file in batch.files {
                     if cap_spent(
-                        results.len(),
+                        files_seen,
                         boundaries.len(),
                         dirs_seen,
                         opts.count_dirs_against_cap,
@@ -1401,11 +1411,14 @@ async fn scan_remote_tree_locked(
                         break;
                     }
                     bytes_seen = bytes_seen.saturating_add(file.size);
-                    results.push(file);
+                    files_seen += 1;
+                    if !opts.remote_totals_only {
+                        results.push(file);
+                    }
                 }
                 for dir in batch.dirs {
                     if opts.count_dirs_against_cap
-                        && cap_spent(results.len(), boundaries.len(), dirs_seen, true) >= cap
+                        && cap_spent(files_seen, boundaries.len(), dirs_seen, true) >= cap
                     {
                         // Dropping a queued directory drops its whole subtree.
                         completeness.truncated = true;
@@ -1431,7 +1444,7 @@ async fn scan_remote_tree_locked(
                         // Only a directory is listed, so only a directory can
                         // fail to list.
                         Some(true),
-                        cap.saturating_sub(results.len()),
+                        cap.saturating_sub(files_seen),
                     );
                 }
                 eprintln!("[scan_remote_tree] warning: {}", failure.message);
@@ -1441,8 +1454,8 @@ async fn scan_remote_tree_locked(
         // One list at a time: emit per directory, matching the cadence the
         // pre-clone-pool path produced (no throttle needed here).
         if let Some(obs) = observer {
-            obs.on_scan_progress(results.len(), usize::from(!queue.is_empty()));
-            obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
+            obs.on_scan_progress(files_seen, usize::from(!queue.is_empty()));
+            obs.on_scan_totals(files_seen, dirs_seen, bytes_seen);
         }
     }
 
@@ -1452,8 +1465,8 @@ async fn scan_remote_tree_locked(
         record_cancelled(&mut completeness, &mut boundaries);
     }
     if let Some(obs) = observer {
-        obs.on_scan_progress(results.len(), 0);
-        obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
+        obs.on_scan_progress(files_seen, 0);
+        obs.on_scan_totals(files_seen, dirs_seen, bytes_seen);
     }
     (results, completeness, boundaries)
 }
@@ -1644,6 +1657,7 @@ fn uses_recursive_fastpath(
     cancel: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> bool {
     !opts.compute_remote_checksum
+        && !opts.remote_totals_only
         && !opts.disable_recursive_fastpath
         && opts.max_depth != Some(0)
         && !scan_cancelled(cancel)
@@ -3286,6 +3300,84 @@ pub(crate) mod tests {
         );
         scan_remote_tree_with_provider_lock_checked(holder, "/root", &opts, &model, cancel, None)
             .await
+    }
+
+    /// Used-storage scans keep only sums. Counts must still spend the cap,
+    /// and the final observer update must include every accepted file even
+    /// when no progress interval elapsed. Exercise both listing models.
+    #[tokio::test]
+    async fn remote_totals_only_keeps_counts_and_caps_without_retaining_files() {
+        struct Totals(std::sync::Mutex<(usize, usize, u64)>);
+        impl DagObserver for Totals {
+            fn on_scan_totals(&self, files: usize, dirs: usize, bytes: u64) {
+                *self.0.lock().unwrap() = (files, dirs, bytes);
+            }
+        }
+        for pool in [false, true] {
+            for cap in [3, 100] {
+                for totals_only in [false, true] {
+                    let tree = WalkTreeProvider::new(
+                        HashMap::from([
+                            (
+                                "/root".into(),
+                                vec![
+                                    provider_file("a", "/root/a", 7),
+                                    crate::providers::RemoteEntry::directory(
+                                        "child".into(),
+                                        "/root/child".into(),
+                                    ),
+                                ],
+                            ),
+                            (
+                                "/root/child".into(),
+                                vec![
+                                    provider_file("b", "/root/child/b", 11),
+                                    provider_file("c", "/root/child/c", 13),
+                                ],
+                            ),
+                        ]),
+                        pool,
+                    );
+                    let holder: Arc<Mutex<Option<Box<dyn StorageProvider>>>> =
+                        Arc::new(Mutex::new(Some(Box::new(tree))));
+                    let model =
+                        crate::provider_transfer_executor::resolve_provider_list_session_model(
+                            &holder, 4,
+                        )
+                        .await;
+                    let totals = Totals(std::sync::Mutex::new((0, 0, 0)));
+                    let opts = ScanOptions {
+                        remote_totals_only: totals_only,
+                        disable_recursive_fastpath: true,
+                        max_entries: Some(cap),
+                        count_dirs_against_cap: true,
+                        ..Default::default()
+                    };
+                    let (rows, completeness, boundaries) =
+                        scan_remote_tree_with_provider_lock_checked(
+                            holder,
+                            "/root",
+                            &opts,
+                            &model,
+                            None,
+                            Some(&totals),
+                        )
+                        .await;
+                    let expected = if cap == 3 { (2, 1, 18) } else { (3, 1, 31) };
+                    assert_eq!(
+                        *totals.0.lock().unwrap(),
+                        expected,
+                        "pool={pool}, cap={cap}"
+                    );
+                    assert_eq!(rows.len(), if totals_only { 0 } else { expected.0 });
+                    assert_eq!(completeness.truncated, cap == 3);
+                    assert_eq!(
+                        boundaries.unbounded,
+                        if cap == 3 { Some("entry_cap") } else { None }
+                    );
+                }
+            }
+        }
     }
 
     /// A cancel that lands while the walk lists its last directory used to be

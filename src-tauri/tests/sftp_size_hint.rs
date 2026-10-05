@@ -52,6 +52,8 @@ const SSH_FXP_READ: u8 = 5;
 const SSH_FXP_WRITE: u8 = 6;
 const SSH_FXF_CREAT: u32 = 0x00000008;
 const SSH_FXP_LSTAT: u8 = 7;
+const SSH_FXP_OPENDIR: u8 = 11;
+const SSH_FXP_READDIR: u8 = 12;
 const SSH_FXP_REALPATH: u8 = 16;
 const SSH_FXP_STAT: u8 = 17;
 const SSH_FXP_STATUS: u8 = 101;
@@ -227,6 +229,31 @@ impl TestSftpHandler {
                     counts.stat_pending.fetch_sub(1, Ordering::SeqCst);
                     let _ = handle.data(channel, framed).await;
                 });
+            }
+            SSH_FXP_OPENDIR => {
+                let Some(id) = r32(data, &mut pos) else {
+                    return;
+                };
+                let path = rstr(data, &mut pos).unwrap_or_default();
+                self.next_handle += 1;
+                let handle = format!("dir{}", self.next_handle);
+                self.handles.insert(handle.clone(), path);
+                self.counts.handles.fetch_add(1, Ordering::SeqCst);
+                let mut reply = vec![SSH_FXP_HANDLE];
+                w32(&mut reply, id);
+                wstr(&mut reply, handle.as_bytes());
+                self.send(channel, reply, session);
+            }
+            SSH_FXP_READDIR => {
+                let Some(id) = r32(data, &mut pos) else {
+                    return;
+                };
+                let handle = rstr(data, &mut pos).unwrap_or_default();
+                assert!(
+                    self.handles.contains_key(&handle),
+                    "read a live directory handle"
+                );
+                self.send(channel, status(id, SSH_FX_EOF, ""), session);
             }
             SSH_FXP_OPEN => {
                 if self.counts.stat_pending.load(Ordering::SeqCst) > 0 {
@@ -576,6 +603,27 @@ async fn hinted_download_overlaps_stat_and_open() {
     files.insert("/moving.bin.v2".to_string(), moving_v2.clone());
     let (port, counts) = start_server(files).await;
     let mut provider = connect(port).await;
+
+    // A fresh list clone must dial through its captured, pinned spec before
+    // READDIR. There is no walker retry here: before #1081 row 30 this first
+    // list fails with NotConnected. A second list reuses the live channel.
+    let mut list_worker = provider.clone_for_list().expect("list clone");
+    assert!(!list_worker.is_connected());
+    assert!(list_worker
+        .list("/")
+        .await
+        .expect("first clone listing")
+        .is_empty());
+    assert!(list_worker.is_connected());
+    assert!(list_worker
+        .list("/")
+        .await
+        .expect("warm clone listing")
+        .is_empty());
+    list_worker
+        .disconnect()
+        .await
+        .expect("disconnect list worker");
 
     // 1. Control: the unhinted path stays sequential. OPEN must NOT arrive
     // during the STAT window; this proves the detector can tell the two
