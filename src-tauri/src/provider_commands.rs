@@ -10133,6 +10133,7 @@ async fn provider_scan_used_inner(
         &roots,
         None,
         MAX_ENTRIES as usize,
+        crate::sync_core::scan::DEFAULT_SCAN_CHECKERS,
         Some(dir_limit),
         None,
         &|files, bytes| {
@@ -14879,6 +14880,75 @@ mod tests {
         assert!(!result.truncated && result.unreadable_dirs == 0);
         assert_eq!(result.method, "bfs-parallel");
         assert!(state.provider.try_lock().is_ok());
+    }
+
+    /// #958 review V1: with several folders listed at once, a server that
+    /// limits concurrency answers some of them 429 or 503. Each is sent again
+    /// after the pause the server asks for, so the figure stays complete; one
+    /// attempt per folder would have counted both as unreadable.
+    #[tokio::test]
+    async fn ehud_webdav_used_scan_retries_a_folder_answered_429_or_503() {
+        use axum::{http::StatusCode, routing::any, Router};
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let limited = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (busy_seen, limited_seen) = (busy.clone(), limited.clone());
+        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let (busy, limited) = (busy.clone(), limited.clone());
+            async move {
+                use axum::response::IntoResponse;
+                use std::sync::atomic::Ordering;
+                if request
+                    .headers()
+                    .get("depth")
+                    .is_some_and(|v| v == "infinity")
+                {
+                    return StatusCode::FORBIDDEN.into_response(); // Walk folder by folder.
+                }
+                let folder = request.uri().path().trim_end_matches('/').to_string();
+                let first = match folder.as_str() {
+                    "/busy" => busy.fetch_add(1, Ordering::SeqCst) == 0,
+                    "/limited" => limited.fetch_add(1, Ordering::SeqCst) == 0,
+                    _ => false,
+                };
+                if first {
+                    let status = if folder == "/busy" {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::TOO_MANY_REQUESTS
+                    };
+                    return (status, [("retry-after", "0")], String::new()).into_response();
+                }
+                let body = if folder.is_empty() {
+                    dav_listing(&[("/", None), ("/busy/", None), ("/limited/", None)])
+                } else {
+                    let own = format!("{folder}/");
+                    let file = format!("{folder}/f.bin");
+                    dav_listing(&[(own.as_str(), None), (file.as_str(), Some(10))])
+                };
+                (StatusCode::MULTI_STATUS, body).into_response()
+            }
+        }));
+        let (state, server) = dav_state(app, |_| {}).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::provider_scan_used_inner(
+                &state,
+                "/".into(),
+                Duration::from_secs(5),
+                |_, _, _| {},
+            ),
+        )
+        .await;
+        server.abort();
+        let result = result.expect("the retries end").expect("the scan answers");
+        assert_eq!(
+            (result.used, result.file_count, result.dir_count),
+            (20, 2, 2),
+            "both folders listed on their second attempt"
+        );
+        assert!(!result.truncated && result.unreadable_dirs == 0);
+        assert_eq!(busy_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(limited_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

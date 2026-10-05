@@ -592,7 +592,9 @@ const WEBDAV_MULTI_THREAD_MAX_STREAMS: usize = 16;
 /// on a cloned `reqwest::Client`.
 const WEBDAV_TRANSFER_MAX_SESSIONS: u16 = 8;
 /// Directories a walk lists at once (#958): the shared walker's default
-/// checkers, and rclone's `--checkers`, which lists WebDAV the same way.
+/// checkers, the same count as rclone's `--checkers`. Like rclone's pacer, a
+/// listing the server answers 429 or 503 is retried after a pause rather than
+/// counted as failed (see `send_propfind`); `--checkers` lowers it in the CLI.
 const WEBDAV_LIST_MAX_SESSIONS: u16 = 8;
 
 impl WebDavProvider {
@@ -1256,14 +1258,35 @@ impl WebDavProvider {
         let dir_path = Self::collection_path(path);
         let path = dir_path.as_str();
 
-        let response = self
-            .request(webdav_methods::propfind(), path)
-            .header("Depth", depth)
-            .header("Content-Type", "application/xml")
-            .body(body)
-            .send()
+        // A walk lists several collections at once (#958), and a server that
+        // limits concurrency answers the extra requests 429 or 503: those, and
+        // a gateway's 502 or 504, are sent again after the pause the server
+        // asks for (`Retry-After`) or an exponential one, before they count as
+        // a folder that did not list. Every attempt is built afresh, so a
+        // Digest session spends a new nonce count on each. `Depth: infinity`
+        // stays one attempt: on any failure its callers walk folder by folder.
+        let response = if depth == "infinity" {
+            self.request(webdav_methods::propfind(), path)
+                .header("Depth", depth)
+                .header("Content-Type", "application/xml")
+                .body(body)
+                .send()
+                .await
+                .map_err(send_error)?
+        } else {
+            super::http_retry::send_with_retry_replayable(
+                &self.client,
+                || {
+                    self.request(webdav_methods::propfind(), path)
+                        .header("Depth", depth)
+                        .header("Content-Type", "application/xml")
+                        .body(body)
+                },
+                &super::http_retry::HttpRetryConfig::default(),
+            )
             .await
-            .map_err(send_error)?;
+            .map_err(send_error)?
+        };
 
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);

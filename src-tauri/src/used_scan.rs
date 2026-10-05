@@ -315,6 +315,29 @@ pub async fn scan_used_bytes(
     max_depth: Option<usize>,
     max_entries: usize,
     cancel: &AtomicBool,
+    on_progress: impl FnMut(u64, u64) + Send,
+) -> Result<UsedScan, ProviderError> {
+    scan_used_bytes_with_checkers(
+        provider,
+        root,
+        max_depth,
+        max_entries,
+        crate::sync_core::scan::DEFAULT_SCAN_CHECKERS,
+        cancel,
+        on_progress,
+    )
+    .await
+}
+
+/// [`scan_used_bytes`] with the number of folders the walk may list at once on
+/// a provider that lists on independent clones: the CLI passes `--checkers`.
+pub async fn scan_used_bytes_with_checkers(
+    provider: &mut Box<dyn StorageProvider>,
+    root: &str,
+    max_depth: Option<usize>,
+    max_entries: usize,
+    checkers: usize,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(u64, u64) + Send,
 ) -> Result<UsedScan, ProviderError> {
     // --- Provider-native single-shot recursive listing -----------------
@@ -339,6 +362,7 @@ pub async fn scan_used_bytes(
         root,
         max_depth,
         max_entries,
+        checkers,
         cancel,
         &mut on_progress,
     )
@@ -348,11 +372,18 @@ pub async fn scan_used_bytes(
 /// Provider-agnostic breadth-first sum on the walker of the sync core. The
 /// provider is parked in a holder for the walk and handed back before this
 /// returns; `cancel` is mirrored into the walk, which reads its own flag.
+///
+/// The hand-back happens when the walk ends. A caller that drops this future
+/// part way is left holding the parked placeholder, which refuses every call,
+/// instead of its provider: cancel through `cancel`, as the CLI does, not by
+/// dropping. (The GUI path drops its future, but it calls
+/// [`walk_used_bytes`] on its own holder and parks nothing.)
 async fn bfs_used_bytes(
     provider: &mut Box<dyn StorageProvider>,
     root: &str,
     max_depth: Option<usize>,
     max_entries: usize,
+    checkers: usize,
     cancel: &AtomicBool,
     on_progress: &mut (impl FnMut(u64, u64) + Send),
 ) -> Result<UsedScan, ProviderError> {
@@ -372,6 +403,7 @@ async fn bfs_used_bytes(
         &roots,
         max_depth,
         max_entries,
+        checkers,
         None,
         Some(Arc::clone(&flag)),
         &report,
@@ -434,29 +466,38 @@ impl crate::transfer_dag::DagObserver for UsedScanObserver<'_> {
 /// its own beside the walker, which is why a used-storage scan of a large
 /// tree took minutes where a sync scan of the same tree took seconds (#958).
 ///
+/// `checkers` is how many folders may be listed at once on such a provider
+/// ([`crate::sync_core::scan::DEFAULT_SCAN_CHECKERS`] in the GUI, `--checkers`
+/// in the CLI); a provider without clones lists one whatever the value.
+///
 /// The figure keeps the meaning it had: symbolic links are left out, a folder
 /// that fails or times out (`dir_limit`) is counted in `unreadable_dirs` while
-/// its siblings are still walked, `max_entries` bounds files plus directories
-/// across all roots, and a depth the caller asked for is a complete answer to
-/// that depth (`depth_limited`) while the depth parachute is a cap. Cancel by
-/// raising `cancel`, or by dropping the future: the walk's tasks are aborted
-/// with it.
+/// its siblings are still walked, and a depth the caller asked for is a
+/// complete answer to that depth (`depth_limited`) while the depth parachute
+/// is a cap. `max_entries` is the walker's cap: across roots it is spent by
+/// files plus folders, but inside one root the walker counts the files it
+/// keeps (and the paths it names as unseen), not the folders waiting in its
+/// queue. A listing made only of folders therefore no longer stops at the
+/// cap the way the old loop did; it is bounded the way the sync walk is, by
+/// the depth parachute and by listing each queued folder. Cancel by raising
+/// `cancel`, or by dropping the future: the walk's tasks are aborted with it.
+#[allow(clippy::too_many_arguments)]
 pub async fn walk_used_bytes(
     provider: &Arc<tokio::sync::Mutex<Option<Box<dyn StorageProvider>>>>,
     roots: &[String],
     max_depth: Option<usize>,
     max_entries: usize,
+    checkers: usize,
     dir_limit: Option<Duration>,
     cancel: Option<Arc<AtomicBool>>,
     on_progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> UsedScan {
     use crate::sync_core::scan::{
-        scan_remote_tree_with_provider_lock_checked, ScanOptions, DEFAULT_SCAN_CHECKERS,
-        DEFAULT_SCAN_DEPTH,
+        scan_remote_tree_with_provider_lock_checked, ScanOptions, DEFAULT_SCAN_DEPTH,
     };
     let list_model = crate::provider_transfer_executor::resolve_provider_list_session_model(
         provider,
-        DEFAULT_SCAN_CHECKERS,
+        checkers.max(1),
     )
     .await;
     let depth_requested = max_depth.is_some();
@@ -1185,6 +1226,7 @@ mod tests {
                 &["/".to_string()],
                 None,
                 500_000,
+                crate::sync_core::scan::DEFAULT_SCAN_CHECKERS,
                 Some(std::time::Duration::from_millis(100)),
                 None,
                 &|_, _| {},
