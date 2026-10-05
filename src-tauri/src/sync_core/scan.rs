@@ -96,6 +96,12 @@ pub struct ScanOptions {
     /// following one lets a link to `.` or `..` inflate the figure. A sync
     /// keeps the default, since it needs the links it does not follow named.
     pub skip_symlinks: bool,
+    /// Spend `max_entries` on the directories the listings name as well as on
+    /// the files kept, so a tree made only of folders (or a listing of millions
+    /// of them) stops at the cap with `entry_cap` instead of growing the queue
+    /// without bound. The used-storage scan sets it, as its own loop always
+    /// counted files plus folders; a sync keeps the default, files only.
+    pub count_dirs_against_cap: bool,
 }
 
 impl ScanOptions {
@@ -1108,7 +1114,10 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
         .checked_sub(SCAN_PROGRESS_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
 
-    while (!queue.is_empty() || in_flight > 0) && results.len() + boundaries.len() < cap {
+    let count_dirs = opts.count_dirs_against_cap;
+    while (!queue.is_empty() || in_flight > 0)
+        && cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) < cap
+    {
         if scan_cancelled(&cancel) {
             record_cancelled(&mut completeness, &mut boundaries);
             break;
@@ -1147,7 +1156,12 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                 Arc::clone(&excludes),
                 want_remote_checksum,
                 cancel.clone(),
-                cap.saturating_sub(results.len() + boundaries.len()),
+                cap.saturating_sub(cap_spent(
+                    results.len(),
+                    boundaries.len(),
+                    dirs_seen,
+                    count_dirs,
+                )),
             );
             in_flight += 1;
         }
@@ -1172,7 +1186,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                     cap.saturating_sub(results.len()),
                 );
                 for file in batch.files {
-                    if results.len() + boundaries.len() >= cap {
+                    if cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) >= cap {
                         completeness.truncated = true;
                         break;
                     }
@@ -1180,7 +1194,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
                     results.push(file);
                 }
                 for dir in batch.dirs {
-                    if results.len() + boundaries.len() >= cap {
+                    if cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) >= cap {
                         // Dropping a queued directory drops its whole subtree.
                         completeness.truncated = true;
                         break;
@@ -1233,7 +1247,7 @@ pub async fn scan_remote_tree_with_provider_lock_checked(
 
     // The loop also exits when the cap is hit, which is a truncated tree whose
     // missing part has no name.
-    if results.len() + boundaries.len() >= cap {
+    if cap_spent(results.len(), boundaries.len(), dirs_seen, count_dirs) >= cap {
         completeness.truncated = true;
         boundaries.unbounded.get_or_insert("entry_cap");
     }
@@ -1295,7 +1309,13 @@ async fn scan_remote_tree_locked(
         // so the tree we report is smaller than the tree that exists. The cap
         // comes first: a directory at the depth limit is still recorded, and a
         // full scan has no room left to record it in.
-        if results.len() + boundaries.len() >= cap {
+        if cap_spent(
+            results.len(),
+            boundaries.len(),
+            dirs_seen,
+            opts.count_dirs_against_cap,
+        ) >= cap
+        {
             completeness.truncated = true;
             boundaries.unbounded.get_or_insert("entry_cap");
             break;
@@ -1329,7 +1349,12 @@ async fn scan_remote_tree_locked(
             boundaries.unbounded.get_or_insert("scan_session_lost");
             break;
         };
-        let link_budget = cap.saturating_sub(results.len() + boundaries.len());
+        let link_budget = cap.saturating_sub(cap_spent(
+            results.len(),
+            boundaries.len(),
+            dirs_seen,
+            opts.count_dirs_against_cap,
+        ));
         let batch = {
             let mut provider_lock = provider.lock().await;
             let Some(provider) = provider_lock.as_mut() else {
@@ -1364,7 +1389,13 @@ async fn scan_remote_tree_locked(
                     cap.saturating_sub(results.len()),
                 );
                 for file in batch.files {
-                    if results.len() + boundaries.len() >= cap {
+                    if cap_spent(
+                        results.len(),
+                        boundaries.len(),
+                        dirs_seen,
+                        opts.count_dirs_against_cap,
+                    ) >= cap
+                    {
                         completeness.truncated = true;
                         boundaries.unbounded.get_or_insert("entry_cap");
                         break;
@@ -1372,8 +1403,16 @@ async fn scan_remote_tree_locked(
                     bytes_seen = bytes_seen.saturating_add(file.size);
                     results.push(file);
                 }
-                dirs_seen += batch.dirs.len();
                 for dir in batch.dirs {
+                    if opts.count_dirs_against_cap
+                        && cap_spent(results.len(), boundaries.len(), dirs_seen, true) >= cap
+                    {
+                        // Dropping a queued directory drops its whole subtree.
+                        completeness.truncated = true;
+                        boundaries.unbounded.get_or_insert("entry_cap");
+                        break;
+                    }
+                    dirs_seen += 1;
                     queue.push_back(dir);
                 }
             }
@@ -1417,6 +1456,13 @@ async fn scan_remote_tree_locked(
         obs.on_scan_totals(results.len(), dirs_seen, bytes_seen);
     }
     (results, completeness, boundaries)
+}
+
+/// What a walk has spent of its entry cap: the files kept and the paths named
+/// as boundaries, plus the directories queued when the caller counts them
+/// ([`ScanOptions::count_dirs_against_cap`]).
+fn cap_spent(kept: usize, boundaries: usize, dirs_queued: usize, count_dirs: bool) -> usize {
+    kept + boundaries + if count_dirs { dirs_queued } else { 0 }
 }
 
 /// Mark a scan cancelled: it stopped at no particular directory, so nothing it

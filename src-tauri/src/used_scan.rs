@@ -474,13 +474,12 @@ impl crate::transfer_dag::DagObserver for UsedScanObserver<'_> {
 /// that fails or times out (`dir_limit`) is counted in `unreadable_dirs` while
 /// its siblings are still walked, and a depth the caller asked for is a
 /// complete answer to that depth (`depth_limited`) while the depth parachute
-/// is a cap. `max_entries` is the walker's cap: across roots it is spent by
-/// files plus folders, but inside one root the walker counts the files it
-/// keeps (and the paths it names as unseen), not the folders waiting in its
-/// queue. A listing made only of folders therefore no longer stops at the
-/// cap the way the old loop did; it is bounded the way the sync walk is, by
-/// the depth parachute and by listing each queued folder. Cancel by raising
-/// `cancel`, or by dropping the future: the walk's tasks are aborted with it.
+/// is a cap. `max_entries` bounds files plus folders, inside each root as
+/// across them ([`crate::sync_core::scan::ScanOptions::count_dirs_against_cap`]):
+/// a tree made only of folders, or a listing of millions of them, stops at
+/// the cap with `hit_cap` set instead of growing the walk's queue without
+/// bound. Cancel by raising `cancel`, or by dropping the future: the walk's
+/// tasks are aborted with it.
 #[allow(clippy::too_many_arguments)]
 pub async fn walk_used_bytes(
     provider: &Arc<tokio::sync::Mutex<Option<Box<dyn StorageProvider>>>>,
@@ -534,6 +533,7 @@ pub async fn walk_used_bytes(
             disable_recursive_fastpath: true,
             dir_list_timeout: dir_limit,
             skip_symlinks: true,
+            count_dirs_against_cap: true,
             ..Default::default()
         };
         let observer = UsedScanObserver {
@@ -1246,5 +1246,64 @@ mod tests {
         );
         assert_eq!(scan.method, "bfs");
         assert!(holder.try_lock().is_ok(), "the provider lock is released");
+    }
+
+    /// A tree of 50 folders holding 50 folders each, and not one file.
+    fn folders_only_tree() -> std::collections::HashMap<String, Vec<crate::providers::RemoteEntry>>
+    {
+        let mut dirs = std::collections::HashMap::new();
+        dirs.insert(
+            "/".to_string(),
+            (0..50)
+                .map(|i| dir(&format!("d{i}"), &format!("/d{i}")))
+                .collect(),
+        );
+        for i in 0..50 {
+            dirs.insert(
+                format!("/d{i}"),
+                (0..50)
+                    .map(|j| dir(&format!("e{j}"), &format!("/d{i}/e{j}")))
+                    .collect(),
+            );
+            for j in 0..50 {
+                dirs.insert(format!("/d{i}/e{j}"), Vec::new());
+            }
+        }
+        dirs
+    }
+
+    /// #1080 review: the cap counts folders, not only files. A tree made only
+    /// of folders used to walk all 2,550 of them under a cap of 100 and call
+    /// the figure complete; it now stops at the cap and says so.
+    #[tokio::test]
+    async fn a_tree_of_folders_only_stops_at_the_entry_cap_on_one_session() {
+        let mut provider: Box<dyn StorageProvider> = Box::new(tree_provider(folders_only_tree()));
+        let cancel = AtomicBool::new(false);
+        let scan = scan_used_bytes(&mut provider, "/", None, 100, &cancel, |_, _| {})
+            .await
+            .expect("the walk answers");
+        assert!(scan.hit_cap && scan.truncated, "{scan:?}");
+        assert!(
+            scan.dir_count <= 100,
+            "the queue stopped at the cap: {scan:?}"
+        );
+        assert_eq!(scan.method, "bfs");
+    }
+
+    /// The same bound on the pooled walk, which takes another code path.
+    #[tokio::test]
+    async fn a_tree_of_folders_only_stops_at_the_entry_cap_on_a_clone_pool() {
+        let tree = crate::sync_core::scan::tests::WalkTreeProvider::new(folders_only_tree(), true);
+        let mut provider: Box<dyn StorageProvider> = Box::new(tree);
+        let cancel = AtomicBool::new(false);
+        let scan = scan_used_bytes(&mut provider, "/", None, 100, &cancel, |_, _| {})
+            .await
+            .expect("the walk answers");
+        assert!(scan.hit_cap && scan.truncated, "{scan:?}");
+        assert!(
+            scan.dir_count <= 100,
+            "the queue stopped at the cap: {scan:?}"
+        );
+        assert_eq!(scan.method, "bfs-parallel");
     }
 }
