@@ -12,6 +12,8 @@ Both surfaces now use `config_app_settings.ui_settings.my_servers_table.visibili
 
 The live cold-start test exposed another gap: before vault unlock the GUI can hydrate from an old browser cache. Both preference hooks now re-read on the existing vault-initialization/unlock refresh as well as window focus.
 
+Review follow-up: profile-view saves now share a serialized read-modify-write queue. Each mutation reads the latest blob after the preceding vault write completes, and the fallback cache changes only after vault acknowledgement. Focus reads carry a generation counter, so a newer read or confirmed settings-change event invalidates an older response. This queue coordinates the two GUI hooks; it does not establish a cross-process transaction with the CLI.
+
 ## Live checks
 
 The isolated portable development vault contained two test profiles. The CLI was built from this branch; the GUI used the unchanged baseline Rust GUI binary with this branch's Vite frontend. WebKitGTK was driven with the `gui-drive` skill, under `G_SLICE=always-malloc`, `G_DEBUG=gc-friendly` and `MALLOC_CHECK_=3`. Tests changed local view preferences only.
@@ -27,12 +29,13 @@ The isolated portable development vault contained two test profiles. The CLI was
 | Saved breakdown true, bare JSON versus explicit JSON breakdown | Bare output remains a two-profile array; explicit output contains profiles, summary and two protocol groups, with identical profile data |
 | Invalid `--hide` together with a breakdown change | Exit 5; saved settings unchanged |
 | Close GUI with stale browser choices, change CLI preferences, reopen with locked vault and unlock | Correct columns and checkbox loaded immediately after unlock, without a manual focus event |
+| Click breakdown and Host controls back-to-back in the real GUI, then start a fresh CLI | Both choices remain saved; GUI shows Host and two protocol rows, and the CLI reads both choices |
 
 The GUI exited normally between cold-start runs without a heap-hardening abort. This verification covers profile preferences; it does not claim a new GUI backend build or packaging test.
 
 ## Focused gates
 
-- TypeScript typecheck and 16 frontend tests passed (table sanitization, preference hydration, focus/unlock refresh, checkbox writes, preservation and failed writes).
+- TypeScript typecheck and 21 frontend tests passed (table sanitization, preference hydration, focus/unlock refresh, checkbox writes, preservation and failed writes). Deferred-promise tests cover a stale read completing after a newer read/event and overlapping column/breakdown saves. The real secure-storage helper is exercised for a failed vault write with no canonical settings value, unchanged fallback, and successful recovery on the next save.
 - Five new CLI preference tests and the existing interactive-refresh argument test passed.
 - The debug CLI build, Rust formatting, whitespace checks and all five security regression checks passed.
 - No locale keys were added or changed; the checkbox reuses an existing translation in all 47 locales.

@@ -2,11 +2,12 @@
 // Copyright (c) 2024-2026 axpnet -- AI-assisted (see AI-TRANSPARENCY.md)
 
 import { useCallback, useEffect, useState } from 'react';
-import { secureGetWithFallback, secureStoreAndClean } from '../utils/secureStorage';
+import { secureGetWithFallback } from '../utils/secureStorage';
+import { APP_SETTINGS_EVENT, updateAppSettings } from '../utils/appSettings';
 
 const ACCOUNT = 'app_settings';
 const CACHE_KEY = 'aeroftp_settings';
-const EVENT = 'aeroftp-settings-changed';
+const EVENT = APP_SETTINGS_EVENT;
 
 type Settings = Record<string, unknown>;
 
@@ -21,13 +22,16 @@ export function useMyServersBreakdown(refreshKey?: number) {
 
     useEffect(() => {
         let cancelled = false;
+        let loadVersion = 0;
         const load = async () => {
+            const version = ++loadVersion;
             const blob = await secureGetWithFallback<Settings>(ACCOUNT, CACHE_KEY);
-            if (!cancelled) setLocal(readBreakdown(blob));
+            if (!cancelled && version === loadVersion) setLocal(readBreakdown(blob));
         };
         void load();
         const onFocus = () => { void load(); };
         const onChanged = (event: Event) => {
+            ++loadVersion;
             setLocal(readBreakdown((event as CustomEvent<Settings | null>).detail));
         };
         window.addEventListener('focus', onFocus);
@@ -41,17 +45,16 @@ export function useMyServersBreakdown(refreshKey?: number) {
 
     const setBreakdown = useCallback(async (next: boolean) => {
         try {
-            const existing = await secureGetWithFallback<Settings>(ACCOUNT, CACHE_KEY);
-            const ui = existing?.ui_settings;
-            const updated = {
-                ...(existing || {}),
-                ui_settings: {
-                    ...(ui && typeof ui === 'object' ? ui : {}),
-                    my_servers_breakdown: next,
-                },
-            };
-            await secureStoreAndClean(ACCOUNT, CACHE_KEY, updated);
-            window.dispatchEvent(new CustomEvent(EVENT, { detail: updated }));
+            await updateAppSettings(existing => {
+                const ui = existing?.ui_settings;
+                return {
+                    ...(existing || {}),
+                    ui_settings: {
+                        ...(ui && typeof ui === 'object' ? ui : {}),
+                        my_servers_breakdown: next,
+                    },
+                };
+            });
         } catch {
             // Keep the last confirmed choice when the vault write fails.
         }

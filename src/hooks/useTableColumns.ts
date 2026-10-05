@@ -2,7 +2,8 @@
 // Copyright (c) 2024-2026 axpnet -- AI-assisted (see AI-TRANSPARENCY.md)
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { secureGetWithFallback, secureStoreAndClean } from '../utils/secureStorage';
+import { secureGetWithFallback } from '../utils/secureStorage';
+import { APP_SETTINGS_EVENT, updateAppSettings } from '../utils/appSettings';
 
 export type TableColAlign = 'left' | 'center' | 'right';
 
@@ -60,7 +61,7 @@ export interface UseTableColumnsResult<TColId extends string> {
 const VAULT_ACCOUNT = 'app_settings';
 const VAULT_KEY = 'aeroftp_settings';
 const SETTINGS_GROUP = 'ui_settings';
-const EVENT_NAME = 'aeroftp-settings-changed';
+const EVENT_NAME = APP_SETTINGS_EVENT;
 
 const DEFAULT_MIN_WIDTH = 60;
 
@@ -276,11 +277,13 @@ export function useTableColumns<TColId extends string>(
 
     useEffect(() => {
         let cancelled = false;
+        let loadVersion = 0;
         const load = async () => {
+            const version = ++loadVersion;
             try {
                 const blob = await secureGetWithFallback<Record<string, unknown>>(VAULT_ACCOUNT, VAULT_KEY);
                 const rawSettings = readSettingsBlob(blob, storageKey);
-                if (!cancelled && rawSettings !== undefined) {
+                if (!cancelled && version === loadVersion && rawSettings !== undefined) {
                     setHasPersisted(true);
                     setConfig(sanitizeConfig(rawSettings, columns, overrideDefaultVisibility, sortableIds));
                 }
@@ -295,6 +298,7 @@ export function useTableColumns<TColId extends string>(
             const detail = (e as CustomEvent<Record<string, unknown> | null>).detail;
             const rawSettings = readSettingsBlob(detail, storageKey);
             if (rawSettings !== undefined) {
+                ++loadVersion;
                 setHasPersisted(true);
                 setConfig(sanitizeConfig(rawSettings, columns, overrideDefaultVisibility, sortableIds));
             }
@@ -314,30 +318,29 @@ export function useTableColumns<TColId extends string>(
         setHasPersisted(true);
         (async () => {
             try {
-                const existing = await secureGetWithFallback<Record<string, unknown>>(VAULT_ACCOUNT, VAULT_KEY);
-                const base = { ...(existing || {}) };
-                // Drop legacy top-level placement (Phase 2 Step 8 back-compat)
-                delete base[storageKey];
-                const uiSettings = base[SETTINGS_GROUP] && typeof base[SETTINGS_GROUP] === 'object'
-                    ? (base[SETTINGS_GROUP] as Record<string, unknown>)
-                    : {};
-                const updated = {
-                    ...base,
-                    [SETTINGS_GROUP]: {
-                        ...uiSettings,
-                        [storageKey]: {
-                            ...readSettingsBlob(existing, storageKey) as Record<string, unknown>,
-                            ...next,
-                            // Keep columns used only by the CLI (e.g. groups).
-                            visibility: {
-                                ...(readSettingsBlob(existing, storageKey) as TableColumnsConfig<TColId> | undefined)?.visibility,
-                                ...next.visibility,
+                await updateAppSettings(existing => {
+                    const base = { ...(existing || {}) };
+                    // Drop legacy top-level placement (Phase 2 Step 8 back-compat)
+                    delete base[storageKey];
+                    const uiSettings = base[SETTINGS_GROUP] && typeof base[SETTINGS_GROUP] === 'object'
+                        ? (base[SETTINGS_GROUP] as Record<string, unknown>)
+                        : {};
+                    return {
+                        ...base,
+                        [SETTINGS_GROUP]: {
+                            ...uiSettings,
+                            [storageKey]: {
+                                ...readSettingsBlob(existing, storageKey) as Record<string, unknown>,
+                                ...next,
+                                // Keep columns used only by the CLI (e.g. groups).
+                                visibility: {
+                                    ...(readSettingsBlob(existing, storageKey) as TableColumnsConfig<TColId> | undefined)?.visibility,
+                                    ...next.visibility,
+                                },
                             },
                         },
-                    },
-                };
-                await secureStoreAndClean(VAULT_ACCOUNT, VAULT_KEY, updated);
-                window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: updated }));
+                    };
+                });
             } catch {
                 /* best-effort */
             }

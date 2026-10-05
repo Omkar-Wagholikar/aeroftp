@@ -13,7 +13,7 @@ const storage = vi.hoisted(() => ({
 }));
 vi.mock('../utils/secureStorage', () => ({
     secureGetWithFallback: storage.get,
-    secureStoreAndClean: storage.store,
+    secureStore: storage.store,
 }));
 vi.mock('../i18n', () => ({ useTranslation: () => (key: string) => key }));
 
@@ -38,7 +38,7 @@ beforeEach(async () => {
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
     storage.blob = {};
     storage.get.mockReset().mockImplementation(async () => structuredClone(storage.blob));
-    storage.store.mockReset().mockImplementation(async (_account, _cache, value) => {
+    storage.store.mockReset().mockImplementation(async (_account, value) => {
         storage.blob = structuredClone(value);
     });
     host = document.createElement('div');
@@ -109,5 +109,58 @@ describe('shared CLI / GUI profile view preferences', () => {
         storage.store.mockRejectedValueOnce(new Error('vault unavailable'));
         await act(async () => checkbox().click());
         expect(checkbox().checked).toBe(false);
+    });
+
+    it('discards older focus reads that finish after a newer focus read', async () => {
+        await mount();
+        const old = { ui_settings: { my_servers_breakdown: false, my_servers_table: { visibility: { subtitle: true } } } };
+        const newer = { ui_settings: { my_servers_breakdown: true, my_servers_table: { visibility: { subtitle: false } } } };
+        const resolve: Array<(value: typeof old) => void> = [];
+        storage.get.mockImplementationOnce(() => new Promise(r => resolve.push(r)))
+            .mockImplementationOnce(() => new Promise(r => resolve.push(r)));
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        storage.blob = newer;
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        await act(async () => resolve.forEach(r => r(old)));
+        expect(checkbox().checked).toBe(true);
+        expect(latest.config.visibility.subtitle).toBe(false);
+    });
+
+    it('does not let pending reads replace a confirmed settings-change event', async () => {
+        await mount();
+        const old = { ui_settings: { my_servers_breakdown: false, my_servers_table: { visibility: { subtitle: true } } } };
+        const newer = { ui_settings: { my_servers_breakdown: true, my_servers_table: { visibility: { subtitle: false } } } };
+        const resolve: Array<(value: typeof old) => void> = [];
+        storage.get.mockImplementationOnce(() => new Promise(r => resolve.push(r)))
+            .mockImplementationOnce(() => new Promise(r => resolve.push(r)));
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        await act(async () => window.dispatchEvent(new CustomEvent('aeroftp-settings-changed', { detail: newer })));
+        await act(async () => resolve.forEach(r => r(old)));
+        expect(checkbox().checked).toBe(true);
+        expect(latest.config.visibility.subtitle).toBe(false);
+    });
+
+    it('retains both a column change and breakdown clicked during a pending save', async () => {
+        await mount();
+        let release!: () => void;
+        const gate = new Promise<void>(r => { release = r; });
+        storage.store.mockImplementationOnce(async (_account, value) => {
+            await gate;
+            storage.blob = structuredClone(value);
+        });
+        await act(async () => {
+            checkbox().click();
+            latest.setVisible('subtitle', false);
+        });
+        expect(storage.store).toHaveBeenCalledTimes(1);
+        await act(async () => {
+            release();
+            await vi.waitFor(() => expect(storage.store).toHaveBeenCalledTimes(2));
+        });
+        const ui = storage.blob.ui_settings as Record<string, unknown>;
+        expect(ui.my_servers_breakdown).toBe(true);
+        expect((ui.my_servers_table as { visibility: Record<string, boolean> }).visibility.subtitle).toBe(false);
+        expect(checkbox().checked).toBe(true);
+        expect(latest.config.visibility.subtitle).toBe(false);
     });
 });
