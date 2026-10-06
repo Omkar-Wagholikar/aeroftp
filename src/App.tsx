@@ -6829,7 +6829,7 @@ const App: React.FC = () => {
   ]);
 
   const buildProviderParams = async (params: ConnectionParams, initialPath: string | null, connectScope = new ConnectScope()) => {
-    const scopedInvoke = <T,>(...args: Parameters<typeof invoke>) => connectScope.step(() => invoke<T>(...args));
+    const scopedInvoke = <T,>(command: string, args?: Record<string, unknown>) => connectScope.step(() => invoke<T>(command, args));
     connectScope.assert();
     let effectiveParams = normalizeProviderConnectionParams(params);
 
