@@ -16171,7 +16171,7 @@ const App: React.FC = () => {
             }
           }}
           onSelectAll={() => {
-            setPanelSelection(activePanel === 'remote' ? 'remote' : 'local', [], 'all');
+            setPanelSelection(activePanel === 'remote' ? 'remote' : activeLocalPanelId, [], 'all');
           }}
           onCut={() => {
             if (activePanel === 'remote' && selectedRemoteFiles.size > 0) {
