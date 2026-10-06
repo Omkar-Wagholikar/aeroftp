@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
+import { ConnectScope, type ProfileConnector, type RegisterProfileConnector } from './gui/connectScope';
 import { useGuiController } from './hooks/useGuiController';
 import { GuiControllerBanner } from './components/GuiControllerBanner';
 import { GuiError } from './gui/controller';
@@ -2451,8 +2452,11 @@ const App: React.FC = () => {
   const runConnect = useCallback(<T,>(
     command: 'provider_connect' | 'connect_ftp',
     params: Record<string, unknown>,
+    scope?: ConnectScope,
   ): Promise<T> => cancellableConnect<T>((token) =>
-    invoke<T>(command, { params: { ...params, connectToken: token } })
+    scope ? scope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); },
+      () => invoke<T>(command, { params: { ...params, connectToken: token } })) :
+      invoke<T>(command, { params: { ...params, connectToken: token } })
   ), [cancellableConnect]);
 
   // Esc aborts an in-progress connection. Always-mounted listener that only
@@ -4716,21 +4720,23 @@ const App: React.FC = () => {
   const openMtpSessionFromLiveDevice = useCallback(async (
     device: MtpDeviceInfo,
     profile?: Pick<ServerProfile, 'id' | 'name' | 'providerId' | 'initialPath' | 'localInitialPath'>,
+    connectScope = new ConnectScope(),
   ) => {
+    connectScope.assert();
     try {
       // Drop any live remote/FTP slot first; open also drains ProviderState.
-      try { await invoke('provider_disconnect'); } catch { /* not connected */ }
-      try { await invoke('disconnect_ftp'); } catch { /* not connected */ }
-      try { await invoke('mtp_close_device', { deviceId: null }); } catch { /* none */ }
+      try { await connectScope.step(() => invoke('provider_disconnect')); } catch { connectScope.assert(); /* not connected */ }
+      try { await connectScope.step(() => invoke('disconnect_ftp')); } catch { connectScope.assert(); /* not connected */ }
+      try { await connectScope.step(() => invoke('mtp_close_device', { deviceId: null })); } catch { connectScope.assert(); /* none */ }
 
       // Ride gvfs when the desktop already holds the single MTP session.
       // Exclusive libmtp after automount always loses (PTP_ERROR_IO) and can wedge
       // the phone; see 09-live-findings-2026-07-16.md.
       let gvfsMount: string | null = null;
       try {
-        const mounts = await invoke<VolumeInfo[]>('list_mounted_volumes');
+        const mounts = await connectScope.step(() => invoke<VolumeInfo[]>('list_mounted_volumes'));
         gvfsMount = findGvfsMtpMount(mounts, device);
-      } catch {
+      } catch { connectScope.assert();
         gvfsMount = null;
       }
 
@@ -4738,16 +4744,16 @@ const App: React.FC = () => {
         profile?.name || device.displayName || undefined;
       let session: MtpSessionInfo;
       if (gvfsMount) {
-        session = await invoke<MtpSessionInfo>('mtp_open_gvfs_mount', {
+        session = await connectScope.step(() => invoke<MtpSessionInfo>('mtp_open_gvfs_mount', {
           mountPath: gvfsMount,
           deviceId: device.deviceId,
           displayName: displayHint ?? null,
-        });
+        }));
         mtpGvfsMountPathRef.current = gvfsMount;
       } else {
-        session = await invoke<MtpSessionInfo>('mtp_open_device', {
+        session = await connectScope.step(() => invoke<MtpSessionInfo>('mtp_open_device', {
           deviceId: device.deviceId,
-        });
+        }));
         mtpGvfsMountPathRef.current = null;
       }
       setActivePortableDeviceId(session.deviceId);
@@ -4790,23 +4796,23 @@ const App: React.FC = () => {
       try {
         if (wantedRemote && wantedRemote !== '/' && wantedRemote !== '.') {
           try {
-            const response = await invoke<{ files: any[]; current_path: string }>('provider_change_dir', {
+            const response = await connectScope.step(() => invoke<{ files: any[]; current_path: string }>('provider_change_dir', {
               path: wantedRemote,
-            });
+            }));
             files = mapProviderFiles(response.files);
             remotePath = response.current_path || wantedRemote;
-          } catch {
+          } catch { connectScope.assert();
             // Default path missing on device: fall back to storage roots.
-            const response = await invoke<{ files: any[]; current_path: string }>('provider_list_files', {
+            const response = await connectScope.step(() => invoke<{ files: any[]; current_path: string }>('provider_list_files', {
               path: null,
-            });
+            }));
             files = mapProviderFiles(response.files);
             remotePath = response.current_path || '/';
           }
         } else {
-          const response = await invoke<{ files: any[]; current_path: string }>('provider_list_files', {
+          const response = await connectScope.step(() => invoke<{ files: any[]; current_path: string }>('provider_list_files', {
             path: null,
-          });
+          }));
           files = mapProviderFiles(response.files);
           remotePath = response.current_path || '/';
         }
@@ -4814,7 +4820,7 @@ const App: React.FC = () => {
         setCurrentRemotePath(remotePath);
         setCurrentRemoteDisplayPath(remotePath);
         setSelectedRemoteFiles(new Set());
-      } catch (listErr) {
+      } catch (listErr) { connectScope.assert();
         // Open succeeded; listing may fail when backend is Null/unlinked or
         // the device needs unlock. Keep the session active and show the error.
         const listErrorMessage = typeof listErr === 'string' ? listErr : String(listErr);
@@ -4845,16 +4851,16 @@ const App: React.FC = () => {
       const wantedLocal = profile?.localInitialPath?.trim();
       if (wantedLocal) {
         try {
-          const listed: LocalFile[] = await invoke('get_local_files', {
+          const listed: LocalFile[] = await connectScope.step(() => invoke('get_local_files', {
             path: wantedLocal,
             showHidden: showHiddenFiles,
-          });
+          }));
           setLocalFiles(listed);
           setCurrentLocalPath(wantedLocal);
           setSelectedLocalFiles(new Set());
           resolvedLocalPath = wantedLocal;
           resolvedLocalFiles = listed;
-        } catch {
+        } catch { connectScope.assert();
           // Keep current local path when the saved default is missing.
         }
       }
@@ -4898,18 +4904,18 @@ const App: React.FC = () => {
       let seen = false;
       try {
         seen = localStorage.getItem(MTP_HONESTY_SEEN_KEY) === 'true';
-      } catch {
+      } catch { connectScope.assert();
         seen = false;
       }
       if (!seen) {
         notify.info(t('sidebar.portable_devices'), t('sidebar.portable_honesty'));
         try {
           localStorage.setItem(MTP_HONESTY_SEEN_KEY, 'true');
-        } catch {
+        } catch { connectScope.assert();
           /* quota */
         }
       }
-    } catch (err) {
+    } catch (err) { connectScope.assert();
       setActivePortableDeviceId(null);
       mtpGvfsMountPathRef.current = null;
       const errorMessage = typeof err === 'string' ? err : String(err);
@@ -6211,7 +6217,10 @@ const App: React.FC = () => {
     async (...args: A): Promise<R> => {
       remoteConnectPhaseRef.current = 'connect';
       try {
-        return await fn(...args);
+        const scope = args[args.length - 1];
+        return scope instanceof ConnectScope
+          ? await scope.cancellable(() => { void cancelActiveConnect(); return cancelRemoteNavigation(); }, () => fn(...args))
+          : await fn(...args);
       } finally {
         remoteConnectPhaseRef.current = false;
       }
@@ -8240,7 +8249,8 @@ const App: React.FC = () => {
 
   useFaviconDetection(sessions, activeSessionId, handleFaviconDetected);
 
-  const switchSession = async (sessionId: string) => {
+  const switchSession = async (sessionId: string, connectScope = new ConnectScope()) => {
+    connectScope.assert();
     // Find the target session from current sessions state
     const targetSession = sessions.find(s => s.id === sessionId);
     if (!targetSession) return;
@@ -8335,11 +8345,11 @@ const App: React.FC = () => {
       let stillAlive = false;
       if (!targetSession.cryptOverlay) {
         try {
-          stillAlive = await invoke<boolean>('provider_probe_alive', {
+          stillAlive = await connectScope.step(() => invoke<boolean>('provider_probe_alive', {
             protocol: protocol ?? null,
             username: targetSession.connectionParams?.username || null,
-          });
-        } catch {
+          }));
+        } catch { connectScope.assert();
           stillAlive = false;
         }
       }
@@ -8348,27 +8358,27 @@ const App: React.FC = () => {
         logger.debug('[switchSession] #128-C: backend session still alive, reusing without reconnect (no 2FA)');
         if (!targetSession.cryptOverlay && targetSession.remotePath && targetSession.remotePath !== '/') {
           try {
-            await listWithSpinner(() => invoke('provider_change_dir', { path: targetSession.remotePath }));
-          } catch (error) {
+            await connectScope.step(() => listWithSpinner(() => invoke('provider_change_dir', { path: targetSession.remotePath })));
+          } catch (error) { connectScope.assert();
             // A cancel must unwind the switch; any other cd failure just keeps
             // the backend cwd and lists from wherever we are.
             if (isListingCancelled(error)) throw error;
           }
         }
-        response = await listWithSpinner(() => invoke('provider_list_files', { path: null }));
+        response = await connectScope.step(() => listWithSpinner(() => invoke('provider_list_files', { path: null })));
       } else if (isOAuth) {
         // OAuth providers - need to reconnect because ProviderState may have a different provider
         logger.debug('[switchSession] OAuth provider, reconnecting...');
 
         // First disconnect any existing provider to avoid conflicts
         try {
-          await invoke('provider_disconnect');
-        } catch {
+          await connectScope.step(() => invoke('provider_disconnect'));
+        } catch { connectScope.assert();
           // Ignore if not connected
         }
         try {
-          await invoke('disconnect_ftp');
-        } catch {
+          await connectScope.step(() => invoke('disconnect_ftp'));
+        } catch { connectScope.assert();
           // Ignore if not connected
         }
 
@@ -8378,7 +8388,7 @@ const App: React.FC = () => {
         let clientSecret: string | null = null;
 
         try {
-          const oauthSettings = await secureGetWithFallback<Record<string, { clientId: string; clientSecret: string }>>('oauth_clients', 'aeroftp_oauth_settings');
+          const oauthSettings = await connectScope.step(() => secureGetWithFallback<Record<string, { clientId: string; clientSecret: string }>>('oauth_clients', 'aeroftp_oauth_settings'));
           if (oauthSettings) {
             const providerKey = protocol === 'googledrive' ? 'googledrive' : protocol;
             if (oauthSettings[providerKey]) {
@@ -8386,7 +8396,7 @@ const App: React.FC = () => {
               clientSecret = oauthSettings[providerKey].clientSecret;
             }
           }
-        } catch (e) {
+        } catch (e) { connectScope.assert();
           console.warn('[switchSession] Failed to parse OAuth settings:', e);
         }
 
@@ -8395,13 +8405,13 @@ const App: React.FC = () => {
         if (!clientId || !clientSecret) {
           try {
             const keyringProvider = protocol; // Credentials stored with protocol name as-is (e.g., 'googledrive')
-            const kid = await invoke<string>('get_credential', { account: `oauth_${keyringProvider}_client_id` });
-            const ksecret = await invoke<string>('get_credential', { account: `oauth_${keyringProvider}_client_secret` });
+            const kid = await connectScope.step(() => invoke<string>('get_credential', { account: `oauth_${keyringProvider}_client_id` }));
+            const ksecret = await connectScope.step(() => invoke<string>('get_credential', { account: `oauth_${keyringProvider}_client_secret` }));
             if (kid && ksecret) {
               clientId = kid;
               clientSecret = ksecret;
             }
-          } catch (e) {
+          } catch (e) { connectScope.assert();
             // Credentials not stored (null), or the vault could not be read.
             keyReadError = keyReadFailure(e);
           }
@@ -8414,9 +8424,10 @@ const App: React.FC = () => {
 
         if (isFourSharedProvider(protocol)) {
           // 4shared uses OAuth 1.0: needs fourshared_connect, not oauth2_connect
-          await invoke('fourshared_connect', {
-            params: { consumer_key: clientId, consumer_secret: clientSecret }
-          });
+          await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(
+            () => { void invoke('cancel_connection', { token }).catch(() => {}); },
+            () => invoke('fourshared_connect', { params: { consumer_key: clientId, consumer_secret: clientSecret,
+              profile_id: targetSession.savedServerId ?? '', connect_token: token } }))));
         } else {
           // OAuth 2.0 providers (Google Drive, Dropbox, OneDrive, Box, pCloud, Zoho)
           const oauthProvider = protocol === 'googledrive' ? 'google_drive' : protocol;
@@ -8425,8 +8436,8 @@ const App: React.FC = () => {
           let region: string | undefined = targetSession.connectionParams?.options?.region;
           if (!region && protocol === 'zohoworkdrive') {
             try {
-              region = await invoke<string>('get_credential', { account: `oauth_${protocol}_region` });
-            } catch {
+              region = await connectScope.step(() => invoke<string>('get_credential', { account: `oauth_${protocol}_region` }));
+            } catch { connectScope.assert();
               // Default "us" will be applied by Rust serde default
             }
           }
@@ -8442,8 +8453,8 @@ const App: React.FC = () => {
             ...(region && { region }),
           };
           try {
-            await invoke('oauth2_connect', { params: oauthParams });
-          } catch (connectErr) {
+            await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => invoke('oauth2_connect', { params: { ...oauthParams, connect_token: token } }))));
+          } catch (connectErr) { connectScope.assert();
             const errMsg = connectErr instanceof Error ? connectErr.message : String(connectErr);
             const lower = errMsg.toLowerCase();
             // Token invalid/expired: re-authenticate and retry
@@ -8452,8 +8463,8 @@ const App: React.FC = () => {
                 lower.includes('token expired') ||
                 (lower.includes('token') && lower.includes('refresh'))) {
               logger.debug('[switchSession] OAuth token invalid, re-authenticating...');
-              await invoke('oauth2_full_auth', { params: oauthParams });
-              await invoke('oauth2_connect', { params: oauthParams });
+              await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => invoke('oauth2_full_auth', { params: { ...oauthParams, connect_token: token } }))));
+              await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => invoke('oauth2_connect', { params: { ...oauthParams, connect_token: token } }))));
             } else {
               throw connectErr;
             }
@@ -8462,9 +8473,9 @@ const App: React.FC = () => {
 
         // Now navigate to the session's path, unless a crypt overlay must be
         // re-applied first because the saved path is plaintext-domain.
-        response = await listWithSpinner(() => targetSession.cryptOverlay
+        response = await connectScope.step(() => listWithSpinner(() => targetSession.cryptOverlay
           ? invoke<FileListResponse>('provider_list_files', { path: null })
-          : invoke<FileListResponse>('provider_change_dir', { path: targetSession.remotePath || '/' }));
+          : invoke<FileListResponse>('provider_change_dir', { path: targetSession.remotePath || '/' })));
       } else if (usesProviderApiForSession) {
         logger.debug('[switchSession] Provider (S3/WebDAV), reconnecting...');
 
@@ -8472,7 +8483,7 @@ const App: React.FC = () => {
         // Safety check: recover missing S3 options
         if (protocol === 's3' && (!connectParams.options || !connectParams.options.bucket)) {
           try {
-            const savedServers = await loadSavedServerProfiles();
+            const savedServers = await connectScope.step(() => loadSavedServerProfiles());
             if (savedServers) {
               const found = savedServers.find((s: any) =>
                 (s.name === targetSession.serverName) ||
@@ -8483,43 +8494,43 @@ const App: React.FC = () => {
                 connectParams = { ...connectParams, options: found.options };
               }
             }
-          } catch (e) { console.error('Option recovery failed', e); }
+          } catch (e) { connectScope.assert(); console.error('Option recovery failed', e); }
         }
 
         // First disconnect any existing connections
-        try { await invoke('provider_disconnect'); } catch { }
-        try { await invoke('disconnect_ftp'); } catch { }
+        try { await connectScope.step(() => invoke('provider_disconnect')); } catch { connectScope.assert(); }
+        try { await connectScope.step(() => invoke('disconnect_ftp')); } catch { connectScope.assert(); }
 
-        const providerPayload = await buildProviderParams(connectParams, targetSession.remotePath || null);
+        const providerPayload = await connectScope.step(() => buildProviderParams(connectParams, targetSession.remotePath || null));
         connectParams = providerPayload.effectiveParams;
         const providerParams = providerPayload.providerParams;
 
-        logger.debug('[switchSession] provider_connect params:', { ...providerParams, password: providerParams.password ? '***' : null });
+        logger.debug('[switchSession] provider protocol:', providerParams.protocol);
         // SEC-P1-06: TOFU host key check for SFTP
         if (protocol === 'sftp') {
-          const accepted = await checkSftpHostKey(connectParams.server, connectParams.port || 22);
+          const accepted = await connectScope.step(() => checkSftpHostKey(connectParams.server, connectParams.port || 22));
           if (!accepted) throw new Error('Host key rejected by user');
         }
-        await runConnect('provider_connect', providerParams);
+        await connectScope.step(() => runConnect('provider_connect', providerParams, connectScope));
         if (!targetSession.cryptOverlay && targetSession.remotePath && targetSession.remotePath !== '/') {
           try {
-            await listWithSpinner(() => invoke('provider_change_dir', { path: targetSession.remotePath }));
-          } catch (e) {
+            await connectScope.step(() => listWithSpinner(() => invoke('provider_change_dir', { path: targetSession.remotePath })));
+          } catch (e) { connectScope.assert();
             if (isListingCancelled(e)) throw e;
             console.warn('Restore path failed', e);
           }
         }
-        response = await listWithSpinner(() => invoke('provider_list_files', { path: null }));
+        response = await connectScope.step(() => listWithSpinner(() => invoke('provider_list_files', { path: null })));
       } else {
         // FTP/FTPS - reconnect and navigate
         logger.debug('[switchSession] FTP provider, reconnecting...');
         // First disconnect any active OAuth provider to avoid conflicts
         try {
-          await invoke('provider_disconnect');
-        } catch {
+          await connectScope.step(() => invoke('provider_disconnect'));
+        } catch { connectScope.assert();
           // Ignore if not connected to OAuth
         }
-        await runConnect('connect_ftp', targetSession.connectionParams as unknown as Record<string, unknown>);
+        await connectScope.step(() => runConnect('connect_ftp', targetSession.connectionParams as unknown as Record<string, unknown>, connectScope));
 
         // Navigate to the saved path to restore session state.
         // Avoid using paths from previous WebDAV/S3 sessions (e.g., /wwwhome, /bucket-name)
@@ -8531,14 +8542,14 @@ const App: React.FC = () => {
 
         if (isValidFtpPath) {
           try {
-            await listWithSpinner(() => invoke('change_directory', { path: savedPath }));
-          } catch (pathError) {
+            await connectScope.step(() => listWithSpinner(() => invoke('change_directory', { path: savedPath })));
+          } catch (pathError) { connectScope.assert();
             if (isListingCancelled(pathError)) throw pathError;
             console.warn('[switchSession] Could not restore FTP path, using home:', pathError);
             // Path doesn't exist on this server, stay at login home directory
           }
         }
-        response = await listWithSpinner(() => invoke('list_files'));
+        response = await connectScope.step(() => listWithSpinner(() => invoke('list_files')));
       }
 
       // Per-session overlay restore. The command layer no longer routes lists
@@ -8561,7 +8572,7 @@ const App: React.FC = () => {
             if (!targetSession.savedServerId) {
               throw new Error('Ad-hoc crypt overlay needs the unlock modal after reconnect.');
             }
-            const reapplied = await maybeAutoUnlockProfileOverlay(targetSession.savedServerId);
+            const reapplied = await connectScope.step(() => maybeAutoUnlockProfileOverlay(targetSession.savedServerId));
             if (!reapplied) {
               throw new Error('Stored crypt overlay credentials did not re-apply.');
             }
@@ -8569,16 +8580,16 @@ const App: React.FC = () => {
             setRcloneCryptVaultId(targetOverlay.kind === 'rclone-crypt' ? sentinel : null);
             setAeroCryptVaultId(targetOverlay.kind === 'aerocrypt' ? sentinel : null);
             bindSessionCryptOverlay({ sessionId }, sentinel, targetOverlay.kind, targetOverlay.remoteScope);
-            response = await listWithSpinner(() => restorePath && restorePath !== '/'
+            response = await connectScope.step(() => listWithSpinner(() => restorePath && restorePath !== '/'
               ? invoke<FileListResponse>('provider_change_dir', { path: restorePath })
-              : invoke<FileListResponse>('provider_list_files', { path: null }));
+              : invoke<FileListResponse>('provider_list_files', { path: null })));
             if (overlayLogIdRef.current) {
               humanLog.updateEntry(overlayLogIdRef.current, { status: 'success', message: t('activity.overlay_unlocked') });
               overlayLogIdRef.current = null;
             }
             recovered = true;
             setLockedOverlayProfile(null);
-          } catch (overlayErr) {
+          } catch (overlayErr) { connectScope.assert();
             // A cancelled listing is not a failed overlay re-apply: rethrow so
             // the switch unwinds instead of tearing the overlay binding down.
             if (isListingCancelled(overlayErr)) throw overlayErr;
@@ -8604,19 +8615,19 @@ const App: React.FC = () => {
             } else {
               clearSessionCryptOverlay({ sessionId });
             }
-            await invoke('provider_clear_crypt_overlay', { full: true }).catch(() => undefined);
+            await connectScope.step(() => invoke('provider_clear_crypt_overlay', { full: true }).catch(() => undefined));
           }
         } else {
-          await invoke('provider_clear_crypt_overlay', { full: false }).catch(() => undefined);
-          response = await listWithSpinner(() => restorePath && restorePath !== '/'
+          await connectScope.step(() => invoke('provider_clear_crypt_overlay', { full: false }).catch(() => undefined));
+          response = await connectScope.step(() => listWithSpinner(() => restorePath && restorePath !== '/'
             ? invoke<FileListResponse>('provider_change_dir', { path: restorePath })
-            : invoke<FileListResponse>('provider_list_files', { path: null }));
+            : invoke<FileListResponse>('provider_list_files', { path: null })));
         }
       } else {
         setRcloneCryptVaultId(null);
         setAeroCryptVaultId(null);
         setCryptOverlayOwner(null);
-        await invoke('provider_clear_crypt_overlay', { full: true }).catch(() => undefined);
+        await connectScope.step(() => invoke('provider_clear_crypt_overlay', { full: true }).catch(() => undefined));
       }
 
       setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, status: 'connected' } : s));
@@ -8646,14 +8657,14 @@ const App: React.FC = () => {
       fetchStorageQuota(protocol, targetSession.connectionParams, { newConnection: true });
 
       // Also refresh local files for this session's local path
-      const localFilesData: LocalFile[] = await invoke('get_local_files', {
+      const localFilesData: LocalFile[] = await connectScope.step(() => invoke('get_local_files', {
         path: targetSession.localPath,
         showHidden: showHiddenFiles
-      });
+      }));
       setLocalFiles(localFilesData);
       setCurrentLocalPath(targetSession.localPath);
 
-    } catch (e) {
+    } catch (e) { connectScope.assert();
       // V2: the user cancelled the switch listing from the panel spinner.
       // cancelRemoteNavigation runs abortSwitchAfterCancel, which unwinds only
       // the half-switched backend, so keep the workspace: mark just THIS target
@@ -8704,7 +8715,8 @@ const App: React.FC = () => {
    * is still alive and only reconnects if another tab has displaced it. Returns
    * true when an open session was found and activated.
    */
-  const goToActiveSession = (savedServerId: string): boolean => {
+  const goToActiveSession = async (savedServerId: string, connectScope = new ConnectScope()): Promise<boolean> => {
+    connectScope.assert();
     if (!savedServerId) return false;
     const existing = sessions.find(s => s.connectionParams?.savedServerId === savedServerId);
     if (!existing) return false;
@@ -8715,7 +8727,7 @@ const App: React.FC = () => {
     setShowRemotePanel(true);
     setShowLocalPreview(false);
     setIsConnected(true);
-    void switchSession(existing.id);
+    await connectScope.cancellable(() => { void cancelActiveConnect(); return cancelRemoteNavigation(); }, () => switchSession(existing.id, connectScope));
     return true;
   };
 
@@ -9423,7 +9435,7 @@ const App: React.FC = () => {
     if (kind) connectAbortEpochRef.current += 1;
     setRemoteListLoading(false);
     setRemoteListReason(null);
-    void (async () => {
+    return (async () => {
       try {
         await invoke('cancel_remote_listing');
       } catch (error) {
@@ -16001,6 +16013,11 @@ const App: React.FC = () => {
 
   const openInFileManager = async (path: string) => { try { await invoke('open_in_file_manager', { path }); } catch { } };
 
+  const profileConnector = useRef<ProfileConnector | null>(null);
+  const registerProfileConnector = useCallback<RegisterProfileConnector>(connector => {
+    profileConnector.current = connector;
+    return () => { if (profileConnector.current === connector) profileConnector.current = null; };
+  }, []);
   const guiController = useGuiController({
     version: appVersion,
     locked: isAppLocked || !vaultBootComplete || accountLockState !== 'ready',
@@ -16010,7 +16027,7 @@ const App: React.FC = () => {
     connected: isConnected,
     activeSessionId,
     sessions: sessions.map(session => ({ id: session.id, name: session.serverName,
-      protocol: session.connectionParams.protocol || 'ftp', status: session.status })),
+      protocol: session.connectionParams.protocol || 'ftp', status: session.status, savedProfileId: session.savedServerId })),
     panels: {
       ...(isConnected && showRemotePanel ? { remote: { path: (rcloneCryptVaultId || aeroCryptVaultId || overlayBadgeDecrypting) ? currentRemoteDisplayPath : currentRemotePath,
         loading: remoteListLoading, selection: selectedRemoteFiles, entriesCount: remoteFiles.length } } : {}),
@@ -16041,10 +16058,14 @@ const App: React.FC = () => {
       setActivePanel(panel === 'remote' ? 'remote' : 'local');
       if (panel !== 'remote') setActiveLocalPanelId(panel);
     },
+    connect: async (id, scope) => {
+      if (!profileConnector.current) throw new GuiError('blocked');
+      return profileConnector.current(id, scope);
+    },
     disconnect: async () => { if (isConnected) await disconnectFromFtp('button'); },
-    stop: async () => { if (remoteSyncRunningRef.current || hasActiveTransfer || hasQueueActivity) await cancelTransfer(); },
+    stop: async () => { await cancelActiveConnect(); if (remoteSyncRunningRef.current || hasActiveTransfer || hasQueueActivity) await cancelTransfer(); },
   }, (intent, ok, owner) => activityLog.log(ok ? 'INFO' : 'ERROR',
-    `${t('guiController.banner', { agent: owner })}: ${intent === 'stop' ? t('guiController.stopped') : t(`guiController.actions.${intent}`)}`,
+    `${t('guiController.banner', { agent: owner })}: ${intent === 'stop' ? t('guiController.stopped') : t(intent === 'connect' ? 'common.connect' : `guiController.actions.${intent}`)}`,
     ok ? 'success' : 'error'));
 
   return (
@@ -17636,6 +17657,7 @@ const App: React.FC = () => {
               the foreground: zero remount = zero flash of the empty state. */}
           <div className={showConnectionScreen ? 'flex-1 min-h-0 flex flex-col' : 'hidden'}>
             <IntroHub
+              registerProfileConnector={registerProfileConnector}
               connectionParams={connectionParams}
               quickConnectDirs={quickConnectDirs}
               loading={loading}
@@ -17668,7 +17690,8 @@ const App: React.FC = () => {
               onAeroFile={handleToggleAeroFile}
               onOpenCrossProfile={(opts) => setShowCrossProfilePanel(opts ?? {})}
               onOpenMountManager={() => setShowMountManager({})}
-              onSavedServerConnect={asConnectPhase(async (params, initialPath, localInitialPath) => {
+              onSavedServerConnect={asConnectPhase(async (params, initialPath, localInitialPath, connectScope = new ConnectScope()) => {
+                connectScope.assert();
                 // NOTE: Do NOT set connectionParams here - that would show the form
                 // The form should only appear when clicking Edit, not when connecting
 
@@ -17679,7 +17702,7 @@ const App: React.FC = () => {
 
                 // Check if this is an OAuth provider
                 const isOAuth = normalizedParams.protocol && (isOAuthProvider(normalizedParams.protocol) || isFourSharedProvider(normalizedParams.protocol));
-                logger.debug('[onSavedServerConnect] params:', { ...normalizedParams, password: normalizedParams.password ? '***' : null });
+                logger.debug('[onSavedServerConnect] profile:', { protocol: normalizedParams.protocol, savedServerId: normalizedParams.savedServerId });
                 logger.debug('[onSavedServerConnect] isOAuth:', isOAuth);
 
                 if (isOAuth) {
@@ -17698,7 +17721,7 @@ const App: React.FC = () => {
                   // previously skipped that block, so an OAuth crypt overlay never
                   // unlocked (no decrypted names, no path-bar overlay badge/button).
                   const savedOverlaySavedId = normalizedParams.savedServerId;
-                  const savedOverlayHint = savedOverlaySavedId ? await getProfileOverlayHint(savedOverlaySavedId) : null;
+                  const savedOverlayHint = savedOverlaySavedId ? await connectScope.step(() => getProfileOverlayHint(savedOverlaySavedId)) : null;
                   let savedOauthResp: FileListResponse | null = null;
                   if (savedOverlayHint && savedOverlaySavedId) {
                     // Probe the provider cwd, but never let a transient listing
@@ -17706,8 +17729,8 @@ const App: React.FC = () => {
                     // errors); still arm the overlay and let the deferred reload
                     // anchor the path on failure.
                     try {
-                      savedOauthResp = await withRemoteListSpinner(() => invoke<FileListResponse>('provider_list_files', { path: null }));
-                    } catch (error) {
+                      savedOauthResp = await connectScope.step(() => withRemoteListSpinner(() => invoke<FileListResponse>('provider_list_files', { path: null })));
+                    } catch (error) { connectScope.assert();
                       // A Cancel is the one failure not to swallow: the session
                       // it would arm the overlay on is already being torn down.
                       if (isListingCancelled(error)) return;
@@ -17723,7 +17746,7 @@ const App: React.FC = () => {
                     setOverlayDecrypting(true);
                     connectListingLogIdRef.current = null;
                   } else {
-                    savedOauthResp = await loadRemoteFiles(normalizedParams.protocol);
+                    savedOauthResp = await connectScope.step(() => loadRemoteFiles(normalizedParams.protocol));
                   }
                   // loadRemoteFiles reports an aborted listing as a null response,
                   // exactly like a swallowed error; only the epoch separates them.
@@ -17731,20 +17754,20 @@ const App: React.FC = () => {
                   // Navigate to initial local directory if specified (with fallback for invalid paths)
                   let resolvedLocalPath = currentLocalPath;
                   if (localInitialPath) {
-                    resolvedLocalPath = await safeChangeLocalDirectory(localInitialPath);
+                    resolvedLocalPath = await connectScope.step(() => safeChangeLocalDirectory(localInitialPath));
                   }
                   // Create session with provider name: pass fresh files to avoid stale closure
-                  await createSession(
+                  await connectScope.step(() => createSession(
                     providerName,
                     normalizedParams,
                     savedOauthResp?.current_path || initialPath || '/',
                     resolvedLocalPath,
                     savedOverlayHint ? [] : savedOauthResp?.files
-                  );
+                  ));
                   // Defer the overlay auto-unlock to the post-connect effect (inline
                   // unlock sees stale session state), same as the provider branch.
                   // LT2b: also arm pending for enabled-without-factor.
-                  if (savedOverlaySavedId && (savedOverlayHint || await getEnabledProfileOverlay(savedOverlaySavedId))) {
+                  if (savedOverlaySavedId && (savedOverlayHint || await connectScope.step(() => getEnabledProfileOverlay(savedOverlaySavedId)))) {
                     setPendingOverlayUnlock(savedOverlaySavedId);
                   }
                   // Pass normalizedParams so persistQuotaToProfile picks up
@@ -17754,7 +17777,7 @@ const App: React.FC = () => {
                   // Reset form for next "Add New Server"
                   setConnectionParams({ server: '', username: '', password: '' });
                   setQuickConnectDirs({ remoteDir: '', localDir: '' });
-                  return;
+                  return 'connected' as const;
                 }
 
                 // Check if this is a non-FTP provider protocol (S3, WebDAV, MEGA, Filen use provider_connect)
@@ -17800,8 +17823,8 @@ const App: React.FC = () => {
 
                   try {
                     // Disconnect any existing connections
-                    try { await invoke('provider_disconnect'); } catch { }
-                    try { await invoke('disconnect_ftp'); } catch { }
+                    try { await connectScope.step(() => invoke('provider_disconnect')); } catch { connectScope.assert(); }
+                    try { await connectScope.step(() => invoke('disconnect_ftp')); } catch { connectScope.assert(); }
 
                     // Resolve {username} placeholder before any path enters
                     // the connect flow. See resolveUsernameTemplate doc.
@@ -17814,19 +17837,19 @@ const App: React.FC = () => {
                         normalizedParams.providerId,
                         normalizedParams.username,
                     );
-                    const providerPayload = await buildProviderParams(normalizedParams, resolvedSavedInitialPath);
+                    const providerPayload = await connectScope.step(() => buildProviderParams(normalizedParams, resolvedSavedInitialPath));
                     const connectedParams = providerPayload.effectiveParams;
                     const providerParams = providerPayload.providerParams;
 
-                    logger.debug('[onSavedServerConnect] provider_connect params:', { ...providerParams, password: providerParams.password ? '***' : null, key_passphrase: providerParams.key_passphrase ? '***' : null });
+                    logger.debug('[onSavedServerConnect] provider protocol:', providerParams.protocol);
                     // SEC-P1-06: TOFU host key check for SFTP
                     if (normalizedParams.protocol === 'sftp') {
-                      const accepted = await checkSftpHostKey(normalizedParams.server, normalizedParams.port || 22);
-                      if (!accepted) return;
+                      const accepted = await connectScope.step(() => checkSftpHostKey(normalizedParams.server, normalizedParams.port || 22));
+                      if (!accepted) return 'pending_human' as const;
                     }
                     const savedConnHost = connectedParams.server || getProviderHostFallback(connectedParams.protocol, connectedParams.username);
-                    const { resolvedIp: savedIp, connectingLogId: savedConnLogId } = await logConnectionSteps(savedConnHost, connectedParams.port || 443, connectedParams.protocol || 'ftp');
-                      await runConnect('provider_connect', providerParams);
+                    const { resolvedIp: savedIp, connectingLogId: savedConnLogId } = await connectScope.step(() => logConnectionSteps(savedConnHost, connectedParams.port || 443, connectedParams.protocol || 'ftp'));
+                      await connectScope.step(() => runConnect('provider_connect', providerParams, connectScope));
 
                       const isFilenConnect =
                         connectedParams.protocol === 'filen' ||
@@ -17836,12 +17859,12 @@ const App: React.FC = () => {
                       if (isFilenConnect) {
                         const resolvedSavedServerId = connectedParams.savedServerId || normalizedParams.savedServerId;
                         try {
-                          const filenAuthVersion = await invoke<number | null>('filen_get_auth_version');
+                          const filenAuthVersion = await connectScope.step(() => invoke<number | null>('filen_get_auth_version'));
 
                           if (typeof filenAuthVersion === 'number') {
                             void persistFilenAuthVersionToProfile(resolvedSavedServerId, filenAuthVersion, connectedParams.username);
                           }
-                        } catch {
+                        } catch { connectScope.assert();
                           // best-effort badge enrichment only
                         }
                       }
@@ -17861,9 +17884,9 @@ const App: React.FC = () => {
                     // path computed above so a Nextcloud-based saved profile's
                     // initialPath (e.g. `/remote.php/dav/files/{username}/`) does
                     // not reach the backend with the placeholder unresolved.
-                    const response = await withRemoteListSpinner(() => invoke<{ files: any[]; current_path: string }>('provider_list_files', {
+                    const response = await connectScope.step(() => withRemoteListSpinner(() => invoke<{ files: any[]; current_path: string }>('provider_list_files', {
                       path: resolvedSavedInitialPath || null
-                    }), listingReason(resolvedSavedInitialPath));
+                    }), listingReason(resolvedSavedInitialPath)));
 
                     const files = response.files.map(f => ({
                       name: f.name,
@@ -17879,7 +17902,7 @@ const App: React.FC = () => {
                     // unlock window and let the phase-2 decrypted reload paint the
                     // real names. Plain profiles render the listing as usual.
                     const overlaySavedId = connectedParams.savedServerId || normalizedParams.savedServerId;
-                    const overlayHint = await getProfileOverlayHint(overlaySavedId);
+                    const overlayHint = await connectScope.step(() => getProfileOverlayHint(overlaySavedId));
                     setCurrentRemotePath(response.current_path);
                     if (overlayHint && overlaySavedId) {
                       overlaySuppressedRef.current = true;
@@ -17897,16 +17920,16 @@ const App: React.FC = () => {
 
                     let resolvedLocalPath2 = currentLocalPath;
                     if (localInitialPath) {
-                      resolvedLocalPath2 = await safeChangeLocalDirectory(localInitialPath);
+                      resolvedLocalPath2 = await connectScope.step(() => safeChangeLocalDirectory(localInitialPath));
                     }
 
-                    await createSession(
+                    await connectScope.step(() => createSession(
                       providerName,
                       connectedParams,
                       response.current_path,
                       resolvedLocalPath2,
                       overlayHint ? [] : files
-                    );
+                    ));
                     // P3.3: defer the AeroCrypt overlay auto-unlock to a post-connect
                     // effect. Running it inline here sees stale React state (the new
                     // session/activeSessionId are not committed yet), so the overlay
@@ -17923,7 +17946,8 @@ const App: React.FC = () => {
                     // Reset form for next "Add New Server"
                     setConnectionParams({ server: '', username: '', password: '' });
                     setQuickConnectDirs({ remoteDir: '', localDir: '' });
-                  } catch (error) {
+                    return 'connected' as const;
+                  } catch (error) { connectScope.assert();
                     // W3.1: user-cancelled connect, not a failure (runConnect
                     // already toasted). finally re-enables the form.
                     if (isConnectCancelledError(error)) return;
@@ -17936,7 +17960,7 @@ const App: React.FC = () => {
                     // a TOTP). Mirrors the order used in connectToFtp.
                     if (tryShowTwoFactorPrompt(error, normalizedParams, maskedProviderName, logId)) {
                       setLoading(false);
-                      return;
+                      return 'pending_human' as const;
                     }
                     humanLog.logError('CONNECT', { server: maskedProviderName }, logId);
                     notify.error(t('connection.connectionFailed'), String(error));
@@ -17950,7 +17974,7 @@ const App: React.FC = () => {
                   } finally {
                     setLoading(false);
                   }
-                  return;
+                  return 'failed' as const;
                 }
 
                 // Standard FTP/SFTP connection
@@ -17962,11 +17986,11 @@ const App: React.FC = () => {
                 const logId = humanLog.logStart('CONNECT', { server: params.server, protocol: protocolLabel });
                 try {
                   // Disconnect any existing provider connections first (S3, WebDAV, OAuth)
-                  try { await invoke('provider_disconnect'); } catch { }
+                  try { await connectScope.step(() => invoke('provider_disconnect')); } catch { connectScope.assert(); }
 
                   const savedFtpProto = params.protocol || 'ftp';
-                  const { resolvedIp: savedFtpIp, connectingLogId: savedFtpConnLogId } = await logConnectionSteps(params.server, params.port || 21, savedFtpProto);
-                  await runConnect('connect_ftp', params as unknown as Record<string, unknown>);
+                  const { resolvedIp: savedFtpIp, connectingLogId: savedFtpConnLogId } = await connectScope.step(() => logConnectionSteps(params.server, params.port || 21, savedFtpProto));
+                  await connectScope.step(() => runConnect('connect_ftp', params as unknown as Record<string, unknown>, connectScope));
                   if (savedFtpConnLogId) humanLog.updateEntry(savedFtpConnLogId, { status: 'success', message: t('activity.connected_to', { ip: savedFtpIp || params.server, port: String(params.port || 21) }) });
                   // Clear standalone connect-failure marker (#180 / 4486730822).
                   if (params.savedServerId) {
@@ -17986,9 +18010,9 @@ const App: React.FC = () => {
                   const ftpResolvedInitialPath = resolveUsernameTemplate(initialPath, params.username);
                   if (ftpResolvedInitialPath) {
                     // Pass the protocol explicitly to avoid using stale state from previous session
-                    await changeRemoteDirectory(ftpResolvedInitialPath, params.protocol || 'ftp');
+                    await connectScope.step(() => changeRemoteDirectory(ftpResolvedInitialPath, params.protocol || 'ftp'));
                   } else {
-                    savedFtpResponse = await loadRemoteFiles();
+                    savedFtpResponse = await connectScope.step(() => loadRemoteFiles());
                   }
                   if (savedFtpResponse) {
                     logListingComplete(savedFtpResponse.current_path || '/', savedFtpResponse.files?.length || 0);
@@ -17996,21 +18020,22 @@ const App: React.FC = () => {
 
                   let resolvedLocalPath3 = currentLocalPath;
                   if (localInitialPath) {
-                    resolvedLocalPath3 = await safeChangeLocalDirectory(localInitialPath);
+                    resolvedLocalPath3 = await connectScope.step(() => safeChangeLocalDirectory(localInitialPath));
                   }
                   // Use displayName if provided, otherwise extract from server
                   const sessionName = params.displayName || params.server.split(':')[0];
-                  createSession(
+                  await connectScope.step(() => createSession(
                     sessionName,
                     params,
                     savedFtpResponse?.current_path || initialPath || '/',
                     resolvedLocalPath3,
                     savedFtpResponse?.files
-                  );
+                  ));
                   // Reset form for next "Add New Server"
                   setConnectionParams({ server: '', username: '', password: '' });
                   setQuickConnectDirs({ remoteDir: '', localDir: '' });
-                } catch (error) {
+                  return 'connected' as const;
+                } catch (error) { connectScope.assert();
                   // W3.1: user-cancelled connect, not a failure (runConnect
                   // already toasted). finally re-enables the form.
                   if (isConnectCancelledError(error)) return;
@@ -18037,6 +18062,7 @@ const App: React.FC = () => {
                 } finally {
                   setLoading(false);
                 }
+                return 'failed' as const;
               })}
               onSkipToFileManager={async () => {
                 // If there are existing sessions, switch back to the last active one

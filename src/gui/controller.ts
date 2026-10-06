@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
-export const GUI_INTENTS = ['state', 'wait', 'show_view', 'navigate', 'refresh', 'select', 'disconnect', 'stop'] as const;
+import { ConnectScope, type ProfileConnectOutcome } from './connectScope';
+
+export const GUI_INTENTS = ['state', 'wait', 'show_view', 'navigate', 'refresh', 'select', 'connect', 'disconnect', 'stop'] as const;
 export type GuiIntent = typeof GUI_INTENTS[number];
 export type GuiPanel = 'remote' | 'local' | 'local2';
 export type GuiView = 'servers' | 'files' | 'other';
 export type GuiErrorCode = 'unsupported_intent' | 'invalid_args' | 'locked' | 'busy' |
-    'blocked' | 'stale_state' | 'lease_interrupted' | 'gui_timeout' | 'action_failed' | 'not_connected';
+    'blocked' | 'stale_state' | 'lease_interrupted' | 'gui_timeout' | 'action_failed' | 'not_connected' | 'pending_human';
 export class GuiError extends Error {
     constructor(public readonly code: GuiErrorCode) { super(code); }
 }
@@ -17,14 +19,14 @@ interface PanelSource {
 export interface GuiSource {
     version: string; locked: boolean; blocked: boolean; view: GuiView; connected: boolean;
     activeSessionId: string | null;
-    sessions: readonly { id: string; name: string; protocol: string; status: string }[];
+    sessions: readonly { id: string; name: string; protocol: string; status: string; savedProfileId?: string }[];
     panels: Partial<Record<GuiPanel, PanelSource>>;
     queue: { active: number; pending: number; failed: number };
 }
 export interface GuiSnapshot {
     schema_version: 1; state_revision: number; version: string; locked: boolean; blocked: boolean;
     view: GuiView; connected: boolean; active_session_id: string | null;
-    sessions: { id: string; name: string; protocol: string; status: string }[];
+    sessions: { id: string; name: string; protocol: string; status: string; saved_profile_id?: string }[];
     panels: Partial<Record<GuiPanel, { path: string; loading: boolean; selection: string[];
         selection_count: number; entries_count: number }>>;
     queue: { active: number; pending: number; failed: number };
@@ -42,6 +44,7 @@ export function buildGuiSnapshot(source: GuiSource, revision = 0): GuiSnapshot {
     if (source.locked) return result;
     result.sessions = source.sessions.slice(0, 32).map(s => ({
         id: boundedText(s.id), name: boundedText(s.name), protocol: boundedText(s.protocol), status: boundedText(s.status),
+        ...(s.savedProfileId ? { saved_profile_id: boundedText(s.savedProfileId) } : {}),
     }));
     for (const panel of ['remote', 'local', 'local2'] as const) {
         const p = source.panels[panel];
@@ -59,6 +62,7 @@ export interface GuiHandlers {
     navigate(panel: GuiPanel, path: string): Promise<void | string>;
     refresh(panel: GuiPanel): Promise<void>;
     select(panel: GuiPanel, names: string[], mode: 'names' | 'all' | 'none'): void;
+    connect?(profileId: string, scope: ConnectScope): Promise<ProfileConnectOutcome>;
     disconnect(): Promise<void>;
     stop(): Promise<void>;
 }
@@ -88,6 +92,9 @@ export function validateGuiRequest(request: GuiRequest): GuiIntent {
     const args = request.args === undefined ? {} : request.args; record(args);
     switch (request.name) {
         case 'state': case 'stop': case 'disconnect': keys(args, []); break;
+        case 'connect':
+            keys(args, ['profile_id']);
+            if (typeof args.profile_id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(args.profile_id)) throw new GuiError('invalid_args'); break;
         case 'show_view':
             keys(args, ['view']); if (args.view !== 'servers' && args.view !== 'files') throw new GuiError('invalid_args'); break;
         case 'wait':
@@ -116,10 +123,12 @@ export class GuiController {
     private disposed = false;
     private pending = 0;
     private lease: GuiLease | null = null;
+    private connectScope: ConnectScope | null = null;
     private expiry: ReturnType<typeof setTimeout> | undefined;
     constructor(private readonly source: () => GuiSource, private readonly handlers: () => GuiHandlers,
         private readonly changed: (lease: GuiLease | null) => void,
         private readonly audit: (intent: GuiIntent, ok: boolean, owner: string) => void = () => {}) {}
+    get connecting(): boolean { return this.connectScope !== null; }
     state(): GuiSnapshot {
         const snapshot = buildGuiSnapshot(this.source());
         const fingerprint = JSON.stringify(snapshot);
@@ -128,6 +137,7 @@ export class GuiController {
         return snapshot;
     }
     interrupt(): void {
+        this.connectScope?.cancel(new GuiError('lease_interrupted'));
         this.epoch++; this.lease = null; clearTimeout(this.expiry); this.changed(null);
     }
     dispose(): void { this.disposed = true; this.interrupt(); }
@@ -150,6 +160,7 @@ export class GuiController {
         let handlerSettled = true;
         let succeeded = false;
         let returned = false;
+        let connectScope: ConnectScope | undefined;
         if (this.pending >= 16) return { ok: false, error: 'busy', snapshot: this.state() };
         this.pending++;
         try {
@@ -202,9 +213,21 @@ export class GuiController {
             const h = this.handlers();
             handlerSettled = false;
             let handlerError: unknown;
+            let connectOutcome: ProfileConnectOutcome | undefined;
             let navigationPath: void | string = undefined;
             const operation = async () => {
                 switch (intent) {
+                    case 'connect':
+                        if (!h.connect) throw new GuiError('blocked');
+                        connectScope = new ConnectScope(() => {
+                            this.guard(epoch, deadline);
+                            if (this.source().locked) throw new GuiError('locked');
+                        });
+                        this.connectScope = connectScope;
+                        connectOutcome = await h.connect(args.profile_id as string, connectScope);
+                        if (connectOutcome === 'pending_human') throw new GuiError('pending_human');
+                        if (connectOutcome !== 'connected') throw new GuiError('action_failed');
+                        break;
                     case 'show_view': await h.showView(args.view as 'servers' | 'files'); break;
                     case 'navigate': navigationPath = await h.navigate(panelArg(args), args.path as string); break;
                     case 'refresh': await h.refresh(panelArg(args)); break;
@@ -221,6 +244,11 @@ export class GuiController {
             // React setters may commit after their callback Promise resolves.
             // Report view/selection/disconnect only when the committed projection agrees.
             const committed = (state: GuiSnapshot): boolean => {
+                if (intent === 'connect') {
+                    return state.connected && state.view === 'files' && state.sessions.some(session =>
+                        session.id === state.active_session_id && session.saved_profile_id === args.profile_id && session.status === 'connected') &&
+                        !state.panels.remote?.loading;
+                }
                 if (intent === 'navigate' || intent === 'refresh') {
                     const p = state.panels[panelArg(args)];
                     return !!p && !p.loading && (typeof navigationPath !== 'string' || p.path === boundedText(navigationPath));
@@ -237,7 +265,10 @@ export class GuiController {
                 }
                 return true;
             };
-            while (!committed(this.state())) await this.delay(25, epoch, deadline);
+            while (!committed(this.state())) {
+                if (intent === 'connect' && this.state().blocked) throw new GuiError('pending_human');
+                await this.delay(25, epoch, deadline);
+            }
             if (intent === 'navigate') {
                 const panel = panelArg(args);
                 const before = snapshot.panels[panel]?.path;
@@ -252,10 +283,16 @@ export class GuiController {
             succeeded = true;
             return { ok: true, error: null, snapshot: this.state() };
         } catch (error) {
+            // A failed/pending-human connect leaves the human dialog intact.
+            if (connectScope && (!handlerSettled || (error instanceof GuiError && ['lease_interrupted', 'gui_timeout', 'locked'].includes(error.code)))) {
+                connectScope.cancel(error instanceof GuiError ? error : new GuiError('action_failed'));
+            }
+            if (this.connectScope === connectScope) this.connectScope = null;
             if (ownsLane && laneEpoch === this.epoch) this.interrupt();
             return { ok: false, error: error instanceof GuiError ? error.code : 'action_failed', snapshot: this.state() };
         } finally {
             returned = true;
+            if (this.connectScope === connectScope) this.connectScope = null;
             this.pending--;
             if (ownsLane && handlerSettled) this.busy = false;
             if (intent) this.audit(intent, succeeded, owner);

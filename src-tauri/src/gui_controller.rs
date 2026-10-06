@@ -18,6 +18,7 @@ const INTENTS: &[&str] = &[
     "navigate",
     "refresh",
     "select",
+    "connect",
     "disconnect",
     "stop",
 ];
@@ -67,6 +68,8 @@ struct Session {
     name: String,
     protocol: String,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved_profile_id: Option<String>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +149,7 @@ fn parse_reply(payload: Value, unlocked: bool) -> Result<Reply, String> {
                 "gui_timeout",
                 "action_failed",
                 "not_connected",
+                "pending_human",
             ]
             .contains(&e)
         })
