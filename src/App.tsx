@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
+import { useGuiController } from './hooks/useGuiController';
+import { GuiControllerBanner } from './components/GuiControllerBanner';
+import { GuiError } from './gui/controller';
 import { TID } from './utils/testIds';
 import * as React from 'react';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
@@ -15992,8 +15995,60 @@ const App: React.FC = () => {
 
   const openInFileManager = async (path: string) => { try { await invoke('open_in_file_manager', { path }); } catch { } };
 
+  const guiController = useGuiController({
+    version: appVersion,
+    locked: isAppLocked || !vaultBootComplete || accountLockState !== 'ready',
+    blocked: !!confirmDialog || !!inputDialog || hostKeyDialog.visible || !!twoFactorPrompt?.open ||
+      overwriteDialog.isOpen || showSettingsPanel || !!showVaultPanel,
+    view: showSettingsPanel || showVaultPanel ? 'other' : showConnectionScreen ? 'servers' : 'files',
+    connected: isConnected,
+    activeSessionId,
+    sessions: sessions.map(session => ({ id: session.id, name: session.serverName,
+      protocol: session.connectionParams.protocol || 'ftp', status: session.status })),
+    panels: {
+      ...(isConnected && showRemotePanel ? { remote: { path: (rcloneCryptVaultId || aeroCryptVaultId || overlayBadgeDecrypting) ? currentRemoteDisplayPath : currentRemotePath,
+        loading: remoteListLoading, selection: selectedRemoteFiles, entriesCount: remoteFiles.length } } : {}),
+      local: { path: currentLocalPath, loading: localListLoading, selection: selectedLocalFiles, entriesCount: localFiles.length },
+      ...(showDualLocalPanel && (!isConnected || !showRemotePanel) ? { local2: { path: currentLocalPath2, loading: false,
+        selection: selectedLocalFiles2, entriesCount: localFiles2.length } } : {}),
+    },
+    queue: {
+      active: transferQueue.items.filter(item => item.status === 'transferring').length,
+      pending: transferQueue.items.filter(item => item.status === 'pending').length,
+      failed: transferQueue.items.filter(item => item.status === 'error').length,
+    },
+  }, {
+    showView: view => setShowConnectionScreen(view === 'servers'),
+    navigate: async (panel, path) => {
+      if (panel === 'remote') await changeRemoteDirectory(path, undefined, !!(rcloneCryptVaultId || aeroCryptVaultId));
+      else if (panel === 'local2') await changeLocalDirectory2(path);
+      else await changeLocalDirectory(path);
+    },
+    refresh: async panel => {
+      if (panel === 'remote') { if (!await loadRemoteFiles()) throw new GuiError('action_failed'); }
+      else if (panel === 'local2') { if (!await loadLocalFiles2(currentLocalPath2)) throw new GuiError('action_failed'); }
+      else if (!await loadLocalFiles(currentLocalPath)) throw new GuiError('action_failed');
+    },
+    select: (panel, names, mode) => {
+      const files = panel === 'remote' ? remoteFiles : panel === 'local2' ? localFiles2 : localFiles;
+      const available = new Set(files.map(file => file.name));
+      if (mode === 'names' && names.some(name => !available.has(name))) throw new GuiError('invalid_args');
+      const selection = new Set(mode === 'all' ? available : mode === 'none' ? [] : names);
+      if (panel === 'remote') setSelectedRemoteFiles(selection);
+      else if (panel === 'local2') setSelectedLocalFiles2(selection);
+      else setSelectedLocalFiles(selection);
+      setActivePanel(panel === 'remote' ? 'remote' : 'local');
+      if (panel !== 'remote') setActiveLocalPanelId(panel);
+    },
+    disconnect: async () => { if (isConnected) await disconnectFromFtp('button'); },
+    stop: async () => { if (hasActiveTransfer || hasQueueActivity) await cancelTransfer(); },
+  }, (intent, ok, owner) => activityLog.log(ok ? 'INFO' : 'ERROR',
+    `${t('guiController.banner', { agent: owner })}: ${intent === 'stop' ? t('guiController.stopped') : t(`guiController.actions.${intent}`)}`,
+    ok ? 'success' : 'error'));
+
   return (
     <>
+      <GuiControllerBanner lease={guiController.lease} onStop={() => { void guiController.stop(); }} />
       {/* Lock Screen - shown when app is locked with master password */}
       {isAppLocked && (masterPasswordSet || autoKeyringTotpRequired) && (
         <LockScreen
