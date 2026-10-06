@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
 import { ConnectScope, type ProfileConnector, type RegisterProfileConnector } from './gui/connectScope';
+import { runOwnedConnectionCleanup } from './gui/connectionCleanup';
 import { useGuiController } from './hooks/useGuiController';
 import { GuiControllerBanner } from './components/GuiControllerBanner';
 import { GuiError } from './gui/controller';
@@ -9367,20 +9368,16 @@ const App: React.FC = () => {
   // stuck call for another, and which disconnect applies depends on the
   // protocol, so issue both. Shared by the connect abort (which then wipes the
   // whole workspace) and the switch abort (which keeps every healthy tab).
-  const lockAndDropBackendConnection = async () => {
+  const lockAndDropBackendConnection = async (owns: () => boolean) => {
     const overlaySessionId = aeroVaultOverlaySession?.sessionId;
-    if (overlaySessionId) {
-      try { await invoke('aerovault_overlay_lock', { sessionId: overlaySessionId }); } catch { }
-    }
-    if (aeroCryptVaultId) {
-      try { await invoke('aerocrypt_lock', { vaultId: aeroCryptVaultId }); } catch { }
-    }
-    if (rcloneCryptVaultId) {
-      try { await invoke('rclone_crypt_lock', { vaultId: rcloneCryptVaultId }); } catch { }
-    }
-    await invoke('provider_clear_crypt_overlay', { full: true }).catch(() => undefined);
-    try { await invoke('provider_disconnect'); } catch { }
-    try { await invoke('disconnect_ftp'); } catch { }
+    return runOwnedConnectionCleanup(owns, [
+      ...(overlaySessionId ? [() => invoke('aerovault_overlay_lock', { sessionId: overlaySessionId })] : []),
+      ...(aeroCryptVaultId ? [() => invoke('aerocrypt_lock', { vaultId: aeroCryptVaultId })] : []),
+      ...(rcloneCryptVaultId ? [() => invoke('rclone_crypt_lock', { vaultId: rcloneCryptVaultId })] : []),
+      () => invoke('provider_clear_crypt_overlay', { full: true }),
+      () => invoke('provider_disconnect'),
+      () => invoke('disconnect_ftp'),
+    ]);
   };
 
   // The crypt/overlay VIEW state a cancelled connect or switch leaves behind.
@@ -9398,9 +9395,10 @@ const App: React.FC = () => {
     setAeroVaultOverlaySession(null);
   };
 
-  const abortConnectAfterCancel = async () => {
+  const abortConnectAfterCancel = async (owns: () => boolean) => {
+    if (!owns()) return;
     remoteConnectPhaseRef.current = false;
-    await lockAndDropBackendConnection();
+    if (!await lockAndDropBackendConnection(owns) || !owns()) return;
     clearCryptOverlayState();
     setIsConnected(false);
     setLoading(false);
@@ -9426,9 +9424,10 @@ const App: React.FC = () => {
   // remote files and remote path untouched. switchSession's cancel branch then
   // marks just the target tab `cached`, so the user stays in a live workspace
   // with every other healthy tab intact.
-  const abortSwitchAfterCancel = async () => {
+  const abortSwitchAfterCancel = async (owns: () => boolean) => {
+    if (!owns()) return;
     remoteConnectPhaseRef.current = false;
-    await lockAndDropBackendConnection();
+    if (!await lockAndDropBackendConnection(owns) || !owns()) return;
     clearCryptOverlayState();
   };
 
@@ -9464,9 +9463,10 @@ const App: React.FC = () => {
       // workspace down and return to My Servers. A cancelled tab SWITCH keeps
       // every healthy tab: unwind only the half-switched backend and let
       // switchSession's cancel branch mark the target tab cached.
-      if (phaseVersion !== remoteConnectPhaseVersionRef.current || navVersion !== remoteNavCounter.current) return;
-      if (kind === 'switch') await abortSwitchAfterCancel();
-      else if (kind) await abortConnectAfterCancel();
+      const owns = () => phaseVersion === remoteConnectPhaseVersionRef.current && navVersion === remoteNavCounter.current;
+      if (!owns()) return;
+      if (kind === 'switch') await abortSwitchAfterCancel(owns);
+      else if (kind) await abortConnectAfterCancel(owns);
     })();
   };
 
