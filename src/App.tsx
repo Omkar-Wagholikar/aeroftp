@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
+import { TID } from './utils/testIds';
 import * as React from 'react';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -13936,12 +13937,12 @@ const App: React.FC = () => {
     };
 
     const items: ContextMenuItem[] = [
-      { label: downloadLabel, icon: <Download size={14} />, action: () => downloadMultipleFiles(filesToUse) },
+      { actionId: 'download', label: downloadLabel, icon: <Download size={14} />, action: () => downloadMultipleFiles(filesToUse) },
       // Media files (images, audio, video, pdf) use Universal Preview modal
       { label: t('common.preview'), icon: <Eye size={14} />, action: () => openUniversalPreview(file, true, sortedRemoteFilesRef.current), disabled: count > 1 || file.is_dir || !isMediaPreviewable(file.name) },
       // Code files use DevTools source viewer
       { label: t('contextMenu.viewSource'), icon: <Code size={14} />, action: () => openDevToolsPreview(file, true), disabled: count > 1 || file.is_dir || !isPreviewable(file.name) },
-      { label: (currentProtocol === 'github' || currentProtocol === 'gitlab') ? t('github.renameCommit') : t('common.rename'), icon: currentProtocol === 'github' ? <Github size={14} /> : currentProtocol === 'gitlab' ? <GitLabLogo size={14} /> : <Pencil size={14} />, action: () => renameFile(file.path, file.name, true, file.is_dir), disabled: count > 1 || currentProtocol === 'immich', shortcut: (currentProtocol === 'github' || currentProtocol === 'gitlab') ? undefined : 'F2' },
+      { actionId: 'rename', label: (currentProtocol === 'github' || currentProtocol === 'gitlab') ? t('github.renameCommit') : t('common.rename'), icon: currentProtocol === 'github' ? <Github size={14} /> : currentProtocol === 'gitlab' ? <GitLabLogo size={14} /> : <Pencil size={14} />, action: () => renameFile(file.path, file.name, true, file.is_dir), disabled: count > 1 || currentProtocol === 'immich', shortcut: (currentProtocol === 'github' || currentProtocol === 'gitlab') ? undefined : 'F2' },
       ...(count > 1 && currentProtocol !== 'immich' ? [{
         label: t('batchRename.title') || 'Batch Rename',
         icon: <Replace size={14} />,
@@ -13959,7 +13960,7 @@ const App: React.FC = () => {
       {
         label: t('contextMenu.properties'), icon: <Info size={14} />, action: () => openRemoteProperties('general')
       },
-      { label: ['zohoworkdrive', 'opendrive', 'jottacloud'].includes(currentProtocol || '') ? t('contextMenu.moveToTrash') : (currentProtocol === 'github' || currentProtocol === 'gitlab') ? t('github.deleteCommit') : t('contextMenu.delete'), icon: currentProtocol === 'github' ? <Github size={14} className="text-red-500" /> : currentProtocol === 'gitlab' ? <GitLabLogo size={14} /> : <Trash2 size={14} />, action: () => deleteMultipleRemoteFiles(filesToUse), danger: true, divider: !['jottacloud', 'mega', 'googledrive', 'box', 'dropbox', 'onedrive', 'zohoworkdrive', 'opendrive'].includes(currentProtocol || '') },
+      { actionId: 'delete', label: ['zohoworkdrive', 'opendrive', 'jottacloud'].includes(currentProtocol || '') ? t('contextMenu.moveToTrash') : (currentProtocol === 'github' || currentProtocol === 'gitlab') ? t('github.deleteCommit') : t('contextMenu.delete'), icon: currentProtocol === 'github' ? <Github size={14} className="text-red-500" /> : currentProtocol === 'gitlab' ? <GitLabLogo size={14} /> : <Trash2 size={14} />, action: () => deleteMultipleRemoteFiles(filesToUse), danger: true, divider: !['jottacloud', 'mega', 'googledrive', 'box', 'dropbox', 'onedrive', 'zohoworkdrive', 'opendrive'].includes(currentProtocol || '') },
       // Jottacloud: Delete now does soft-delete (Trash mountpoint) via the trait,
       // so the separate "Move to Trash" item was a second button doing exactly
       // the same call; the entry above carries the honest label instead (#397).
@@ -15054,7 +15055,7 @@ const App: React.FC = () => {
     const isAeroFileDualActive = (!isConnected || !showRemotePanel) && showDualLocalPanel;
     const items: ContextMenuItem[] = [
       {
-        label: uploadLabel,
+        actionId: 'upload', label: uploadLabel,
         icon: _activeProto === 'github' ? <Github size={14} /> : _activeProto === 'gitlab' ? <GitLabLogo size={14} /> : <Cloud size={14} />,
         action: () => uploadMultipleFiles(filesToUpload),
         disabled: !isConnected
@@ -15251,7 +15252,7 @@ const App: React.FC = () => {
       { label: t('common.preview'), icon: <Eye size={14} />, action: () => openUniversalPreview(file, false, sortedLocalFilesRef.current), disabled: count > 1 || file.is_dir || !isMediaPreviewable(file.name) },
       // Code files use DevTools source viewer
       { label: t('contextMenu.viewSource'), icon: <Code size={14} />, action: () => openDevToolsPreview(file, false), disabled: count > 1 || file.is_dir || !isPreviewable(file.name) },
-      { label: t('common.rename'), icon: <Pencil size={14} />, action: () => renameFile(file.path, file.name, false), disabled: count > 1, shortcut: 'F2' },
+      { actionId: 'rename', label: t('common.rename'), icon: <Pencil size={14} />, action: () => renameFile(file.path, file.name, false), disabled: count > 1, shortcut: 'F2' },
       ...(count > 1 ? [{
         label: t('batchRename.title') || 'Batch Rename',
         icon: <Replace size={14} />,
@@ -15332,7 +15333,7 @@ const App: React.FC = () => {
           }
         }
       },
-      { label: t('contextMenu.delete'), icon: <Trash2 size={14} />, action: () => deleteMultipleLocalFiles(filesToUpload), danger: true, divider: true },
+      { actionId: 'delete', label: t('contextMenu.delete'), icon: <Trash2 size={14} />, action: () => deleteMultipleLocalFiles(filesToUpload), danger: true, divider: true },
       {
         label: t('contextMenu.cut') || 'Cut', icon: <Scissors size={14} />, action: () => {
           const selectedFiles = localFiles.filter(f => selection.has(f.name)).map(f => ({ name: f.name, path: f.path, is_dir: f.is_dir }));
@@ -15755,7 +15756,7 @@ const App: React.FC = () => {
         disabled: !hasClipboard,
       },
       {
-        label: t('contextMenu.newFolder'), icon: <FolderPlus size={14} />,
+        actionId: 'mkdir', label: t('contextMenu.newFolder'), icon: <FolderPlus size={14} />,
         action: () => createFolder(true),
         divider: currentProtocol !== 'zohoworkdrive',
         disabled: currentProtocol === 'immich' && currentRemotePath !== '/',
@@ -15927,7 +15928,7 @@ const App: React.FC = () => {
         disabled: !hasClipboard,
       },
       {
-        label: t('contextMenu.newFolder'), icon: <FolderPlus size={14} />,
+        actionId: 'mkdir', label: t('contextMenu.newFolder'), icon: <FolderPlus size={14} />,
         action: () => createFolder(false, localPanelId),
         divider: true,
       },
@@ -18045,10 +18046,10 @@ const App: React.FC = () => {
                       path bar above and LocalFilePanel) so the affordance is bound to
                       the panel it operates on (issue #178 #3). The legacy global Up
                       button has been removed to avoid redundancy. */}
-                  <button onClick={() => activePanel === 'remote' ? loadRemoteFiles() : loadLocalFiles(currentLocalPath)} className="group px-3 py-1.5 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm flex items-center gap-1.5 transition-all hover:scale-105 hover:shadow-md" aria-label={t('common.refresh')}>
+                  <button data-testid={TID.toolbarRefresh} data-panel={activePanel} onClick={() => activePanel === 'remote' ? loadRemoteFiles() : loadLocalFiles(currentLocalPath)} className="group px-3 py-1.5 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm flex items-center gap-1.5 transition-all hover:scale-105 hover:shadow-md" aria-label={t('common.refresh')}>
                     <RefreshCw size={16} className="group-hover:rotate-180 transition-transform duration-500" /> {t('common.refresh')}
                   </button>
-                  <button onClick={() => createFolder(activePanel === 'remote')} className="group px-3 py-1.5 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm flex items-center gap-1.5 transition-all hover:scale-105 hover:shadow-md" aria-label={t('common.new')}>
+                  <button data-testid={TID.toolbarMkdir} data-panel={activePanel} onClick={() => createFolder(activePanel === 'remote')} className="group px-3 py-1.5 bg-gray-200 dark:bg-gray-600 hover:bg-gray-300 dark:hover:bg-gray-500 rounded-lg text-sm flex items-center gap-1.5 transition-all hover:scale-105 hover:shadow-md" aria-label={t('common.new')}>
                     <FolderPlus size={16} className="group-hover:scale-110 transition-transform" /> {t('common.new')}
                   </button>
                   {activePanel === 'local' && (
@@ -18087,6 +18088,8 @@ const App: React.FC = () => {
                   {/* Upload / Download dynamic button */}
                   {isConnected && showRemotePanel && (
                     <button
+                      data-testid={TID.toolbarTransfer}
+                      data-direction={activePanel === 'local' ? 'upload' : 'download'}
                       onClick={() => activePanel === 'local' ? uploadMultipleFiles() : downloadMultipleFiles()}
                       disabled={(activePanel === 'local' ? selectedLocalFiles.size : selectedRemoteFiles.size) === 0 || scanningState.active}
                       className={`relative px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5 transition-all ${(activePanel === 'local' ? selectedLocalFiles.size : selectedRemoteFiles.size) > 0 && !scanningState.active
@@ -18108,7 +18111,7 @@ const App: React.FC = () => {
                     </button>
                   )}
                   {/* Delete button */}
-                  <button
+                  <button data-testid={TID.toolbarDelete} data-panel={activePanel}
                     onClick={() => {
                       if (activePanel === 'remote' && selectedRemoteFiles.size > 0) {
                         deleteMultipleRemoteFiles(Array.from(selectedRemoteFiles));
@@ -18180,6 +18183,7 @@ const App: React.FC = () => {
                           toolbar buttons were removed to avoid a duplicated overlay
                           icon: the lit badge is the single, type-coloured control. */}
                       <button
+                        data-testid={TID.toolbarCancelAll}
                         onClick={cancelTransfer}
                         disabled={!syncCancelling && !isForceStopMode && !hasActiveTransfer && !hasQueueActivity}
                         className={`px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5 transition-all ${syncCancelling
@@ -18334,6 +18338,7 @@ const App: React.FC = () => {
                         not-connected fallback is needed. */}
                     <div className="flex-1 min-w-0">
                       <BreadcrumbBar
+                        panel="remote"
                         currentPath={(rcloneCryptVaultId || aeroCryptVaultId || overlayBadgeDecrypting) ? currentRemoteDisplayPath : currentRemotePath}
                         onNavigate={(path) => changeRemoteDirectory(path, undefined, !!(rcloneCryptVaultId || aeroCryptVaultId))}
                         isCoherent={!isSyncPathMismatch}
@@ -18369,6 +18374,8 @@ const App: React.FC = () => {
                       const upDisabled = !isConnected || currentRemotePath === '/' || !!atSyncRoot;
                       return (
                         <button
+                          data-testid={TID.breadcrumbUp}
+                          data-panel="remote"
                           onClick={() => !upDisabled && changeRemoteDirectory('..')}
                           disabled={upDisabled}
                           className={`flex-shrink-0 p-1.5 rounded transition-colors ${upDisabled ? 'text-gray-300 dark:text-gray-600 cursor-not-allowed' : 'text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'}`}
@@ -18380,6 +18387,8 @@ const App: React.FC = () => {
                       );
                     })()}
                     <button
+                      data-testid={TID.panelRefresh}
+                      data-panel="remote"
                       onClick={(e) => {
                         const btn = e.currentTarget;
                         btn.querySelector('svg')?.classList.add('animate-spin');
@@ -18673,6 +18682,8 @@ const App: React.FC = () => {
                   )}
                   <div
                     ref={remoteFileScrollRef}
+                    data-testid={TID.panel}
+                    data-panel="remote"
                     className="relative flex-1 overflow-auto"
                     onMouseDown={remoteMarquee.onMouseDown}
                     onContextMenu={(e) => {
@@ -18775,6 +18786,8 @@ const App: React.FC = () => {
                             <tr
                               key={`${file.name}-${i}`}
                               data-file-row
+                              data-testid={TID.fileRow}
+                              data-panel="remote"
                               data-file-name={file.name}
                               data-file-index={i}
                               role="row"
@@ -19029,6 +19042,8 @@ const App: React.FC = () => {
                           <div
                             key={`${file.name}-${i}`}
                             data-file-card
+                            data-testid={TID.fileRow}
+                            data-panel="remote"
                             data-file-name={file.name}
                             data-file-index={i}
                             draggable={file.name !== '..' && inlineRename?.path !== file.path}
