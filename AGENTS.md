@@ -30,12 +30,7 @@ aeroftp-cli transfer "Source Server" "Destination Server" /src/path /dst/path --
 
 ## Controlling the desktop GUI
 
-When the user explicitly requests visible work in the AeroFTP GUI, use the
-semantic controller tools **if they are available in your tool catalog**.
-They currently run inside the desktop GUI's AeroAgent. External CLI, native MCP
-and orchestration clients do not yet have a GUI-control bridge; there is no
-`aeroftp-cli gui` command. Report that limitation if the tools are unavailable.
-Do not silently substitute a headless operation for requested visible GUI work.
+When the user explicitly requests visible work in the AeroFTP GUI, use the semantic controller tools **if they are available in your tool catalog**. They currently run inside the desktop GUI's AeroAgent. External CLI, native MCP and orchestration clients do not yet have a GUI-control bridge; there is no `aeroftp-cli gui` command. Report that limitation if the tools are unavailable. Do not silently substitute a headless operation for requested visible GUI work.
 
 | Tool | Arguments | Behavior |
 |------|-----------|----------|
@@ -56,11 +51,7 @@ The current closed action catalog is:
 | `disconnect` | No action fields | Shared disconnect handler has completed |
 | `stop` | No action fields | Interrupts agent control and calls the real application Stop handler |
 
-`panel` is `remote`, `local` or `local2`. Unknown intents and fields are refused.
-Use a saved profile's **ID**, not its name, host or credentials: duplicate names
-are allowed. Discover IDs through saved-profile discovery (`server_list_saved`
-inside AeroAgent or `aeroftp-cli profiles --json`). The connect operation resolves
-secrets internally and can reuse an existing tab belonging to that profile.
+`panel` is `remote`, `local` or `local2`. Unknown intents and fields are refused. Use a saved profile's **ID**, not its name, host or credentials: duplicate names are allowed. Discover IDs through saved-profile discovery (`server_list_saved` inside AeroAgent or `aeroftp-cli profiles --json`). The connect operation resolves secrets internally and can reuse an existing tab belonging to that profile.
 
 Example tool calls, in order:
 
@@ -74,45 +65,20 @@ Example tool calls, in order:
 {"tool":"gui_run","args":{"intent":"stop"}}
 ```
 
-The `tool`/`args` envelope above illustrates tool calls; it is not a CLI or new
-IPC protocol. `gui_run` requires backend approval (medium tier). `gui_state` and
-`gui_wait` are observations. This does not grant arbitrary DOM clicks, script
-execution, shell access, file writes or weaker approval settings.
+The `tool`/`args` envelope above illustrates tool calls; it is not a CLI or new IPC protocol. `gui_run` requires backend approval (medium tier). `gui_state` and `gui_wait` are observations. This does not grant arbitrary DOM clicks, script execution, shell access, file writes or weaker approval settings.
 
-Replies contain `ok`, a bounded `error` code and `snapshot`. The snapshot includes
-`schema_version`, `state_revision`, view/connection state, sessions and panel
-paths/counts/loading/selection. Session projection may include `saved_profile_id`;
-it never includes connection parameters, passwords or API keys. A locked app
-returns a redacted snapshot. Lists are bounded; the active session is retained.
-`timeout_ms` defaults to 10000 and must be between 100 and 30000. Use an observed
-`state_revision` as `if_revision` when an action must reject intervening changes.
+Replies contain `ok`, a bounded `error` code and `snapshot`. The snapshot includes `schema_version`, `state_revision`, view/connection state, sessions and panel paths/counts/loading/selection. Session projection may include `saved_profile_id`; it never includes connection parameters, passwords or API keys. A locked app returns a redacted snapshot. Lists are bounded; the active session is retained. `timeout_ms` defaults to 10000 and must be between 100 and 30000. Use an observed `state_revision` as `if_revision` when an action must reject intervening changes.
 
 Handle outcomes explicitly:
 
-- `pending_human`: a host-key confirmation, locked overlay or other human step
-  needs attention. Agent control yields; do not answer secret/security prompts
-  automatically. After the human resolves it, observe state and obtain a fresh
-  approved request. A late answer cannot revive the interrupted request.
-- `stale_state`, `busy`, `blocked`: observe current state and the blocking
-  condition before considering another action. Do not guess or race it.
-- `locked`: let the user unlock through the ordinary GUI. Never read or fill the
-  master-password field through controller tools.
-- `lease_interrupted`, `gui_timeout`, `action_failed`: report the outcome and
-  inspect current state. Do not automatically retry a cancelled or timed-out
-  mutation; its underlying work may still be settling.
+- `pending_human`: a host-key confirmation, locked overlay or other human step needs attention. Agent control yields; do not answer secret/security prompts automatically. After the human resolves it, observe state and obtain a fresh approved request. A late answer cannot revive the interrupted request.
+- `stale_state`, `busy`, `blocked`: observe current state and the blocking condition before considering another action. Do not guess or race it.
+- `locked`: let the user unlock through the ordinary GUI. Never read or fill the master-password field through controller tools.
+- `lease_interrupted`, `gui_timeout`, `action_failed`: report the outcome and inspect current state. Do not automatically retry a cancelled or timed-out mutation; its underlying work may still be settling.
 
-The control banner identifies agent activity and exposes Stop. Trusted human
-input, account/profile changes and lock interrupt control. Stop remains available
-while locked or busy. Transfers retain the app's existing soft-first/hard-second
-Stop behavior; per-queue-item stopping is not part of this catalog.
+The control banner identifies agent activity and exposes Stop. Trusted human input, account/profile changes and lock interrupt control. Stop remains available while locked or busy. Transfers retain the app's existing soft-first/hard-second Stop behavior; per-queue-item stopping is not part of this catalog.
 
-General Settings, AI Settings (models/providers/marketplace), AeroTools and other
-tool panels do **not yet** have controller operations in this catalog. Do not
-infer support from a visible button or a stable `data-testid`. As these operations
-are implemented, this guide must document their exact allowed fields, approval,
-completion and secret exclusions. Saved passwords and AI keys must never be read,
-revealed, copied, replaced or cleared. Fresh-profile password insertion requires
-a separate authorized write-only creation draft and is not currently supported.
+General Settings, AI Settings (models/providers/marketplace), AeroTools and other tool panels do **not yet** have controller operations in this catalog. Do not infer support from a visible button or a stable `data-testid`. As these operations are implemented, this guide must document their exact allowed fields, approval, completion and secret exclusions. Saved passwords and AI keys must never be read, revealed, copied, replaced or cleared. Fresh-profile password insertion requires a separate authorized write-only creation draft and is not currently supported.
 
 ## How Credentials Work
 
@@ -153,19 +119,9 @@ The `profiles --json` output:
 ]
 ```
 
-`protocol` is always the transport you connect over. `cryptOverlay` is the
-encrypted-overlay binding: `null` when there is none, otherwise `"aerocrypt"`
-(native, which is also what a binding that names no kind means) or
-`"rclone-crypt"` (interop). `protocolClass` is the class the GUI
-table shows for the same profile, so a profile with an enabled overlay reads
-`"protocol": "ftp"` and `"protocolClass": "Crypt"` together.
+`protocol` is always the transport you connect over. `cryptOverlay` is the encrypted-overlay binding: `null` when there is none, otherwise `"aerocrypt"` (native, which is also what a binding that names no kind means) or `"rclone-crypt"` (interop). `protocolClass` is the class the GUI table shows for the same profile, so a profile with an enabled overlay reads `"protocol": "ftp"` and `"protocolClass": "Crypt"` together.
 
-Read `cryptOverlay` before writing to a path: on a bound profile the CLI
-decrypts names and contents transparently, so what you upload lands encrypted
-on the remote. The same two fields appear in `agent-bootstrap --json`,
-`agent-info --json` and the agent's `server_list_saved`, and they survive
-`agent-info --redact-identifiers`, which
-hides who the account is (host, username) and not how the connection is shaped.
+Read `cryptOverlay` before writing to a path: on a bound profile the CLI decrypts names and contents transparently, so what you upload lands encrypted on the remote. The same two fields appear in `agent-bootstrap --json`, `agent-info --json` and the agent's `server_list_saved`, and they survive `agent-info --redact-identifiers`, which hides who the account is (host, username) and not how the connection is shaped.
 
 ## Common Commands
 
@@ -260,8 +216,7 @@ aeroftp-cli ls --profile "Server" /path/ --json
 aeroftp-cli ls --profile "Server" /path/ -l
 ```
 
-**stdout** contains data only (file listings, file content, JSON).
-**stderr** contains status messages, progress bars, warnings.
+**stdout** contains data only (file listings, file content, JSON). **stderr** contains status messages, progress bars, warnings.
 
 ```bash
 # Pipe file content cleanly
@@ -444,10 +399,7 @@ A tool the level does not cover is asked for in an interactive terminal and refu
 
 ### Strict mode (recommended for unattended runs)
 
-Pass `--strict` (or set `AEROFTP_STRICT=1`) to make any safety-relaxing flag a
-hard error (exit 5) instead of a silent downgrade. This is the safest posture
-for agent-generated or CI commands: a command that smuggles in a relaxation
-flag fails loudly rather than proceeding. Refused under strict mode:
+Pass `--strict` (or set `AEROFTP_STRICT=1`) to make any safety-relaxing flag a hard error (exit 5) instead of a silent downgrade. This is the safest posture for agent-generated or CI commands: a command that smuggles in a relaxation flag fails loudly rather than proceeding. Refused under strict mode:
 
 | Flag | What it would relax |
 |------|---------------------|
@@ -459,8 +411,7 @@ flag fails loudly rather than proceeding. Refused under strict mode:
 | `--azure-archive-tier-delete` | Deletes archived blobs before overwrite |
 | `--auto-approve medium`/`high`/`all`, `-y`/`--yes` | Auto-approval above the read-only `safe` tier |
 
-Performance knobs (`--limit-rate`, concurrency, AIMD window sizing) and
-safety-adding flags (`--immutable`) are unaffected.
+Performance knobs (`--limit-rate`, concurrency, AIMD window sizing) and safety-adding flags (`--immutable`) are unaffected.
 
 ### Native MCP Server
 
