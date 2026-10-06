@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2026 axpnet: AI-assisted (see AI-TRANSPARENCY.md)
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { GuiController, buildGuiSnapshot, validateGuiRequest, type GuiSource, type GuiHandlers, type GuiRequest, type GuiPanel, type GuiLease, type GuiIntent } from './controller';
+import { GuiController, GuiError, buildGuiSnapshot, validateGuiRequest, type GuiSource, type GuiHandlers, type GuiRequest, type GuiPanel, type GuiLease, type GuiIntent } from './controller';
 
 let source: GuiSource;
 let handlers: GuiHandlers;
@@ -69,6 +69,9 @@ it('checks exact argument types and refuses hidden extra fields', () => {
         { name: 'select', args: { panel: 'remote', names: ['../secret'] } },
         { name: 'select', args: { panel: 'remote', names: ['file'], mode: 'all' } },
         { name: 'state', script: 'evil' },
+        { name: 'wait', args: { condition: ['connected'] } },
+        { name: 'refresh', args: { panel: ['local'] } },
+        { name: 'select', args: { panel: 'local', names: ['file'], mode: ['names'] } },
     ]) expect(() => validateGuiRequest(request as GuiRequest)).toThrow('invalid_args');
 });
 
@@ -149,4 +152,37 @@ it('bounds Stop even when its original handler does not settle', async () => {
     handlers.stop = vi.fn(() => new Promise<void>(() => {}));
     expect((await run('stop', {}, { timeout_ms: 100 })).error).toBe('gui_timeout');
     expect(handlers.stop).toHaveBeenCalledOnce();
+});
+
+
+it('honors a broker deadline shorter than the validated request timeout', async () => {
+    expect((await controller.run({ name: 'disconnect', timeout_ms: 10000 }, 'AeroAgent', Date.now() + 40)).error).toBe('gui_timeout');
+    expect(handlers.disconnect).not.toHaveBeenCalled();
+});
+
+
+it('waits for committed UI state after a setter callback has resolved', async () => {
+    handlers.showView = vi.fn(() => { setTimeout(() => { source.view = 'servers'; }, 60); });
+    const r = await run('show_view', { view: 'servers' });
+    expect(r.ok).toBe(true); expect(r.snapshot.view).toBe('servers');
+    source.view = 'files';
+    handlers.select = vi.fn(() => { setTimeout(() => { source.panels.local!.selection = new Set(); }, 60); });
+    const selected = await run('select', { panel: 'local', mode: 'none' });
+    expect(selected.ok).toBe(true); expect(selected.snapshot.panels.local?.selection_count).toBe(0);
+});
+
+
+it('Stop remains successful when human input interrupts during its handler', async () => {
+    let resolve!: () => void;
+    handlers.stop = vi.fn(() => new Promise<void>(r => { resolve = r; }));
+    const stop = run('stop'); controller.interrupt(); resolve();
+    expect((await stop).ok).toBe(true);
+});
+
+it('uses the canonical navigation result and waits for its committed path', async () => {
+    handlers.navigate = vi.fn(async () => { setTimeout(() => { source.panels.local!.path = '/canonical'; }, 60); return '/canonical'; });
+    const r = await run('navigate', { panel: 'local', path: '/local/../canonical' });
+    expect(r.ok).toBe(true); expect(r.snapshot.panels.local?.path).toBe('/canonical');
+    handlers.navigate = vi.fn(async () => { throw new GuiError('action_failed'); });
+    expect((await run('navigate', { panel: 'local', path: '/canonical' })).error).toBe('action_failed');
 });

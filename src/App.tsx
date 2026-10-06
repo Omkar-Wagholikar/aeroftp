@@ -5474,7 +5474,7 @@ const App: React.FC = () => {
   }, [currentLocalPath, currentLocalPath2, loadLocalFiles, loadLocalFiles2]);
 
   const changeLocalDirectory2 = useCallback(async (path: string) => {
-    await loadLocalFiles2(path);
+    return await loadLocalFiles2(path) ? path : null;
   }, [loadLocalFiles2]);
 
   const createLocalTab2 = useCallback(async () => {
@@ -9191,13 +9191,13 @@ const App: React.FC = () => {
     // Sync navigation guard: prevent navigating above the sync base path
     if (isSyncNavigation && syncBasePaths && path === '..') {
       const norm = (p: string) => p.endsWith('/') && p.length > 1 ? p.slice(0, -1) : p;
-      if (norm(currentRemotePath) === norm(syncBasePaths.remote)) return;
+      if (norm(currentRemotePath) === norm(syncBasePaths.remote)) return null;
     }
     // #401: ignore a re-entrant navigation while one is already in flight, so a
     // second double-click cannot stack a second cd and overshoot (relative ".."
     // on FTP would go up twice). A ref, not the async loading state, so two
     // clicks in the same tick are both caught.
-    if (remoteNavInFlightRef.current) return;
+    if (remoteNavInFlightRef.current) return null;
     // Bump the shared remote-listing generation: used to discard stale async
     // responses. loadRemoteFiles shares this counter, so any newer listing (a
     // navigation, a connect, or a manual refresh) supersedes an older one and the
@@ -9261,7 +9261,7 @@ const App: React.FC = () => {
         response = await invoke('change_directory', { path });
       }
       // Discard response if a newer navigation was initiated while we awaited
-      if (navId !== remoteNavCounter.current) return;
+      if (navId !== remoteNavCounter.current) return null;
       applyRemoteFileList(response as FileListResponse & { display_current_path?: string });
       setRemoteSearchResults(null);
       humanLog.logNavigate(response.current_path, true);
@@ -9277,22 +9277,23 @@ const App: React.FC = () => {
         const newLocalPath = (relativePath ? basePath + relPath : basePath) || '/';
         // Check if local path exists
         try {
-          if (navId !== remoteNavCounter.current) return;
+          if (navId !== remoteNavCounter.current) return null;
           const files: LocalFile[] = await invoke('get_local_files', { path: newLocalPath, showHidden: showHiddenFiles });
-          if (navId !== remoteNavCounter.current) return;
+          if (navId !== remoteNavCounter.current) return null;
           setLocalFiles(files);
           setCurrentLocalPath(newLocalPath);
           setSelectedLocalFiles(new Set());
         } catch {
           // Local directory doesn't exist - show dialog
-          if (navId !== remoteNavCounter.current) return;
+          if (navId !== remoteNavCounter.current) return null;
           setSyncNavDialog({ missingPath: newLocalPath, isRemote: false, targetPath: newLocalPath });
         }
       }
+      return (response as FileListResponse & { display_current_path?: string }).display_current_path || response.current_path;
     } catch (error) {
-      if (navId !== remoteNavCounter.current) return;
+      if (navId !== remoteNavCounter.current) return null;
       // A listing the user aborted is not a failed navigation: stay silent.
-      if (isListingCancelled(error)) return;
+      if (isListingCancelled(error)) return null;
       if (String(error).toLowerCase().includes('overlay session')) {
         setAeroVaultOverlaySession(null);
         if (activeSessionId) {
@@ -9304,6 +9305,7 @@ const App: React.FC = () => {
         }
       }
       notify.error(t('common.error'), t('toast.changeDirFailed', { error: String(error) }));
+      return null;
     } finally {
       // Release OUR latch only if we still own it (token === our navId): a Cancel
       // or a superseding refresh may have already handed the latch to someone else
@@ -9440,10 +9442,10 @@ const App: React.FC = () => {
       const normBase = norm(syncBasePaths.local);
       const normTarget = norm(path);
       // Block if target is a proper ancestor of the base path
-      if (normTarget !== normBase && (normTarget === '/' || normBase.startsWith(normTarget + '/'))) return;
+      if (normTarget !== normBase && (normTarget === '/' || normBase.startsWith(normTarget + '/'))) return null;
     }
     // #401: block a re-entrant local navigation the same way as remote.
-    if (localNavInFlightRef.current) return;
+    if (localNavInFlightRef.current) return null;
     localNavInFlightRef.current = true;
     setLocalListLoading(true);
     let success = false;
@@ -9453,7 +9455,7 @@ const App: React.FC = () => {
       setLocalListLoading(false);
       localNavInFlightRef.current = false;
     }
-    if (!success) return; // Don't record failed navigations
+    if (!success) return null; // Don't record failed navigations
     humanLog.logNavigate(path, false);
     addRecentPath(path);
     // Exit trash view when navigating to a regular path
@@ -9493,19 +9495,20 @@ const App: React.FC = () => {
         const response: FileListResponse = isProvider
           ? await invoke('provider_change_dir', { path: newRemotePath })
           : await invoke('change_directory', { path: newRemotePath });
-        if (navId !== remoteNavCounter.current) return;
+        if (navId !== remoteNavCounter.current) return null;
         setRemoteFiles(response.files);
         setCurrentRemotePath(response.current_path);
         setSelectedRemoteFiles(new Set());
         setRemoteSearchResults(null);
       } catch {
         // Remote directory doesn't exist - show dialog
-        if (navId !== remoteNavCounter.current) return;
+        if (navId !== remoteNavCounter.current) return null;
         setSyncNavDialog({ missingPath: newRemotePath, isRemote: true, targetPath: newRemotePath });
       } finally {
         if (navId === remoteNavCounter.current) setRemoteListLoading(false);
       }
     }
+    return path;
   };
 
   const chooseEndpointLocalFolder = useCallback(async (panelId: 'local' | 'local2') => {
@@ -16020,9 +16023,10 @@ const App: React.FC = () => {
   }, {
     showView: view => setShowConnectionScreen(view === 'servers'),
     navigate: async (panel, path) => {
-      if (panel === 'remote') await changeRemoteDirectory(path, undefined, !!(rcloneCryptVaultId || aeroCryptVaultId));
-      else if (panel === 'local2') await changeLocalDirectory2(path);
-      else await changeLocalDirectory(path);
+      const target = panel === 'remote' ? await changeRemoteDirectory(path, undefined, !!(rcloneCryptVaultId || aeroCryptVaultId))
+        : panel === 'local2' ? await changeLocalDirectory2(path) : await changeLocalDirectory(path);
+      if (target === null || target === undefined) throw new GuiError('action_failed');
+      return target;
     },
     refresh: async panel => {
       if (panel === 'remote') { if (!await loadRemoteFiles()) throw new GuiError('action_failed'); }
@@ -16041,7 +16045,7 @@ const App: React.FC = () => {
       if (panel !== 'remote') setActiveLocalPanelId(panel);
     },
     disconnect: async () => { if (isConnected) await disconnectFromFtp('button'); },
-    stop: async () => { if (hasActiveTransfer || hasQueueActivity) await cancelTransfer(); },
+    stop: async () => { if (remoteSyncRunningRef.current || hasActiveTransfer || hasQueueActivity) await cancelTransfer(); },
   }, (intent, ok, owner) => activityLog.log(ok ? 'INFO' : 'ERROR',
     `${t('guiController.banner', { agent: owner })}: ${intent === 'stop' ? t('guiController.stopped') : t(`guiController.actions.${intent}`)}`,
     ok ? 'success' : 'error'));
@@ -19006,6 +19010,7 @@ const App: React.FC = () => {
                     ) : viewMode === 'large' ? (
                       /* Large Icons View */
                       <LargeIconsGrid
+                        panelKey="remote"
                         // This grid renders the REMOTE panel here. Without the
                         // flag every thumbnail asked the local filesystem for a
                         // remote path and fell back to a generic icon (#347).

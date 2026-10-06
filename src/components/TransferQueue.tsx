@@ -710,7 +710,6 @@ export const TransferQueue: React.FC<TransferQueueProps> = ({
                             )}
                             {onStopAll && (
                                 <button
-                                    data-testid={TID.queueStopAll}
                                     onClick={(e) => { e.stopPropagation(); onStopAll(); }}
                                     className="px-2 py-1 text-[11px] bg-red-600 hover:bg-red-500 text-white rounded transition-colors"
                                 >

@@ -1165,6 +1165,7 @@ export const LocalFilePanel: React.FC<LocalFilePanelProps> = ({
         ) : (
           /* ===================== LARGE ICONS VIEW ===================== */
           <LargeIconsGrid
+            panelKey={panelKey}
             files={sortedFiles}
             selectedFiles={selectedFiles}
             currentPath={currentPath}

@@ -135,3 +135,15 @@ it('records committed intermediate state even when a path changes back before th
     expect(result).toMatchObject({ ok: false, error: 'stale_state' });
     expect(handlers.disconnect).not.toHaveBeenCalled();
 });
+
+
+it('accepts a satisfied minimum-timeout wait without rewriting it to invalid arguments', async () => {
+    await mount();
+    bridge.invoke.mockResolvedValueOnce(90);
+    await act(async () => bridge.callbacks.get('gui-intent')!({ payload: {
+        id: 'short-wait', expires_at: Date.now() + 100, request: { name: 'wait', args: { condition: 'connected' }, timeout_ms: 100 },
+    } }));
+    await until(() => bridge.invoke.mock.calls.some(([name]) => name === 'gui_intent_result'));
+    expect(bridge.invoke.mock.calls.find(([name]) => name === 'gui_intent_result')![1].payload)
+        .toMatchObject({ ok: true, error: null, snapshot: { connected: true } });
+});

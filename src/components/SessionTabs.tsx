@@ -377,6 +377,7 @@ export const SessionTabs: React.FC<SessionTabsProps> = ({
                         data-session-id={session.id}
                         data-active={isActive}
                         data-status={session.status}
+                        aria-disabled={isLocked || undefined}
                         draggable={!!onReorder && !isLocked}
                         onDragStart={(e) => { if (isLocked) { e.preventDefault(); return; } handleTabDragStart(e, idx); }}
                         onDragOver={(e) => handleTabDragOver(e, idx)}

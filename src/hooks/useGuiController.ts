@@ -59,13 +59,13 @@ export function useGuiController(source: GuiSource, handlers: GuiHandlers, audit
         void (async () => {
             try {
                 const remaining = await invoke<number>('gui_intent_claim', { id });
-                if (remaining <= 100 || controller.current !== service) return;
+                if (remaining <= 25 || controller.current !== service) return;
                 const mutating = !['state', 'wait'].includes(request.name);
                 // Busy requests must not overwrite the identity of an in-flight mutation.
                 const ownsId = mutating && mutationId.current === null;
                 if (ownsId) mutationId.current = id;
                 try {
-                    const reply = await service.run({ ...request, timeout_ms: Math.min(30000, remaining - 50) }, 'AeroAgent');
+                    const reply = await service.run(request, 'AeroAgent', Date.now() + remaining - 25);
                     await invoke('gui_intent_result', { id, payload: reply });
                 } finally { if (ownsId && mutationId.current === id) mutationId.current = null; }
             } catch { /* Broker expiry/window/account refusal has no raw error to expose. */ }

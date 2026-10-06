@@ -56,7 +56,7 @@ export function buildGuiSnapshot(source: GuiSource, revision = 0): GuiSnapshot {
 
 export interface GuiHandlers {
     showView(view: 'servers' | 'files'): void | Promise<void>;
-    navigate(panel: GuiPanel, path: string): Promise<void>;
+    navigate(panel: GuiPanel, path: string): Promise<void | string>;
     refresh(panel: GuiPanel): Promise<void>;
     select(panel: GuiPanel, names: string[], mode: 'names' | 'all' | 'none'): void;
     disconnect(): Promise<void>;
@@ -76,7 +76,7 @@ function keys(args: Record<string, unknown>, allowed: string[]) {
     if (Object.keys(args).some(key => !allowed.includes(key))) throw new GuiError('invalid_args');
 }
 function panelArg(args: Record<string, unknown>): GuiPanel {
-    if (!['remote', 'local', 'local2'].includes(String(args.panel))) throw new GuiError('invalid_args');
+    if (typeof args.panel !== 'string' || !['remote', 'local', 'local2'].includes(args.panel)) throw new GuiError('invalid_args');
     return args.panel as GuiPanel;
 }
 export function validateGuiRequest(request: GuiRequest): GuiIntent {
@@ -91,14 +91,14 @@ export function validateGuiRequest(request: GuiRequest): GuiIntent {
         case 'show_view':
             keys(args, ['view']); if (args.view !== 'servers' && args.view !== 'files') throw new GuiError('invalid_args'); break;
         case 'wait':
-            keys(args, ['condition']); if (!['connected', 'disconnected', 'idle', 'unlocked'].includes(String(args.condition))) throw new GuiError('invalid_args'); break;
+            keys(args, ['condition']); if (typeof args.condition !== 'string' || !['connected', 'disconnected', 'idle', 'unlocked'].includes(args.condition)) throw new GuiError('invalid_args'); break;
         case 'navigate':
             keys(args, ['panel', 'path']); panelArg(args);
             if (typeof args.path !== 'string' || !args.path.trim() || args.path.length > 4096 || /[\x00-\x1f]/.test(args.path)) throw new GuiError('invalid_args'); break;
         case 'refresh': keys(args, ['panel']); panelArg(args); break;
         case 'select':
             keys(args, ['panel', 'names', 'mode']); panelArg(args);
-            if (!['names', 'all', 'none'].includes(String(args.mode ?? 'names'))) throw new GuiError('invalid_args');
+            if (typeof (args.mode ?? 'names') !== 'string' || !['names', 'all', 'none'].includes((args.mode ?? 'names') as string)) throw new GuiError('invalid_args');
             if (args.mode === 'all' || args.mode === 'none') {
                 if (args.names !== undefined) throw new GuiError('invalid_args');
             } else if (!Array.isArray(args.names) || args.names.length > 100 ||
@@ -131,19 +131,19 @@ export class GuiController {
         this.epoch++; this.lease = null; clearTimeout(this.expiry); this.changed(null);
     }
     dispose(): void { this.disposed = true; this.interrupt(); }
-    private guard(epoch: number, deadline: number): void {
-        if (this.disposed || epoch !== this.epoch) throw new GuiError('lease_interrupted');
+    private guard(epoch: number, deadline: number, checkEpoch = true): void {
+        if (this.disposed || (checkEpoch && epoch !== this.epoch)) throw new GuiError('lease_interrupted');
         if (Date.now() >= deadline) throw new GuiError('gui_timeout');
     }
-    private async delay(ms: number, epoch: number, deadline: number): Promise<void> {
+    private async delay(ms: number, epoch: number, deadline: number, checkEpoch = true): Promise<void> {
         const end = Date.now() + ms;
         while (Date.now() < end) {
-            this.guard(epoch, deadline);
+            this.guard(epoch, deadline, checkEpoch);
             await new Promise(resolve => setTimeout(resolve, Math.min(25, end - Date.now())));
         }
-        this.guard(epoch, deadline);
+        this.guard(epoch, deadline, checkEpoch);
     }
-    async run(input: GuiRequest, owner = 'AeroAgent'): Promise<GuiReply> {
+    async run(input: GuiRequest, owner = 'AeroAgent', brokerDeadline = Infinity): Promise<GuiReply> {
         let intent: GuiIntent | undefined;
         let ownsLane = false;
         let laneEpoch: number | undefined;
@@ -157,17 +157,19 @@ export class GuiController {
             // Copy only validated request data before any asynchronous boundary.
             const request = structuredClone(input);
             const args = request.args ?? {};
+            // The claimed broker budget may be shorter than the validated request timeout.
+            const deadline = Math.min(Date.now() + (request.timeout_ms ?? 10000), brokerDeadline);
+            this.guard(this.epoch, deadline);
             const snapshot = this.state();
             if (request.if_revision !== undefined && request.if_revision !== snapshot.state_revision) throw new GuiError('stale_state');
             if (intent === 'state') { succeeded = true; return { ok: true, error: null, snapshot }; }
             if (intent === 'stop') {
                 this.interrupt();
                 const epoch = this.epoch;
-                const deadline = Date.now() + (request.timeout_ms ?? 10000);
                 let settled = false;
                 let failure: unknown;
                 void this.handlers().stop().catch(error => { failure = error; }).finally(() => { settled = true; });
-                while (!settled) await this.delay(25, epoch, deadline);
+                while (!settled) await this.delay(25, epoch, deadline, false);
                 if (failure) throw failure;
                 succeeded = true;
                 return { ok: true, error: null, snapshot: this.state() };
@@ -175,7 +177,6 @@ export class GuiController {
             if (this.disposed) throw new GuiError('lease_interrupted');
             if (snapshot.locked && !(intent === 'wait' && args.condition === 'unlocked')) throw new GuiError('locked');
             const epoch = this.epoch;
-            const deadline = Date.now() + (request.timeout_ms ?? 10000);
             if (intent === 'wait') {
                 while (true) {
                     this.guard(epoch, deadline);
@@ -201,10 +202,11 @@ export class GuiController {
             const h = this.handlers();
             handlerSettled = false;
             let handlerError: unknown;
+            let navigationPath: void | string = undefined;
             const operation = async () => {
                 switch (intent) {
                     case 'show_view': await h.showView(args.view as 'servers' | 'files'); break;
-                    case 'navigate': await h.navigate(panelArg(args), args.path as string); break;
+                    case 'navigate': navigationPath = await h.navigate(panelArg(args), args.path as string); break;
                     case 'refresh': await h.refresh(panelArg(args)); break;
                     case 'select': h.select(panelArg(args), (args.names ?? []) as string[], (args.mode ?? 'names') as 'names' | 'all' | 'none'); break;
                     case 'disconnect': await h.disconnect(); break;
@@ -216,11 +218,28 @@ export class GuiController {
             });
             while (!handlerSettled) await this.delay(25, epoch, deadline);
             if (handlerError) throw handlerError;
+            // React setters may commit after their callback Promise resolves.
+            // Report view/selection/disconnect only when the committed projection agrees.
+            const committed = (state: GuiSnapshot): boolean => {
+                if (intent === 'navigate' && typeof navigationPath === 'string') return state.panels[panelArg(args)]?.path === boundedText(navigationPath);
+                if (intent === 'show_view') return state.view === args.view;
+                if (intent === 'disconnect') return !state.connected;
+                if (intent === 'select') {
+                    const p = state.panels[panelArg(args)];
+                    if (!p) return false;
+                    if (args.mode === 'all') return p.selection_count === p.entries_count;
+                    if (args.mode === 'none') return p.selection_count === 0;
+                    const names = new Set(args.names as string[]);
+                    return p.selection_count === names.size && p.selection.every(name => names.has(name));
+                }
+                return true;
+            };
+            while (!committed(this.state())) await this.delay(25, epoch, deadline);
             if (intent === 'navigate') {
                 const panel = panelArg(args);
                 const before = snapshot.panels[panel]?.path;
                 const after = this.state().panels[panel]?.path;
-                if (args.path !== '.' && args.path !== before && before === after) throw new GuiError('action_failed');
+                if (navigationPath === undefined && args.path !== '.' && args.path !== before && before === after) throw new GuiError('action_failed');
             }
             // A handler can already have acted when cancellation or timeout arrives.
             // Keep the mutation lane owned until that handler actually settles.

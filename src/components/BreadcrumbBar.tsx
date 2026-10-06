@@ -321,9 +321,9 @@ export const BreadcrumbBar: React.FC<BreadcrumbBarProps> = ({
           onMouseDown={(e) => {
             // Prevent blur from firing before click
             e.preventDefault();
-            confirmEdit();
           }}
           className="flex-shrink-0 p-1 rounded hover:bg-green-50 text-green-600 hover:text-green-500 dark:hover:bg-gray-700/50 dark:text-green-400 dark:hover:text-green-300 transition-colors"
+          onClick={confirmEdit}
           title={t('breadcrumb.confirm') || 'Confirm'}
         >
           <Check size={14} />

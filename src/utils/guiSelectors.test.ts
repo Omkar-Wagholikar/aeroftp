@@ -11,9 +11,12 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ConfirmDialog, InputDialog } from '../components/Dialogs';
 import { PasswordInput } from '../components/common/PasswordInput';
 import { OverwriteDialog } from '../components/OverwriteDialog';
+import { LargeIconsGrid } from '../components/LargeIconsGrid';
+import { SessionTabs } from '../components/SessionTabs';
+import { TransferQueue } from '../components/TransferQueue';
 import { TID } from './testIds';
 import { guiTarget } from './guiTestTarget';
-import type { ServerProfile } from '../types';
+import type { FtpSession, LocalFile, ServerProfile } from '../types';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn().mockResolvedValue([]) }));
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
@@ -104,4 +107,58 @@ it('refuses denied ancestors, disabled controls and hostile selector characters'
     const button = host.querySelector('button')!;
     button.dataset.profileId = 'id"] [data-agent="deny';
     expect(guiTarget(host, 'test', { 'data-profile-id': button.dataset.profileId })).toBe(button);
+});
+
+it('confirms a breadcrumb by click exactly once after the focus-preserving mousedown', async () => {
+    const navigate = vi.fn();
+    await render(h(BreadcrumbBar, { panel: 'local', currentPath: '/test', onNavigate: navigate, t: translate }));
+    await click(TID.breadcrumbEdit, { 'data-panel': 'local' });
+    const input = guiTarget(host, TID.breadcrumbInput, { 'data-panel': 'local' }) as HTMLInputElement;
+    await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, '/next');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const button = guiTarget(host, TID.breadcrumbConfirm, { 'data-panel': 'local' });
+    await act(async () => {
+        button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        button.click();
+    });
+    expect(navigate).toHaveBeenCalledExactlyOnceWith('/next');
+});
+
+it('addresses same-name large icons by panel and preserves the selection callback', async () => {
+    const file: LocalFile = { name: 'sample.txt', path: '/test/sample.txt', size: 8, is_dir: false, modified: null };
+    const select = vi.fn();
+    const props = { files: [file], selectedFiles: new Set<string>(), currentPath: '/test',
+        onFileClick: select, onFileDoubleClick: vi.fn(), onNavigateUp: vi.fn(), isAtRoot: true,
+        getFileIcon: () => ({ icon: null, color: '' }), onContextMenu: vi.fn(), dragOverTarget: null,
+        inlineRename: null, onInlineRenameChange: vi.fn(), onInlineRenameCommit: vi.fn(),
+        onInlineRenameCancel: vi.fn(), formatBytes: String };
+    await render(h('div', {}, h(LargeIconsGrid, { ...props, panelKey: 'local2' }),
+        h(LargeIconsGrid, { ...props, panelKey: 'remote', isRemote: true })));
+    expect(() => guiTarget(host, TID.fileRow, { 'data-file-name': file.name })).toThrow('GUI target count: 2');
+    await click(TID.fileRow, { 'data-panel': 'local2', 'data-file-name': file.name });
+    expect(select).toHaveBeenCalledOnce();
+    expect(select.mock.calls[0][0]).toBe(file);
+});
+
+it('refuses a transfer-locked session while keeping the active session address usable', async () => {
+    const session: FtpSession = { id: 'first', serverId: 'server', serverName: 'Fixture', status: 'connected',
+        remotePath: '/', localPath: '/', remoteFiles: [], localFiles: [], lastActivity: new Date(),
+        connectionParams: { server: 'test.invalid', port: 21, username: 'tester', password: '', protocol: 'ftp' } };
+    const select = vi.fn();
+    await render(h(SessionTabs, { sessions: [session, { ...session, id: 'second' }], activeSessionId: 'first',
+        transferLocked: true, onTabClick: select, onTabClose: vi.fn(), onCloseAll: vi.fn(), onNewTab: vi.fn() }));
+    expect(() => guiTarget(host, TID.sessionTab, { 'data-session-id': 'second' })).toThrow('GUI target disabled');
+    await click(TID.sessionTab, { 'data-session-id': 'first' });
+    expect(select).toHaveBeenCalledExactlyOnceWith('first');
+});
+
+it('offers one Stop-all address when an expanded queue is paused', async () => {
+    const stop = vi.fn();
+    await render(h(TransferQueue, { items: [{ id: 'queued', filename: 'sample.txt', path: '/sample.txt',
+        size: 8, status: 'pending', type: 'upload' }], isVisible: true, isPaused: true,
+        pauseReason: 'Fixture', onStopAll: stop, onToggle: vi.fn() }));
+    await click(TID.queueStopAll);
+    expect(stop).toHaveBeenCalledOnce();
 });

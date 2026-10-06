@@ -88,6 +88,9 @@ const ALLOWED_TOOLS: &[&str] = &[
     "clipboard_read",
     "clipboard_write",
     // App control tools
+    "gui_state",
+    "gui_wait",
+    "gui_run",
     "set_theme",
     "app_info",
     "sync_control",
@@ -128,6 +131,7 @@ fn sync_control_requires_approval(args: &Value) -> bool {
 
 fn requires_backend_write_approval(tool_name: &str, args: &Value) -> bool {
     match tool_name {
+        "gui_run" => true,
         "sync_control" => sync_control_requires_approval(args),
         "server_exec" | "cross_profile_transfer" => true,
         _ => matches!(
@@ -2628,9 +2632,45 @@ mod session_grant_tests {
 mod approval_tests {
     use super::{
         build_ai_tool_approval_details, build_ai_tool_approval_message,
-        requires_backend_write_approval, split_approval_message,
+        requires_backend_write_approval, split_approval_message, ALLOWED_TOOLS,
     };
     use serde_json::json;
+
+    #[test]
+    fn gui_controller_tools_are_reachable_and_control_requires_approval() {
+        use crate::ai_core::tools::{find_tool, DangerLevel, Surfaces};
+        for (name, danger) in [
+            ("gui_state", DangerLevel::ReadOnly),
+            ("gui_wait", DangerLevel::ReadOnly),
+            ("gui_run", DangerLevel::Medium),
+        ] {
+            assert!(
+                ALLOWED_TOOLS.contains(&name),
+                "{name} cannot reach the broker"
+            );
+            let definition = find_tool(name).expect("GUI controller tool must exist");
+            assert_eq!(definition.danger, danger);
+            assert_eq!(definition.surfaces, Surfaces::GUI);
+        }
+        assert!(!requires_backend_write_approval("gui_state", &json!({})));
+        assert!(!requires_backend_write_approval(
+            "gui_wait",
+            &json!({"condition":"idle"})
+        ));
+        for intent in [
+            "show_view",
+            "navigate",
+            "refresh",
+            "select",
+            "disconnect",
+            "stop",
+        ] {
+            assert!(requires_backend_write_approval(
+                "gui_run",
+                &json!({"intent":intent})
+            ));
+        }
+    }
 
     #[test]
     fn the_approval_window_gets_the_action_and_the_details_apart() {
