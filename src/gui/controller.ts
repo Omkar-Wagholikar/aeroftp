@@ -42,7 +42,11 @@ export function buildGuiSnapshot(source: GuiSource, revision = 0): GuiSnapshot {
         sessions: [], panels: {}, queue: { active: 0, pending: 0, failed: 0 },
     };
     if (source.locked) return result;
-    result.sessions = source.sessions.slice(0, 32).map(s => ({
+    // Keep the active session observable even when older tabs fill the cap.
+    const sessions = source.sessions.slice(0, 32);
+    const active = source.sessions.find(s => s.id === source.activeSessionId);
+    if (active && !sessions.includes(active)) sessions[31] = active;
+    result.sessions = sessions.map(s => ({
         id: boundedText(s.id), name: boundedText(s.name), protocol: boundedText(s.protocol), status: boundedText(s.status),
         ...(s.savedProfileId ? { saved_profile_id: boundedText(s.savedProfileId) } : {}),
     }));
@@ -239,15 +243,18 @@ export class GuiController {
                 handlerSettled = true;
                 if (returned) this.busy = false;
             });
-            while (!handlerSettled) await this.delay(25, epoch, deadline);
+            while (!handlerSettled) {
+                if (intent === 'connect' && this.state().blocked) throw new GuiError('pending_human');
+                await this.delay(25, epoch, deadline);
+            }
             if (handlerError) throw handlerError;
             // React setters may commit after their callback Promise resolves.
             // Report view/selection/disconnect only when the committed projection agrees.
             const committed = (state: GuiSnapshot): boolean => {
                 if (intent === 'connect') {
-                    return state.connected && state.view === 'files' && state.sessions.some(session =>
+                    return !state.blocked && state.connected && state.view === 'files' && state.sessions.some(session =>
                         session.id === state.active_session_id && session.saved_profile_id === args.profile_id && session.status === 'connected') &&
-                        !state.panels.remote?.loading;
+                        !!state.panels.remote && !state.panels.remote.loading;
                 }
                 if (intent === 'navigate' || intent === 'refresh') {
                     const p = state.panels[panelArg(args)];

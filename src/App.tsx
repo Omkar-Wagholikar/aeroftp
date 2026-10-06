@@ -978,6 +978,7 @@ const App: React.FC = () => {
   // is already usable (false) must not cost the user the session: it just
   // aborts the listing and leaves them in the directory they were in.
   const remoteConnectPhaseRef = useRef<false | 'connect' | 'switch'>(false);
+  const remoteConnectPhaseVersionRef = useRef(0);
   // Bumped the instant a Cancel decides to abort a connect. A connect flow is a
   // long chain of awaits that paints the panel, names the tab and registers the
   // session; the aborted listing only unwinds the await it was blocked on, so
@@ -2454,7 +2455,7 @@ const App: React.FC = () => {
     params: Record<string, unknown>,
     scope?: ConnectScope,
   ): Promise<T> => cancellableConnect<T>((token) =>
-    scope ? scope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); },
+    scope ? scope.cancellable(() => invoke<void>('cancel_connection', { token }),
       () => invoke<T>(command, { params: { ...params, connectToken: token } })) :
       invoke<T>(command, { params: { ...params, connectToken: token } })
   ), [cancellableConnect]);
@@ -6078,7 +6079,6 @@ const App: React.FC = () => {
         setCryptOverlayOwner(null);
         setRcloneCryptVaultId(null);
         setAeroCryptVaultId(null);
-        setPendingOverlayUnlock(null);
         // Plain server (no overlay): the connect-time listing path is already
         // correct, so drop the captured id without rewriting it.
         connectListingLogIdRef.current = null;
@@ -6103,7 +6103,10 @@ const App: React.FC = () => {
         } catch {
           // best-effort: fall through as plain if the profile re-read fails
         }
-        if (!cancelled) setLockedOverlayProfile(locked);
+        if (!cancelled) {
+          setLockedOverlayProfile(locked);
+          setPendingOverlayUnlock(null);
+        }
 
         // If we had suppressed the connect listing expecting an overlay that did
         // not materialise (binding probe matched but unlock failed), reveal the
@@ -6215,14 +6218,15 @@ const App: React.FC = () => {
   // whitespace, so the flag is carried by a wrapper instead of by the body.
   const asConnectPhase = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
     async (...args: A): Promise<R> => {
+      const phaseVersion = ++remoteConnectPhaseVersionRef.current;
       remoteConnectPhaseRef.current = 'connect';
       try {
         const scope = args[args.length - 1];
         return scope instanceof ConnectScope
-          ? await scope.cancellable(() => { void cancelActiveConnect(); return cancelRemoteNavigation(); }, () => fn(...args))
+          ? await scope.cancellable(() => cancelRemoteNavigation(), () => fn(...args))
           : await fn(...args);
       } finally {
-        remoteConnectPhaseRef.current = false;
+        if (phaseVersion === remoteConnectPhaseVersionRef.current) remoteConnectPhaseRef.current = false;
       }
     };
 
@@ -6824,7 +6828,9 @@ const App: React.FC = () => {
     supportsSftpTransferPresets,
   ]);
 
-  const buildProviderParams = async (params: ConnectionParams, initialPath: string | null) => {
+  const buildProviderParams = async (params: ConnectionParams, initialPath: string | null, connectScope = new ConnectScope()) => {
+    const scopedInvoke = <T,>(...args: Parameters<typeof invoke>) => connectScope.step(() => invoke<T>(...args));
+    connectScope.assert();
     let effectiveParams = normalizeProviderConnectionParams(params);
 
     // Issue #215: the MEGAcmd WebDAV bridge is a local daemon AeroFTP can start
@@ -6842,8 +6848,9 @@ const App: React.FC = () => {
         // daemon is not running, and this preflight runs BEFORE runConnect's
         // token is armed, so Esc could not abort it. Run it under a connect
         // token so the backend honors a cancel and the Esc handler is live.
-        const url = await cancellableConnect<string>((connectToken) =>
-          invoke<string>('mega_webdav_url', { connectToken }));
+        const url = await cancellableConnect<string>((connectToken) => connectScope.cancellable(
+          () => invoke<void>('cancel_connection', { token: connectToken }),
+          () => invoke<string>('mega_webdav_url', { connectToken })));
         if (url) {
           let port = effectiveParams.port || 4443;
           try {
@@ -6860,6 +6867,7 @@ const App: React.FC = () => {
           };
         }
       } catch (e) {
+        connectScope.assert();
         // A user cancel (Esc) must abort the whole connect, not silently fall
         // through to a connect against the saved endpoint (#360).
         if (isConnectCancelledError(e)) throw e;
@@ -6873,14 +6881,14 @@ const App: React.FC = () => {
     if (effectiveParams.protocol === 'github' &&
         effectiveParams.options?.githubAuthMode === 'authorize') {
       effectiveParams = { ...effectiveParams, password: '' };
-      await invoke('github_load_oauth_token').catch(() => {});
+      try { await scopedInvoke('github_load_oauth_token'); } catch { connectScope.assert(); }
     }
 
     // GitHub PAT mode: load PAT from vault if password is empty (reconnect scenario)
     if (effectiveParams.protocol === 'github' &&
         effectiveParams.options?.githubAuthMode === 'pat' &&
         !effectiveParams.password) {
-      await invoke('github_get_pat').catch(() => {});
+      try { await scopedInvoke('github_get_pat'); } catch { connectScope.assert(); }
     }
 
     if (effectiveParams.protocol === 'github' && effectiveParams.options?.githubAuthMode === 'app') {
@@ -6905,18 +6913,20 @@ const App: React.FC = () => {
         let tokenExpiresAt: string;
 
         // Try vault first (most common path after initial import), then disk, then vault fallback
-        const hasVaultPem = await invoke<boolean>('github_has_vault_pem', { appId, installationId }).catch(() => false);
+        let hasVaultPem = false;
+        try { hasVaultPem = await scopedInvoke<boolean>('github_has_vault_pem', { appId, installationId }); }
+        catch { connectScope.assert(); }
 
         if (pemStored || hasVaultPem) {
           // PEM in vault: preferred path, no file on disk needed
-          const resp = await invoke<{ success: boolean; expires_at: string }>('github_app_token_from_vault', {
+          const resp = await scopedInvoke<{ success: boolean; expires_at: string }>('github_app_token_from_vault', {
             appId,
             installationId,
           });
           tokenExpiresAt = resp.expires_at;
         } else if (pemPath) {
           // PEM not in vault: try reading from disk (first import or vault lost)
-          const resp = await invoke<{ success: boolean; expires_at: string }>('github_app_token_from_pem', {
+          const resp = await scopedInvoke<{ success: boolean; expires_at: string }>('github_app_token_from_pem', {
             pemPath,
             appId,
             installationId,
@@ -6945,7 +6955,7 @@ const App: React.FC = () => {
     // needed for quota display and future REST API features
     if (effectiveParams.providerId === 'infinicloud' && effectiveParams.options?.apiKey) {
       try {
-        const discovery = await invoke<{
+        const discovery = await scopedInvoke<{
           node: string;
           webdav_url: string;
           capacity: number;
@@ -6967,6 +6977,7 @@ const App: React.FC = () => {
           },
         };
       } catch (e) {
+        connectScope.assert();
         // If server is already set, discovery failure is non-fatal (quota won't work but connection proceeds)
         if (!effectiveParams.server) {
           throw new Error(`InfiniCloud discovery failed: ${e}`);
@@ -6985,9 +6996,9 @@ const App: React.FC = () => {
     let filenApiKey = effectiveParams.options?.filen_api_key || null;
     if (protocol === 'filen' && !filenApiKey && effectiveParams.savedServerId) {
       try {
-        const storedFilenKey = await invoke<string>('get_credential', { account: `filen_api_key_${effectiveParams.savedServerId}` });
+        const storedFilenKey = await scopedInvoke<string>('get_credential', { account: `filen_api_key_${effectiveParams.savedServerId}` });
         if (storedFilenKey) filenApiKey = storedFilenKey;
-      } catch { /* no stored Filen API key for this profile */ }
+      } catch { connectScope.assert(); /* no stored Filen API key for this profile */ }
     }
 
     // Endpoint + region from the one shared rule (stored endpoint, explicit
@@ -7142,6 +7153,7 @@ const App: React.FC = () => {
     setLoading(true);
     // A branch switch disconnects and logs in again, so it is a connect: a
     // Cancel on its listing leaves no session to fall back to.
+    const phaseVersion = ++remoteConnectPhaseVersionRef.current;
     remoteConnectPhaseRef.current = 'connect';
     try {
       const { effectiveParams, providerParams } = await buildProviderParams(nextParams, currentRemotePath || null);
@@ -7184,7 +7196,7 @@ const App: React.FC = () => {
       if (isListingCancelled(error)) return;
       notify.error(t('common.error'), String(error));
     } finally {
-      remoteConnectPhaseRef.current = false;
+      if (phaseVersion === remoteConnectPhaseVersionRef.current) remoteConnectPhaseRef.current = false;
       setLoading(false);
     }
   }, [activeSessionId, connectionParams, currentRemotePath, notify, refreshGitHubContext, sessions, t]);
@@ -7284,7 +7296,7 @@ const App: React.FC = () => {
     humanLog.logRaw('activity.listing_complete', 'INFO', { path, count: String(count) }, 'success');
 
   // SEC-P1-06: TOFU host key check: returns true if key is accepted or already known
-  const checkSftpHostKey = async (host: string, port: number): Promise<boolean> => {
+  const checkSftpHostKey = async (host: string, port: number, connectScope?: ConnectScope): Promise<boolean> => {
     try {
       const info = await invoke<HostKeyInfo>('sftp_check_host_key', { host, port });
       if (info.status === 'known') return true;
@@ -7294,9 +7306,13 @@ const App: React.FC = () => {
       }
       // Show TOFU or key-changed dialog
       return new Promise<boolean>((resolve) => {
-        setHostKeyDialog({ visible: true, info, host, port, resolve });
+        const remove = connectScope?.onCancel(() => resolve(false));
+        // Human acceptance can remember the host key, but cannot resume an
+        // agent request that already yielded control or was stopped.
+        setHostKeyDialog({ visible: true, info, host, port, resolve: accepted => { remove?.(); resolve(accepted); } });
       });
     } catch (error) {
+      connectScope?.assert();
       notify.error('Host key check failed', String(error));
       return false;
     }
@@ -8327,6 +8343,7 @@ const App: React.FC = () => {
     // completely silent, which on a slow server reads as a frozen app. Every
     // listing here now raises the spinner, and a Cancel tears the half-switched
     // session down rather than leaving the user staring at stale files.
+    const phaseVersion = ++remoteConnectPhaseVersionRef.current;
     remoteConnectPhaseRef.current = 'switch';
     const listWithSpinner = <T,>(fn: () => Promise<T>): Promise<T> =>
       withRemoteListSpinner(fn, listingReason(targetSession.remotePath));
@@ -8425,7 +8442,7 @@ const App: React.FC = () => {
         if (isFourSharedProvider(protocol)) {
           // 4shared uses OAuth 1.0: needs fourshared_connect, not oauth2_connect
           await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(
-            () => { void invoke('cancel_connection', { token }).catch(() => {}); },
+            () => invoke<void>('cancel_connection', { token }),
             () => invoke('fourshared_connect', { params: { consumer_key: clientId, consumer_secret: clientSecret,
               profile_id: targetSession.savedServerId ?? '', connect_token: token } }))));
         } else {
@@ -8453,7 +8470,7 @@ const App: React.FC = () => {
             ...(region && { region }),
           };
           try {
-            await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => invoke('oauth2_connect', { params: { ...oauthParams, connect_token: token } }))));
+            await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => invoke<void>('cancel_connection', { token }), () => invoke('oauth2_connect', { params: { ...oauthParams, connect_token: token } }))));
           } catch (connectErr) { connectScope.assert();
             const errMsg = connectErr instanceof Error ? connectErr.message : String(connectErr);
             const lower = errMsg.toLowerCase();
@@ -8463,8 +8480,8 @@ const App: React.FC = () => {
                 lower.includes('token expired') ||
                 (lower.includes('token') && lower.includes('refresh'))) {
               logger.debug('[switchSession] OAuth token invalid, re-authenticating...');
-              await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => invoke('oauth2_full_auth', { params: { ...oauthParams, connect_token: token } }))));
-              await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => invoke('oauth2_connect', { params: { ...oauthParams, connect_token: token } }))));
+              await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => invoke<void>('cancel_connection', { token }), () => invoke('oauth2_full_auth', { params: { ...oauthParams, connect_token: token } }))));
+              await connectScope.step(() => cancellableConnect(token => connectScope.cancellable(() => invoke<void>('cancel_connection', { token }), () => invoke('oauth2_connect', { params: { ...oauthParams, connect_token: token } }))));
             } else {
               throw connectErr;
             }
@@ -8501,14 +8518,14 @@ const App: React.FC = () => {
         try { await connectScope.step(() => invoke('provider_disconnect')); } catch { connectScope.assert(); }
         try { await connectScope.step(() => invoke('disconnect_ftp')); } catch { connectScope.assert(); }
 
-        const providerPayload = await connectScope.step(() => buildProviderParams(connectParams, targetSession.remotePath || null));
+        const providerPayload = await connectScope.step(() => buildProviderParams(connectParams, targetSession.remotePath || null, connectScope));
         connectParams = providerPayload.effectiveParams;
         const providerParams = providerPayload.providerParams;
 
         logger.debug('[switchSession] provider protocol:', providerParams.protocol);
         // SEC-P1-06: TOFU host key check for SFTP
         if (protocol === 'sftp') {
-          const accepted = await connectScope.step(() => checkSftpHostKey(connectParams.server, connectParams.port || 22));
+          const accepted = await connectScope.step(() => checkSftpHostKey(connectParams.server, connectParams.port || 22, connectScope));
           if (!accepted) throw new Error('Host key rejected by user');
         }
         await connectScope.step(() => runConnect('provider_connect', providerParams, connectScope));
@@ -8703,7 +8720,7 @@ const App: React.FC = () => {
       // the user can supply the code without re-opening Edit on the profile.
       tryShowTwoFactorPrompt(e, targetSession.connectionParams, targetSession.serverName, reconnectLogId);
     } finally {
-      remoteConnectPhaseRef.current = false;
+      if (phaseVersion === remoteConnectPhaseVersionRef.current) remoteConnectPhaseRef.current = false;
     }
   };
 
@@ -8904,6 +8921,7 @@ const App: React.FC = () => {
 
     // AeroCloud opens (or re-points) a connection before it lists, so a Cancel
     // on its listing has no usable session to fall back to either.
+    const phaseVersion = ++remoteConnectPhaseVersionRef.current;
     remoteConnectPhaseRef.current = 'connect';
     try {
       // Get cloud config to know which server profile and folders
@@ -9198,7 +9216,7 @@ const App: React.FC = () => {
       notify.error(t('connection.connectionFailed'), String(error));
       setShowCloudPanel(true);
     } finally {
-      remoteConnectPhaseRef.current = false;
+      if (phaseVersion === remoteConnectPhaseVersionRef.current) remoteConnectPhaseRef.current = false;
       setLoading(false);
     }
   };
@@ -9428,7 +9446,8 @@ const App: React.FC = () => {
   // session down: that disconnect needs the mutex the abort just freed.
   const cancelRemoteNavigation = () => {
     const kind = remoteConnectPhaseRef.current;
-    remoteNavCounter.current += 1;
+    const phaseVersion = remoteConnectPhaseVersionRef.current;
+    const navVersion = ++remoteNavCounter.current;
     remoteNavInFlightRef.current = 0;
     // Synchronously, before any await: the connect/switch flow must observe the
     // abort on its very next resumption, not once the backend round trip returns.
@@ -9445,6 +9464,7 @@ const App: React.FC = () => {
       // workspace down and return to My Servers. A cancelled tab SWITCH keeps
       // every healthy tab: unwind only the half-switched backend and let
       // switchSession's cancel branch mark the target tab cached.
+      if (phaseVersion !== remoteConnectPhaseVersionRef.current || navVersion !== remoteNavCounter.current) return;
       if (kind === 'switch') await abortSwitchAfterCancel();
       else if (kind) await abortConnectAfterCancel();
     })();
@@ -16022,7 +16042,7 @@ const App: React.FC = () => {
     version: appVersion,
     locked: isAppLocked || !vaultBootComplete || accountLockState !== 'ready',
     blocked: !!confirmDialog || !!inputDialog || hostKeyDialog.visible || !!twoFactorPrompt?.open ||
-      overwriteDialog.isOpen || showSettingsPanel || !!showVaultPanel,
+      overwriteDialog.isOpen || showSettingsPanel || !!showVaultPanel || !!lockedOverlayProfile,
     view: showSettingsPanel || showVaultPanel ? 'other' : showConnectionScreen ? 'servers' : 'files',
     connected: isConnected,
     activeSessionId,
@@ -16030,7 +16050,8 @@ const App: React.FC = () => {
       protocol: session.connectionParams.protocol || 'ftp', status: session.status, savedProfileId: session.savedServerId })),
     panels: {
       ...(isConnected && showRemotePanel ? { remote: { path: (rcloneCryptVaultId || aeroCryptVaultId || overlayBadgeDecrypting) ? currentRemoteDisplayPath : currentRemotePath,
-        loading: remoteListLoading, selection: selectedRemoteFiles, entriesCount: remoteFiles.length } } : {}),
+        loading: remoteListLoading || !!pendingOverlayUnlock || overlayBadgeDecrypting,
+        selection: selectedRemoteFiles, entriesCount: remoteFiles.length } } : {}),
       local: { path: currentLocalPath, loading: localListLoading, selection: selectedLocalFiles, entriesCount: localFiles.length },
       ...(showDualLocalPanel && (!isConnected || !showRemotePanel) ? { local2: { path: currentLocalPath2, loading: localListLoading2,
         selection: selectedLocalFiles2, entriesCount: localFiles2.length } } : {}),
@@ -17837,14 +17858,14 @@ const App: React.FC = () => {
                         normalizedParams.providerId,
                         normalizedParams.username,
                     );
-                    const providerPayload = await connectScope.step(() => buildProviderParams(normalizedParams, resolvedSavedInitialPath));
+                    const providerPayload = await connectScope.step(() => buildProviderParams(normalizedParams, resolvedSavedInitialPath, connectScope));
                     const connectedParams = providerPayload.effectiveParams;
                     const providerParams = providerPayload.providerParams;
 
                     logger.debug('[onSavedServerConnect] provider protocol:', providerParams.protocol);
                     // SEC-P1-06: TOFU host key check for SFTP
                     if (normalizedParams.protocol === 'sftp') {
-                      const accepted = await connectScope.step(() => checkSftpHostKey(normalizedParams.server, normalizedParams.port || 22));
+                      const accepted = await connectScope.step(() => checkSftpHostKey(normalizedParams.server, normalizedParams.port || 22, connectScope));
                       if (!accepted) return 'pending_human' as const;
                     }
                     const savedConnHost = connectedParams.server || getProviderHostFallback(connectedParams.protocol, connectedParams.username);

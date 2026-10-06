@@ -7,10 +7,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { MyServersPanel } from './MyServersPanel';
 import { ConnectScope, type ProfileConnector } from '../../gui/connectScope';
 import type { ServerProfile } from '../../types';
+import type { MtpDeviceInfo } from '../../types/aerofile';
 const state = vi.hoisted(() => ({
     profiles: [] as ServerProfile[],
     invoke: vi.fn<(name: string, args?: Record<string, unknown>) => Promise<unknown>>(),
-    refreshDevices: vi.fn(async () => []),
+    refreshDevices: vi.fn<() => Promise<MtpDeviceInfo[]>>(async () => []),
     status: { isUnlocked: true, activeUserId: 1, unlockedUserId: 1 },
 }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: state.invoke }));
@@ -42,15 +43,17 @@ let root: Root; let host: HTMLDivElement; let connector: ProfileConnector;
 const connect = vi.fn(async () => 'connected' as const);
 beforeEach(() => {
     (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
-    localStorage.clear(); connect.mockClear(); state.invoke.mockReset();
+    localStorage.clear(); connect.mockClear(); state.invoke.mockReset().mockImplementation(async name =>
+        name === 'peer_identity_get' ? { afid: 'fixture' } : name === 'peer_friends_list' ? [] : undefined);
     state.status = { isUnlocked: true, activeUserId: 1, unlockedUserId: 1 };
+    state.refreshDevices.mockReset().mockResolvedValue([]);
     state.profiles = [{ id: 'fixture', name: 'Fixture', protocol: 'ftp', host: 'fixture.invalid', username: 'fixture' } as ServerProfile];
     host = document.createElement('div'); document.body.append(host); root = createRoot(host);
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); });
-async function mount() {
+async function mount(extra: Partial<React.ComponentProps<typeof MyServersPanel>> = {}) {
     await act(async () => root.render(h(MyServersPanel, { onConnect: connect, onEdit: vi.fn(), onQuickConnect: vi.fn(),
-        registerProfileConnector: value => { connector = value; return () => {}; } })));
+        registerProfileConnector: value => { connector = value; return () => {}; }, ...extra })));
 }
 async function until(check: () => boolean) {
     for (let n = 0; !check(); n++) {
@@ -66,6 +69,35 @@ it('stops the actual saved-profile handler while its credential read is pending'
     await until(() => !!release); scope.cancel(new Error('lease_interrupted'));
     await act(async () => { release('PRIVATE_PASSWORD_SENTINEL'); await expect(pending).rejects.toThrow(); });
     expect(connect).not.toHaveBeenCalled();
+});
+it('routes an unbound peer profile to the existing human handshake without reading credentials', async () => {
+    state.profiles[0].protocol = 'peer';
+    await mount(); let outcome;
+    await act(async () => { outcome = await connector('fixture', new ConnectScope()); });
+    expect(outcome).toBe('pending_human'); expect(connect).not.toHaveBeenCalled();
+    expect(state.invoke.mock.calls.map(([name]) => name)).not.toContain('get_credential');
+});
+it('activates an existing saved-profile tab and awaits its real handler', async () => {
+    let resolve!: (value: boolean) => void; const activate = vi.fn(() => new Promise<boolean>(yes => { resolve = yes; }));
+    await mount({ activeProfileIds: new Set(['fixture']), onActivateSession: activate });
+    let pending!: ReturnType<ProfileConnector>; let settled = false;
+    await act(async () => { pending = connector('fixture', new ConnectScope()).finally(() => { settled = true; }); });
+    await until(() => !!resolve); expect(settled).toBe(false);
+    await act(async () => { resolve(true); expect(await pending).toBe('connected'); });
+    expect(connect).not.toHaveBeenCalled();
+    expect(state.invoke.mock.calls.map(([name]) => name)).not.toContain('get_credential');
+});
+it('awaits a matched MTP device open without dispatching a credential-provider connection', async () => {
+    state.profiles[0] = { ...state.profiles[0], protocol: 'mtp', deviceFingerprint: { kind: 'mtp', canonical: 'mtp:serial=fixture' } };
+    state.refreshDevices.mockResolvedValue([{ deviceId: 'fixture-device', fingerprint: 'mtp:serial=fixture' } as MtpDeviceInfo]);
+    let resolve!: () => void; const open = vi.fn(() => new Promise<void>(yes => { resolve = yes; }));
+    await mount({ onOpenMtpDeviceProfile: open });
+    let pending!: ReturnType<ProfileConnector>; let settled = false;
+    await act(async () => { pending = connector('fixture', new ConnectScope()).finally(() => { settled = true; }); });
+    await until(() => !!resolve); expect(settled).toBe(false);
+    await act(async () => { resolve(); expect(await pending).toBe('connected'); });
+    expect(open.mock.calls).toHaveLength(1); expect(connect).not.toHaveBeenCalled();
+    expect(state.invoke.mock.calls.map(([name]) => name)).not.toContain('get_credential');
 });
 it('prevents OAuth key continuations from opening authentication after Stop', async () => {
     state.profiles[0].protocol = 'dropbox'; let release!: (value: string) => void;

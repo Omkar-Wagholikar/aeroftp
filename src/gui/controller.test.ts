@@ -230,6 +230,39 @@ it('another already connected profile cannot satisfy a failed or pending-human c
     expect((await run('connect', { profile_id: 'requested' })).error).toBe('pending_human');
     expect((await run('state')).snapshot.sessions[0].saved_profile_id).toBe('other');
 });
+it('keeps an active tab beyond the snapshot cap and requires an actual remote panel', async () => {
+    source.sessions = Array.from({ length: 33 }, (_, i) => ({ id: `s${i}`, name: 'Tab', protocol: 'ftp', status: 'connected', savedProfileId: `p${i}` }));
+    source.activeSessionId = 's32';
+    handlers.connect = vi.fn(async () => 'connected' as const);
+    const reply = await run('connect', { profile_id: 'p32' });
+    expect(reply.ok).toBe(true); expect(reply.snapshot.sessions).toHaveLength(32);
+    expect(reply.snapshot.sessions.some(s => s.id === 's32')).toBe(true);
+    delete source.panels.remote;
+    expect((await run('connect', { profile_id: 'p32' }, { timeout_ms: 100 })).error).toBe('gui_timeout');
+});
+it('does not report success when a locked overlay blocks an otherwise connected idle session', async () => {
+    handlers.connect = async id => {
+        source.sessions = [{ ...source.sessions[0], savedProfileId: id }];
+        source.blocked = true; return 'connected';
+    };
+    expect((await run('connect', { profile_id: 'requested' })).error).toBe('pending_human');
+    expect(changed).toHaveBeenLastCalledWith(null);
+});
+it('yields to a human dialog without letting its late answer resume the agent connect', async () => {
+    let answer!: () => void; const dispatch = vi.fn();
+    handlers.connect = async (_id, scope) => {
+        await scope.step(() => new Promise<void>(resolve => {
+            answer = resolve; source.blocked = true;
+            scope.onCancel(() => resolve());
+        }));
+        dispatch(); return 'connected';
+    };
+    expect((await run('connect', { profile_id: 'requested' })).error).toBe('pending_human');
+    expect(source.blocked).toBe(true); answer();
+    await new Promise(resolve => setTimeout(resolve, 35));
+    expect(dispatch).not.toHaveBeenCalled(); source.blocked = false;
+    expect((await run('refresh', { panel: 'local' })).ok).toBe(true);
+});
 it('Stop before a delayed credential result prevents dispatch and keeps the lane until it settles', async () => {
     let release!: () => void; const dispatch = vi.fn(); let began = false;
     handlers.connect = async (_id, scope) => {

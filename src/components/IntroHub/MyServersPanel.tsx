@@ -1017,7 +1017,7 @@ export function MyServersPanel({
         if (connectingId || connectingProfileId) return 'failed';
         const scopedCancellable = cancellableConnect ? <T,>(run: (token: string) => Promise<T>) =>
             cancellableConnect(token => connectScope.cancellable(
-                () => { void invoke('cancel_connection', { token }).catch(() => {}); }, () => run(token))) : undefined;
+                () => invoke<void>('cancel_connection', { token }), () => run(token))) : undefined;
 
         // AeroShare friend (design §2 "what happens after you click"): if a
         // drive is already bound, fall through to the standard credential-based
@@ -1292,17 +1292,16 @@ export function MyServersPanel({
                                     ...(latest.options || {}),
                                     filen_auth_version: authVersion,
                                 },
-                            })));
+                            }), true));
                             setServers(updatedWithAuth);
                         }
-                    } catch { connectScope.assert();
+                    } catch {
                         // best-effort badge enrichment only
                     }
                 })();
             }
             return outcome ?? 'connected';
         } catch (e) { connectScope.assert();
-            connectScope.assert();
             if (!isConnectCancelledError(e)) logger.error('Connection failed', e);
             return 'failed';
         } finally {
