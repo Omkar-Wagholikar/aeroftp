@@ -4,7 +4,9 @@
 import { useGuiController } from './hooks/useGuiController';
 import { GuiControllerBanner } from './components/GuiControllerBanner';
 import { GuiError } from './gui/controller';
-import { TID } from './utils/testIds';
+import { TID, type GuiPanelId } from './utils/testIds';
+import { applyPanelSelection, type PanelSelectionMode } from './utils/panelSelection';
+import { LatestListing } from './utils/latestListing';
 import * as React from 'react';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -917,6 +919,7 @@ const App: React.FC = () => {
   // spinner, so a stall on a slow provider is legible instead of mysterious.
   const [remoteListReason, setRemoteListReason] = useState<string | null>(null);
   const [localListLoading, setLocalListLoading] = useState(false);
+  const [localListLoading2, setLocalListLoading2] = useState(false);
   // Transfer progress: ref holds data (no re-renders), boolean state only changes on start/complete
   const activeTransferRef = useRef<TransferProgress | null>(null);
   const [hasActiveTransfer, setHasActiveTransfer] = useState(false);
@@ -1702,6 +1705,7 @@ const App: React.FC = () => {
   // Race condition guard for loadLocalFiles: increments on each call,
   // stale responses are discarded when callId !== current counter value.
   const loadLocalCallIdRef = React.useRef(0);
+  const latestLocalListing2 = useRef(new LatestListing());
 
   // File clipboard for Cut/Copy/Paste
   const fileClipboardRef = React.useRef<{
@@ -2647,6 +2651,14 @@ const App: React.FC = () => {
     };
   };
 
+  // The same selection action serves menus, keyboard shortcuts and GUI intents.
+  const setPanelSelection = (panel: GuiPanelId, names: readonly string[] = [], mode: PanelSelectionMode = 'names') => {
+    const target = panel === 'remote' ? { files: remoteFiles, setSelection: setSelectedRemoteFiles }
+      : panel === 'local2' ? { files: localFiles2, setSelection: setSelectedLocalFiles2 }
+        : { files: localFiles, setSelection: setSelectedLocalFiles };
+    return applyPanelSelection(target, names, mode);
+  };
+
   // Keyboard Shortcuts
   useKeyboardShortcuts({
     'F1': () => setShowShortcutsDialog(v => !v),
@@ -2766,12 +2778,7 @@ const App: React.FC = () => {
 
     // Ctrl+A: select all files
     'Ctrl+A': () => {
-      if (activePanel === 'remote') {
-        setSelectedRemoteFiles(new Set(remoteFiles.map(f => f.name)));
-      } else {
-        const panel = getActiveLocalState();
-        panel.setSelection(new Set(panel.files.map(f => f.name)));
-      }
+      setPanelSelection(activePanel === 'remote' ? 'remote' : activeLocalPanelId, [], 'all');
     },
 
     // Ctrl+U: upload selected local files
@@ -5428,37 +5435,33 @@ const App: React.FC = () => {
   const loadLocalFiles2 = useCallback(async (path: string): Promise<boolean> => {
     if (!path) return false; // defence in depth: see loadLocalFiles above
     try {
-      const files: LocalFile[] = await invoke('get_local_files', { path, showHidden: showHiddenFiles });
-      setLocalFiles2(files);
-      setCurrentLocalPath2(path);
-      setSelectedLocalFiles2(new Set());
-      return true;
-    } catch (error) {
-      if (isGvfsMtpPath(path)) {
-        notify.error(t('common.error'), t('sidebar.portable_unplugged'));
+      return await latestLocalListing2.current.run(async isCurrent => {
         try {
-          const home = await homeDir().catch(() => '/');
-          if (home === path) return false;
-          const homeFiles: LocalFile[] = await invoke('get_local_files', {
-            path: home,
-            showHidden: showHiddenFiles,
-          });
-          setLocalFiles2(homeFiles);
-          setCurrentLocalPath2(home);
-          setSelectedLocalFiles2(new Set());
-          return true;
-        } catch {
-          return false;
+          const files = await invoke<LocalFile[]>('get_local_files', { path, showHidden: showHiddenFiles });
+          return { files, path };
+        } catch (error) {
+          if (!isCurrent() || !isGvfsMtpPath(path)) throw error;
+          notify.error(t('common.error'), t('sidebar.portable_unplugged'));
+          try {
+            const home = await homeDir().catch(() => '/');
+            if (home === path || !isCurrent()) return null;
+            const files = await invoke<LocalFile[]>('get_local_files', { path: home, showHidden: showHiddenFiles });
+            return { files, path: home };
+          } catch {
+            return null;
+          }
         }
-      }
+      }, result => {
+        setLocalFiles2(result.files);
+        setCurrentLocalPath2(result.path);
+        setSelectedLocalFiles2(new Set());
+      }, setLocalListLoading2);
+    } catch (error) {
       notify.error(t('common.error'), `Failed to list local files: ${error}`);
       return false;
     }
   }, [showHiddenFiles, notify, t, setLocalFiles2, setCurrentLocalPath2, setSelectedLocalFiles2]);
 
-  // Reload every local panel whose current path equals `dir` (panel 1 and/or
-  // dual panel 2). Paste / cut destinations must not hardcode panel 1: dual
-  // local mode and PLACES gvfs paths often target panel 2.
   const refreshLocalPanelForPath = useCallback(async (dir: string | null | undefined) => {
     if (!dir) return;
     const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
@@ -15865,7 +15868,7 @@ const App: React.FC = () => {
       }] : []),
       {
         label: t('contextMenu.selectAll') || 'Select All', icon: <CheckCircle2 size={14} />,
-        action: () => setSelectedRemoteFiles(new Set(remoteFiles.map(f => f.name))),
+        action: () => { setPanelSelection('remote', [], 'all'); },
         disabled: remoteFiles.length === 0,
       },
     ];
@@ -15944,7 +15947,7 @@ const App: React.FC = () => {
       },
       {
         label: t('contextMenu.selectAll') || 'Select All', icon: <CheckCircle2 size={14} />,
-        action: () => ctxPanel.setSelection(new Set(ctxPanel.files.map(f => f.name))),
+        action: () => { setPanelSelection(ctxPanel.id, [], 'all'); },
         disabled: ctxPanel.files.length === 0,
         divider: true,
       },
@@ -16012,7 +16015,7 @@ const App: React.FC = () => {
       ...(isConnected && showRemotePanel ? { remote: { path: (rcloneCryptVaultId || aeroCryptVaultId || overlayBadgeDecrypting) ? currentRemoteDisplayPath : currentRemotePath,
         loading: remoteListLoading, selection: selectedRemoteFiles, entriesCount: remoteFiles.length } } : {}),
       local: { path: currentLocalPath, loading: localListLoading, selection: selectedLocalFiles, entriesCount: localFiles.length },
-      ...(showDualLocalPanel && (!isConnected || !showRemotePanel) ? { local2: { path: currentLocalPath2, loading: false,
+      ...(showDualLocalPanel && (!isConnected || !showRemotePanel) ? { local2: { path: currentLocalPath2, loading: localListLoading2,
         selection: selectedLocalFiles2, entriesCount: localFiles2.length } } : {}),
     },
     queue: {
@@ -16034,13 +16037,7 @@ const App: React.FC = () => {
       else if (!await loadLocalFiles(currentLocalPath)) throw new GuiError('action_failed');
     },
     select: (panel, names, mode) => {
-      const files = panel === 'remote' ? remoteFiles : panel === 'local2' ? localFiles2 : localFiles;
-      const available = new Set(files.map(file => file.name));
-      if (mode === 'names' && names.some(name => !available.has(name))) throw new GuiError('invalid_args');
-      const selection = new Set(mode === 'all' ? available : mode === 'none' ? [] : names);
-      if (panel === 'remote') setSelectedRemoteFiles(selection);
-      else if (panel === 'local2') setSelectedLocalFiles2(selection);
-      else setSelectedLocalFiles(selection);
+      if (!setPanelSelection(panel, names, mode)) throw new GuiError('invalid_args');
       setActivePanel(panel === 'remote' ? 'remote' : 'local');
       if (panel !== 'remote') setActiveLocalPanelId(panel);
     },
@@ -16174,11 +16171,7 @@ const App: React.FC = () => {
             }
           }}
           onSelectAll={() => {
-            if (activePanel === 'remote') {
-              setSelectedRemoteFiles(new Set(remoteFiles.map(f => f.name)));
-            } else {
-              setSelectedLocalFiles(new Set(localFiles.map(f => f.name)));
-            }
+            setPanelSelection(activePanel === 'remote' ? 'remote' : 'local', [], 'all');
           }}
           onCut={() => {
             if (activePanel === 'remote' && selectedRemoteFiles.size > 0) {
@@ -19413,7 +19406,7 @@ const App: React.FC = () => {
                     isSyncPathMismatch={false}
                     isSyncNavigation={false}
                     syncBasePaths={null}
-                    isLoading={false}
+                    isLoading={localListLoading2}
                     localFiles={localFiles2}
                     sortedFiles={sortedLocalFiles2}
                     selectedFiles={selectedLocalFiles2}
