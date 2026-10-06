@@ -17754,7 +17754,10 @@ const App: React.FC = () => {
                     } catch (error) { connectScope.assert();
                       // A Cancel is the one failure not to swallow: the session
                       // it would arm the overlay on is already being torn down.
-                      if (isListingCancelled(error)) return;
+                      // Report 'failed' so performConnect cannot read this bare
+                      // return as 'connected' and leave the GUI controller
+                      // waiting for a connected commit that will never come.
+                      if (isListingCancelled(error)) return 'failed' as const;
                       savedOauthResp = null;
                     }
                     const savedOverlayAnchor = savedOverlayHint.anchor || savedOauthResp?.current_path || '/';
@@ -17771,7 +17774,9 @@ const App: React.FC = () => {
                   }
                   // loadRemoteFiles reports an aborted listing as a null response,
                   // exactly like a swallowed error; only the epoch separates them.
-                  if (connectEpoch !== connectAbortEpochRef.current) return;
+                  // A stale/aborted attempt must report 'failed', not the bare
+                  // return that performConnect would read as 'connected'.
+                  if (connectEpoch !== connectAbortEpochRef.current) return 'failed' as const;
                   // Navigate to initial local directory if specified (with fallback for invalid paths)
                   let resolvedLocalPath = currentLocalPath;
                   if (localInitialPath) {
@@ -17969,11 +17974,14 @@ const App: React.FC = () => {
                     setQuickConnectDirs({ remoteDir: '', localDir: '' });
                     return 'connected' as const;
                   } catch (error) { connectScope.assert();
-                    // W3.1: user-cancelled connect, not a failure (runConnect
-                    // already toasted). finally re-enables the form.
-                    if (isConnectCancelledError(error)) return;
+                    // W3.1: user-cancelled connect, no error toast (runConnect
+                    // already toasted). finally re-enables the form. Still
+                    // report 'failed': a bare return reaches performConnect as
+                    // undefined, which it maps to 'connected', leaving the GUI
+                    // controller waiting on a commit that will never happen.
+                    if (isConnectCancelledError(error)) return 'failed' as const;
                     // Nor is a listing aborted from the panel spinner's Cancel.
-                    if (isListingCancelled(error)) return;
+                    if (isListingCancelled(error)) return 'failed' as const;
                     // Issue #128: surface dedicated 2FA prompt for MEGA / Filen / Internxt.
                     // Check for the 2FA challenge BEFORE emitting the failure log so the
                     // activity panel shows the "enter 2FA hint" line instead of the misleading
@@ -18057,12 +18065,16 @@ const App: React.FC = () => {
                   setQuickConnectDirs({ remoteDir: '', localDir: '' });
                   return 'connected' as const;
                 } catch (error) { connectScope.assert();
-                  // W3.1: user-cancelled connect, not a failure (runConnect
-                  // already toasted). finally re-enables the form.
-                  if (isConnectCancelledError(error)) return;
+                  // W3.1: user-cancelled connect, no error toast (runConnect
+                  // already toasted). finally re-enables the form. Still
+                  // report 'failed': a bare return reaches performConnect as
+                  // undefined, which it maps to 'connected', leaving the GUI
+                  // controller waiting on a commit that will never happen.
+                  if (isConnectCancelledError(error)) return 'failed' as const;
                   // Nor is a listing the user aborted from the panel spinner:
-                  // the login worked, so no failure marker on the card.
-                  if (isListingCancelled(error)) return;
+                  // the login worked, so no failure marker on the card (the
+                  // marker is recorded below, and these returns skip it).
+                  if (isListingCancelled(error)) return 'failed' as const;
                   // A logged-in session whose Remote Path answers 550 is a path
                   // problem, not a credentials one: say so instead of the
                   // misleading "Check credentials".
