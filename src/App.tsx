@@ -1492,9 +1492,14 @@ const App: React.FC = () => {
   // range than dualPanelLeftFlex's 0.2..1.8: this one is clamped to an actual
   // pixel floor at drag time (see startRemoteLocalResize), not a fixed ratio.
   const [remoteLocalLeftFlex, setRemoteLocalLeftFlex] = useState<number>(() => {
-    const raw = localStorage.getItem('aerofile_remote_local_split');
-    const n = raw ? parseFloat(raw) : NaN;
-    return Number.isFinite(n) && n >= 0.05 && n <= 1.95 ? n : 1.0;
+    try {
+      const raw = localStorage.getItem('aerofile_remote_local_split');
+      const n = raw ? parseFloat(raw) : NaN;
+      return Number.isFinite(n) && n >= 0.05 && n <= 1.95 ? n : 1.0;
+    } catch (e) {
+      console.warn('[layout] could not read remote/local split', e);
+      return 1.0;
+    }
   });
   const dualPanelContainerRef = useRef<HTMLDivElement | null>(null);
   // Forward ref to transferLocalSelectionAcrossPanels: the function is defined
@@ -1506,7 +1511,11 @@ const App: React.FC = () => {
     localStorage.setItem('aerofile_dual_panel_split', String(dualPanelLeftFlex));
   }, [dualPanelLeftFlex]);
   React.useEffect(() => {
-    localStorage.setItem('aerofile_remote_local_split', String(remoteLocalLeftFlex));
+    try {
+      localStorage.setItem('aerofile_remote_local_split', String(remoteLocalLeftFlex));
+    } catch (e) {
+      console.warn('[layout] could not persist remote/local split', e);
+    }
   }, [remoteLocalLeftFlex]);
   const startDualPanelResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -19174,13 +19183,15 @@ const App: React.FC = () => {
                     onDoubleClick={() => setRemoteLocalLeftFlex(1.0)}
                     onKeyDown={(e) => {
                       const STEP = 0.1;
-                      // Matches the pixel-floor clamp in startRemoteLocalResize:
-                      // 0.05/1.95 is a close static approximation of "as far as
-                      // a 160px-vs-container-width floor allows" for a normal
-                      // window size, so arrow/Home/End land near where a mouse
-                      // drag would actually stop instead of a tighter, stale
-                      // bound.
-                      const clamp = (v: number) => Math.max(0.05, Math.min(1.95, v));
+                      // Derive the same 160px-pixel-floor bound startRemoteLocalResize
+                      // uses for mouse dragging, instead of the static 0.05/1.95
+                      // approximation: at narrow container widths that approximation
+                      // could let Home/End reach a pane size the mouse path would
+                      // never allow.
+                      const width = dualPanelContainerRef.current?.getBoundingClientRect().width ?? 0;
+                      const minFlex = width > 0 ? 2 * Math.min(0.5, 160 / width) : 0.05;
+                      const maxFlex = 2 - minFlex;
+                      const clamp = (v: number) => Math.max(minFlex, Math.min(maxFlex, v));
                       if (e.key === 'ArrowLeft') {
                         e.preventDefault();
                         setRemoteLocalLeftFlex(prev => clamp(prev - STEP));
@@ -19189,10 +19200,10 @@ const App: React.FC = () => {
                         setRemoteLocalLeftFlex(prev => clamp(prev + STEP));
                       } else if (e.key === 'Home') {
                         e.preventDefault();
-                        setRemoteLocalLeftFlex(0.05);
+                        setRemoteLocalLeftFlex(minFlex);
                       } else if (e.key === 'End') {
                         e.preventDefault();
-                        setRemoteLocalLeftFlex(1.95);
+                        setRemoteLocalLeftFlex(maxFlex);
                       } else if (e.key === 'Enter' || e.key === ' ') {
                         e.preventDefault();
                         setRemoteLocalLeftFlex(1.0);
