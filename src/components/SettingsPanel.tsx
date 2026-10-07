@@ -11,7 +11,7 @@ import { AeroShareContacts } from './AeroShare/AeroShareContacts';
 import { CheckpointEndpoints } from './CheckpointEndpoints';
 import { AeroSharePrivacySettings } from './AeroShare/AeroSharePrivacySettings';
 import type { Theme } from '../hooks/useTheme';
-import { getEffectiveTheme } from '../hooks/useTheme';
+import { getEffectiveTheme, isNightTime } from '../hooks/useTheme';
 import { useIconTheme } from '../hooks/useIconTheme';
 import { getIconThemeProvider, type IconTheme } from '../utils/iconThemes';
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart';
@@ -2079,6 +2079,30 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ isOpen, onClose, o
                                                                 {t('settings.autoTheme')}
                                                             </p>
                                                             <p className="text-sm text-gray-500">{t('settings.autoThemeDesc')}</p>
+                                                        </div>
+                                                    }
+                                                />
+                                            </div>
+
+                                            {/* Night mode toggle: dark on a fixed clock schedule, independent of OS preference */}
+                                            <div className="pt-2">
+                                                <Checkbox
+                                                    checked={appThemeProp === 'night'}
+                                                    onChange={(v) => {
+                                                        if (v) {
+                                                            setAppTheme?.('night');
+                                                        } else {
+                                                            setAppTheme?.(isNightTime() ? 'dark' : 'light');
+                                                        }
+                                                        // Icon theme auto-syncs via useEffect in App.tsx
+                                                    }}
+                                                    label={
+                                                        <div>
+                                                            <p className="font-medium flex items-center gap-2">
+                                                                <Clock size={14} />
+                                                                {t('settings.nightTheme')}
+                                                            </p>
+                                                            <p className="text-sm text-gray-500">{t('settings.nightThemeDesc')}</p>
                                                         </div>
                                                     }
                                                 />

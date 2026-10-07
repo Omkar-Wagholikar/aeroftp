@@ -3277,6 +3277,8 @@
             "aerovaultOverlayTimeoutDesc": "AeroVault Overlay sessions auto-lock after this period of inactivity. Lower values are safer but require more frequent unlocks.",
             "autoTheme": "Auto (System)",
             "autoThemeDesc": "Automatically switch between Light and Dark based on your system preference",
+            "nightTheme": "Night mode",
+            "nightThemeDesc": "Automatically switch to Dark from 7pm to 7am, regardless of your system preference",
             "backup": "Backup",
             "backgroundsTab": "Backgrounds",
             "binary": "Binary",

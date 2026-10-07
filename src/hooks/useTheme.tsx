@@ -38,7 +38,13 @@ const HorseIcon: React.FC<{ size?: number; className?: string }> = ({ size = 18,
     </svg>
 );
 
-export type Theme = 'light' | 'dark' | 'truedark' | 'tokyo' | 'cyber' | 'green' | 'ice' | 'redhorse' | 'auto';
+export type Theme = 'light' | 'dark' | 'truedark' | 'tokyo' | 'cyber' | 'green' | 'ice' | 'redhorse' | 'auto' | 'night';
+
+/** Night mode's fixed dark window: 7pm through 6:59am local time. */
+export const isNightTime = (): boolean => {
+    const hour = new Date().getHours();
+    return hour >= 19 || hour < 7;
+};
 
 /** Resolved theme (no 'auto') */
 export type EffectiveTheme = 'light' | 'dark' | 'truedark' | 'tokyo' | 'cyber' | 'green' | 'ice' | 'redhorse';
@@ -49,6 +55,9 @@ export type EffectiveTheme = 'light' | 'dark' | 'truedark' | 'tokyo' | 'cyber' |
 export const getEffectiveTheme = (theme: Theme, prefersDark: boolean): EffectiveTheme => {
     if (theme === 'auto') {
         return prefersDark ? 'dark' : 'light';
+    }
+    if (theme === 'night') {
+        return isNightTime() ? 'dark' : 'light';
     }
     return theme;
 };
@@ -94,6 +103,9 @@ export const useTheme = () => {
         if (saved === 'auto') {
             return window.matchMedia('(prefers-color-scheme: dark)').matches;
         }
+        if (saved === 'night') {
+            return isNightTime();
+        }
         return saved === 'dark' || saved === 'truedark' || saved === 'tokyo' || saved === 'cyber' || saved === 'green' || saved === 'redhorse';
     });
 
@@ -102,7 +114,9 @@ export const useTheme = () => {
             const nextIsDark =
                 theme === 'auto'
                     ? window.matchMedia('(prefers-color-scheme: dark)').matches
-                    : (theme === 'dark' || theme === 'truedark' || theme === 'tokyo' || theme === 'cyber' || theme === 'green' || theme === 'redhorse');
+                    : theme === 'night'
+                        ? isNightTime()
+                        : (theme === 'dark' || theme === 'truedark' || theme === 'tokyo' || theme === 'cyber' || theme === 'green' || theme === 'redhorse');
 
             setIsDark(prev => (prev === nextIsDark ? prev : nextIsDark));
         };
@@ -110,7 +124,13 @@ export const useTheme = () => {
         localStorage.setItem('aeroftp-theme', theme);
         const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
         mediaQuery.addEventListener('change', updateDarkMode);
-        return () => mediaQuery.removeEventListener('change', updateDarkMode);
+        // Clock time has no change event, so night mode re-checks on a timer to
+        // actually flip at the 7pm/7am boundary while the app stays open.
+        const nightInterval = theme === 'night' ? window.setInterval(updateDarkMode, 60_000) : null;
+        return () => {
+            mediaQuery.removeEventListener('change', updateDarkMode);
+            if (nightInterval !== null) window.clearInterval(nightInterval);
+        };
     }, [theme]);
 
     // Re-read theme from localStorage when a keystore import restores it.
