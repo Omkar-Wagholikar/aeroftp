@@ -3828,6 +3828,7 @@
             "helpText": "Press [F1] anytime to show this dialog",
             "jumpFirst": "Jump to first item",
             "jumpLast": "Jump to last item",
+            "lockNow": "Lock now",
             "moveToOtherPanel": "Move to other panel",
             "navigation": "Navigation",
             "newFolder": "New folder",

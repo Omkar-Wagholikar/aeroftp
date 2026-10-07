@@ -75,6 +75,7 @@ export const ShortcutsDialog: React.FC<ShortcutsDialogProps> = ({ isOpen, onClos
                 { keys: ['Ctrl', 'Shift', 'P'], action: t('shortcuts.commandPalette') },
                 { keys: ['Ctrl', 'F'], action: t('shortcuts.focusSearch') },
                 { keys: ['Ctrl', ','], action: t('shortcuts.openSettings') },
+                { keys: ['Ctrl', 'Shift', 'K'], action: t('shortcuts.lockNow') },
                 { keys: ['F1'], action: t('shortcuts.showShortcuts') },
                 { keys: ['Ctrl', 'Q'], action: t('shortcuts.quit') },
                 { keys: ['Escape'], action: t('shortcuts.closeDialog') },

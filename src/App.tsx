@@ -303,6 +303,7 @@ import {
     ACCOUNT_LOCK_SCREEN_REQUESTED_EVENT,
     decideBootAccountAction,
     defaultUserIdFromList,
+    dispatchAccountLockScreenRequested,
     getUnlockStatus,
     initUserPartitions,
     legacyDefaultToMigrate,
@@ -2658,6 +2659,24 @@ const App: React.FC = () => {
     // opt-in (default install resolves to compact). Mirrors the View
     // menu entry and the Settings > Appearance toggle.
     'Ctrl+Shift+V': () => { toggleCardLayout(); },
+
+    // Lock the app immediately from anywhere. Ctrl+Shift+L is already the
+    // Activity Log toggle, so this uses K instead. There are two independent
+    // lock mechanisms depending on install config (see credential_store.rs):
+    // multi-user accounts (UserDropdown's "Lock") and, separately, a
+    // master-password vault lock (the titlebar Lock button's onLockApp).
+    // Trigger whichever applies rather than guessing which one this install
+    // uses.
+    'Ctrl+Shift+K': () => {
+      dispatchAccountLockScreenRequested();
+      if (masterPasswordSet) {
+        void invoke('lock_credential_store').catch(() => {
+          // Best effort: if the vault is already locked or the command
+          // fails, the account-lock dispatch above still covers multi-user.
+        });
+        setIsAppLocked(true);
+      }
+    },
 
     // Delete: delete selected files
     'Delete': () => {

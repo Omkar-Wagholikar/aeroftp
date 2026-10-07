@@ -34,8 +34,11 @@ export const useKeyboardShortcuts = (config: ShortcutConfig, deps: React.Depende
             const target = event.target instanceof HTMLElement ? event.target : null;
             const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
             if (isTextEditingTarget(target) || isTextEditingTarget(active)) {
-                // Allow F-keys and Escape even in inputs
-                if (!event.key.startsWith('F') && event.key !== 'Escape') {
+                // Allow F-keys, Escape, and the Lock Now panic shortcut even in
+                // inputs: someone mid-password-entry is exactly who most needs
+                // an instant lock to still work.
+                const isLockShortcut = (event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'k';
+                if (!event.key.startsWith('F') && event.key !== 'Escape' && !isLockShortcut) {
                     return;
                 }
             }
