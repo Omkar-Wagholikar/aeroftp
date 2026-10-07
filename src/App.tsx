@@ -1485,6 +1485,17 @@ const App: React.FC = () => {
     const n = raw ? parseFloat(raw) : NaN;
     return Number.isFinite(n) && n >= 0.2 && n <= 1.8 ? n : 1.0;
   });
+  // Connected-mode Local/Remote split (flex-grow of whichever panel renders
+  // visually left, range 0.05..1.95). Same convention as dualPanelLeftFlex but
+  // for the Remote+Local layout rather than the dual-local-panel one, since
+  // that one hardcoded a 50/50 w-1/2 split with no resize handle at all. Wider
+  // range than dualPanelLeftFlex's 0.2..1.8: this one is clamped to an actual
+  // pixel floor at drag time (see startRemoteLocalResize), not a fixed ratio.
+  const [remoteLocalLeftFlex, setRemoteLocalLeftFlex] = useState<number>(() => {
+    const raw = localStorage.getItem('aerofile_remote_local_split');
+    const n = raw ? parseFloat(raw) : NaN;
+    return Number.isFinite(n) && n >= 0.05 && n <= 1.95 ? n : 1.0;
+  });
   const dualPanelContainerRef = useRef<HTMLDivElement | null>(null);
   // Forward ref to transferLocalSelectionAcrossPanels: the function is defined
   // later in this component but the F5/F6 keyboard handlers (declared before
@@ -1494,6 +1505,9 @@ const App: React.FC = () => {
   React.useEffect(() => {
     localStorage.setItem('aerofile_dual_panel_split', String(dualPanelLeftFlex));
   }, [dualPanelLeftFlex]);
+  React.useEffect(() => {
+    localStorage.setItem('aerofile_remote_local_split', String(remoteLocalLeftFlex));
+  }, [remoteLocalLeftFlex]);
   const startDualPanelResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     const container = dualPanelContainerRef.current;
@@ -1508,6 +1522,44 @@ const App: React.FC = () => {
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
       document.body.style.userSelect = '';
+    };
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, []);
+  const startRemoteLocalResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const container = dualPanelContainerRef.current;
+    if (!container) return;
+    // rAF-batched for the same reason as startDualPanelResize: collapse every
+    // mousemove between frames into at most one state update per frame.
+    let pendingFraction: number | null = null;
+    let rafId: number | null = null;
+    const flush = () => {
+      rafId = null;
+      if (pendingFraction !== null) setRemoteLocalLeftFlex(2 * pendingFraction);
+    };
+    const onMove = (ev: MouseEvent) => {
+      const rect = container.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      // Pixel floor rather than a fixed 10%/90% fraction: on a wide window a
+      // percentage clamp leaves far more room than needed and reads as "stuck"
+      // well before either pane is actually too small to use, which is what
+      // was reported here. 160px keeps enough space for a path bar and a
+      // couple of columns; it scales with the window instead of capping both
+      // panes to a fixed ratio of each other.
+      const MIN_PANE_PX = 160;
+      const minFraction = Math.min(0.5, MIN_PANE_PX / rect.width);
+      const maxFraction = 1 - minFraction;
+      pendingFraction = Math.max(minFraction, Math.min(maxFraction, (ev.clientX - rect.left) / rect.width));
+      if (rafId === null) rafId = requestAnimationFrame(flush);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.userSelect = '';
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      if (pendingFraction !== null) setRemoteLocalLeftFlex(2 * pendingFraction);
     };
     document.body.style.userSelect = 'none';
     window.addEventListener('mousemove', onMove);
@@ -18216,7 +18268,10 @@ const App: React.FC = () => {
                 {isConnected && showRemotePanel && <div
                   role="region"
                   aria-label="Remote files"
-                  className={`relative w-1/2 min-h-0 ${swapPanels ? 'border-l order-2' : 'border-r order-1'} border-gray-200 dark:border-gray-700 flex flex-col transition-all duration-150 ${crossPanelTarget === 'remote' ? 'ring-2 ring-inset ring-blue-400 bg-blue-50/30 dark:bg-blue-900/10' : ''}`}
+                  className={`relative min-h-0 min-w-0 ${swapPanels ? 'border-l order-3' : 'border-r order-1'} border-gray-200 dark:border-gray-700 flex flex-col transition-all duration-150 ${crossPanelTarget === 'remote' ? 'ring-2 ring-inset ring-blue-400 bg-blue-50/30 dark:bg-blue-900/10' : ''}`}
+                  style={swapPanels
+                    ? { flexGrow: 2 - remoteLocalLeftFlex, flexShrink: 1, flexBasis: 0 }
+                    : { flexGrow: remoteLocalLeftFlex, flexShrink: 1, flexBasis: 0 }}
                   onDragOver={(e) => handlePanelDragOver(e, 'remote')}
                   onDrop={(e) => handlePanelDrop(e, 'remote')}
                   onDragLeave={handlePanelDragLeave}
@@ -19100,6 +19155,53 @@ const App: React.FC = () => {
                   </div>
                 </div>}
 
+                {/* Resize handle between Remote and Local when both are shown
+                    (connected mode). Mirrors the dual-local-panel resizer:
+                    same drag math, same keyboard support. This pairing
+                    previously hardcoded a 50/50 w-1/2 split with no way to
+                    resize it at all. */}
+                {isConnected && showRemotePanel && (
+                  <div
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label={t('aerofile.resizePanels') || 'Resize panels'}
+                    title={t('aerofile.resizePanels') || 'Resize panels'}
+                    aria-valuemin={20}
+                    aria-valuemax={180}
+                    aria-valuenow={Math.round(remoteLocalLeftFlex * 100)}
+                    tabIndex={0}
+                    onMouseDown={startRemoteLocalResize}
+                    onDoubleClick={() => setRemoteLocalLeftFlex(1.0)}
+                    onKeyDown={(e) => {
+                      const STEP = 0.1;
+                      // Matches the pixel-floor clamp in startRemoteLocalResize:
+                      // 0.05/1.95 is a close static approximation of "as far as
+                      // a 160px-vs-container-width floor allows" for a normal
+                      // window size, so arrow/Home/End land near where a mouse
+                      // drag would actually stop instead of a tighter, stale
+                      // bound.
+                      const clamp = (v: number) => Math.max(0.05, Math.min(1.95, v));
+                      if (e.key === 'ArrowLeft') {
+                        e.preventDefault();
+                        setRemoteLocalLeftFlex(prev => clamp(prev - STEP));
+                      } else if (e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        setRemoteLocalLeftFlex(prev => clamp(prev + STEP));
+                      } else if (e.key === 'Home') {
+                        e.preventDefault();
+                        setRemoteLocalLeftFlex(0.05);
+                      } else if (e.key === 'End') {
+                        e.preventDefault();
+                        setRemoteLocalLeftFlex(1.95);
+                      } else if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setRemoteLocalLeftFlex(1.0);
+                      }
+                    }}
+                    className="order-2 w-1.5 hover:w-2.5 cursor-col-resize bg-gray-300 dark:bg-gray-600 hover:bg-blue-400 dark:hover:bg-blue-500 focus:bg-blue-500 focus:outline-none transition-colors flex-shrink-0"
+                    style={{ touchAction: 'none' }}
+                  />
+                )}
 
                 {/* Local: full width when remote panel is hidden */}
                 <LocalFilePanel
@@ -19109,7 +19211,15 @@ const App: React.FC = () => {
                   panelKey="local"
                   isFocused={(!isConnected || !showRemotePanel) && showDualLocalPanel && activeLocalPanelId === 'local'}
                   onPanelFocus={() => { setActivePanel('local'); setActiveLocalPanelId('local'); }}
-                  style={(!isConnected || !showRemotePanel) && showDualLocalPanel ? { flexGrow: dualPanelLeftFlex, flexShrink: 1, flexBasis: 0 } : undefined}
+                  style={
+                    (!isConnected || !showRemotePanel) && showDualLocalPanel
+                      ? { flexGrow: dualPanelLeftFlex, flexShrink: 1, flexBasis: 0 }
+                      : isConnected && showRemotePanel
+                        ? (swapPanels
+                          ? { flexGrow: remoteLocalLeftFlex, flexShrink: 1, flexBasis: 0 }
+                          : { flexGrow: 2 - remoteLocalLeftFlex, flexShrink: 1, flexBasis: 0 })
+                        : undefined
+                  }
                   endpointSelector={localUnifiedPanel ? {
                     endpoint: localUnifiedPanel.endpoint,
                     savedProfiles: endpointSelectorProfiles,
@@ -19121,7 +19231,7 @@ const App: React.FC = () => {
                     onCopyHere: () => { void planLocalSelectionAcrossPanels('copy', 'local2'); },
                     onMoveHere: () => { void planLocalSelectionAcrossPanels('move', 'local2'); },
                   } : null}
-                  className={isConnected && showRemotePanel ? (swapPanels ? 'order-1' : 'order-2') : undefined}
+                  className={isConnected && showRemotePanel ? (swapPanels ? 'order-1' : 'order-3') : undefined}
                   currentPath={currentLocalPath}
                   setCurrentPath={setCurrentLocalPath}
                   onNavigate={changeLocalDirectory}
